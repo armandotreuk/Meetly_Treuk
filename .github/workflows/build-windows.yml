@@ -81,7 +81,7 @@ jobs:
         shell: bash
         run: |
           cd upstream/frontend
-          pnpm install --frozen-lockfile
+          pnpm install --no-frozen-lockfile
 
       # --- Rust setup ---
       - name: Install Rust stable
