@@ -431,41 +431,27 @@ impl SettingsRepository {
 }
 
 fn decrypt_setting_fields(s: &mut Setting) {
-    let fields: [(&str, &mut Option<String>); 5] = [
-        ("groq", &mut s.groq_api_key),
-        ("openai", &mut s.openai_api_key),
-        ("anthropic", &mut s.anthropic_api_key),
-        ("ollama", &mut s.ollama_api_key),
-        ("openrouter", &mut s.open_router_api_key),
-    ];
-    for (provider, field) in fields {
-        if let Some(ref val) = *field {
-            if crate::security::is_encrypted(val) {
-                if let Ok(dec) = crate::security::decrypt_api_key(val) {
-                    *field = Some(dec);
-                }
-            }
-        }
-    }
-    let _ = fields;
+    decrypt_field(&mut s.groq_api_key);
+    decrypt_field(&mut s.openai_api_key);
+    decrypt_field(&mut s.anthropic_api_key);
+    decrypt_field(&mut s.ollama_api_key);
+    decrypt_field(&mut s.open_router_api_key);
 }
 
 fn decrypt_transcript_setting_fields(s: &mut TranscriptSetting) {
-    let fields: [(&str, &mut Option<String>); 5] = [
-        ("whisper", &mut s.whisper_api_key),
-        ("deepgram", &mut s.deepgram_api_key),
-        ("elevenLabs", &mut s.eleven_labs_api_key),
-        ("groq", &mut s.groq_api_key),
-        ("openai", &mut s.openai_api_key),
-    ];
-    for (provider, field) in fields {
-        if let Some(ref val) = *field {
-            if crate::security::is_encrypted(val) {
-                if let Ok(dec) = crate::security::decrypt_api_key(val) {
-                    *field = Some(dec);
-                }
+    decrypt_field(&mut s.whisper_api_key);
+    decrypt_field(&mut s.deepgram_api_key);
+    decrypt_field(&mut s.eleven_labs_api_key);
+    decrypt_field(&mut s.groq_api_key);
+    decrypt_field(&mut s.openai_api_key);
+}
+
+fn decrypt_field(field: &mut Option<String>) {
+    if let Some(ref val) = *field {
+        if crate::security::is_encrypted(val) {
+            if let Ok(dec) = crate::security::decrypt_api_key(val) {
+                *field = Some(dec);
             }
         }
     }
-    let _ = fields;
 }
