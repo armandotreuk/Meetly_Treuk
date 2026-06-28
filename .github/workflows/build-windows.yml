@@ -1,0 +1,170 @@
+name: "Build Windows (CI)"
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      build-type:
+        description: 'Build type'
+        required: true
+        type: choice
+        options: [debug, release]
+        default: release
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-windows:
+    name: Build Windows x64 (CPU)
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get version from tauri.conf.json
+        id: get-version
+        shell: bash
+        run: |
+          VERSION=$(grep -o '"version": "[^"]*"' upstream/frontend/src-tauri/tauri.conf.json | cut -d'"' -f4)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Determine build profile
+        id: build-profile
+        shell: bash
+        run: |
+          if [[ "${{ github.event.inputs.build-type }}" == "debug" || "${{ github.event.inputs.build-type }}" == "" ]]; then
+            echo "profile=debug" >> "$GITHUB_OUTPUT"
+            echo "args=--debug" >> "$GITHUB_OUTPUT"
+          else
+            echo "profile=release" >> "$GITHUB_OUTPUT"
+            echo "args=" >> "$GITHUB_OUTPUT"
+          fi
+
+      # --- Frontend setup ---
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Get pnpm store directory
+        shell: bash
+        run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
+
+      - name: Setup pnpm cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('upstream/frontend/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-pnpm-store-
+
+      - name: Install frontend dependencies
+        shell: bash
+        run: |
+          cd upstream/frontend
+          pnpm install --frozen-lockfile
+
+      # --- Rust setup ---
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "upstream -> upstream/target"
+          key: windows-x64-cpu-v1
+
+      # --- Build ---
+      - name: Build Tauri app (CPU, no GPU acceleration)
+        shell: bash
+        run: |
+          cd upstream/frontend
+          pnpm tauri build ${{ steps.build-profile.outputs.args }}
+        env:
+          CARGO_TARGET_DIR: ../target
+
+      - name: Rename build profile dir for upload
+        shell: bash
+        run: |
+          if [[ "${{ steps.build-profile.outputs.profile }}" == "debug" ]]; then
+            ARTIFACT_DIR="upstream/target/debug"
+          else
+            ARTIFACT_DIR="upstream/target/release"
+          fi
+          echo "ARTIFACT_DIR=$ARTIFACT_DIR" >> $GITHUB_ENV
+
+      # --- Upload ---
+      - name: Upload MSI installer
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: meetily-windows-msi-v${{ steps.get-version.outputs.version }}
+          path: upstream/target/release/bundle/msi/*.msi
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload NSIS installer
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: meetily-windows-nsis-v${{ steps.get-version.outputs.version }}
+          path: upstream/target/release/bundle/nsis/*.exe
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload compiled exe (for dev testing)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: meetily-windows-exe-v${{ steps.get-version.outputs.version }}
+          path: upstream/target/release/meetily.exe
+          if-no-files-found: warn
+          retention-days: 14
+
+  # Quick cargo check on every push (faster than full build)
+  check-rust:
+    name: Cargo Check (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "upstream -> upstream/target"
+          key: windows-x64-check-v1
+
+      - name: Cargo check workspace
+        shell: bash
+        run: |
+          cd upstream
+          cargo check --workspace 2>&1 || true
+        env:
+          CARGO_TARGET_DIR: target

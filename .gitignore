@@ -1,0 +1,36 @@
+# Build artifacts
+build/
+meetily-build-target/
+
+# Upstream git metadata (we keep the code, not the .git)
+upstream/.git/
+
+# Node/pnpm
+upstream/frontend/node_modules/
+upstream/frontend/.next/
+upstream/frontend/out/
+
+# Rust
+upstream/target/
+target/
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+upstream/frontend/src-tauri/logs/
+
+# Models (downloaded at runtime, not committed)
+*.gguf
+*.onnx
+
+# Secrets
+.env
+.env.local
