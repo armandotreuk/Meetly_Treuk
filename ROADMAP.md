@@ -10,30 +10,31 @@
 
 _Goal: a clean fork that builds on Windows, with the plaintext-key leak fixed and the notes table wired up. No new user-facing features beyond F11._
 
-- [ ] **0.1 Fork & upstream integration**
-  - [ ] `git clone https://github.com/Zackriya-Solutions/meetily` into `upstream/` (submodule or full clone)
-  - [ ] Add `upstream` remote; record base commit in `MIGRATION.md`
-  - [ ] Create our `src/` overlay directory structure (per `ARCHITECTURE.md` §1)
-  - [ ] Remove `analytics/` module + all call sites (decision 3)
-  - [ ] Disable Tauri auto-updater in `tauri.conf.json` (decision 4)
-- [ ] **0.2 Windows build verification**
-  - [ ] Verify prerequisites: `rustc` ≥ 1.77, Node.js + pnpm, VS Build Tools C++ workload, CMake
-  - [ ] `cd frontend && pnpm install && pnpm tauri:dev` — app launches
-  - [ ] Transcription smoke test (record 30s, confirm transcript + summary appear)
-  - [ ] PT-BR smoke test (record/insert a Portuguese clip)
-- [ ] **0.3 F10 — Encrypted API key storage**
-  - [ ] Add `keyring` crate to `frontend/src-tauri/Cargo.toml`
-  - [ ] Create `frontend/src-tauri/src/security/{mod.rs,aes.rs,keyring.rs}`
-  - [ ] Migration: `key_metadata` table + one-time plaintext→ciphertext migration
-  - [ ] Wrap all `*ApiKey` reads/writes in `database/settings.rs`
-  - [ ] Verify: existing OpenRouter/OCI keys migrate automatically and still work
-  - [ ] Verify: DB file alone no longer reveals keys
-- [ ] **0.4 F11 — Meeting notes editor**
-  - [ ] Create `frontend/src-tauri/src/database/meeting_notes.rs` (CRUD on existing empty table)
-  - [ ] Expose Tauri commands: `get_notes`, `save_notes`
-  - [ ] Create `frontend/src/components/MeetingNotesEditor.tsx` (markdown editor + autosave)
-  - [ ] Add "Notes" tab to `frontend/src/components/MeetingDetail.tsx`
-  - [ ] Verify: notes persist across app restarts
+- [x] **0.1 Fork & upstream integration**
+  - [x] `git clone https://github.com/Zackriya-Solutions/meetily` into `upstream/`
+  - [x] Record base commit in `MIGRATION.md` (v0.4.0, commit `0281737`)
+  - [x] Remove `analytics/` module + all call sites (decision 3) — 3,157 lines deleted
+  - [x] Disable Tauri auto-updater in `tauri.conf.json` (decision 4)
+  - [x] Pushed to GitHub at `https://github.com/armandotreuk/Meetly_Treuk`
+- [x] **0.2 Windows build verification**
+  - [x] Prerequisites: Rust 1.96.0, Node 24 + pnpm 11.9, CMake 11.13, VS 2026 C++
+  - [x] Frontend (`pnpm build`) succeeds — 11 static pages generated
+  - [x] CI workflow created (GitHub Actions Windows runner — local builds blocked by SAC)
+  - [ ] Rust build verification (CI Cargo Check — runs pending)
+  - [ ] Transcription + PT-BR smoke test (needs CI binary)
+- [x] **0.3 F10 — Encrypted API key storage**
+  - [x] Add `keyring`, `aes-gcm`, `base64` crates to `Cargo.toml`
+  - [x] Create `frontend/src-tauri/src/security/{mod.rs,aes.rs,keyring.rs}`
+  - [x] AES-256-GCM encryption with master key in OS keychain
+  - [x] Wrap all API key reads/writes in `database/repositories/setting.rs`
+  - [x] Lazy migration: plaintext keys encrypted on first read
+  - [ ] Verify with CI binary
+- [x] **0.4 F11 — Meeting notes editor**
+  - [x] `database/repositories/meeting_notes.rs` — CRUD on existing table
+  - [x] Tauri commands: `get_meeting_notes`, `save_meeting_notes`, `delete_meeting_notes`
+  - [x] `MeetingDetails/NotesPanel.tsx` — markdown editor with 2s autosave
+  - [x] Notes toggle button in meeting details page
+  - [ ] Verify with CI binary
 
 **Phase 0 exit criteria:** clean fork builds on Windows, runs dev mode, transcribes PT-BR audio, stores all API keys encrypted, and lets the user write per-meeting notes.
 
