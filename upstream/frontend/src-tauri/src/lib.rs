@@ -48,6 +48,7 @@ pub mod anthropic;
 pub mod groq;
 pub mod openrouter;
 pub mod parakeet_engine;
+pub mod security;
 pub mod state;
 pub mod summary;
 pub mod tray;
@@ -496,6 +497,12 @@ pub fn run() {
                 database::setup::initialize_database_on_startup(&_app.handle()).await
             })
             .expect("Failed to initialize database");
+
+            // F10: Initialize security module (OS keyring master key)
+            log::info!("Initializing security module (encrypted key storage)...");
+            if let Err(e) = security::init() {
+                log::warn!("Failed to initialize security module: {} — API keys will be stored in plaintext", e);
+            }
 
             // Initialize bundled templates directory for dynamic template discovery
             log::info!("Initializing bundled templates directory...");

@@ -32,9 +32,13 @@ impl SettingsRepository {
     pub async fn get_model_config(
         pool: &SqlitePool,
     ) -> std::result::Result<Option<Setting>, sqlx::Error> {
-        let setting = sqlx::query_as::<_, Setting>("SELECT * FROM settings LIMIT 1")
+        let mut setting = sqlx::query_as::<_, Setting>("SELECT * FROM settings LIMIT 1")
             .fetch_optional(pool)
             .await?;
+        // F10: Decrypt all API key fields before returning
+        if let Some(ref mut s) = setting {
+            decrypt_setting_fields(s);
+        }
         Ok(setting)
     }
 
@@ -79,6 +83,15 @@ impl SettingsRepository {
             ));
         }
 
+        // F10: Encrypt the API key before storing
+        let stored_key = match crate::security::encrypt_api_key(api_key) {
+            Ok(enc) => enc,
+            Err(e) => {
+                log::error!("Failed to encrypt API key for provider {}: {}", provider, e);
+                return Err(sqlx::Error::Protocol(format!("Encryption failed: {}", e).into()));
+            }
+        };
+
         let api_key_column = match provider {
             "openai" => "openaiApiKey",
             "claude" => "anthropicApiKey",
@@ -102,7 +115,7 @@ impl SettingsRepository {
             "#,
             api_key_column, api_key_column
         );
-        sqlx::query(&query).bind(api_key).execute(pool).await?;
+        sqlx::query(&query).bind(stored_key).execute(pool).await?;
 
         Ok(())
     }
@@ -136,16 +149,44 @@ impl SettingsRepository {
             api_key_column
         );
         let api_key = sqlx::query_scalar(&query).fetch_optional(pool).await?;
-        Ok(api_key)
+        // F10: Decrypt the API key if it's encrypted; migrate plaintext if found
+        match api_key {
+            Some(ref val) if crate::security::is_encrypted(val) => {
+                match crate::security::decrypt_api_key(val) {
+                    Ok(dec) => Ok(Some(dec)),
+                    Err(e) => {
+                        log::error!("Failed to decrypt API key for provider {}: {}", provider, e);
+                        Ok(None)
+                    }
+                }
+            }
+            Some(ref val) if !val.is_empty() => {
+                // Plaintext key found — migrate to encrypted on read
+                log::info!("Migrating plaintext API key to encrypted for provider {}", provider);
+                if let Ok(enc) = crate::security::encrypt_api_key(val) {
+                    let migrate_query = format!(
+                        "UPDATE settings SET {} = $1 WHERE id = '1'",
+                        api_key_column
+                    );
+                    let _ = sqlx::query(&migrate_query).bind(&enc).execute(pool).await;
+                }
+                Ok(Some(val.clone()))
+            }
+            _ => Ok(api_key),
+        }
     }
 
     pub async fn get_transcript_config(
         pool: &SqlitePool,
     ) -> std::result::Result<Option<TranscriptSetting>, sqlx::Error> {
-        let setting =
+        let mut setting =
             sqlx::query_as::<_, TranscriptSetting>("SELECT * FROM transcript_settings LIMIT 1")
                 .fetch_optional(pool)
                 .await?;
+        // F10: Decrypt all transcript API key fields before returning
+        if let Some(ref mut s) = setting {
+            decrypt_transcript_setting_fields(s);
+        }
         Ok(setting)
 
     }
@@ -177,6 +218,15 @@ impl SettingsRepository {
         provider: &str,
         api_key: &str,
     ) -> std::result::Result<(), sqlx::Error> {
+        // F10: Encrypt the transcript API key before storing
+        let stored_key = match crate::security::encrypt_api_key(api_key) {
+            Ok(enc) => enc,
+            Err(e) => {
+                log::error!("Failed to encrypt transcript API key for provider {}: {}", provider, e);
+                return Err(sqlx::Error::Protocol(format!("Encryption failed: {}", e).into()));
+            }
+        };
+
         let api_key_column = match provider {
             "localWhisper" => "whisperApiKey",
             "parakeet" => return Ok(()), // Parakeet doesn't need an API key, return early
@@ -200,7 +250,7 @@ impl SettingsRepository {
             "#,
             api_key_column, crate::config::DEFAULT_PARAKEET_MODEL, api_key_column
         );
-        sqlx::query(&query).bind(api_key).execute(pool).await?;
+        sqlx::query(&query).bind(stored_key).execute(pool).await?;
 
         Ok(())
     }
@@ -228,7 +278,30 @@ impl SettingsRepository {
             api_key_column
         );
         let api_key = sqlx::query_scalar(&query).fetch_optional(pool).await?;
-        Ok(api_key)
+        // F10: Decrypt the transcript API key if encrypted; migrate plaintext if found
+        match api_key {
+            Some(ref val) if crate::security::is_encrypted(val) => {
+                match crate::security::decrypt_api_key(val) {
+                    Ok(dec) => Ok(Some(dec)),
+                    Err(e) => {
+                        log::error!("Failed to decrypt transcript API key for provider {}: {}", provider, e);
+                        Ok(None)
+                    }
+                }
+            }
+            Some(ref val) if !val.is_empty() => {
+                log::info!("Migrating plaintext transcript API key to encrypted for provider {}", provider);
+                if let Ok(enc) = crate::security::encrypt_api_key(val) {
+                    let migrate_query = format!(
+                        "UPDATE transcript_settings SET {} = $1 WHERE id = '1'",
+                        api_key_column
+                    );
+                    let _ = sqlx::query(&migrate_query).bind(&enc).execute(pool).await;
+                }
+                Ok(Some(val.clone()))
+            }
+            _ => Ok(api_key),
+        }
     }
 
     pub async fn delete_api_key(
@@ -323,8 +396,18 @@ impl SettingsRepository {
         pool: &SqlitePool,
         config: &CustomOpenAIConfig,
     ) -> std::result::Result<(), sqlx::Error> {
+        // F10: Encrypt the API key inside the config before storing
+        let mut config_to_store = config.clone();
+        if let Some(ref key) = config.api_key {
+            if !crate::security::is_encrypted(key) {
+                if let Ok(enc) = crate::security::encrypt_api_key(key) {
+                    config_to_store.api_key = Some(enc);
+                }
+            }
+        }
+
         // Serialize config to JSON
-        let config_json = serde_json::to_string(config)
+        let config_json = serde_json::to_string(&config_to_store)
             .map_err(|e| sqlx::Error::Protocol(
                 format!("Failed to serialize config to JSON: {}", e).into()
             ))?;
@@ -345,4 +428,44 @@ impl SettingsRepository {
 
         Ok(())
     }
+}
+
+fn decrypt_setting_fields(s: &mut Setting) {
+    let fields: [(&str, &mut Option<String>); 5] = [
+        ("groq", &mut s.groq_api_key),
+        ("openai", &mut s.openai_api_key),
+        ("anthropic", &mut s.anthropic_api_key),
+        ("ollama", &mut s.ollama_api_key),
+        ("openrouter", &mut s.open_router_api_key),
+    ];
+    for (provider, field) in fields {
+        if let Some(ref val) = *field {
+            if crate::security::is_encrypted(val) {
+                if let Ok(dec) = crate::security::decrypt_api_key(val) {
+                    *field = Some(dec);
+                }
+            }
+        }
+    }
+    let _ = fields;
+}
+
+fn decrypt_transcript_setting_fields(s: &mut TranscriptSetting) {
+    let fields: [(&str, &mut Option<String>); 5] = [
+        ("whisper", &mut s.whisper_api_key),
+        ("deepgram", &mut s.deepgram_api_key),
+        ("elevenLabs", &mut s.eleven_labs_api_key),
+        ("groq", &mut s.groq_api_key),
+        ("openai", &mut s.openai_api_key),
+    ];
+    for (provider, field) in fields {
+        if let Some(ref val) = *field {
+            if crate::security::is_encrypted(val) {
+                if let Ok(dec) = crate::security::decrypt_api_key(val) {
+                    *field = Some(dec);
+                }
+            }
+        }
+    }
+    let _ = fields;
 }
