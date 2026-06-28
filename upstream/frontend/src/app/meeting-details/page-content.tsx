@@ -8,7 +8,9 @@ import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import { TranscriptPanel } from '@/components/MeetingDetails/TranscriptPanel';
 import { SummaryPanel } from '@/components/MeetingDetails/SummaryPanel';
+import { NotesPanel } from '@/components/MeetingDetails/NotesPanel';
 import { ModelConfig } from '@/components/ModelSettingsModal';
+import { StickyNote } from 'lucide-react';
 
 // Custom hooks
 import { useMeetingData } from '@/hooks/meeting-details/useMeetingData';
@@ -57,6 +59,7 @@ export default function PageContent({
   const [customPrompt, setCustomPrompt] = useState<string>('');
   const [isRecording] = useState(false);
   const [summaryResponse] = useState<SummaryResponse | null>(null);
+  const [showNotes, setShowNotes] = useState(false);
 
   // Ref to store the modal open function from SummaryGeneratorButtonGroup
   const openModelSettingsRef = useRef<(() => void) | null>(null);
@@ -227,7 +230,20 @@ export default function PageContent({
           isModelConfigLoading={false}
           onOpenModelSettings={handleRegisterModalOpen}
         />
+        {showNotes && (
+          <NotesPanel meetingId={meeting.id} />
+        )}
       </div>
+      {/* F11: Notes toggle button */}
+      <button
+        onClick={() => setShowNotes(!showNotes)}
+        className={`absolute top-4 right-4 z-10 p-2 rounded-lg shadow-sm transition-colors ${
+          showNotes ? 'bg-blue-100 text-blue-600' : 'bg-white text-gray-400 hover:text-gray-600'
+        }`}
+        title={showNotes ? 'Hide notes' : 'Show notes'}
+      >
+        <StickyNote className="h-4 w-4" />
+      </button>
     </motion.div>
   );
 }

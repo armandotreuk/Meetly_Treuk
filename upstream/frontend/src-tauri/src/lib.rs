@@ -709,6 +709,10 @@ pub fn run() {
             // Database and Models path commands
             database::commands::get_database_directory,
             database::commands::open_database_folder,
+            // F11: Meeting notes commands
+            database::commands::get_meeting_notes,
+            database::commands::save_meeting_notes,
+            database::commands::delete_meeting_notes,
             whisper_engine::commands::open_models_folder,
             // Onboarding commands
             onboarding::get_onboarding_status,

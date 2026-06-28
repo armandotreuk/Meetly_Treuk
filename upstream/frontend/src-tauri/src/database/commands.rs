@@ -5,6 +5,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use super::manager::DatabaseManager;
 use crate::state::AppState;
+use tauri::State;
 
 #[derive(Serialize)]
 pub struct DatabaseCheckResult {
@@ -275,4 +276,46 @@ pub async fn open_database_folder(app: AppHandle) -> Result<(), String> {
 
     info!("Opened database folder: {}", folder_path);
     Ok(())
+}
+
+// F11: Meeting notes commands
+
+#[tauri::command]
+pub async fn get_meeting_notes(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Option<super::repositories::meeting_notes::MeetingNote>, String> {
+    let pool = state.db_manager.pool();
+    super::repositories::meeting_notes::MeetingNotesRepository::get_notes(pool, &meeting_id)
+        .await
+        .map_err(|e| format!("Failed to get meeting notes: {}", e))
+}
+
+#[tauri::command]
+pub async fn save_meeting_notes(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    notes_markdown: Option<String>,
+    notes_json: Option<String>,
+) -> Result<(), String> {
+    let pool = state.db_manager.pool();
+    super::repositories::meeting_notes::MeetingNotesRepository::save_notes(
+        pool,
+        &meeting_id,
+        notes_markdown.as_deref(),
+        notes_json.as_deref(),
+    )
+    .await
+    .map_err(|e| format!("Failed to save meeting notes: {}", e))
+}
+
+#[tauri::command]
+pub async fn delete_meeting_notes(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<(), String> {
+    let pool = state.db_manager.pool();
+    super::repositories::meeting_notes::MeetingNotesRepository::delete_notes(pool, &meeting_id)
+        .await
+        .map_err(|e| format!("Failed to delete meeting notes: {}", e))
 }
