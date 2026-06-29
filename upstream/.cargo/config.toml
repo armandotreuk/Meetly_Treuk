@@ -1,7 +1,0 @@
-# Build configuration for Personal Meetly
-# The target directory MUST be outside OneDrive to avoid:
-# 1. Smart App Control blocking unsigned build scripts (os error 4551)
-# 2. OneDrive sync conflicts with build artifacts
-# 3. OneDrive Files On-Demand evicting compiled binaries
-[build]
-target-dir = "C:/Users/arman/meetily-build-target"

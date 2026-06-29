@@ -162,9 +162,38 @@ jobs:
           key: windows-x64-check-v1
 
       - name: Cargo check workspace
+        id: cargo-check
         shell: bash
         run: |
           cd upstream
-          cargo check --workspace
+          # Run cargo check, capture all output to a file (no color codes for clean parsing)
+          CARGO_TERM_COLOR=never cargo check --workspace --message-format=short > /tmp/cargo_check_out.txt 2>&1
+          RC=$?
+          echo "cargo_check_exit_code=$RC" >> "$GITHUB_OUTPUT"
+          if [ "$RC" -ne 0 ]; then
+            echo "=== CARGO CHECK FAILED (exit $RC) ==="
+            echo "--- CARGO OUTPUT (full) ---"
+            cat /tmp/cargo_check_out.txt
+            echo "--- END CARGO OUTPUT ---"
+            # Emit each output line as a workflow error annotation (visible via the
+            # public check-runs annotations API even without GitHub authentication).
+            # Annotations have an overall limit (~50) per check-run; cap accordingly.
+            awk '
+              {
+                line = $0
+                sub(/\r$/, "", line)
+                # Truncate per-line to avoid breaking the workflow command parser
+                if (length(line) > 3500) line = substr(line, 1, 3500) "..."
+                # Override any `::` prefix cargo might emit, to avoid double parsing
+                if (line ~ /^::/) line = " " line
+              }
+              NR <= 50 {
+                printf "::error file=.github,line=%d,title=cargo-check::%s\n", NR, line
+              }
+            ' /tmp/cargo_check_out.txt
+            exit "$RC"
+          else
+            echo "=== CARGO CHECK PASSED ==="
+          fi
         env:
           CARGO_TARGET_DIR: target
