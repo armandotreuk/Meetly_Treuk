@@ -46,7 +46,8 @@ jobs:
         id: build-profile
         shell: bash
         run: |
-          if [[ "${{ github.event.inputs.build-type }}" == "debug" || "${{ github.event.inputs.build-type }}" == "" ]]; then
+          # Default to release for push events; allow override via workflow_dispatch input
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.build-type }}" == "debug" ]]; then
             echo "profile=debug" >> "$GITHUB_OUTPUT"
             echo "args=--debug" >> "$GITHUB_OUTPUT"
           else
@@ -125,9 +126,9 @@ jobs:
           echo "=== LLAMA-HELPER BUILD EXIT CODE: $RC ==="
           cat "$LOG"
           if [ "$RC" -ne 0 ]; then exit 0; fi
-          # Copy to sidecar location
+          # Copy to sidecar location (Tauri expects binaries/llama-helper on Windows, .exe appended automatically)
           mkdir -p frontend/src-tauri/binaries
-          cp "$SRC" "frontend/src-tauri/binaries/llama-helper-${TARGET}${EXT}"
+          cp "$SRC" "frontend/src-tauri/binaries/llama-helper"
           ls -la frontend/src-tauri/binaries/
 
       - name: Upload llama-helper build output (for public debugging)
@@ -211,7 +212,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: meetily-windows-msi-v${{ steps.get-version.outputs.version }}
-          path: upstream/target/release/bundle/msi/*.msi
+          path: ${{ env.ARTIFACT_DIR }}/bundle/msi/*.msi
           if-no-files-found: warn
           retention-days: 30
 
@@ -220,7 +221,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: meetily-windows-nsis-v${{ steps.get-version.outputs.version }}
-          path: upstream/target/release/bundle/nsis/*.exe
+          path: ${{ env.ARTIFACT_DIR }}/bundle/nsis/*.exe
           if-no-files-found: warn
           retention-days: 30
 
@@ -229,7 +230,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: meetily-windows-exe-v${{ steps.get-version.outputs.version }}
-          path: upstream/target/release/meetily.exe
+          path: ${{ env.ARTIFACT_DIR }}/meetily.exe
           if-no-files-found: warn
           retention-days: 14
 
