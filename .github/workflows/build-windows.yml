@@ -217,6 +217,7 @@ jobs:
         continue-on-error: true
         env:
           CARGO_DEBUG_LOG: ${{ runner.temp }}/cargo_check_out.txt
+          CARGO_TARGET_DIR: target
         run: |
           cd upstream
           # Capture all cargo output (no color codes for clean parsing)
@@ -229,8 +230,6 @@ jobs:
           cat "$LOG"
           echo "--- CARGO OUTPUT END ---"
           exit 0   # Always succeed; the artifact upload + a separate check step will surface the failure
-        env:
-          CARGO_TARGET_DIR: target
 
       - name: Upload cargo check output (for public debugging)
         if: always()
