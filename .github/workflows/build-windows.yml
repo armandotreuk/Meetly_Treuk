@@ -171,6 +171,23 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
 
+      - name: Write build outputs to step summary
+        if: always()
+        shell: bash
+        run: |
+          # Write to step summary so it's visible via the public check-runs API
+          {
+            echo "## Tauri Build Output"
+            echo '```'
+            cat "$RUNNER_TEMP/tauri_build_out.txt" 2>/dev/null || echo "(no file)"
+            echo '```'
+            echo ""
+            echo "## Llama-Helper Build Output"
+            echo '```'
+            cat "$RUNNER_TEMP/llama_helper_out.txt" 2>/dev/null || echo "(no file)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Fail job if Tauri build failed
         if: steps.tauri-build.outputs.tauri_build_exit_code != '0'
         shell: bash
