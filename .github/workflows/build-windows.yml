@@ -156,9 +156,9 @@ jobs:
           CARGO_TARGET_DIR: ../target
         run: |
           cd upstream/frontend
-          # Clean previous bundle output to force re-bundling
-          rm -rf ../target/release/bundle
-          pnpm tauri build ${{ steps.build-profile.outputs.args }} > "$TAURI_BUILD_LOG" 2>&1
+          # Clean entire target directory to force full rebuild including bundler
+          rm -rf ../target
+          pnpm tauri build ${{ steps.build-profile.outputs.args }} --verbose > "$TAURI_BUILD_LOG" 2>&1
           RC=$?
           echo "tauri_build_exit_code=$RC" >> "$GITHUB_OUTPUT"
           echo "=== TAURI BUILD EXIT CODE: $RC ==="
