@@ -97,28 +97,54 @@ jobs:
 
       # --- Build ---
       - name: Build llama-helper sidecar
+        id: llama-helper
         shell: bash
+        continue-on-error: true
+        env:
+          LLAMA_DEBUG_LOG: ${{ runner.temp }}/llama_helper_out.txt
         run: |
           cd upstream
-          # Build llama-helper in the same profile as the Tauri app so the binary
-          # matches the runtime expectation (debug vs release). No GPU features
-          # for the CPU-only Windows build.
+          # Capture all output so it can be attached as an artifact (use RUNNER_TEMP,
+          # not /tmp/, since /tmp/ is not recognized by upload-artifact on Windows).
+          LOG="$LLAMA_DEBUG_LOG"
           TARGET="x86_64-pc-windows-msvc"
           if [[ "${{ steps.build-profile.outputs.profile }}" == "debug" ]]; then
             echo "Building llama-helper in debug profile..."
-            cargo build --debug -p llama-helper
+            cargo build --debug -p llama-helper > "$LOG" 2>&1
+            RC=$?
             EXT=".exe"
             SRC="target/debug/llama-helper${EXT}"
           else
             echo "Building llama-helper in release profile..."
-            cargo build --release -p llama-helper
+            cargo build --release -p llama-helper > "$LOG" 2>&1
+            RC=$?
             EXT=".exe"
             SRC="target/release/llama-helper${EXT}"
           fi
-          # Tauri expects the sidecar named <name>-<target-triple><ext>
+          echo "llama_helper_exit_code=$RC" >> "$GITHUB_OUTPUT"
+          echo "=== LLAMA-HELPER BUILD EXIT CODE: $RC ==="
+          cat "$LOG"
+          if [ "$RC" -ne 0 ]; then exit 0; fi
+          # Copy to sidecar location
           mkdir -p frontend/src-tauri/binaries
           cp "$SRC" "frontend/src-tauri/binaries/llama-helper-${TARGET}${EXT}"
           ls -la frontend/src-tauri/binaries/
+
+      - name: Upload llama-helper build output (for public debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-helper-output
+          path: ${{ runner.temp }}/llama_helper_out.txt
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Fail job if llama-helper build failed
+        if: steps.llama-helper.outputs.llama_helper_exit_code != '0'
+        shell: bash
+        run: |
+          echo "llama-helper build failed with exit code ${{ steps.llama-helper.outputs.llama_helper_exit_code }}"
+          exit 1
 
       - name: Build Tauri app (CPU, no GPU acceleration)
         shell: bash
@@ -189,15 +215,18 @@ jobs:
         id: cargo-check
         shell: bash
         continue-on-error: true
+        env:
+          CARGO_DEBUG_LOG: ${{ runner.temp }}/cargo_check_out.txt
         run: |
           cd upstream
           # Capture all cargo output (no color codes for clean parsing)
-          CARGO_TERM_COLOR=never cargo check --workspace --message-format=short > /tmp/cargo_check_out.txt 2>&1
+          LOG="$CARGO_DEBUG_LOG"
+          CARGO_TERM_COLOR=never cargo check --workspace --message-format=short > "$LOG" 2>&1
           RC=$?
           echo "cargo_check_exit_code=$RC" >> "$GITHUB_OUTPUT"
           echo "=== CARGO CHECK EXIT CODE: $RC ==="
           echo "--- CARGO OUTPUT START ---"
-          cat /tmp/cargo_check_out.txt
+          cat "$LOG"
           echo "--- CARGO OUTPUT END ---"
           exit 0   # Always succeed; the artifact upload + a separate check step will surface the failure
         env:
@@ -208,7 +237,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cargo-check-output
-          path: /tmp/cargo_check_out.txt
+          path: ${{ runner.temp }}/cargo_check_out.txt
           retention-days: 14
           if-no-files-found: warn
 
