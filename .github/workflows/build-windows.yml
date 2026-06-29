@@ -147,12 +147,36 @@ jobs:
           exit 1
 
       - name: Build Tauri app (CPU, no GPU acceleration)
+        id: tauri-build
         shell: bash
+        continue-on-error: true
+        env:
+          TAURI_BUILD_LOG: ${{ runner.temp }}/tauri_build_out.txt
+          CARGO_TARGET_DIR: ../target
         run: |
           cd upstream/frontend
-          pnpm tauri build ${{ steps.build-profile.outputs.args }}
-        env:
-          CARGO_TARGET_DIR: ../target
+          pnpm tauri build ${{ steps.build-profile.outputs.args }} > "$TAURI_BUILD_LOG" 2>&1
+          RC=$?
+          echo "tauri_build_exit_code=$RC" >> "$GITHUB_OUTPUT"
+          echo "=== TAURI BUILD EXIT CODE: $RC ==="
+          cat "$TAURI_BUILD_LOG"
+          exit 0
+
+      - name: Upload Tauri build output (for public debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauri-build-output
+          path: ${{ runner.temp }}/tauri_build_out.txt
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Fail job if Tauri build failed
+        if: steps.tauri-build.outputs.tauri_build_exit_code != '0'
+        shell: bash
+        run: |
+          echo "Tauri build failed with exit code ${{ steps.tauri-build.outputs.tauri_build_exit_code }}"
+          exit 1
 
       - name: Rename build profile dir for upload
         shell: bash
