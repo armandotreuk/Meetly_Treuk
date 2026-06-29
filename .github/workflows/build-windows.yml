@@ -159,41 +159,38 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           workspaces: "upstream -> upstream/target"
-          key: windows-x64-check-v1
+          key: windows-x64-check-v2
 
       - name: Cargo check workspace
         id: cargo-check
         shell: bash
+        continue-on-error: true
         run: |
           cd upstream
-          # Run cargo check, capture all output to a file (no color codes for clean parsing)
+          # Capture all cargo output (no color codes for clean parsing)
           CARGO_TERM_COLOR=never cargo check --workspace --message-format=short > /tmp/cargo_check_out.txt 2>&1
           RC=$?
           echo "cargo_check_exit_code=$RC" >> "$GITHUB_OUTPUT"
-          if [ "$RC" -ne 0 ]; then
-            echo "=== CARGO CHECK FAILED (exit $RC) ==="
-            echo "--- CARGO OUTPUT (full) ---"
-            cat /tmp/cargo_check_out.txt
-            echo "--- END CARGO OUTPUT ---"
-            # Emit each output line as a workflow error annotation (visible via the
-            # public check-runs annotations API even without GitHub authentication).
-            # Annotations have an overall limit (~50) per check-run; cap accordingly.
-            awk '
-              {
-                line = $0
-                sub(/\r$/, "", line)
-                # Truncate per-line to avoid breaking the workflow command parser
-                if (length(line) > 3500) line = substr(line, 1, 3500) "..."
-                # Override any `::` prefix cargo might emit, to avoid double parsing
-                if (line ~ /^::/) line = " " line
-              }
-              NR <= 50 {
-                printf "::error file=.github,line=%d,title=cargo-check::%s\n", NR, line
-              }
-            ' /tmp/cargo_check_out.txt
-            exit "$RC"
-          else
-            echo "=== CARGO CHECK PASSED ==="
-          fi
+          echo "=== CARGO CHECK EXIT CODE: $RC ==="
+          echo "--- CARGO OUTPUT START ---"
+          cat /tmp/cargo_check_out.txt
+          echo "--- CARGO OUTPUT END ---"
+          exit 0   # Always succeed; the artifact upload + a separate check step will surface the failure
         env:
           CARGO_TARGET_DIR: target
+
+      - name: Upload cargo check output (for public debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-check-output
+          path: /tmp/cargo_check_out.txt
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Fail job if cargo check failed
+        if: steps.cargo-check.outputs.cargo_check_exit_code != '0'
+        shell: bash
+        run: |
+          echo "Cargo check failed with exit code ${{ steps.cargo-check.outputs.cargo_check_exit_code }}"
+          exit 1
