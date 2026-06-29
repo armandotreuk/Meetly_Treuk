@@ -93,9 +93,33 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           workspaces: "upstream -> upstream/target"
-          key: windows-x64-cpu-v1
+          key: windows-x64-cpu-v2
 
       # --- Build ---
+      - name: Build llama-helper sidecar
+        shell: bash
+        run: |
+          cd upstream
+          # Build llama-helper in the same profile as the Tauri app so the binary
+          # matches the runtime expectation (debug vs release). No GPU features
+          # for the CPU-only Windows build.
+          TARGET="x86_64-pc-windows-msvc"
+          if [[ "${{ steps.build-profile.outputs.profile }}" == "debug" ]]; then
+            echo "Building llama-helper in debug profile..."
+            cargo build --debug -p llama-helper
+            EXT=".exe"
+            SRC="target/debug/llama-helper${EXT}"
+          else
+            echo "Building llama-helper in release profile..."
+            cargo build --release -p llama-helper
+            EXT=".exe"
+            SRC="target/release/llama-helper${EXT}"
+          fi
+          # Tauri expects the sidecar named <name>-<target-triple><ext>
+          mkdir -p frontend/src-tauri/binaries
+          cp "$SRC" "frontend/src-tauri/binaries/llama-helper-${TARGET}${EXT}"
+          ls -la frontend/src-tauri/binaries/
+
       - name: Build Tauri app (CPU, no GPU acceleration)
         shell: bash
         run: |
