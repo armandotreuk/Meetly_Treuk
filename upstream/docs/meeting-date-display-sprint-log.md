@@ -488,3 +488,20 @@ The final approach is the smallest change that delivers the meeting-date-display
 
 **Sprint 6.4 verdict:** PASS. Ready to commit.
 
+---
+
+### Sub-sprint 6.5: Stage, commit, push
+
+**Final review (subagent):** Initial FAIL on docs — `features-user-guide.md` (untracked, 269 lines) shipped Sections 1–6 (FTS5, Folders, Chat, MCP) for features not on this branch, and §7 overpromised a "Search results" row that requires the FTS5 search UI. Sprint log had an unscoped FTS bullet. Trimmed `features-user-guide.md` to 24 lines (§7 only, "Search results" bullet and smoke-test row 4 removed), tagged the sprint-log FTS bullet as "(deferred until FTS5 branch lands)". Re-reviewed: PASS — all code verified clean, data flow traced end-to-end, stale-literal fix confirmed at both rename sites, types compatible, no dead code, no off-scope changes.
+
+**Excludions (intentional):**
+- `frontend/src/types/index.ts` — 183-line refactor (indent, `any`→`unknown`, new FTS5/Chat/Meeting interfaces) from other in-flight work; feature uses `CurrentMeeting` from `SidebarProvider.tsx`, not `Meeting` from `types/index.ts`.
+- `frontend/src-tauri/src/database/models.rs` — `MeetingModel.created_at` already in HEAD; modification is other work.
+- `frontend/src/components/Sidebar/MeetingTreeItem.tsx` + `frontend/src/hooks/useSidebarTree.ts` — untracked, only imported by the incomplete `FolderTreeItem.tsx` (Folders feature); dead code in the final inline approach.
+
+**Committed:** `4ead6e5` on `enhance/meeting-date-display` — "Enhance: display meeting creation date in sidebar list and meeting header". 11 files changed, 619 insertions(+), 10 deletions(-).
+
+**Pushed:** to `origin/enhance/meeting-date-display`. PR link: https://github.com/armandotreuk/Meetly_Treuk/pull/new/enhance/meeting-date-display
+
+**Feature shipped.**
+
