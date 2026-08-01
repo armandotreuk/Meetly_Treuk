@@ -10,6 +10,7 @@ import { ModelConfig } from '@/components/ModelSettingsModal';
 import { SettingTabs } from '../SettingTabs';
 import { TranscriptModelProps } from '@/components/TranscriptSettings';
 import Analytics from '@/lib/analytics';
+import { formatMeetingDate } from '@/lib/utils';
 import { invoke } from '@tauri-apps/api/core';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { toast } from 'sonner';
@@ -557,6 +558,10 @@ const Sidebar: React.FC = () => {
     const isActive = item.type === 'file' && currentMeeting?.id === item.id;
     const isMeetingItem = item.id.includes('-') && !item.id.startsWith('intro-call');
 
+    // Meeting date sub-line (short format, hidden for intro row)
+    const meeting = isMeetingItem ? meetings.find((m) => m.id === item.id) : null;
+    const dateStr = meeting ? formatMeetingDate(meeting.created_at, 'short') : '';
+
     // Check if this item has a matching transcript snippet
     const matchingResult = isMeetingItem ? findMatchingSnippet(item.id) : null;
     const hasTranscriptMatch = !!matchingResult;
@@ -641,6 +646,9 @@ const Sidebar: React.FC = () => {
                   </div>
                 )}
               </div>
+
+              {/* Meeting date sub-line (short format, hidden for intro row) */}
+              {dateStr && <div className="mt-1 ml-8 text-xs text-gray-500">{dateStr}</div>}
 
               {/* Show transcript match snippet if available */}
               {hasTranscriptMatch && (

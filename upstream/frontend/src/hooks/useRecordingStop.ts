@@ -310,7 +310,8 @@ export function useRecordingStop(
             if (meetingData) {
               setCurrentMeeting({
                 id: meetingId,
-                title: meetingData.title
+                title: meetingData.title,
+                created_at: meetingData.created_at,
               });
               console.log('✅ Current meeting set:', meetingData.title);
             }

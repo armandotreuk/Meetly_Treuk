@@ -21,6 +21,7 @@ import {
   saveMeetingSummaryLanguage,
   SummaryLanguageStorage,
 } from '@/lib/summary-language-preferences';
+import { formatMeetingDate } from '@/lib/utils';
 
 interface SummaryPanelProps {
   meeting: {
@@ -252,17 +253,27 @@ export function SummaryPanel({
     </Popover>
   );
 
+  const formattedFullDate = formatMeetingDate(meeting.created_at, 'full');
+
   return (
     <div className="flex-1 min-w-0 flex flex-col bg-white overflow-hidden">
       {/* Title area */}
       <div className="p-4 border-b border-gray-200">
-        {/* <EditableTitle
+        <EditableTitle
           title={meetingTitle}
           isEditing={isEditingTitle}
           onStartEditing={onStartEditTitle}
           onFinishEditing={onFinishEditTitle}
           onChange={onTitleChange}
-        /> */}
+        />
+        {formattedFullDate && (
+          <time
+            dateTime={meeting.created_at}
+            className="text-sm text-gray-500 mt-2 block"
+          >
+            {formattedFullDate}
+          </time>
+        )}
 
         {/* Button groups - only show when summary exists */}
         {aiSummary && !isSummaryLoading && (

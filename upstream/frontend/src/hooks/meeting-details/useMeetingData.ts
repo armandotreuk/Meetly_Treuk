@@ -57,10 +57,14 @@ export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMe
 
       // Update meetings with new title
       const updatedMeetings = sidebarMeetings.map((m: CurrentMeeting) =>
-        m.id === meeting.id ? { id: m.id, title: meetingTitle } : m
+        m.id === meeting.id ? { ...m, title: meetingTitle } : m
       );
       setMeetings(updatedMeetings);
-      setCurrentMeeting({ id: meeting.id, title: meetingTitle });
+      setCurrentMeeting({
+        id: meeting.id,
+        title: meetingTitle,
+        created_at: meeting.created_at,
+      });
       return true;
     } catch (error) {
       console.error('Failed to save meeting title:', error);
@@ -146,10 +150,14 @@ export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMe
     console.log('📝 Updating meeting title to:', newTitle);
     setMeetingTitle(newTitle);
     const updatedMeetings = sidebarMeetings.map((m: CurrentMeeting) =>
-      m.id === meeting.id ? { id: m.id, title: newTitle } : m
+      m.id === meeting.id ? { ...m, title: newTitle } : m
     );
     setMeetings(updatedMeetings);
-    setCurrentMeeting({ id: meeting.id, title: newTitle });
+    setCurrentMeeting({
+      id: meeting.id,
+      title: newTitle,
+      created_at: meeting.created_at,
+    });
   }, [meeting.id, sidebarMeetings, setMeetings, setCurrentMeeting]);
 
   return {

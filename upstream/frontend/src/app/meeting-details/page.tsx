@@ -137,7 +137,11 @@ function MeetingDetailsContent() {
       });
 
       // Sync with sidebar context
-      setCurrentMeeting({ id: metadata.id, title: metadata.title });
+      setCurrentMeeting({
+        id: metadata.id,
+        title: metadata.title,
+        created_at: metadata.created_at,
+      });
     }
   }, [metadata, transcripts, meetingId, setCurrentMeeting]);
 

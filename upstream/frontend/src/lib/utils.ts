@@ -30,3 +30,36 @@ export function isOllamaNotInstalledError(errorMessage: string): boolean {
 
   return patterns.some(pattern => lowerError.includes(pattern));
 }
+
+/**
+ * Format a meeting created_at ISO string for display.
+ *
+ * @param iso - ISO 8601 string from the backend (Rust serializes via `to_rfc3339()`).
+ *               Accepts null/undefined to gracefully handle old meetings.
+ * @param format - "full" for header ("July 31, 2026 at 2:30 PM"),
+ *                 "short" for sidebar list ("Jul 31, 2:30 PM").
+ * @returns Formatted string, or "" for nullish/empty/unparseable input.
+ */
+export function formatMeetingDate(
+  iso: string | null | undefined,
+  format: "full" | "short"
+): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  if (format === "short") {
+    return d.toLocaleDateString(undefined, {
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    });
+  }
+  return d.toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
