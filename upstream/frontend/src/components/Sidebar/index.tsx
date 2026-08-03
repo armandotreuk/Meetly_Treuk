@@ -1,7 +1,7 @@
 'use client';
 
-import React, { useState, useMemo, useEffect, useCallback } from 'react';
-import { ChevronDown, ChevronRight, File, Settings, ChevronLeftCircle, ChevronRightCircle, Calendar, StickyNote, Home, Trash2, Mic, Square, Plus, Search, Pencil, NotebookPen, SearchIcon, X, Upload } from 'lucide-react';
+import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react';
+import { ChevronDown, ChevronRight, Settings, ChevronLeftCircle, ChevronRightCircle, Home, Mic, Square, NotebookPen, SearchIcon, X, Upload, FolderPlus, Inbox } from 'lucide-react';
 import { useRouter, usePathname } from 'next/navigation';
 import { useSidebar } from './SidebarProvider';
 import type { CurrentMeeting } from '@/components/Sidebar/SidebarProvider';
@@ -10,13 +10,16 @@ import { ModelConfig } from '@/components/ModelSettingsModal';
 import { SettingTabs } from '../SettingTabs';
 import { TranscriptModelProps } from '@/components/TranscriptSettings';
 import Analytics from '@/lib/analytics';
-import { formatMeetingDate } from '@/lib/utils';
 import { invoke } from '@tauri-apps/api/core';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { toast } from 'sonner';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 import { useImportDialog } from '@/contexts/ImportDialogContext';
 import { useConfig } from '@/contexts/ConfigContext';
+import { FolderTreeItem } from './FolderTreeItem';
+import { MeetingTreeItem, type DragPayload } from './MeetingTreeItem';
+import { MoveToFolderModal } from './MoveToFolderModal';
+import { useSidebarTree, type MeetingLike, type MeetingNode } from '@/hooks/useSidebarTree';
 
 import {
   Dialog,
@@ -33,11 +36,78 @@ import { ComplianceNotification } from '../ComplianceNotification';
 import { Input } from '../ui/input';
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from '../ui/input-group';
 
-interface SidebarItem {
-  id: string;
-  title: string;
-  type: 'folder' | 'file';
-  children?: SidebarItem[];
+// "Sem pasta" virtual section: top of the tree, holds meetings with
+// folder_id == null. Not renameable/deletable; dropping a meeting detaches
+// it, dropping a folder moves it to root. Mirrors FolderTreeItem's
+// drag-event contract (meetily-dragenter/leave/drop on a data-drop-target).
+function UnfiledSection({ meetings, expanded, onToggle, onDropMeeting, onDropFolder, renderMeeting }: {
+  meetings: MeetingLike[];
+  expanded: boolean;
+  onToggle: () => void;
+  onDropMeeting: (meetingId: string) => void;
+  onDropFolder: (folderId: string) => void;
+  renderMeeting: (node: MeetingNode, depth: number) => React.ReactNode;
+}) {
+  const [isDropTarget, setIsDropTarget] = useState(false);
+  const headerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const el = headerRef.current;
+    if (!el) return;
+    const onEnter = () => setIsDropTarget(true);
+    const onLeave = () => setIsDropTarget(false);
+    const onDrop = (e: Event) => {
+      setIsDropTarget(false);
+      const payload = (e as CustomEvent<{ payload: DragPayload }>).detail?.payload;
+      if (!payload) return;
+      if (payload.kind === 'meeting') onDropMeeting(payload.id);
+      else onDropFolder(payload.id);
+    };
+    el.addEventListener('meetily-dragenter', onEnter);
+    el.addEventListener('meetily-dragleave', onLeave);
+    el.addEventListener('meetily-drop', onDrop as EventListener);
+    return () => {
+      el.removeEventListener('meetily-dragenter', onEnter);
+      el.removeEventListener('meetily-dragleave', onLeave);
+      el.removeEventListener('meetily-drop', onDrop as EventListener);
+    };
+  }, [onDropMeeting, onDropFolder]);
+
+  return (
+    <div>
+      <div
+        ref={headerRef}
+        data-drop-target="unfiled"
+        className={`flex items-center px-3 py-2 my-0.5 rounded-md text-sm cursor-pointer select-none ${
+          isDropTarget ? 'bg-blue-100 ring-2 ring-blue-400' : 'hover:bg-gray-50'
+        }`}
+        onClick={onToggle}
+      >
+        <span className="flex-shrink-0 mr-1">
+          {expanded ? (
+            <ChevronDown className="w-4 h-4 text-gray-500" />
+          ) : (
+            <ChevronRight className="w-4 h-4 text-gray-500" />
+          )}
+        </span>
+        <Inbox className="w-4 h-4 mr-2 flex-shrink-0 text-gray-600" />
+        <span className="flex-1 truncate font-medium">Sem pasta</span>
+        <span className="text-xs text-gray-400 mr-2">{meetings.length}</span>
+      </div>
+      {expanded && (
+        <div>
+          {meetings.map((m) =>
+            renderMeeting({ kind: 'meeting', id: m.id, title: m.title, createdAt: m.created_at }, 1)
+          )}
+          {meetings.length === 0 && (
+            <p className="text-xs text-gray-400 italic px-3 py-2" style={{ paddingLeft: '24px' }}>
+              Arraste meetings aqui ou use Mover para...
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
 const Sidebar: React.FC = () => {
@@ -46,7 +116,6 @@ const Sidebar: React.FC = () => {
   const {
     currentMeeting,
     setCurrentMeeting,
-    sidebarItems,
     isCollapsed,
     toggleCollapse,
     handleRecordingToggle,
@@ -55,14 +124,20 @@ const Sidebar: React.FC = () => {
     isSearching,
     meetings,
     setMeetings,
-    serverAddress
+    serverAddress,
+    folders,
+    createFolder,
+    renameFolder,
+    moveFolder,
+    deleteFolder,
+    moveMeetingToFolder
   } = useSidebar();
 
   // Get recording state from RecordingStateContext (single source of truth)
   const { isRecording } = useRecordingState();
   const { openImportDialog } = useImportDialog();
   const { betaFeatures } = useConfig();
-  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set(['meetings']));
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set(['unfiled']));
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [showModelSettings, setShowModelSettings] = useState(false);
   const [modelConfig, setModelConfig] = useState<ModelConfig>({
@@ -86,14 +161,23 @@ const Sidebar: React.FC = () => {
   });
   const [editingTitle, setEditingTitle] = useState<string>('');
 
-  // Ensure 'meetings' folder is always expanded
-  useEffect(() => {
-    if (!expandedFolders.has('meetings')) {
-      const newExpanded = new Set(expandedFolders);
-      newExpanded.add('meetings');
-      setExpandedFolders(newExpanded);
-    }
-  }, [expandedFolders]);
+  // Folder tree modals
+  const [moveModalState, setMoveModalState] = useState<{ isOpen: boolean; kind: 'meeting' | 'folder'; id: string | null }>({
+    isOpen: false,
+    kind: 'meeting',
+    id: null
+  });
+  const [folderModalState, setFolderModalState] = useState<{
+    isOpen: boolean;
+    mode: 'create' | 'rename';
+    folderId: string | null;
+    parentId: string | null;
+  }>({ isOpen: false, mode: 'create', folderId: null, parentId: null });
+  const [folderNameInput, setFolderNameInput] = useState<string>('');
+  const [deleteFolderModalState, setDeleteFolderModalState] = useState<{ isOpen: boolean; folderId: string | null }>({
+    isOpen: false,
+    folderId: null
+  });
 
   // useEffect(() => {
   //   if (settingsSaveSuccess !== null) {
@@ -247,76 +331,102 @@ const Sidebar: React.FC = () => {
 
     // Search through transcripts
     await searchTranscripts(value);
+  }, [searchTranscripts]);
 
-    // Make sure the meetings folder is expanded when searching
-    if (!expandedFolders.has('meetings')) {
-      const newExpanded = new Set(expandedFolders);
-      newExpanded.add('meetings');
-      setExpandedFolders(newExpanded);
+  // Folder tree (pastas lógicas): unfiled bucket + recursive folder roots.
+  const { unfiled, roots } = useSidebarTree(folders, meetings);
+
+  const folderNameById = useMemo(() => new Map(folders.map((f) => [f.id, f.name])), [folders]);
+
+  // Global search is flat (decision #19): transcript matches ∪ title matches,
+  // rendered without the tree.
+  const searchFilteredMeetings = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return [];
+    const matchedIds = new Set(searchResults.map((r) => r.id));
+    return meetings.filter((m) => matchedIds.has(m.id) || m.title.toLowerCase().includes(q));
+  }, [meetings, searchQuery, searchResults]);
+
+  // Folder action handlers (backend errors surface as toasts)
+  const handleMoveMeeting = useCallback(async (meetingId: string, folderId: string | null) => {
+    try {
+      await moveMeetingToFolder(meetingId, folderId);
+    } catch (error) {
+      toast.error('Falha ao mover meeting', {
+        description: error instanceof Error ? error.message : String(error)
+      });
     }
-  }, [expandedFolders, searchTranscripts]);
+  }, [moveMeetingToFolder]);
 
-  // Combine search results with sidebar items
-  const filteredSidebarItems = useMemo(() => {
-    if (!searchQuery.trim()) return sidebarItems;
-
-    // If we have search results, highlight matching meetings
-    if (searchResults.length > 0) {
-      // Get the IDs of meetings that matched in transcripts
-      const matchedMeetingIds = new Set(searchResults.map(result => result.id));
-
-      return sidebarItems
-        .map(folder => {
-          // Always include folders in the results
-          if (folder.type === 'folder') {
-            if (!folder.children) return folder;
-
-            // Filter children based on search results or title match
-            const filteredChildren = folder.children.filter(item => {
-              // Include if the meeting ID is in our search results
-              if (matchedMeetingIds.has(item.id)) return true;
-
-              // Or if the title matches the search query
-              return item.title.toLowerCase().includes(searchQuery.toLowerCase());
-            });
-
-            return {
-              ...folder,
-              children: filteredChildren
-            };
-          }
-
-          // For non-folder items, check if they match the search
-          return (matchedMeetingIds.has(folder.id) ||
-            folder.title.toLowerCase().includes(searchQuery.toLowerCase()))
-            ? folder : undefined;
-        })
-        .filter((item): item is SidebarItem => item !== undefined); // Type-safe filter
-    } else {
-      // Fall back to title-only filtering if no transcript results
-      return sidebarItems
-        .map(folder => {
-          // Always include folders in the results
-          if (folder.type === 'folder') {
-            if (!folder.children) return folder;
-
-            // Filter children based on search query
-            const filteredChildren = folder.children.filter(item =>
-              item.title.toLowerCase().includes(searchQuery.toLowerCase())
-            );
-
-            return {
-              ...folder,
-              children: filteredChildren
-            };
-          }
-
-          // For non-folder items, check if they match the search
-          return folder.title.toLowerCase().includes(searchQuery.toLowerCase()) ? folder : undefined;
-        })
-        .filter((item): item is SidebarItem => item !== undefined); // Type-safe filter
+  const handleMoveFolder = useCallback(async (folderId: string, newParentId: string | null) => {
+    try {
+      await moveFolder(folderId, newParentId);
+    } catch (error) {
+      // Backend rejects cycles with a descriptive message
+      toast.error('Falha ao mover pasta', {
+        description: error instanceof Error ? error.message : String(error)
+      });
     }
-  }, [sidebarItems, searchQuery, searchResults, expandedFolders]);
+  }, [moveFolder]);
+
+  const openCreateFolderModal = (parentId: string | null) => {
+    setFolderModalState({ isOpen: true, mode: 'create', folderId: null, parentId });
+    setFolderNameInput('');
+  };
+
+  const openRenameFolderModal = (folderId: string, currentName: string) => {
+    setFolderModalState({ isOpen: true, mode: 'rename', folderId, parentId: null });
+    setFolderNameInput(currentName);
+  };
+
+  const handleFolderModalConfirm = async () => {
+    const name = folderNameInput.trim();
+    if (!name) {
+      toast.error('Nome da pasta não pode ser vazio');
+      return;
+    }
+    try {
+      if (folderModalState.mode === 'create') {
+        await createFolder(name, folderModalState.parentId);
+        // Reveal the new subfolder inside its parent
+        if (folderModalState.parentId) {
+          const parentId = folderModalState.parentId;
+          setExpandedFolders((prev) => new Set(prev).add(parentId));
+        }
+        toast.success('Pasta criada');
+      } else if (folderModalState.folderId) {
+        await renameFolder(folderModalState.folderId, name);
+        toast.success('Pasta renomeada');
+      }
+      setFolderModalState((s) => ({ ...s, isOpen: false }));
+    } catch (error) {
+      toast.error('Falha ao salvar pasta', {
+        description: error instanceof Error ? error.message : String(error)
+      });
+    }
+  };
+
+  const handleDeleteFolderConfirm = async () => {
+    const id = deleteFolderModalState.folderId;
+    setDeleteFolderModalState({ isOpen: false, folderId: null });
+    if (!id) return;
+    try {
+      await deleteFolder(id);
+      toast.success('Pasta excluída', { description: 'Meetings movidos para Sem pasta' });
+    } catch (error) {
+      toast.error('Falha ao excluir pasta', {
+        description: error instanceof Error ? error.message : String(error)
+      });
+    }
+  };
+
+  const handleMoveModalSelect = async (folderId: string | null) => {
+    const { kind, id } = moveModalState;
+    setMoveModalState((s) => ({ ...s, isOpen: false }));
+    if (!id) return;
+    if (kind === 'meeting') await handleMoveMeeting(id, folderId);
+    else await handleMoveFolder(id, folderId);
+  };
 
 
   const handleDelete = async (itemId: string) => {
@@ -512,7 +622,7 @@ const Sidebar: React.FC = () => {
               <button
                 onClick={() => {
                   if (isCollapsed) toggleCollapse();
-                  toggleFolder('meetings');
+                  toggleFolder('unfiled');
                 }}
                 className={`p-2 rounded-lg transition-colors duration-150 ${isMeetingPage ? 'bg-gray-100' : 'hover:bg-gray-100'
                   }`}
@@ -552,121 +662,22 @@ const Sidebar: React.FC = () => {
     return searchResults.find(result => result.id === itemId);
   };
 
-  const renderItem = (item: SidebarItem, depth = 0) => {
-    const isExpanded = expandedFolders.has(item.id);
-    const paddingLeft = `${depth * 12 + 12}px`;
-    const isActive = item.type === 'file' && currentMeeting?.id === item.id;
-    const isMeetingItem = item.id.includes('-') && !item.id.startsWith('intro-call');
-
-    // Meeting date sub-line (short format, hidden for intro row)
-    const meeting = isMeetingItem ? meetings.find((m) => m.id === item.id) : null;
-    const dateStr = meeting ? formatMeetingDate(meeting.created_at, 'short') : '';
-
-    // Check if this item has a matching transcript snippet
-    const matchingResult = isMeetingItem ? findMatchingSnippet(item.id) : null;
-    const hasTranscriptMatch = !!matchingResult;
-
-    if (isCollapsed) return null;
-
-    return (
-      <div key={item.id}>
-        <div
-          className={`flex items-center transition-all duration-150 group ${item.type === 'folder' && depth === 0
-            ? 'p-3 text-lg font-semibold h-10 mx-3 mt-3 rounded-lg'
-            : `px-3 py-2 my-0.5 rounded-md text-sm ${isActive ? 'bg-blue-100 text-blue-700 font-medium' :
-              hasTranscriptMatch ? 'bg-yellow-50' : 'hover:bg-gray-50'
-            } cursor-pointer`
-            }`}
-          style={item.type === 'folder' && depth === 0 ? {} : { paddingLeft }}
-          onClick={() => {
-            if (item.type === 'folder') {
-              toggleFolder(item.id);
-            } else {
-              setCurrentMeeting({ id: item.id, title: item.title });
-              const basePath = item.id.startsWith('intro-call') ? '/' :
-                item.id.includes('-') ? `/meeting-details?id=${item.id}` : `/notes/${item.id}`;
-              router.push(basePath);
-            }
-          }}
-        >
-          {item.type === 'folder' ? (
-            <>
-              {item.id === 'meetings' ? (
-                <Calendar className="w-4 h-4 mr-2" />
-              ) : item.id === 'notes' ? (
-                <Calendar className="w-4 h-4 mr-2" />
-              ) : null}
-              <span className={depth === 0 ? "" : "font-medium"}>{item.title}</span>
-              <div className="ml-auto">
-                {isExpanded ? (
-                  <ChevronDown className="w-4 h-4 text-gray-500" />
-                ) : (
-                  <ChevronRight className="w-4 h-4 text-gray-500" />
-                )}
-              </div>
-              {searchQuery && item.id === 'meetings' && isSearching && (
-                <span className="ml-2 text-xs text-blue-500 animate-pulse">Searching...</span>
-              )}
-            </>
-          ) : (
-            <div className="flex flex-col w-full">
-              <div className="flex items-center w-full">
-                {isMeetingItem ? (
-                  <div className="flex-shrink-0 flex items-center justify-center w-6 h-6 rounded-full mr-2 bg-gray-100">
-                    <File className="w-3.5 h-3.5 text-gray-600" />
-                  </div>
-                ) : (
-                  <div className="flex-shrink-0 flex items-center justify-center w-6 h-6 rounded-full mr-2 bg-blue-100">
-                    <Plus className="w-3.5 h-3.5 text-blue-600" />
-                  </div>
-                )}
-                <span className="flex-1 break-words">{item.title}</span>
-                {isMeetingItem && (
-                  <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-150">
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleEditStart(item.id, item.title);
-                      }}
-                      className="hover:text-blue-600 p-1 rounded-md hover:bg-blue-50 flex-shrink-0"
-                      aria-label="Edit meeting title"
-                    >
-                      <Pencil className="w-4 h-4" />
-                    </button>
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setDeleteModalState({ isOpen: true, itemId: item.id });
-                      }}
-                      className="hover:text-red-600 p-1 rounded-md hover:bg-red-50 flex-shrink-0"
-                      aria-label="Delete meeting"
-                    >
-                      <Trash2 className="w-4 h-4" />
-                    </button>
-                  </div>
-                )}
-              </div>
-
-              {/* Meeting date sub-line (short format, hidden for intro row) */}
-              {dateStr && <div className="mt-1 ml-8 text-xs text-gray-500">{dateStr}</div>}
-
-              {/* Show transcript match snippet if available */}
-              {hasTranscriptMatch && (
-                <div className="mt-1 ml-8 text-xs text-gray-500 bg-yellow-50 p-1.5 rounded border border-yellow-100 line-clamp-2">
-                  <span className="font-medium text-yellow-600">Match:</span> {matchingResult.matchContext}
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-        {item.type === 'folder' && isExpanded && item.children && (
-          <div className="ml-1">
-            {item.children.map(child => renderItem(child, depth + 1))}
-          </div>
-        )}
-      </div>
-    );
-  };
+  // Shared meeting row renderer: used by the tree (FolderTreeItem children),
+  // the unfiled section, and flat search results. MeetingTreeItem owns the
+  // drag-source behavior, date sub-line, and rename/delete/move actions.
+  const renderMeeting = (node: MeetingNode, depth: number) => (
+    <MeetingTreeItem
+      key={node.id}
+      meetingId={node.id}
+      title={node.title}
+      depth={depth}
+      currentMeetingId={currentMeeting?.id}
+      createdAt={node.createdAt}
+      onEditMeeting={handleEditStart}
+      onRequestDeleteMeeting={(id) => setDeleteModalState({ isOpen: true, itemId: id })}
+      onRequestMoveMeeting={(id) => setMoveModalState({ isOpen: true, kind: 'meeting', id })}
+    />
+  );
 
   return (
     <div className="fixed top-0 left-0 h-screen z-40">
@@ -747,32 +758,81 @@ const Sidebar: React.FC = () => {
             {/* Meeting Notes folder header - fixed */}
             {!isCollapsed && (
               <div className="flex-shrink-0">
-                {filteredSidebarItems.filter(item => item.type === 'folder').map(item => (
-                  <div key={item.id}>
-                    <div
-                      className="flex items-center transition-all duration-150 p-3 text-lg font-semibold h-10 mx-3 mt-3 rounded-lg"
-                    >
-                      <NotebookPen className="w-4 h-4 mr-2 text-gray-600" />
-                      <span className="text-gray-700">{item.title}</span>
-                      {searchQuery && item.id === 'meetings' && isSearching && (
-                        <span className="ml-2 text-xs text-blue-500 animate-pulse">Searching...</span>
-                      )}
-                    </div>
-                  </div>
-                ))}
+                <div className="flex items-center transition-all duration-150 p-3 text-lg font-semibold h-10 mx-3 mt-3 rounded-lg group">
+                  <NotebookPen className="w-4 h-4 mr-2 text-gray-600" />
+                  <span className="text-gray-700">Meeting Notes</span>
+                  {searchQuery && isSearching && (
+                    <span className="ml-2 text-xs text-blue-500 animate-pulse">Searching...</span>
+                  )}
+                  <button
+                    onClick={() => openCreateFolderModal(null)}
+                    className="ml-auto text-gray-400 hover:text-blue-600 p-1 rounded-md hover:bg-blue-50 opacity-0 group-hover:opacity-100 transition-opacity duration-150"
+                    aria-label="Nova pasta"
+                    title="Nova pasta"
+                  >
+                    <FolderPlus className="w-4 h-4" />
+                  </button>
+                </div>
               </div>
             )}
 
-            {/* Scrollable meeting items */}
+            {/* Scrollable meeting items: flat results when searching, folder tree otherwise */}
             {!isCollapsed && (
               <div className="flex-1 overflow-y-auto custom-scrollbar min-h-0">
-                {filteredSidebarItems
-                  .filter(item => item.type === 'folder' && expandedFolders.has(item.id) && item.children)
-                  .map(item => (
-                    <div key={`${item.id}-children`} className="mx-3">
-                      {item.children!.map(child => renderItem(child, 1))}
-                    </div>
-                  ))}
+                <div className="mx-3">
+                  {searchQuery.trim() ? (
+                    <>
+                      {searchFilteredMeetings.map((m) => (
+                        <MeetingTreeItem
+                          key={m.id}
+                          meetingId={m.id}
+                          title={m.title}
+                          depth={0}
+                          currentMeetingId={currentMeeting?.id}
+                          createdAt={m.created_at}
+                          snippetContext={findMatchingSnippet(m.id)?.matchContext ?? null}
+                          folderName={m.folder_id ? folderNameById.get(m.folder_id) ?? null : null}
+                          onEditMeeting={handleEditStart}
+                          onRequestDeleteMeeting={(id) => setDeleteModalState({ isOpen: true, itemId: id })}
+                          onRequestMoveMeeting={(id) => setMoveModalState({ isOpen: true, kind: 'meeting', id })}
+                        />
+                      ))}
+                      {searchFilteredMeetings.length === 0 && !isSearching && (
+                        <p className="text-xs text-gray-400 italic px-3 py-2">Nenhum resultado.</p>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <UnfiledSection
+                        meetings={unfiled}
+                        expanded={expandedFolders.has('unfiled')}
+                        onToggle={() => toggleFolder('unfiled')}
+                        onDropMeeting={(id) => handleMoveMeeting(id, null)}
+                        onDropFolder={(id) => handleMoveFolder(id, null)}
+                        renderMeeting={renderMeeting}
+                      />
+                      {roots.map((folder) => (
+                        <FolderTreeItem
+                          key={folder.id}
+                          folder={folder}
+                          depth={0}
+                          expanded={expandedFolders}
+                          onToggle={toggleFolder}
+                          currentMeetingId={currentMeeting?.id}
+                          onEditMeeting={handleEditStart}
+                          onRequestDeleteMeeting={(id) => setDeleteModalState({ isOpen: true, itemId: id })}
+                          onMoveMeeting={handleMoveMeeting}
+                          onMoveFolder={handleMoveFolder}
+                          onCreateSubfolder={openCreateFolderModal}
+                          onRenameFolder={openRenameFolderModal}
+                          onRequestDeleteFolder={(id) => setDeleteFolderModalState({ isOpen: true, folderId: id })}
+                          onRequestMoveFolder={(id) => setMoveModalState({ isOpen: true, kind: 'folder', id })}
+                          renderMeeting={renderMeeting}
+                        />
+                      ))}
+                    </>
+                  )}
+                </div>
               </div>
             )}
           </div>
@@ -879,6 +939,75 @@ const Sidebar: React.FC = () => {
               className="px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-md transition-colors"
             >
               Save
+            </button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Move meeting/folder modal */}
+      <MoveToFolderModal
+        isOpen={moveModalState.isOpen}
+        excludeId={moveModalState.kind === 'folder' ? moveModalState.id : null}
+        folders={folders}
+        title={moveModalState.kind === 'folder' ? 'Mover pasta para...' : 'Mover meeting para...'}
+        onCancel={() => setMoveModalState((s) => ({ ...s, isOpen: false }))}
+        onSelect={handleMoveModalSelect}
+      />
+
+      {/* Delete folder confirmation */}
+      <ConfirmationModal
+        isOpen={deleteFolderModalState.isOpen}
+        text="Excluir esta pasta? Subpastas serão excluídas junto e todos os meetings voltarão para Sem pasta."
+        onConfirm={handleDeleteFolderConfirm}
+        onCancel={() => setDeleteFolderModalState({ isOpen: false, folderId: null })}
+      />
+
+      {/* Create/rename folder modal */}
+      <Dialog open={folderModalState.isOpen} onOpenChange={(open) => {
+        if (!open) setFolderModalState((s) => ({ ...s, isOpen: false }));
+      }}>
+        <DialogContent className="sm:max-w-[425px]">
+          <VisuallyHidden>
+            <DialogTitle>{folderModalState.mode === 'create' ? 'Nova Pasta' : 'Renomear Pasta'}</DialogTitle>
+          </VisuallyHidden>
+          <div className="py-4">
+            <h3 className="text-lg font-semibold mb-4">
+              {folderModalState.mode === 'create' ? 'Nova Pasta' : 'Renomear Pasta'}
+            </h3>
+            <div>
+              <label htmlFor="folder-name" className="block text-sm font-medium text-gray-700 mb-2">
+                Nome da pasta
+              </label>
+              <input
+                id="folder-name"
+                type="text"
+                value={folderNameInput}
+                onChange={(e) => setFolderNameInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    handleFolderModalConfirm();
+                  } else if (e.key === 'Escape') {
+                    setFolderModalState((s) => ({ ...s, isOpen: false }));
+                  }
+                }}
+                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                placeholder="Nome da pasta"
+                autoFocus
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <button
+              onClick={() => setFolderModalState((s) => ({ ...s, isOpen: false }))}
+              className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-md transition-colors"
+            >
+              Cancelar
+            </button>
+            <button
+              onClick={handleFolderModalConfirm}
+              className="px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-md transition-colors"
+            >
+              Salvar
             </button>
           </DialogFooter>
         </DialogContent>

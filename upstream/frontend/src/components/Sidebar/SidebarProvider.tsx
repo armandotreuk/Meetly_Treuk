@@ -5,6 +5,8 @@ import { usePathname, useRouter } from 'next/navigation';
 import Analytics from '@/lib/analytics';
 import { invoke } from '@tauri-apps/api/core';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
+import { usePanelResize } from '@/hooks/usePanelResize';
+import type { MeetingFolder } from '@/types';
 
 
 interface SidebarItem {
@@ -18,6 +20,7 @@ export interface CurrentMeeting {
   id: string;
   title: string;
   created_at?: string;
+  folder_id?: string | null;
 }
 
 // Search result type for transcript search
@@ -48,10 +51,22 @@ interface SidebarContextType {
   setTranscriptServerAddress: (address: string) => void;
   // Summary polling management
   activeSummaryPolls: Map<string, NodeJS.Timeout>;
-  startSummaryPolling: (meetingId: string, processId: string, onUpdate: (result: any) => void) => void;
+  startSummaryPolling: (meetingId: string, processId: string, onUpdate: (result: any) => void, templateId?: string) => void;
   stopSummaryPolling: (meetingId: string) => void;
   // Refetch meetings from backend
   refetchMeetings: () => Promise<void>;
+  // Meeting folders (pastas lógicas). Actions throw on backend error so
+  // callers can surface the message (e.g. cycle rejection) in a toast.
+  folders: MeetingFolder[];
+  refetchFolders: () => Promise<void>;
+  createFolder: (name: string, parentId?: string | null) => Promise<MeetingFolder>;
+  renameFolder: (id: string, name: string) => Promise<void>;
+  moveFolder: (id: string, newParentId: string | null) => Promise<void>;
+  deleteFolder: (id: string) => Promise<void>;
+  moveMeetingToFolder: (meetingId: string, folderId: string | null) => Promise<void>;
+  // Panel-resize (in-flight): sidebar width in px and active-drag flag
+  sidebarWidth: number;
+  sidebarDragging: boolean;
 
 }
 
@@ -76,9 +91,19 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const [serverAddress, setServerAddress] = useState('');
   const [transcriptServerAddress, setTranscriptServerAddress] = useState('');
   const [activeSummaryPolls, setActiveSummaryPolls] = useState<Map<string, NodeJS.Timeout>>(new Map());
+  const [folders, setFolders] = useState<MeetingFolder[]>([]);
 
   // Use recording state from RecordingStateContext (single source of truth)
   const { isRecording } = useRecordingState();
+
+  // ponytail: sidebar resize — initial 256 matches `w-64`, min 200, max 40% of viewport.
+  // handleProps is intentionally not attached to a resize handle yet; feature is in-flight.
+  const { width: sidebarWidth, isDragging: sidebarDragging } = usePanelResize({
+    initial: 256,
+    min: 200,
+    maxFraction: 0.4,
+    side: 'left',
+  });
 
   const pathname = usePathname();
   const router = useRouter();
@@ -87,11 +112,12 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const fetchMeetings = React.useCallback(async () => {
     if (serverAddress) {
       try {
-        const meetings = await invoke('api_get_meetings') as Array<{ id: string, title: string, created_at?: string }>;
+        const meetings = await invoke('api_get_meetings') as Array<{ id: string, title: string, created_at?: string, folder_id?: string | null }>;
         const transformedMeetings = meetings.map((meeting: any) => ({
           id: meeting.id,
           title: meeting.title,
-          created_at: meeting.created_at
+          created_at: meeting.created_at,
+          folder_id: meeting.folder_id ?? null
         }));
         setMeetings(transformedMeetings);
         Analytics.trackBackendConnection(true);
@@ -103,9 +129,49 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     }
   }, [serverAddress]);
 
+  const fetchFolders = React.useCallback(async () => {
+    if (!serverAddress) return;
+    try {
+      const folders = await invoke('api_get_folders') as MeetingFolder[];
+      setFolders(folders);
+    } catch (error) {
+      console.error('Error fetching folders:', error);
+      setFolders([]);
+    }
+  }, [serverAddress]);
+
   useEffect(() => {
     fetchMeetings();
-  }, [serverAddress, fetchMeetings]);
+    fetchFolders();
+  }, [serverAddress, fetchMeetings, fetchFolders]);
+
+  // Folder actions: optimistic local state, backend error propagates to caller.
+  const createFolder = React.useCallback(async (name: string, parentId: string | null = null) => {
+    const folder = await invoke('api_create_folder', { name, parentId }) as MeetingFolder;
+    setFolders(prev => [...prev, folder]);
+    return folder;
+  }, []);
+
+  const renameFolder = React.useCallback(async (id: string, name: string) => {
+    await invoke('api_rename_folder', { id, name });
+    setFolders(prev => prev.map(f => (f.id === id ? { ...f, name } : f)));
+  }, []);
+
+  const moveFolder = React.useCallback(async (id: string, newParentId: string | null) => {
+    await invoke('api_move_folder', { id, newParentId });
+    setFolders(prev => prev.map(f => (f.id === id ? { ...f, parent_id: newParentId } : f)));
+  }, []);
+
+  const deleteFolder = React.useCallback(async (id: string) => {
+    await invoke('api_delete_folder', { id });
+    // Backend cascade detaches subfolders + meetings; refetch both to stay true.
+    await Promise.all([fetchFolders(), fetchMeetings()]);
+  }, [fetchFolders, fetchMeetings]);
+
+  const moveMeetingToFolder = React.useCallback(async (meetingId: string, folderId: string | null) => {
+    await invoke('api_set_meeting_folder', { meetingId, folderId });
+    setMeetings(prev => prev.map(m => (m.id === meetingId ? { ...m, folder_id: folderId } : m)));
+  }, []);
 
   useEffect(() => {
     const fetchSettings = async () => {
@@ -190,7 +256,8 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const startSummaryPolling = React.useCallback((
     meetingId: string,
     processId: string,
-    onUpdate: (result: any) => void
+    onUpdate: (result: any) => void,
+    templateId?: string
   ) => {
     // Stop existing poll for this meeting if any
     if (activeSummaryPolls.has(meetingId)) {
@@ -223,6 +290,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       try {
         const result = await invoke('api_get_summary', {
           meetingId: meetingId,
+          templateId,
         }) as any;
 
         console.log(`📊 Polling update for ${meetingId}:`, result.status);
@@ -314,6 +382,15 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       startSummaryPolling,
       stopSummaryPolling,
       refetchMeetings: fetchMeetings,
+      folders,
+      refetchFolders: fetchFolders,
+      createFolder,
+      renameFolder,
+      moveFolder,
+      deleteFolder,
+      moveMeetingToFolder,
+      sidebarWidth,
+      sidebarDragging,
 
     }}>
       {children}
