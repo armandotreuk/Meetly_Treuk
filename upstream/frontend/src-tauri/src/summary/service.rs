@@ -1,14 +1,16 @@
 use crate::database::repositories::{
-    meeting::MeetingsRepository, setting::SettingsRepository, summary::SummaryProcessesRepository,
+    meeting::MeetingsRepository, meeting_notes::MeetingNotesRepository, setting::SettingsRepository,
+    summary::SummaryProcessesRepository,
 };
-use crate::summary::llm_client::LLMProvider;
+use crate::ollama::metadata::ModelMetadataCache;
 use crate::summary::language_detection::detect_summary_language;
+use crate::summary::llm_client::LLMProvider;
 use crate::summary::metadata::read_detected_summary_language_from_metadata;
 use crate::summary::processor::{
     extract_meeting_name_from_markdown, generate_meeting_summary, language_name_from_code,
 };
 use crate::summary::templates::{self, Template};
-use crate::ollama::metadata::ModelMetadataCache;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::collections::HashMap;
@@ -18,12 +20,10 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
-use once_cell::sync::Lazy;
 
 // Global cache for model metadata (5 minute TTL)
-static METADATA_CACHE: Lazy<ModelMetadataCache> = Lazy::new(|| {
-    ModelMetadataCache::new(Duration::from_secs(300))
-});
+static METADATA_CACHE: Lazy<ModelMetadataCache> =
+    Lazy::new(|| ModelMetadataCache::new(Duration::from_secs(300)));
 
 // Global registry for cancellation tokens (thread-safe)
 static CANCELLATION_REGISTRY: Lazy<Arc<Mutex<HashMap<String, CancellationToken>>>> =
@@ -59,6 +59,8 @@ const ENGLISH_CACHE_FIELD: &str = "english_cache";
 struct SummaryCacheSource {
     transcript_fingerprint: String,
     custom_prompt_fingerprint: String,
+    #[serde(default)]
+    notes_fingerprint: String,
     template_id: String,
     template_fingerprint: String,
     token_threshold: usize,
@@ -94,6 +96,7 @@ fn stable_text_fingerprint(text: &str) -> String {
 fn build_summary_cache_source(
     text: &str,
     custom_prompt: &str,
+    notes: &str,
     template_id: &str,
     template_fingerprint: &str,
     token_threshold: usize,
@@ -108,6 +111,7 @@ fn build_summary_cache_source(
     SummaryCacheSource {
         transcript_fingerprint: stable_text_fingerprint(text),
         custom_prompt_fingerprint: stable_text_fingerprint(custom_prompt),
+        notes_fingerprint: stable_text_fingerprint(notes),
         template_id: template_id.to_string(),
         template_fingerprint: template_fingerprint.to_string(),
         token_threshold,
@@ -212,7 +216,10 @@ impl SummaryService {
                 return true;
             }
         }
-        warn!("No active summary generation found for meeting: {}", meeting_id);
+        warn!(
+            "No active summary generation found for meeting: {}",
+            meeting_id
+        );
         false
     }
 
@@ -225,14 +232,14 @@ impl SummaryService {
         }
     }
 
-    async fn read_detected_summary_language(
-        pool: &SqlitePool,
-        meeting_id: &str,
-    ) -> Option<String> {
+    async fn read_detected_summary_language(pool: &SqlitePool, meeting_id: &str) -> Option<String> {
         let meeting = match MeetingsRepository::get_meeting_metadata(pool, meeting_id).await {
             Ok(Some(meeting)) => meeting,
             Ok(None) => {
-                warn!("Meeting not found while reading detected summary language: {}", meeting_id);
+                warn!(
+                    "Meeting not found while reading detected summary language: {}",
+                    meeting_id
+                );
                 return None;
             }
             Err(e) => {
@@ -265,7 +272,10 @@ impl SummaryService {
         let detection = detect_summary_language(&transcript_texts);
         match &detection.language {
             Some(language) => {
-                info!("Detected transcript summary language for normalization: {}", language);
+                info!(
+                    "Detected transcript summary language for normalization: {}",
+                    language
+                );
             }
             None => {
                 info!(
@@ -315,13 +325,16 @@ impl SummaryService {
         let provider = match LLMProvider::from_str(&model_provider) {
             Ok(p) => p,
             Err(e) => {
-                Self::update_process_failed(&pool, &meeting_id, &e).await;
+                Self::update_process_failed(&pool, &meeting_id, &template_id, &e).await;
                 return;
             }
         };
 
         // Validate and setup api_key, Flexible for Ollama, BuiltInAI, and CustomOpenAI
-        let api_key = if provider == LLMProvider::Ollama || provider == LLMProvider::BuiltInAI || provider == LLMProvider::CustomOpenAI {
+        let api_key = if provider == LLMProvider::Ollama
+            || provider == LLMProvider::BuiltInAI
+            || provider == LLMProvider::CustomOpenAI
+        {
             // These providers don't require API keys from the standard database column
             String::new()
         } else {
@@ -329,12 +342,13 @@ impl SummaryService {
                 Ok(Some(key)) if !key.is_empty() => key,
                 Ok(None) | Ok(Some(_)) => {
                     let err_msg = format!("API key not found for {}", &model_provider);
-                    Self::update_process_failed(&pool, &meeting_id, &err_msg).await;
+                    Self::update_process_failed(&pool, &meeting_id, &template_id, &err_msg).await;
                     return;
                 }
                 Err(e) => {
-                    let err_msg = format!("Failed to retrieve API key for {}: {}", &model_provider, e);
-                    Self::update_process_failed(&pool, &meeting_id, &err_msg).await;
+                    let err_msg =
+                        format!("Failed to retrieve API key for {}: {}", &model_provider, e);
+                    Self::update_process_failed(&pool, &meeting_id, &template_id, &err_msg).await;
                     return;
                 }
             }
@@ -355,33 +369,38 @@ impl SummaryService {
         };
 
         // Get CustomOpenAI config if provider is CustomOpenAI
-        let (custom_openai_endpoint, custom_openai_api_key, custom_openai_max_tokens, custom_openai_temperature, custom_openai_top_p) =
-            if provider == LLMProvider::CustomOpenAI {
-                match SettingsRepository::get_custom_openai_config(&pool).await {
-                    Ok(Some(config)) => {
-                        info!("✓ Using custom OpenAI endpoint: {}", config.endpoint);
-                        (
-                            Some(config.endpoint),
-                            config.api_key,
-                            config.max_tokens.map(|t| t as u32),
-                            config.temperature,
-                            config.top_p,
-                        )
-                    }
-                    Ok(None) => {
-                        let err_msg = "Custom OpenAI provider selected but no configuration found";
-                        Self::update_process_failed(&pool, &meeting_id, err_msg).await;
-                        return;
-                    }
-                    Err(e) => {
-                        let err_msg = format!("Failed to retrieve custom OpenAI config: {}", e);
-                        Self::update_process_failed(&pool, &meeting_id, &err_msg).await;
-                        return;
-                    }
+        let (
+            custom_openai_endpoint,
+            custom_openai_api_key,
+            custom_openai_max_tokens,
+            custom_openai_temperature,
+            custom_openai_top_p,
+        ) = if provider == LLMProvider::CustomOpenAI {
+            match SettingsRepository::get_custom_openai_config(&pool).await {
+                Ok(Some(config)) => {
+                    info!("✓ Using custom OpenAI endpoint: {}", config.endpoint);
+                    (
+                        Some(config.endpoint),
+                        config.api_key,
+                        config.max_tokens.map(|t| t as u32),
+                        config.temperature,
+                        config.top_p,
+                    )
                 }
-            } else {
-                (None, None, None, None, None)
-            };
+                Ok(None) => {
+                    let err_msg = "Custom OpenAI provider selected but no configuration found";
+                    Self::update_process_failed(&pool, &meeting_id, &template_id, err_msg).await;
+                    return;
+                }
+                Err(e) => {
+                    let err_msg = format!("Failed to retrieve custom OpenAI config: {}", e);
+                    Self::update_process_failed(&pool, &meeting_id, &template_id, &err_msg).await;
+                    return;
+                }
+            }
+        } else {
+            (None, None, None, None, None)
+        };
 
         // For CustomOpenAI, use its API key (if any) instead of the empty string
         let final_api_key = if provider == LLMProvider::CustomOpenAI {
@@ -392,7 +411,10 @@ impl SummaryService {
 
         // Dynamically fetch context size based on provider and model
         let token_threshold = if provider == LLMProvider::Ollama {
-            match METADATA_CACHE.get_or_fetch(&model_name, ollama_endpoint.as_deref()).await {
+            match METADATA_CACHE
+                .get_or_fetch(&model_name, ollama_endpoint.as_deref())
+                .await
+            {
                 Ok(metadata) => {
                     // Reserve 300 tokens for prompt overhead
                     let optimal = metadata.context_size.saturating_sub(300);
@@ -407,7 +429,7 @@ impl SummaryService {
                         "Failed to fetch context for {}: {}. Using default 4000",
                         model_name, e
                     );
-                    4000  // Fallback to safe default
+                    4000 // Fallback to safe default
                 }
             }
         } else if provider == LLMProvider::BuiltInAI {
@@ -428,12 +450,12 @@ impl SummaryService {
                 }
                 Err(e) => {
                     warn!("{}, using default 2048", e);
-                    1748  // 2048 - 300 for overhead
+                    1748 // 2048 - 300 for overhead
                 }
             }
         } else {
             // Cloud providers (OpenAI, Claude, Groq, CustomOpenAI) handle large contexts automatically
-            100000  // Effectively unlimited for single-pass processing
+            100000 // Effectively unlimited for single-pass processing
         };
 
         // Get app data directory for BuiltInAI provider
@@ -443,10 +465,9 @@ impl SummaryService {
             info!("📝 Summary language preference: {}", code);
         }
 
-        let detected_summary_language =
-            Self::read_detected_summary_language(&pool, &meeting_id)
-                .await
-                .or_else(|| Self::detect_summary_language_from_text(&text));
+        let detected_summary_language = Self::read_detected_summary_language(&pool, &meeting_id)
+            .await
+            .or_else(|| Self::detect_summary_language_from_text(&text));
 
         if let Some(code) = &detected_summary_language {
             info!("📝 Detected transcript summary language: {}", code);
@@ -456,15 +477,32 @@ impl SummaryService {
             Ok(template) => template,
             Err(e) => {
                 let err_msg = format!("Failed to load template '{}': {}", template_id, e);
-                Self::update_process_failed(&pool, &meeting_id, &err_msg).await;
+                Self::update_process_failed(&pool, &meeting_id, &template_id, &err_msg).await;
                 return;
             }
         };
         let template_fingerprint = template_cache_fingerprint(&template);
 
+        // Fetch user notes taken during the meeting; non-empty markdown is injected into the
+        // summary prompt as an additional important source. Cache key includes the notes
+        // fingerprint so editing notes invalidates the cached English summary.
+        let user_notes: Option<String> = match MeetingNotesRepository::get_notes(&pool, &meeting_id).await {
+            Ok(Some(n)) => n.notes_markdown.filter(|m| !m.trim().is_empty()),
+            Ok(None) => None,
+            Err(e) => {
+                warn!(
+                    "Failed to load meeting notes for {} (summary will proceed without them): {}",
+                    meeting_id, e
+                );
+                None
+            }
+        };
+        let user_notes_for_cache = user_notes.clone().unwrap_or_default();
+
         let cache_source = build_summary_cache_source(
             &text,
             &custom_prompt,
+            &user_notes_for_cache,
             &template_id,
             &template_fingerprint,
             token_threshold,
@@ -477,11 +515,11 @@ impl SummaryService {
             custom_openai_top_p,
         );
 
-        let cached_english = match SummaryProcessesRepository::get_summary_data(&pool, &meeting_id).await {
+        let cached_english = match SummaryProcessesRepository::get_summary_data(&pool, &meeting_id, &template_id).await {
             Err(e) => {
                 warn!(
-                    "Failed to load prior summary row for cache lookup (meeting_id={}): {}. Falling back to full pass-1 generation.",
-                    meeting_id, e
+                    "Failed to load prior summary row for cache lookup (meeting_id={} template_id={}): {}. Falling back to full pass-1 generation.",
+                    meeting_id, template_id, e
                 );
                 None
             }
@@ -512,6 +550,7 @@ impl SummaryService {
             &final_api_key,
             &text,
             &custom_prompt,
+            user_notes.as_deref(),
             &template_id,
             &template,
             token_threshold,
@@ -541,16 +580,46 @@ impl SummaryService {
                 );
                 info!("Final markdown generated ({} chars)", final_markdown.len());
 
-                if let Some(name) = extract_meeting_name_from_markdown(&final_markdown)
-                    .filter(|n| !n.is_empty())
+                if let Some(name) =
+                    extract_meeting_name_from_markdown(&final_markdown).filter(|n| !n.is_empty())
                 {
-                    info!("Extracted meeting name from summary: '{}'", name);
-                    if let Err(e) =
-                        MeetingsRepository::update_meeting_name(&pool, &meeting_id, &name).await
-                    {
-                        error!("Failed to update meeting name for {}: {}", meeting_id, e);
+                    // Rename the meeting only when:
+                    //   (a) the meeting has no title yet — fresh recording, or
+                    //   (b) no other completed summary exists for this meeting
+                    //       EXCLUDING the row we just finished writing. So the
+                    //       FIRST generated summary wins the title; subsequent
+                    //       summaries (other templates) don't overwrite it.
+                    // This preserves pre-single-template behavior for the first
+                    // summary, while making multi-template generation avoid
+                    // clobbering the name from a different template.
+                    let current_title_empty = match MeetingsRepository::get_meeting(&pool, &meeting_id).await {
+                        Ok(Some(m)) => m.title.trim().is_empty(),
+                        _ => false, // meeting lookup failed: don't risk a no-op rename
+                    };
+                    let is_first_completed = !SummaryProcessesRepository::has_other_completed_summaries(
+                        &pool,
+                        &meeting_id,
+                        &template_id,
+                    )
+                    .await
+                    .unwrap_or(false);
+
+                    if current_title_empty || is_first_completed {
+                        info!(
+                            "Extracted meeting name from summary: '{}' (title_empty={}, first_completed={})",
+                            name, current_title_empty, is_first_completed
+                        );
+                        if let Err(e) =
+                            MeetingsRepository::update_meeting_name(&pool, &meeting_id, &name).await
+                        {
+                            error!("Failed to update meeting name for {}: {}", meeting_id, e);
+                        } else {
+                            info!("Successfully updated meeting name for {}", meeting_id);
+                        }
                     } else {
-                        info!("Successfully updated meeting name for {}", meeting_id);
+                        info!(
+                            "Skipping meeting rename: a title exists and another completed summary already set it"
+                        );
                     }
                 }
 
@@ -565,32 +634,36 @@ impl SummaryService {
                 if let Err(e) = SummaryProcessesRepository::update_process_completed(
                     &pool,
                     &meeting_id,
+                    &template_id,
                     result_json,
                     num_chunks,
                     duration,
                 )
                 .await
                 {
-                    error!(
-                        "Failed to save completed process for {}: {}",
-                        meeting_id, e
-                    );
+                    error!("Failed to save completed process for {}: {}", meeting_id, e);
                 } else {
-                    info!(
-                        "Summary saved successfully for meeting_id: {}",
-                        meeting_id
-                    );
+                    info!("Summary saved successfully for meeting_id: {} template_id: {}", meeting_id, template_id);
                 }
             }
             Err(e) => {
                 // Check if error is due to cancellation
                 if e.contains("cancelled") {
-                    info!("Summary generation was cancelled for meeting_id: {}", meeting_id);
-                    if let Err(db_err) = SummaryProcessesRepository::update_process_cancelled(&pool, &meeting_id).await {
-                        error!("Failed to update DB status to cancelled for {}: {}", meeting_id, db_err);
+                    info!(
+                        "Summary generation was cancelled for meeting_id: {} template_id: {}",
+                        meeting_id, template_id
+                    );
+                    if let Err(db_err) =
+                        SummaryProcessesRepository::update_process_cancelled(&pool, &meeting_id, &template_id)
+                            .await
+                    {
+                        error!(
+                            "Failed to update DB status to cancelled for {} template {}: {}",
+                            meeting_id, template_id, db_err
+                        );
                     }
                 } else {
-                    Self::update_process_failed(&pool, &meeting_id, &e).await;
+                    Self::update_process_failed(&pool, &meeting_id, &template_id, &e).await;
                 }
             }
         }
@@ -601,18 +674,29 @@ impl SummaryService {
     /// # Arguments
     /// * `pool` - SQLx connection pool
     /// * `meeting_id` - Meeting identifier
+    /// * `template_id` - Template identifier (which row to mark failed)
     /// * `error_msg` - Error message to store
-    async fn update_process_failed(pool: &SqlitePool, meeting_id: &str, error_msg: &str) {
+    async fn update_process_failed(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        template_id: &str,
+        error_msg: &str,
+    ) {
         error!(
-            "Processing failed for meeting_id {}: {}",
-            meeting_id, error_msg
+            "Processing failed for meeting_id {} template_id {}: {}",
+            meeting_id, template_id, error_msg
         );
-        if let Err(e) =
-            SummaryProcessesRepository::update_process_failed(pool, meeting_id, error_msg).await
+        if let Err(e) = SummaryProcessesRepository::update_process_failed(
+            pool,
+            meeting_id,
+            template_id,
+            error_msg,
+        )
+        .await
         {
             error!(
-                "Failed to update DB status to failed for {}: {}",
-                meeting_id, e
+                "Failed to update DB status to failed for {} template {}: {}",
+                meeting_id, template_id, e
             );
         }
     }
@@ -666,12 +750,18 @@ mod tests {
 
     #[test]
     fn test_strip_title_if_present_preserves_already_stripped() {
-        assert_eq!(strip_title_if_present("## Action Items\nfoo"), "## Action Items\nfoo");
+        assert_eq!(
+            strip_title_if_present("## Action Items\nfoo"),
+            "## Action Items\nfoo"
+        );
     }
 
     #[test]
     fn test_strip_title_if_present_strips_leading_h1() {
-        assert_eq!(strip_title_if_present("# Meeting Title\n## Action Items\nfoo"), "## Action Items\nfoo");
+        assert_eq!(
+            strip_title_if_present("# Meeting Title\n## Action Items\nfoo"),
+            "## Action Items\nfoo"
+        );
     }
 
     #[test]
@@ -707,6 +797,7 @@ mod tests {
         build_summary_cache_source(
             "transcript body",
             "custom prompt",
+            "",
             "standard_meeting",
             &template_fingerprint,
             3700,
@@ -806,6 +897,7 @@ mod tests {
             build_summary_cache_source(
                 "changed transcript",
                 "custom prompt",
+                "",
                 "standard_meeting",
                 &template_fingerprint,
                 3700,
@@ -820,6 +912,7 @@ mod tests {
             build_summary_cache_source(
                 "transcript body",
                 "changed prompt",
+                "",
                 "standard_meeting",
                 &template_fingerprint,
                 3700,
@@ -834,6 +927,7 @@ mod tests {
             build_summary_cache_source(
                 "transcript body",
                 "custom prompt",
+                "",
                 "daily_standup",
                 &template_fingerprint,
                 3700,
@@ -848,6 +942,7 @@ mod tests {
             build_summary_cache_source(
                 "transcript body",
                 "custom prompt",
+                "",
                 "standard_meeting",
                 &template_fingerprint,
                 3700,
@@ -862,6 +957,7 @@ mod tests {
             build_summary_cache_source(
                 "transcript body",
                 "custom prompt",
+                "",
                 "standard_meeting",
                 &template_fingerprint,
                 3700,
@@ -876,6 +972,7 @@ mod tests {
             build_summary_cache_source(
                 "transcript body",
                 "custom prompt",
+                "",
                 "standard_meeting",
                 &template_fingerprint,
                 3700,
@@ -890,6 +987,22 @@ mod tests {
             build_summary_cache_source(
                 "transcript body",
                 "custom prompt",
+                "changed notes invalidate cache",
+                "standard_meeting",
+                &template_fingerprint,
+                3700,
+                "ollama",
+                "gemma3:1b",
+                Some("http://localhost:11434"),
+                None,
+                None,
+                None,
+                None,
+            ),
+            build_summary_cache_source(
+                "transcript body",
+                "custom prompt",
+                "",
                 "standard_meeting",
                 &template_fingerprint,
                 3700,

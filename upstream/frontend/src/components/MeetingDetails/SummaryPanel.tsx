@@ -1,6 +1,6 @@
 "use client";
 
-import { Summary, SummaryResponse, Transcript } from '@/types';
+import { Summary, SummaryResponse, Transcript, MeetingSummaryInfo } from '@/types';
 import { EditableTitle } from '@/components/EditableTitle';
 import { BlockNoteSummaryView, BlockNoteSummaryViewRef } from '@/components/AISummary/BlockNoteSummaryView';
 import { EmptyStateSummary } from '@/components/EmptyStateSummary';
@@ -61,6 +61,13 @@ interface SummaryPanelProps {
   onTemplateSelect: (templateId: string, templateName: string) => void;
   isModelConfigLoading?: boolean;
   onOpenModelSettings?: (openFn: () => void) => void;
+  // Multi-template summaries (Sprint D) — threaded down from page-content.
+  summaries?: MeetingSummaryInfo[];
+  activeTemplateId?: string | null;
+  onActiveTemplateChange?: (templateId: string | null) => void;
+  onSummariesChanged?: () => void | Promise<void>;
+  containerRef?: (el: HTMLDivElement | null) => void;
+  compact?: boolean;
 }
 
 export function SummaryPanel({

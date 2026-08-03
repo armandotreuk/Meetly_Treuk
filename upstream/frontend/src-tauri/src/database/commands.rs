@@ -109,9 +109,9 @@ pub async fn check_default_legacy_database(app: AppHandle) -> Result<Option<Stri
 #[tauri::command]
 pub async fn check_homebrew_database(path: String) -> Result<Option<DatabaseCheckResult>, String> {
     let db_path = PathBuf::from(&path);
-    
+
     info!("Checking for Homebrew database at: {}", path);
-    
+
     // Check if file exists and is a regular file
     if db_path.exists() && db_path.is_file() {
         // Get file metadata to check size
@@ -119,13 +119,10 @@ pub async fn check_homebrew_database(path: String) -> Result<Option<DatabaseChec
             Ok(metadata) => {
                 let size = metadata.len();
                 info!("Found Homebrew database: {} ({} bytes)", path, size);
-                
+
                 // Only consider it valid if it has content (not empty)
                 if size > 0 {
-                    Ok(Some(DatabaseCheckResult {
-                        exists: true,
-                        size,
-                    }))
+                    Ok(Some(DatabaseCheckResult { exists: true, size }))
                 } else {
                     info!("Database file exists but is empty");
                     Ok(None)
@@ -166,6 +163,9 @@ pub async fn import_and_initialize_database(
 
     info!("Legacy database imported and initialized successfully");
 
+    // Start MCP server now that AppState is available (first-launch path)
+    crate::mcp::server::spawn_from_app(&app);
+
     // Emit event to notify frontend that database is ready
     app.emit("database-initialized", ())
         .map_err(|e| format!("Failed to emit database-initialized event: {}", e))?;
@@ -186,12 +186,19 @@ pub async fn initialize_fresh_database(app: AppHandle) -> Result<(), String> {
         })?;
 
     // Update app state with the new manager
-    app.manage(AppState { db_manager: db_manager.clone() });
+    app.manage(AppState {
+        db_manager: db_manager.clone(),
+    });
+
+    // Start MCP server now that AppState is available (first-launch path)
+    crate::mcp::server::spawn_from_app(&app);
 
     // Set default model configuration for fresh installs
     let pool = db_manager.pool();
-    
-    let default_summary_model = crate::summary::summary_engine::commands::get_recommended_summary_model_for_current_system()
+
+    let default_summary_model =
+        crate::summary::summary_engine::commands::get_recommended_summary_model_for_current_system(
+        )
         .unwrap_or("qwen3.5:2b");
 
     // Default Summary Model: Built-in AI (Qwen recommendation for this system)
@@ -201,16 +208,21 @@ pub async fn initialize_fresh_database(app: AppHandle) -> Result<(), String> {
         default_summary_model,
         "large-v3", // Default whisper model (unused for builtin but required)
         None,
-    ).await {
+    )
+    .await
+    {
         error!("Failed to set default summary model config: {}", e);
     }
 
     // Default Transcription Model: Parakeet
-    if let Err(e) = crate::database::repositories::setting::SettingsRepository::save_transcript_config(
-        pool,
-        "parakeet",
-        crate::config::DEFAULT_PARAKEET_MODEL,
-    ).await {
+    if let Err(e) =
+        crate::database::repositories::setting::SettingsRepository::save_transcript_config(
+            pool,
+            "parakeet",
+            crate::config::DEFAULT_PARAKEET_MODEL,
+        )
+        .await
+    {
         error!("Failed to set default transcription model config: {}", e);
     }
 
@@ -306,7 +318,30 @@ pub async fn save_meeting_notes(
         notes_json.as_deref(),
     )
     .await
-    .map_err(|e| format!("Failed to save meeting notes: {}", e))
+    .map_err(|e| format!("Failed to save meeting notes: {}", e))?;
+
+    // Export notes.md to the meeting folder (fire-and-forget on IO error — DB is the source of truth).
+    let folder_path: Option<Option<String>> = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT folder_path FROM meetings WHERE id = ?",
+    )
+    .bind(&meeting_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+    if let Some(Some(path)) = folder_path {
+        let notes_md = std::path::Path::new(&path).join("notes.md");
+        let content = notes_markdown.clone().unwrap_or_default();
+        if let Err(e) = std::fs::write(&notes_md, content.as_bytes()) {
+            log::warn!(
+                "Failed to export notes.md to {} for meeting {}: {}",
+                notes_md.display(),
+                meeting_id,
+                e
+            );
+        }
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -315,7 +350,119 @@ pub async fn delete_meeting_notes(
     meeting_id: String,
 ) -> Result<(), String> {
     let pool = state.db_manager.pool();
+
+    // Look up folder before deleting the DB row.
+    let folder_path: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT folder_path FROM meetings WHERE id = ?",
+    )
+    .bind(&meeting_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+
     super::repositories::meeting_notes::MeetingNotesRepository::delete_notes(pool, &meeting_id)
         .await
-        .map_err(|e| format!("Failed to delete meeting notes: {}", e))
+        .map_err(|e| format!("Failed to delete meeting notes: {}", e))?;
+
+    // Best-effort removal of the exported file.
+    if let Some(Some(path)) = folder_path {
+        let notes_md = std::path::Path::new(&path).join("notes.md");
+        let _ = std::fs::remove_file(&notes_md);
+    }
+
+    Ok(())
+}
+
+// F1: Template commands
+
+#[tauri::command]
+pub async fn list_templates(
+    state: State<'_, AppState>,
+) -> Result<Vec<super::repositories::templates::Template>, String> {
+    let pool = state.db_manager.pool();
+    super::repositories::templates::TemplatesRepository::list_all(pool)
+        .await
+        .map_err(|e| format!("Failed to list templates: {}", e))
+}
+
+#[tauri::command]
+pub async fn list_user_templates(
+    state: State<'_, AppState>,
+) -> Result<Vec<super::repositories::templates::Template>, String> {
+    let pool = state.db_manager.pool();
+    super::repositories::templates::TemplatesRepository::list_user_templates(pool)
+        .await
+        .map_err(|e| format!("Failed to list user templates: {}", e))
+}
+
+#[tauri::command]
+pub async fn list_builtin_templates(
+    state: State<'_, AppState>,
+) -> Result<Vec<super::repositories::templates::Template>, String> {
+    let pool = state.db_manager.pool();
+    super::repositories::templates::TemplatesRepository::list_builtin_templates(pool)
+        .await
+        .map_err(|e| format!("Failed to list builtin templates: {}", e))
+}
+
+#[tauri::command]
+pub async fn get_template(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<Option<super::repositories::templates::Template>, String> {
+    let pool = state.db_manager.pool();
+    super::repositories::templates::TemplatesRepository::get_by_id(pool, id)
+        .await
+        .map_err(|e| format!("Failed to get template: {}", e))
+}
+
+#[tauri::command]
+pub async fn create_template(
+    state: State<'_, AppState>,
+    name: String,
+    description: String,
+    schema_json: String,
+) -> Result<super::repositories::templates::Template, String> {
+    let pool = state.db_manager.pool();
+    super::repositories::templates::TemplatesRepository::create(
+        pool,
+        super::repositories::templates::CreateTemplateRequest {
+            name,
+            description,
+            schema_json,
+        },
+    )
+    .await
+    .map_err(|e| format!("Failed to create template: {}", e))
+}
+
+#[tauri::command]
+pub async fn update_template(
+    state: State<'_, AppState>,
+    id: i64,
+    name: Option<String>,
+    description: Option<String>,
+    schema_json: Option<String>,
+) -> Result<super::repositories::templates::Template, String> {
+    let pool = state.db_manager.pool();
+    super::repositories::templates::TemplatesRepository::update(
+        pool,
+        id,
+        super::repositories::templates::UpdateTemplateRequest {
+            name,
+            description,
+            schema_json,
+        },
+    )
+    .await
+    .map_err(|e| format!("Failed to update template: {}", e))
+}
+
+#[tauri::command]
+pub async fn delete_template(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    let pool = state.db_manager.pool();
+    super::repositories::templates::TemplatesRepository::delete(pool, id)
+        .await
+        .map_err(|e| format!("Failed to delete template: {}", e))
 }

@@ -94,14 +94,24 @@ impl Template {
             ));
 
             // Add item format instructions if present
-            let item_format = section.item_format.as_ref()
+            let item_format = section
+                .item_format
+                .as_ref()
                 .or(section.example_item_format.as_ref());
 
             if let Some(format) = item_format {
-                instructions.push_str(&format!(
-                    "  - Items in this section should follow the format: `{}`.\n",
-                    format
-                ));
+                // Check if this is a markdown table format (contains pipes)
+                if format.contains('|') {
+                    instructions.push_str(&format!(
+                        "  - This section MUST be formatted as a Markdown table using pipe syntax. Include the header row, separator row (with ---), and data rows. Example format:\n{}\n",
+                        format
+                    ));
+                } else {
+                    instructions.push_str(&format!(
+                        "  - Items in this section should follow the format: `{}`.\n",
+                        format
+                    ));
+                }
             }
         }
 
@@ -118,15 +128,13 @@ mod tests {
         let template = Template {
             name: "Test Template".to_string(),
             description: "A test template".to_string(),
-            sections: vec![
-                TemplateSection {
-                    title: "Summary".to_string(),
-                    instruction: "Provide a summary".to_string(),
-                    format: "paragraph".to_string(),
-                    item_format: None,
-                    example_item_format: None,
-                },
-            ],
+            sections: vec![TemplateSection {
+                title: "Summary".to_string(),
+                instruction: "Provide a summary".to_string(),
+                format: "paragraph".to_string(),
+                item_format: None,
+                example_item_format: None,
+            }],
         };
 
         assert!(template.validate().is_ok());
@@ -148,17 +156,36 @@ mod tests {
         let template = Template {
             name: "Test".to_string(),
             description: "Test".to_string(),
-            sections: vec![
-                TemplateSection {
-                    title: "Test".to_string(),
-                    instruction: "Test".to_string(),
-                    format: "invalid".to_string(),
-                    item_format: None,
-                    example_item_format: None,
-                },
-            ],
+            sections: vec![TemplateSection {
+                title: "Test".to_string(),
+                instruction: "Test".to_string(),
+                format: "invalid".to_string(),
+                item_format: None,
+                example_item_format: None,
+            }],
         };
 
         assert!(template.validate().is_err());
+    }
+
+    #[test]
+    fn test_section_instructions_with_table_format() {
+        let template = Template {
+            name: "Test".to_string(),
+            description: "Test".to_string(),
+            sections: vec![TemplateSection {
+                title: "Action Items".to_string(),
+                instruction: "List action items".to_string(),
+                format: "list".to_string(),
+                item_format: Some("| Owner | Task | Due |\n| --- | --- | --- |".to_string()),
+                example_item_format: None,
+            }],
+        };
+
+        let instructions = template.to_section_instructions();
+        // For table format, it uses the new explicit markdown table instruction
+        assert!(instructions.contains("MUST be formatted as a Markdown table"));
+        assert!(instructions.contains("| Owner | Task | Due |"));
+        assert!(instructions.contains("| --- | --- | --- |"));
     }
 }

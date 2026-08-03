@@ -8,6 +8,7 @@ import { toast } from 'sonner';
 interface UseMeetingDataProps {
   meeting: any;
   summaryData: Summary | null;
+  activeTemplateId?: string | null;
   onMeetingUpdated?: () => Promise<void>;
 }
 

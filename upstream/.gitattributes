@@ -1,0 +1,24 @@
+# Git line-ending policy. Combined with `.editorconfig`, this keeps
+# files consistent regardless of the OS the developer uses.
+#
+# Rationale: Rust, JS/TS, JSON, YAML, and Markdown all treat LF as the
+# canonical line ending. CRLF in the repo produces noisy diffs and
+# breaks the `cargo fmt --check` and `prettier --check` CI gates that
+# run on Linux.
+
+# Default for everything: text, LF on commit, LF in working tree.
+*                 text=auto eol=lf
+
+# Shell scripts must always be LF — Windows-style line endings will
+# break the shebang and turn them into non-executable garbage on *nix.
+*.sh              text eol=lf
+*.bash            text eol=lf
+*.ps1             text eol=lf
+*.bat             text eol=lf
+
+# Markdown hard breaks depend on trailing spaces — leave them alone.
+*.md              text eol=lf whitespace=-trailing-space
+
+# Lockfiles are machine-generated, never edit them by hand.
+pnpm-lock.yaml    -text
+Cargo.lock        -text

@@ -1,11 +1,13 @@
 "use client";
 
-import { useState, useEffect, useRef, useCallback } from 'react';
-import { invoke } from '@tauri-apps/api/core';
-import { toast } from 'sonner';
-import { Loader2, Save } from 'lucide-react';
-import { Button } from '@/components/ui/button';
-import { ScrollArea } from '@/components/ui/scroll-area';
+import { useState, useEffect, useRef, useCallback } from "react";
+import { logger } from "@/lib/logger";
+
+import { invoke } from "@tauri-apps/api/core";
+import { toast } from "sonner";
+import { Loader2, Save, X } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { ScrollArea } from "@/components/ui/scroll-area";
 
 interface MeetingNote {
     meeting_id: string;
@@ -17,15 +19,21 @@ interface MeetingNote {
 
 interface NotesPanelProps {
     meetingId: string;
+    width?: number;
+    onClose?: () => void;
 }
 
-export function NotesPanel({ meetingId }: NotesPanelProps) {
-    const [notes, setNotes] = useState('');
+export function NotesPanel({ meetingId, width, onClose }: NotesPanelProps) {
+    const [notes, setNotes] = useState("");
     const [isLoading, setIsLoading] = useState(true);
     const [isSaving, setIsSaving] = useState(false);
     const [isDirty, setIsDirty] = useState(false);
     const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-    const lastSavedRef = useRef<string>('');
+    const lastSavedRef = useRef<string>("");
+
+    // ponytail: threshold 320px hardcoded; upgrade path if reused = extract useCompactPanelHeader.
+    const effectiveWidth = width ?? 320;
+    const isCompact = width !== undefined && width < 320;
 
     useEffect(() => {
         let cancelled = false;
@@ -33,21 +41,21 @@ export function NotesPanel({ meetingId }: NotesPanelProps) {
         const loadNotes = async () => {
             setIsLoading(true);
             try {
-                const result = await invoke<MeetingNote | null>('get_meeting_notes', {
+                const result = await invoke<MeetingNote | null>("get_meeting_notes", {
                     meetingId,
                 });
                 if (!cancelled && result) {
-                    const markdown = result.notes_markdown || '';
+                    const markdown = result.notes_markdown || "";
                     setNotes(markdown);
                     lastSavedRef.current = markdown;
                 } else if (!cancelled) {
-                    setNotes('');
-                    lastSavedRef.current = '';
+                    setNotes("");
+                    lastSavedRef.current = "";
                 }
             } catch (error) {
-                console.error('Failed to load meeting notes:', error);
+                logger.error("Failed to load meeting notes:", error);
                 if (!cancelled) {
-                    toast.error('Failed to load notes');
+                    toast.error("Failed to load notes");
                 }
             } finally {
                 if (!cancelled) setIsLoading(false);
@@ -64,25 +72,28 @@ export function NotesPanel({ meetingId }: NotesPanelProps) {
         };
     }, [meetingId]);
 
-    const saveNotes = useCallback(async (markdown: string) => {
-        if (markdown === lastSavedRef.current) return;
+    const saveNotes = useCallback(
+        async (markdown: string) => {
+            if (markdown === lastSavedRef.current) return;
 
-        setIsSaving(true);
-        try {
-            await invoke('save_meeting_notes', {
-                meetingId,
-                notesMarkdown: markdown,
-                notesJson: null,
-            });
-            lastSavedRef.current = markdown;
-            setIsDirty(false);
-        } catch (error) {
-            console.error('Failed to save meeting notes:', error);
-            toast.error('Failed to save notes');
-        } finally {
-            setIsSaving(false);
-        }
-    }, [meetingId]);
+            setIsSaving(true);
+            try {
+                await invoke("save_meeting_notes", {
+                    meetingId,
+                    notesMarkdown: markdown,
+                    notesJson: null,
+                });
+                lastSavedRef.current = markdown;
+                setIsDirty(false);
+            } catch (error) {
+                logger.error("Failed to save meeting notes:", error);
+                toast.error("Failed to save notes");
+            } finally {
+                setIsSaving(false);
+            }
+        },
+        [meetingId]
+    );
 
     const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
         const value = e.target.value;
@@ -114,32 +125,51 @@ export function NotesPanel({ meetingId }: NotesPanelProps) {
     }
 
     return (
-        <div className="flex flex-col h-full bg-white border-l border-gray-200">
+        <div
+            className="flex flex-col h-full bg-white border-l border-gray-200 shrink-0"
+            style={{ width: effectiveWidth }}
+        >
             <div className="flex items-center justify-between px-4 py-2 border-b border-gray-200 bg-gray-50">
                 <h3 className="text-sm font-semibold text-gray-700">Notes</h3>
                 <div className="flex items-center gap-2">
                     {isSaving && (
                         <span className="text-xs text-gray-400 flex items-center gap-1">
                             <Loader2 className="h-3 w-3 animate-spin" />
-                            Saving...
+                            {!isCompact && "Saving..."}
                         </span>
                     )}
                     {isDirty && !isSaving && (
-                        <span className="text-xs text-amber-500">Unsaved</span>
+                        <span className="text-xs text-amber-500">
+                            {!isCompact && "Unsaved"}
+                        </span>
                     )}
                     {!isDirty && !isSaving && notes.length > 0 && (
-                        <span className="text-xs text-green-500">Saved</span>
+                        <span className="text-xs text-green-500">
+                            {!isCompact && "Saved"}
+                        </span>
                     )}
                     <Button
                         variant="ghost"
                         size="sm"
                         onClick={handleManualSave}
                         disabled={!isDirty || isSaving}
-                        className="h-7 text-xs"
+                        className={isCompact ? "h-7 w-7 p-0" : "h-7 text-xs"}
+                        title="Save"
                     >
-                        <Save className="h-3 w-3 mr-1" />
-                        Save
+                        <Save className="h-3 w-3" />
+                        {!isCompact && <>Save</>}
                     </Button>
+                    {onClose && (
+                        <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={onClose}
+                            className="h-7 w-7 p-0 text-gray-400 hover:text-gray-600"
+                            title="Hide notes"
+                        >
+                            <X className="h-4 w-4" />
+                        </Button>
+                    )}
                 </div>
             </div>
             <ScrollArea className="flex-1">
@@ -154,7 +184,7 @@ export function NotesPanel({ meetingId }: NotesPanelProps) {
                     }}
                     placeholder="Add your notes here..."
                     className="w-full h-full min-h-[60vh] p-4 text-sm text-gray-800 resize-none border-0 outline-none font-mono"
-                    style={{ fontFamily: 'inherit' }}
+                    style={{ fontFamily: "inherit" }}
                 />
             </ScrollArea>
         </div>

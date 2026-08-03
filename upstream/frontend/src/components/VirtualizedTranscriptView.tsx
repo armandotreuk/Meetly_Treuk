@@ -1,4 +1,4 @@
-'use client';
+"use client";
 
 import { useCallback, useRef, useReducer, startTransition, useEffect, useState, memo } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
@@ -41,26 +41,26 @@ const VIRTUALIZATION_THRESHOLD = 10;
 
 // Helper function to format seconds as recording-relative time [MM:SS]
 function formatRecordingTime(seconds: number | undefined): string {
-    if (seconds === undefined) return '[--:--]';
+    if (seconds === undefined) return "[--:--]";
 
     const totalSeconds = Math.floor(seconds);
     const minutes = Math.floor(totalSeconds / 60);
     const secs = totalSeconds % 60;
 
-    return `[${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}]`;
+    return `[${minutes.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}]`;
 }
 
 // Helper function to remove filler words and repetitions
 function cleanStopWords(text: string): string {
-    const stopWords = ['uh', 'um', 'er', 'ah', 'hmm', 'hm', 'eh', 'oh'];
+    const stopWords = ["uh", "um", "er", "ah", "hmm", "hm", "eh", "oh"];
 
     let cleanedText = text;
-    stopWords.forEach(word => {
-        const pattern = new RegExp(`\\b${word}\\b[,\\s]*`, 'gi');
-        cleanedText = cleanedText.replace(pattern, ' ');
+    stopWords.forEach((word) => {
+        const pattern = new RegExp(`\\b${word}\\b[,\\s]*`, "gi");
+        cleanedText = cleanedText.replace(pattern, " ");
     });
 
-    return cleanedText.replace(/\s+/g, ' ').trim();
+    return cleanedText.replace(/\s+/g, " ").trim();
 }
 
 // Memoized transcript segment component
@@ -79,7 +79,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
     isStreaming: boolean;
     showConfidence: boolean;
 }) {
-    const displayText = cleanStopWords(text) || (text.trim() === '' ? '[Silence]' : text);
+    const displayText = cleanStopWords(text) || (text.trim() === "" ? "[Silence]" : text);
 
     return (
         <div id={`segment-${id}`} className="mb-3">
@@ -92,7 +92,10 @@ const TranscriptSegment = memo(function TranscriptSegment({
                     </TooltipTrigger>
                     <TooltipContent>
                         {confidence !== undefined && showConfidence && (
-                            <ConfidenceIndicator confidence={confidence} showIndicator={showConfidence} />
+                            <ConfidenceIndicator
+                                confidence={confidence}
+                                showIndicator={showConfidence}
+                            />
                         )}
                     </TooltipContent>
                 </Tooltip>
@@ -181,7 +184,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
             },
             {
                 root: null,
-                rootMargin: '100px',
+                rootMargin: "100px",
                 threshold: 0,
             }
         );
@@ -216,8 +219,8 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
             });
         };
 
-        scrollElement.addEventListener('scroll', handleScroll, { passive: true });
-        return () => scrollElement.removeEventListener('scroll', handleScroll);
+        scrollElement.addEventListener("scroll", handleScroll, { passive: true });
+        return () => scrollElement.removeEventListener("scroll", handleScroll);
     }, [onLoadMore, hasMore, isLoadingMore, isRecording]);
 
     // Use simple rendering for small lists, virtualization for large lists
@@ -235,159 +238,179 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
             </AnimatePresence>
 
             {/* Content - add padding when recording to prevent overlap */}
-            <div className={isRecording ? 'pt-2' : ''}>
-            {segments.length === 0 ? (
-                // Empty state
-                <motion.div
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    className="text-center text-gray-500 mt-8"
-                >
-                    {isRecording ? (
-                        <>
-                            <div className="flex items-center justify-center mb-3">
-                                <div className={`w-3 h-3 rounded-full ${isPaused ? 'bg-orange-500' : 'bg-blue-500 animate-pulse'}`}></div>
-                            </div>
-                            <p className="text-sm text-gray-600">
-                                {isPaused ? 'Recording paused' : 'Listening for speech...'}
-                            </p>
-                            <p className="text-xs mt-1 text-gray-400">
-                                {isPaused ? 'Click resume to continue recording' : 'Speak to see live transcription'}
-                            </p>
-                        </>
-                    ) : (
-                        <>
-                            <p className="text-lg font-semibold">Welcome to meetily!</p>
-                            <p className="text-xs mt-1">Start recording to see live transcription</p>
-                        </>
-                    )}
-                </motion.div>
-            ) : useVirtualization ? (
-                // Virtualized rendering for large lists
-                <>
-                    <div
-                        style={{
-                            height: virtualizer.getTotalSize(),
-                            width: "100%",
-                            position: "relative",
-                        }}
+            <div className={isRecording ? "pt-2" : ""}>
+                {segments.length === 0 ? (
+                    // Empty state
+                    <motion.div
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        className="text-center text-gray-500 mt-8"
                     >
-                        {virtualizer.getVirtualItems().map((virtualRow) => {
-                            const segment = segments[virtualRow.index];
-                            const isStreaming = streamingSegmentId === segment.id;
-
-                            return (
-                                <div
-                                    key={segment.id}
-                                    data-index={virtualRow.index}
-                                    ref={virtualizer.measureElement}
-                                    style={{
-                                        position: "absolute",
-                                        top: 0,
-                                        left: 0,
-                                        width: "100%",
-                                        transform: `translateY(${virtualRow.start}px)`,
-                                    }}
-                                >
-                                    <TranscriptSegment
-                                        id={segment.id}
-                                        timestamp={segment.timestamp}
-                                        text={getDisplayText(segment)}
-                                        confidence={segment.confidence}
-                                        isStreaming={isStreaming}
-                                        showConfidence={showConfidence}
-                                    />
+                        {isRecording ? (
+                            <>
+                                <div className="flex items-center justify-center mb-3">
+                                    <div
+                                        className={`w-3 h-3 rounded-full ${isPaused ? "bg-orange-500" : "bg-blue-500 animate-pulse"}`}
+                                    ></div>
                                 </div>
-                            );
-                        })}
-                    </div>
-
-                    {/* Infinite scroll trigger and loading indicator */}
-                    {(hasMore || isLoadingMore) && !isRecording && segments.length > 0 && (
-                        <div ref={loadMoreTriggerRef} className="flex justify-center items-center py-4 mt-2">
-                            {isLoadingMore ? (
-                                <div className="flex items-center gap-2 text-gray-500">
-                                    <div className="w-4 h-4 border-2 border-gray-300 border-t-gray-600 rounded-full animate-spin" />
-                                    <span className="text-sm">Loading more...</span>
-                                </div>
-                            ) : hasMore && totalCount > 0 ? (
-                                <span className="text-sm text-gray-400">
-                                    Showing {loadedCount} of {totalCount} segments
-                                </span>
-                            ) : null}
-                        </div>
-                    )}
-
-                    {/* Listening indicator when recording */}
-                    {!isStopping && isRecording && !isPaused && !isProcessing && segments.length > 0 && (
-                        <motion.div
-                            initial={{ opacity: 0 }}
-                            animate={{ opacity: 1 }}
-                            exit={{ opacity: 0 }}
-                            className="flex items-center gap-2 mt-4 text-gray-500"
+                                <p className="text-sm text-gray-600">
+                                    {isPaused ? "Recording paused" : "Listening for speech..."}
+                                </p>
+                                <p className="text-xs mt-1 text-gray-400">
+                                    {isPaused
+                                        ? "Click resume to continue recording"
+                                        : "Speak to see live transcription"}
+                                </p>
+                            </>
+                        ) : (
+                            <>
+                                <p className="text-lg font-semibold">Welcome to meetily!</p>
+                                <p className="text-xs mt-1">
+                                    Start recording to see live transcription
+                                </p>
+                            </>
+                        )}
+                    </motion.div>
+                ) : useVirtualization ? (
+                    // Virtualized rendering for large lists
+                    <>
+                        <div
+                            style={{
+                                height: virtualizer.getTotalSize(),
+                                width: "100%",
+                                position: "relative",
+                            }}
                         >
-                            <div className="w-2 h-2 bg-blue-500 rounded-full animate-pulse"></div>
-                            <span className="text-sm">Listening...</span>
-                        </motion.div>
-                    )}
-                </>
-            ) : (
-                // Simple rendering for small lists (better animations)
-                <>
-                    <div className="space-y-1">
-                        {segments.map((segment) => {
-                            const isStreaming = streamingSegmentId === segment.id;
+                            {virtualizer.getVirtualItems().map((virtualRow) => {
+                                const segment = segments[virtualRow.index];
+                                const isStreaming = streamingSegmentId === segment.id;
 
-                            return (
+                                return (
+                                    <div
+                                        key={segment.id}
+                                        data-index={virtualRow.index}
+                                        ref={virtualizer.measureElement}
+                                        style={{
+                                            position: "absolute",
+                                            top: 0,
+                                            left: 0,
+                                            width: "100%",
+                                            transform: `translateY(${virtualRow.start}px)`,
+                                        }}
+                                    >
+                                        <TranscriptSegment
+                                            id={segment.id}
+                                            timestamp={segment.timestamp}
+                                            text={getDisplayText(segment)}
+                                            confidence={segment.confidence}
+                                            isStreaming={isStreaming}
+                                            showConfidence={showConfidence}
+                                        />
+                                    </div>
+                                );
+                            })}
+                        </div>
+
+                        {/* Infinite scroll trigger and loading indicator */}
+                        {(hasMore || isLoadingMore) && !isRecording && segments.length > 0 && (
+                            <div
+                                ref={loadMoreTriggerRef}
+                                className="flex justify-center items-center py-4 mt-2"
+                            >
+                                {isLoadingMore ? (
+                                    <div className="flex items-center gap-2 text-gray-500">
+                                        <div className="w-4 h-4 border-2 border-gray-300 border-t-gray-600 rounded-full animate-spin" />
+                                        <span className="text-sm">Loading more...</span>
+                                    </div>
+                                ) : hasMore && totalCount > 0 ? (
+                                    <span className="text-sm text-gray-400">
+                                        Showing {loadedCount} of {totalCount} segments
+                                    </span>
+                                ) : null}
+                            </div>
+                        )}
+
+                        {/* Listening indicator when recording */}
+                        {!isStopping &&
+                            isRecording &&
+                            !isPaused &&
+                            !isProcessing &&
+                            segments.length > 0 && (
                                 <motion.div
-                                    key={segment.id}
-                                    initial={{ opacity: 0, y: 5 }}
-                                    animate={{ opacity: 1, y: 0 }}
-                                    transition={{ duration: 0.15 }}
+                                    initial={{ opacity: 0 }}
+                                    animate={{ opacity: 1 }}
+                                    exit={{ opacity: 0 }}
+                                    className="flex items-center gap-2 mt-4 text-gray-500"
                                 >
-                                    <TranscriptSegment
-                                        id={segment.id}
-                                        timestamp={segment.timestamp}
-                                        text={getDisplayText(segment)}
-                                        confidence={segment.confidence}
-                                        isStreaming={isStreaming}
-                                        showConfidence={showConfidence}
-                                    />
+                                    <div className="w-2 h-2 bg-blue-500 rounded-full animate-pulse"></div>
+                                    <span className="text-sm">Listening...</span>
                                 </motion.div>
-                            );
-                        })}
-                    </div>
+                            )}
+                    </>
+                ) : (
+                    // Simple rendering for small lists (better animations)
+                    <>
+                        <div className="space-y-1">
+                            {segments.map((segment) => {
+                                const isStreaming = streamingSegmentId === segment.id;
 
-                    {/* Infinite scroll trigger (for small lists that grow) */}
-                    {(hasMore || isLoadingMore) && !isRecording && segments.length > 0 && (
-                        <div ref={loadMoreTriggerRef} className="flex justify-center items-center py-4 mt-2">
-                            {isLoadingMore ? (
-                                <div className="flex items-center gap-2 text-gray-500">
-                                    <div className="w-4 h-4 border-2 border-gray-300 border-t-gray-600 rounded-full animate-spin" />
-                                    <span className="text-sm">Loading more...</span>
-                                </div>
-                            ) : hasMore && totalCount > 0 ? (
-                                <span className="text-sm text-gray-400">
-                                    Showing {loadedCount} of {totalCount} segments
-                                </span>
-                            ) : null}
+                                return (
+                                    <motion.div
+                                        key={segment.id}
+                                        initial={{ opacity: 0, y: 5 }}
+                                        animate={{ opacity: 1, y: 0 }}
+                                        transition={{ duration: 0.15 }}
+                                    >
+                                        <TranscriptSegment
+                                            id={segment.id}
+                                            timestamp={segment.timestamp}
+                                            text={getDisplayText(segment)}
+                                            confidence={segment.confidence}
+                                            isStreaming={isStreaming}
+                                            showConfidence={showConfidence}
+                                        />
+                                    </motion.div>
+                                );
+                            })}
                         </div>
-                    )}
 
-                    {/* Listening indicator when recording */}
-                    {!isStopping && isRecording && !isPaused && !isProcessing && segments.length > 0 && (
-                        <motion.div
-                            initial={{ opacity: 0 }}
-                            animate={{ opacity: 1 }}
-                            exit={{ opacity: 0 }}
-                            className="flex items-center gap-2 mt-4 text-gray-500"
-                        >
-                            <div className="w-2 h-2 bg-blue-500 rounded-full animate-pulse"></div>
-                            <span className="text-sm">Listening...</span>
-                        </motion.div>
-                    )}
-                </>
-            )}
+                        {/* Infinite scroll trigger (for small lists that grow) */}
+                        {(hasMore || isLoadingMore) && !isRecording && segments.length > 0 && (
+                            <div
+                                ref={loadMoreTriggerRef}
+                                className="flex justify-center items-center py-4 mt-2"
+                            >
+                                {isLoadingMore ? (
+                                    <div className="flex items-center gap-2 text-gray-500">
+                                        <div className="w-4 h-4 border-2 border-gray-300 border-t-gray-600 rounded-full animate-spin" />
+                                        <span className="text-sm">Loading more...</span>
+                                    </div>
+                                ) : hasMore && totalCount > 0 ? (
+                                    <span className="text-sm text-gray-400">
+                                        Showing {loadedCount} of {totalCount} segments
+                                    </span>
+                                ) : null}
+                            </div>
+                        )}
+
+                        {/* Listening indicator when recording */}
+                        {!isStopping &&
+                            isRecording &&
+                            !isPaused &&
+                            !isProcessing &&
+                            segments.length > 0 && (
+                                <motion.div
+                                    initial={{ opacity: 0 }}
+                                    animate={{ opacity: 1 }}
+                                    exit={{ opacity: 0 }}
+                                    className="flex items-center gap-2 mt-4 text-gray-500"
+                                >
+                                    <div className="w-2 h-2 bg-blue-500 rounded-full animate-pulse"></div>
+                                    <span className="text-sm">Listening...</span>
+                                </motion.div>
+                            )}
+                    </>
+                )}
             </div>
         </div>
     );

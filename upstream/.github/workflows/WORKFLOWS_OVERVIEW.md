@@ -2,9 +2,30 @@
 
 This document provides a quick overview of all available CI/CD workflows in this repository.
 
-**Note:** All workflows in this repository use **manual triggers only** (`workflow_dispatch`). There are no automatic triggers from push or pull request events.
+**Note:** Most workflows in this repository use **manual triggers** (`workflow_dispatch`). The exception is `ci.yml`, which runs automatically on every PR and push to `main` / `devtest`.
 
 ## Workflow Files
+
+### 0. **ci.yml** - Continuous Integration (automatic)
+**Purpose:** Fast, deterministic checks on every PR and push.
+
+**Key Features:**
+- Runs on every PR and push to `main` / `devtest` (no manual trigger needed)
+- Frontend job: `tsc --noEmit`, `vitest run`, `prettier --check`, `next lint`
+- Rust job: `cargo fmt --all -- --check`, `cargo test --lib`, `cargo clippy`
+- Restores the vendored `whisper-rs-sys/bindings.rs` before any cargo invocation
+- Uses `Swatinem/rust-cache` to cache the cargo registry and target dir
+
+**Triggers:**
+- `pull_request` against `main` or `devtest`
+- `push` to `main` or `devtest`
+- Manual dispatch (for ad-hoc reruns)
+
+**Use When:**
+- You want quick feedback on whether a change breaks the build
+- The full platform builds in `build-*.yml` would be overkill for a small PR
+
+---
 
 ### 1. **build-devtest.yml** - DevTest Builds
 **Purpose:** Fast builds for development and testing

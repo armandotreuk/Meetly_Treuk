@@ -6,8 +6,8 @@
     "build": {
         "frontendDist": "../out",
         "devUrl": "http://localhost:3118",
-        "beforeDevCommand": "pnpm dev",
-        "beforeBuildCommand": "pnpm build"
+        "beforeDevCommand": "npx next dev -p 3118",
+        "beforeBuildCommand": "npx next build"
     },
     "app": {
         "windows": [
@@ -94,7 +94,8 @@
             "icons/app_icon.ico"
         ],
         "resources": [
-            "templates/*.json"
+            "templates/*.json",
+            "templates/fonts/*"
         ],
         "externalBin": [
             "binaries/llama-helper",
@@ -108,6 +109,5 @@
         "windows": {
             "signCommand": "powershell -ExecutionPolicy Bypass -File scripts/sign-windows.ps1 -FilePath %1"
         }
-    },
     }
 }

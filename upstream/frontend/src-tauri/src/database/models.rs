@@ -9,6 +9,16 @@ pub struct MeetingModel {
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
     pub folder_path: Option<String>,
+    pub folder_id: Option<String>,
+}
+
+/// Logical folder for grouping meetings (multi-level, in-DB only; disk layout is unaffected).
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct MeetingFolderModel {
+    pub id: String,
+    pub name: String,
+    pub parent_id: Option<String>,
+    pub created_at: DateTimeUtc,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type)]
@@ -40,6 +50,7 @@ pub struct Transcript {
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct SummaryProcess {
     pub meeting_id: String,
+    pub template_id: String,
     pub status: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -49,7 +60,7 @@ pub struct SummaryProcess {
     pub end_time: Option<chrono::DateTime<chrono::Utc>>,
     pub chunk_count: i64,
     pub processing_time: f64,
-    pub metadata: Option<String>, // JSON
+    pub metadata: Option<String>,      // JSON
     pub result_backup: Option<String>, // Backup of result before regeneration
     pub result_backup_timestamp: Option<chrono::DateTime<chrono::Utc>>, // When backup was created
 }
@@ -96,14 +107,30 @@ pub struct Setting {
     #[sqlx(rename = "customOpenAIConfig")]
     #[serde(rename = "customOpenAIConfig")]
     pub custom_openai_config: Option<String>,
+    /// Global vocabulary list (newline-separated words/phrases) biasing Whisper + summary LLM
+    #[sqlx(rename = "customVocabulary")]
+    #[serde(rename = "customVocabulary")]
+    pub custom_vocabulary: Option<String>,
+    /// Chat with Meetings: separate LLM provider (falls back to summary provider if NULL)
+    #[sqlx(rename = "chatProvider")]
+    #[serde(rename = "chatProvider")]
+    pub chat_provider: Option<String>,
+    /// Chat with Meetings: separate model name (falls back to summary model if NULL)
+    #[sqlx(rename = "chatModel")]
+    #[serde(rename = "chatModel")]
+    pub chat_model: Option<String>,
+    /// Chat with Meetings: separate Ollama endpoint (falls back to summary endpoint if NULL)
+    #[sqlx(rename = "chatOllamaEndpoint")]
+    #[serde(rename = "chatOllamaEndpoint")]
+    pub chat_ollama_endpoint: Option<String>,
 }
 
 impl Setting {
     /// Parse the custom OpenAI config from JSON string
     pub fn get_custom_openai_config(&self) -> Option<crate::summary::CustomOpenAIConfig> {
-        self.custom_openai_config.as_ref().and_then(|json| {
-            serde_json::from_str(json).ok()
-        })
+        self.custom_openai_config
+            .as_ref()
+            .and_then(|json| serde_json::from_str(json).ok())
     }
 }
 
@@ -127,4 +154,23 @@ pub struct TranscriptSetting {
     #[sqlx(rename = "openaiApiKey")]
     #[serde(rename = "openaiApiKey")]
     pub openai_api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct Template {
+    pub id: i64,
+    pub name: String,
+    pub description: Option<String>,
+    #[sqlx(rename = "schema_json")]
+    #[serde(rename = "schema_json")]
+    pub schema_json: String,
+    #[sqlx(rename = "is_builtin")]
+    #[serde(rename = "is_builtin")]
+    pub is_builtin: i64,
+    #[sqlx(rename = "created_at")]
+    #[serde(rename = "created_at")]
+    pub created_at: String,
+    #[sqlx(rename = "updated_at")]
+    #[serde(rename = "updated_at")]
+    pub updated_at: String,
 }

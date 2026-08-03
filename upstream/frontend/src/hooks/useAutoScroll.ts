@@ -1,9 +1,10 @@
 import { useRef, useState, useEffect, useCallback, RefObject } from "react";
 import { Virtualizer } from "@tanstack/react-virtual";
+import { TranscriptSegmentData } from "@/types";
 
 interface UseAutoScrollProps {
     scrollRef: RefObject<HTMLDivElement | null>;
-    segments: any[];
+    segments: TranscriptSegmentData[];
     isRecording: boolean;
     isPaused: boolean;
     activeSegmentId?: string;
@@ -144,7 +145,13 @@ export function useAutoScroll({
 
         // Only scroll if new segments arrived AND user is currently at bottom
         // Check isNearBottom() immediately to avoid race conditions with the debounced scroll handler
-        if (hasNewSegments && autoScrollRef.current && isRecording && !isPaused && segmentCount > 0) {
+        if (
+            hasNewSegments &&
+            autoScrollRef.current &&
+            isRecording &&
+            !isPaused &&
+            segmentCount > 0
+        ) {
             // Check if user is at bottom RIGHT NOW before scrolling
             const isCurrentlyAtBottom = isNearBottom();
             if (!isCurrentlyAtBottom) {
@@ -174,7 +181,16 @@ export function useAutoScroll({
                 isProgrammaticScrollRef.current = false;
             }, 150);
         }
-    }, [segments.length, isRecording, isPaused, useVirtualization, virtualizer, scrollRef, isNearBottom, disableAutoScroll]);
+    }, [
+        segments.length,
+        isRecording,
+        isPaused,
+        useVirtualization,
+        virtualizer,
+        scrollRef,
+        isNearBottom,
+        disableAutoScroll,
+    ]);
 
     // Auto-scroll to active segment (when clicking on search results, etc.)
     useEffect(() => {
@@ -182,7 +198,9 @@ export function useAutoScroll({
             isProgrammaticScrollRef.current = true;
 
             if (useVirtualization && virtualizer) {
-                const index = segments.findIndex((s: any) => s.id === activeSegmentId);
+                const index = segments.findIndex(
+                    (s: TranscriptSegmentData) => s.id === activeSegmentId
+                );
                 if (index >= 0) {
                     virtualizer.scrollToIndex(index, { align: "center", behavior: "smooth" });
                 }

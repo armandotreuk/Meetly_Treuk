@@ -88,7 +88,9 @@ impl SettingsRepository {
             Ok(enc) => enc,
             Err(e) => {
                 log::error!("Failed to encrypt API key for provider {}: {}", provider, e);
-                return Err(sqlx::Error::Protocol(format!("Encryption failed: {}", e).into()));
+                return Err(sqlx::Error::Protocol(
+                    format!("Encryption failed: {}", e).into(),
+                ));
             }
         };
 
@@ -148,7 +150,7 @@ impl SettingsRepository {
             "SELECT {} FROM settings WHERE id = '1' LIMIT 1",
             api_key_column
         );
-        let api_key = sqlx::query_scalar(&query).fetch_optional(pool).await?;
+        let api_key: Option<String> = sqlx::query_scalar(&query).fetch_optional(pool).await?;
         // F10: Decrypt the API key if it's encrypted; migrate plaintext if found
         match api_key {
             Some(ref val) if crate::security::is_encrypted(val) => {
@@ -156,18 +158,21 @@ impl SettingsRepository {
                     Ok(dec) => Ok(Some(dec)),
                     Err(e) => {
                         log::error!("Failed to decrypt API key for provider {}: {}", provider, e);
-                        Ok(None)
+                        Err(sqlx::Error::Protocol(
+                            format!("Stored API key for {} could not be decrypted (encryption key lost?) — please re-enter it in model settings", provider).into(),
+                        ))
                     }
                 }
             }
             Some(ref val) if !val.is_empty() => {
                 // Plaintext key found — migrate to encrypted on read
-                log::info!("Migrating plaintext API key to encrypted for provider {}", provider);
+                log::info!(
+                    "Migrating plaintext API key to encrypted for provider {}",
+                    provider
+                );
                 if let Ok(enc) = crate::security::encrypt_api_key(val) {
-                    let migrate_query = format!(
-                        "UPDATE settings SET {} = $1 WHERE id = '1'",
-                        api_key_column
-                    );
+                    let migrate_query =
+                        format!("UPDATE settings SET {} = $1 WHERE id = '1'", api_key_column);
                     let _ = sqlx::query(&migrate_query).bind(&enc).execute(pool).await;
                 }
                 Ok(Some(val.clone()))
@@ -188,7 +193,6 @@ impl SettingsRepository {
             decrypt_transcript_setting_fields(s);
         }
         Ok(setting)
-
     }
 
     pub async fn save_transcript_config(
@@ -222,8 +226,14 @@ impl SettingsRepository {
         let stored_key = match crate::security::encrypt_api_key(api_key) {
             Ok(enc) => enc,
             Err(e) => {
-                log::error!("Failed to encrypt transcript API key for provider {}: {}", provider, e);
-                return Err(sqlx::Error::Protocol(format!("Encryption failed: {}", e).into()));
+                log::error!(
+                    "Failed to encrypt transcript API key for provider {}: {}",
+                    provider,
+                    e
+                );
+                return Err(sqlx::Error::Protocol(
+                    format!("Encryption failed: {}", e).into(),
+                ));
             }
         };
 
@@ -248,7 +258,9 @@ impl SettingsRepository {
             ON CONFLICT(id) DO UPDATE SET
                 "{}" = $1
             "#,
-            api_key_column, crate::config::DEFAULT_PARAKEET_MODEL, api_key_column
+            api_key_column,
+            crate::config::DEFAULT_PARAKEET_MODEL,
+            api_key_column
         );
         sqlx::query(&query).bind(stored_key).execute(pool).await?;
 
@@ -277,20 +289,29 @@ impl SettingsRepository {
             "SELECT {} FROM transcript_settings WHERE id = '1' LIMIT 1",
             api_key_column
         );
-        let api_key = sqlx::query_scalar(&query).fetch_optional(pool).await?;
+        let api_key: Option<String> = sqlx::query_scalar(&query).fetch_optional(pool).await?;
         // F10: Decrypt the transcript API key if encrypted; migrate plaintext if found
         match api_key {
             Some(ref val) if crate::security::is_encrypted(val) => {
                 match crate::security::decrypt_api_key(val) {
                     Ok(dec) => Ok(Some(dec)),
                     Err(e) => {
-                        log::error!("Failed to decrypt transcript API key for provider {}: {}", provider, e);
-                        Ok(None)
+                        log::error!(
+                            "Failed to decrypt transcript API key for provider {}: {}",
+                            provider,
+                            e
+                        );
+                        Err(sqlx::Error::Protocol(
+                            format!("Stored API key for {} could not be decrypted (encryption key lost?) — please re-enter it in model settings", provider).into(),
+                        ))
                     }
                 }
             }
             Some(ref val) if !val.is_empty() => {
-                log::info!("Migrating plaintext transcript API key to encrypted for provider {}", provider);
+                log::info!(
+                    "Migrating plaintext transcript API key to encrypted for provider {}",
+                    provider
+                );
                 if let Ok(enc) = crate::security::encrypt_api_key(val) {
                     let migrate_query = format!(
                         "UPDATE transcript_settings SET {} = $1 WHERE id = '1'",
@@ -358,7 +379,7 @@ impl SettingsRepository {
             FROM settings
             WHERE id = '1'
             LIMIT 1
-            "#
+            "#,
         )
         .fetch_optional(pool)
         .await?;
@@ -369,10 +390,26 @@ impl SettingsRepository {
 
                 if let Some(json) = config_json {
                     // Parse JSON into CustomOpenAIConfig
-                    let config: CustomOpenAIConfig = serde_json::from_str(&json)
-                        .map_err(|e| sqlx::Error::Protocol(
-                            format!("Invalid JSON in customOpenAIConfig: {}", e).into()
-                        ))?;
+                    let mut config: CustomOpenAIConfig = serde_json::from_str(&json).map_err(|e| {
+                        sqlx::Error::Protocol(
+                            format!("Invalid JSON in customOpenAIConfig: {}", e).into(),
+                        )
+                    })?;
+
+                    // F10: save_custom_openai_config encrypts api_key — decrypt on read
+                    if let Some(ref mut key) = config.api_key {
+                        if crate::security::is_encrypted(key) {
+                            match crate::security::decrypt_api_key(key) {
+                                Ok(dec) => *key = dec,
+                                Err(e) => {
+                                    log::error!("Failed to decrypt custom OpenAI API key: {}", e);
+                                    return Err(sqlx::Error::Protocol(
+                                        "Stored custom OpenAI API key could not be decrypted — please re-enter it in model settings".into(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
 
                     Ok(Some(config))
                 } else {
@@ -407,10 +444,9 @@ impl SettingsRepository {
         }
 
         // Serialize config to JSON
-        let config_json = serde_json::to_string(&config_to_store)
-            .map_err(|e| sqlx::Error::Protocol(
-                format!("Failed to serialize config to JSON: {}", e).into()
-            ))?;
+        let config_json = serde_json::to_string(&config_to_store).map_err(|e| {
+            sqlx::Error::Protocol(format!("Failed to serialize config to JSON: {}", e).into())
+        })?;
 
         // Upsert into settings table
         sqlx::query(
@@ -426,6 +462,90 @@ impl SettingsRepository {
         .execute(pool)
         .await?;
 
+        Ok(())
+    }
+
+    pub async fn get_custom_vocabulary(
+        pool: &SqlitePool,
+    ) -> std::result::Result<Option<String>, sqlx::Error> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT customVocabulary FROM settings WHERE id = '1' LIMIT 1")
+                .fetch_optional(pool)
+                .await?;
+        Ok(row.and_then(|r| r.0))
+    }
+
+    pub async fn save_custom_vocabulary(
+        pool: &SqlitePool,
+        vocabulary: &str,
+    ) -> std::result::Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO settings (id, provider, model, whisperModel, customVocabulary)
+            VALUES ('1', 'openai', 'gpt-4o-2024-11-20', 'large-v3', $1)
+            ON CONFLICT(id) DO UPDATE SET
+                customVocabulary = excluded.customVocabulary
+            "#,
+        )
+        .bind(vocabulary)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    // ===== CHAT MODEL CONFIG =====
+
+    /// Returns the chat-specific provider/model. Falls back to summary config if chat columns are NULL.
+    pub async fn get_chat_model_config(
+        pool: &SqlitePool,
+    ) -> std::result::Result<Option<Setting>, sqlx::Error> {
+        let mut setting = sqlx::query_as::<_, Setting>("SELECT * FROM settings LIMIT 1")
+            .fetch_optional(pool)
+            .await?;
+        if let Some(ref mut s) = setting {
+            decrypt_setting_fields(s);
+        }
+        Ok(setting)
+    }
+
+    /// Returns (provider, model, ollama_endpoint) for chat, falling back to summary if chat fields are NULL.
+    pub fn resolve_chat_config(setting: &Setting) -> (String, String, Option<String>) {
+        let provider = setting
+            .chat_provider
+            .clone()
+            .unwrap_or_else(|| setting.provider.clone());
+        let model = setting
+            .chat_model
+            .clone()
+            .unwrap_or_else(|| setting.model.clone());
+        let endpoint = setting
+            .chat_ollama_endpoint
+            .clone()
+            .or_else(|| setting.ollama_endpoint.clone());
+        (provider, model, endpoint)
+    }
+
+    pub async fn save_chat_model_config(
+        pool: &SqlitePool,
+        provider: &str,
+        model: &str,
+        ollama_endpoint: Option<&str>,
+    ) -> std::result::Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO settings (id, provider, model, whisperModel, chatProvider, chatModel, chatOllamaEndpoint)
+            VALUES ('1', 'ollama', 'llama3.2:latest', 'large-v3', $1, $2, $3)
+            ON CONFLICT(id) DO UPDATE SET
+                chatProvider = excluded.chatProvider,
+                chatModel = excluded.chatModel,
+                chatOllamaEndpoint = excluded.chatOllamaEndpoint
+            "#,
+        )
+        .bind(provider)
+        .bind(model)
+        .bind(ollama_endpoint)
+        .execute(pool)
+        .await?;
         Ok(())
     }
 }

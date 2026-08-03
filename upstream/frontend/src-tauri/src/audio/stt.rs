@@ -125,7 +125,6 @@ pub struct TranscriptionResult {
 }
 
 impl TranscriptionResult {
-    // TODO --optimize
     pub fn cleanup_overlap(&mut self, previous_transcript: String) -> Option<(String, String)> {
         if let Some(transcription) = &self.transcription {
             let transcription = transcription.to_string();

@@ -204,7 +204,25 @@ For more details, see the [Architecture documentation](docs/architecture.md).
 
 ## For Developers
 
-If you want to contribute to Meetily or build it from source, you'll need to have Rust and Node.js installed. For detailed build instructions, please see the [Building from Source guide](docs/BUILDING.md).
+If you want to contribute to Meetily or build it from source, you'll need Rust (stable, ≥ 1.77) and Node.js (≥ 18) installed. For detailed platform-specific build instructions, see the [Building from Source guide](docs/BUILDING.md).
+
+### Development quick reference
+
+All commands run from `frontend/` unless noted.
+
+| Task                          | Command                                                       |
+| ----------------------------- | ------------------------------------------------------------- |
+| Install JS dependencies       | `pnpm install`                                                |
+| Run unit tests (Vitest)       | `pnpm test`                                                   |
+| TypeScript type check         | `pnpm run typecheck`                                          |
+| Lint (ESLint, Next.js)        | `pnpm run lint` / `pnpm run lint:fix`                         |
+| Format (Prettier)             | `pnpm run format` / `pnpm run format:check`                   |
+| Run Rust unit tests           | `cd frontend/src-tauri && cargo test --lib --frozen`          |
+| Format Rust code              | `cd frontend/src-tauri && cargo fmt --all`                    |
+| Lint Rust code (clippy)       | `cd frontend/src-tauri && cargo clippy --lib`                 |
+| Restore whisper-rs-sys bindings | `node frontend/scripts/restore-whisper-bindings.mjs`       |
+
+A full description of the test, lint, and format tooling is in [CONTRIBUTING.md](CONTRIBUTING.md#testing-linting-and-formatting). Every PR is gated by the checks in [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 ## Meetily Pro
 

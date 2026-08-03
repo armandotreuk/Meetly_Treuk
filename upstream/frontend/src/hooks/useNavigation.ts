@@ -1,10 +1,7 @@
 "use client";
 
 import { useSidebar } from "@/components/Sidebar/SidebarProvider";
-import { useRouter } from "next/navigation"
-
-
-
+import { useRouter } from "next/navigation";
 
 export const useNavigation = (meetingId: string, meetingTitle: string) => {
     const router = useRouter();
@@ -17,4 +14,3 @@ export const useNavigation = (meetingId: string, meetingTitle: string) => {
 
     return handleNavigation;
 };
-

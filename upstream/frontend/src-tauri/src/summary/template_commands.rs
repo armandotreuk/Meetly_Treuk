@@ -1,6 +1,7 @@
+use crate::state::AppState;
 use crate::summary::templates;
 use serde::{Deserialize, Serialize};
-use tauri::Runtime;
+use tauri::{Manager, Runtime};
 use tracing::{info, warn};
 
 /// Template metadata for UI display
@@ -14,6 +15,12 @@ pub struct TemplateInfo {
 
     /// Brief description of the template's purpose
     pub description: String,
+
+    /// Whether this is a built-in template (read-only) or user template
+    pub is_builtin: bool,
+
+    /// Source of the template: "builtin", "bundled", "custom", or "database"
+    pub source: String,
 }
 
 /// Detailed template structure for preview/debugging
@@ -30,31 +37,74 @@ pub struct TemplateDetails {
 
     /// List of section titles in order
     pub sections: Vec<String>,
+
+    /// Whether this is a built-in template
+    pub is_builtin: bool,
 }
 
 /// Lists all available templates
 ///
-/// Returns templates from both built-in (embedded) and custom (user data directory) sources.
-/// Templates are automatically discovered - no code changes needed to add new templates.
+/// Returns templates from built-in (embedded), bundled (app resources), custom (user data directory), and database sources.
+/// Database templates take precedence for user-created templates.
 ///
 /// # Returns
-/// Vector of TemplateInfo with id, name, and description for each template
+/// Vector of TemplateInfo with id, name, description, is_builtin, and source for each template
 #[tauri::command]
 pub async fn api_list_templates<R: Runtime>(
-    _app: tauri::AppHandle<R>,
+    app: tauri::AppHandle<R>,
 ) -> Result<Vec<TemplateInfo>, String> {
     info!("api_list_templates called");
 
-    let templates = templates::list_templates();
+    // Get templates from the file-based system (built-in, bundled, custom)
+    let file_templates = templates::list_templates();
 
-    let template_infos: Vec<TemplateInfo> = templates
+    let mut template_infos: Vec<TemplateInfo> = file_templates
         .into_iter()
         .map(|(id, name, description)| TemplateInfo {
             id,
             name,
             description,
+            is_builtin: false, // Will be determined below
+            source: "file".to_string(),
         })
         .collect();
+
+    // Add database templates (user-created templates from DB)
+    if let Some(app_state) = app.try_state::<AppState>() {
+        let pool = app_state.db_manager.pool();
+        if let Ok(db_templates) =
+            crate::database::repositories::templates::TemplatesRepository::list_all(pool).await
+        {
+            for db_template in db_templates {
+                // Check if already exists in file_templates (by name)
+                let exists = template_infos.iter().any(|t| t.name == db_template.name);
+                if !exists {
+                    template_infos.push(TemplateInfo {
+                        id: db_template.id.to_string(),
+                        name: db_template.name,
+                        description: db_template.description,
+                        is_builtin: db_template.is_builtin != 0,
+                        source: if db_template.is_builtin != 0 {
+                            "builtin"
+                        } else {
+                            "database"
+                        }
+                        .to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Sort: builtin first, then by name
+    template_infos.sort_by(|a, b| {
+        // Builtin templates first
+        match (a.is_builtin, b.is_builtin) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.name.cmp(&b.name),
+        }
+    });
 
     info!("Found {} available templates", template_infos.len());
 
@@ -70,12 +120,43 @@ pub async fn api_list_templates<R: Runtime>(
 /// TemplateDetails with full template structure
 #[tauri::command]
 pub async fn api_get_template_details<R: Runtime>(
-    _app: tauri::AppHandle<R>,
+    app: tauri::AppHandle<R>,
     template_id: String,
 ) -> Result<TemplateDetails, String> {
-    info!("api_get_template_details called for template_id: {}", template_id);
+    info!(
+        "api_get_template_details called for template_id: {}",
+        template_id
+    );
 
-    let template = templates::get_template(&template_id)?;
+    // First try database
+    let mut template = None;
+    let mut is_builtin = false;
+
+    if let Some(app_state) = app.try_state::<AppState>() {
+        let pool = app_state.db_manager.pool();
+        // Try parsing as i64 for database ID
+        if let Ok(id) = template_id.parse::<i64>() {
+            if let Ok(Some(db_template)) =
+                crate::database::repositories::templates::TemplatesRepository::get_by_id(pool, id)
+                    .await
+            {
+                if let Ok(parsed) = crate::summary::templates::loader::validate_and_parse_template(
+                    &db_template.schema_json,
+                ) {
+                    is_builtin = db_template.is_builtin != 0;
+                    template = Some(parsed);
+                }
+            }
+        }
+    }
+
+    // Fallback to file-based system
+    if template.is_none() {
+        let parsed = templates::get_template(&template_id)?;
+        template = Some(parsed);
+    }
+
+    let template = template.ok_or_else(|| format!("Template '{}' not found", template_id))?;
 
     let section_titles: Vec<String> = template
         .sections
@@ -88,6 +169,7 @@ pub async fn api_get_template_details<R: Runtime>(
         name: template.name,
         description: template.description,
         sections: section_titles,
+        is_builtin,
     };
 
     info!("Retrieved template details for '{}'", details.name);

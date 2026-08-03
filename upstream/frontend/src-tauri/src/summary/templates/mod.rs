@@ -37,8 +37,8 @@
 //!
 //! Custom templates must follow the JSON schema defined in `types::Template`.
 
-mod defaults;
-mod loader;
+pub mod defaults;
+pub mod loader;
 mod types;
 
 // Re-export public API

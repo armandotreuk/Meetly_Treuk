@@ -1,4 +1,5 @@
 use crate::api::{TranscriptSearchResult, TranscriptSegment};
+use crate::database::repositories::fts::FtsRepository;
 use chrono::Utc;
 use sqlx::{Connection, Error as SqlxError, SqlitePool};
 use tracing::{error, info};
@@ -78,6 +79,12 @@ impl TranscriptsRepository {
 
         // Commit the transaction
         transaction.commit().await?;
+
+        // Update FTS index — best-effort; a failure here doesn't invalidate
+        // the transcript data we just committed.
+        if let Err(e) = FtsRepository::refresh_meeting(pool, &meeting_id).await {
+            error!("Failed to refresh FTS for meeting {}: {}", meeting_id, e);
+        }
 
         Ok(meeting_id)
     }

@@ -1,7 +1,7 @@
-use sqlx::SqlitePool;
+use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use anyhow::Result;
+use sqlx::SqlitePool;
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct MeetingNote {

@@ -1,0 +1,27 @@
+# rustfmt configuration for the meetily Tauri backend.
+#
+# Only stable options are listed here. Nightly-only style knobs
+# (format_strings, imports_granularity, brace_style, etc.) are
+# intentionally omitted to keep `cargo fmt` working on stable Rust.
+#
+# Project conventions:
+# - 4-space indentation, no tabs.
+# - 100-character line limit (matches the existing codebase; analysis
+#   showed ~99% of lines fit within this width).
+# - Unix newlines.
+# - Re-export order matches the source order of `use` statements.
+
+edition = "2021"
+max_width = 100
+hard_tabs = false
+tab_spaces = 4
+newline_style = "Unix"
+use_small_heuristics = "Default"
+reorder_imports = true
+reorder_modules = true
+remove_nested_parens = true
+use_try_shorthand = true
+use_field_init_shorthand = true
+force_explicit_abi = true
+fn_params_layout = "Tall"
+match_arm_leading_pipes = "Never"

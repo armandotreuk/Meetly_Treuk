@@ -29,23 +29,26 @@ macro_rules! perf_trace {
 }
 
 // Make these macros available to other modules
+#[allow(unused_imports)]
 pub(crate) use perf_debug;
+#[allow(unused_imports)]
 pub(crate) use perf_trace;
 
 // Re-export async logging macros for external use (removed due to macro conflicts)
 
 // Declare audio module
+pub mod anthropic;
 pub mod api;
 pub mod audio;
 pub mod config;
 pub mod console_utils;
 pub mod database;
+pub mod export;
+pub mod groq;
 pub mod notifications;
 pub mod ollama;
 pub mod onboarding;
 pub mod openai;
-pub mod anthropic;
-pub mod groq;
 pub mod openrouter;
 pub mod parakeet_engine;
 pub mod security;
@@ -54,8 +57,9 @@ pub mod summary;
 pub mod tray;
 pub mod utils;
 pub mod whisper_engine;
+pub mod mcp;
 
-use audio::{list_audio_devices, AudioDevice, trigger_audio_permission};
+use audio::{list_audio_devices, trigger_audio_permission, AudioDevice};
 use log::{error as log_error, info as log_info};
 use notifications::commands::NotificationManagerState;
 use std::sync::Arc;
@@ -67,6 +71,10 @@ static RECORDING_FLAG: AtomicBool = AtomicBool::new(false);
 // Global language preference storage (default to "auto-translate" for automatic translation to English)
 static LANGUAGE_PREFERENCE: std::sync::LazyLock<StdMutex<String>> =
     std::sync::LazyLock::new(|| StdMutex::new("auto-translate".to_string()));
+
+// Global custom vocabulary prompt storage (flattened from user's newline-separated words/phrases)
+static VOCABULARY_PROMPT: std::sync::LazyLock<StdMutex<String>> =
+    std::sync::LazyLock::new(|| StdMutex::new(String::new()));
 
 #[derive(Debug, Deserialize)]
 struct RecordingArgs {
@@ -124,10 +132,7 @@ async fn start_recording<R: Runtime>(
             )
             .await
             {
-                log_error!(
-                    "Failed to show recording started notification: {}",
-                    e
-                );
+                log_error!("Failed to show recording started notification: {}", e);
             } else {
                 log_info!("Successfully showed recording started notification");
             }
@@ -185,10 +190,7 @@ async fn stop_recording<R: Runtime>(app: AppHandle<R>, args: RecordingArgs) -> R
             )
             .await
             {
-                log_error!(
-                    "Failed to show recording stopped notification: {}",
-                    e
-                );
+                log_error!("Failed to show recording stopped notification: {}", e);
             } else {
                 log_info!("Successfully showed recording stopped notification");
             }
@@ -357,10 +359,7 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
             )
             .await
             {
-                log_error!(
-                    "Failed to show recording started notification: {}",
-                    e
-                );
+                log_error!("Failed to show recording started notification: {}", e);
             }
 
             Ok(())
@@ -385,6 +384,73 @@ async fn set_language_preference(language: String) -> Result<(), String> {
 // Internal helper function to get language preference (for use within Rust code)
 pub fn get_language_preference_internal() -> Option<String> {
     LANGUAGE_PREFERENCE.lock().ok().map(|lang| lang.clone())
+}
+
+// Internal helper to read the flattened vocabulary prompt for whisper initial_prompt and summary glossary
+pub fn get_vocabulary_prompt_internal() -> String {
+    VOCABULARY_PROMPT.lock().ok().map(|p| p.clone()).unwrap_or_default()
+}
+
+// ponytail: flattens the user's newline-separated word list into a single whisper initial_prompt sentence.
+// Ceiling: whisper's initial_prompt context window is ~224 tokens, so very long lists silently fall off the end.
+// Upgrade path: per-template vocabularies or a term-prioritization strategy if recognition of rare words suffers.
+pub fn build_whisper_prompt_from_vocabulary(raw: &str) -> String {
+    const MAX_PROMPT_LEN: usize = 200;
+    let mut words: Vec<&str> = raw
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if words.is_empty() {
+        return String::new();
+    }
+    words.dedup();
+    let mut prompt = String::from("The following conversation may include these specific terms: ");
+    for (i, w) in words.iter().enumerate() {
+        if i > 0 {
+            prompt.push_str(", ");
+        }
+        if prompt.len() + w.len() > MAX_PROMPT_LEN {
+            break;
+        }
+        prompt.push_str(w);
+    }
+    prompt.push('.');
+    prompt
+}
+
+#[tauri::command]
+async fn api_get_custom_vocabulary<R: Runtime>(app: AppHandle<R>) -> Result<String, String> {
+    let storage = app
+        .try_state::<state::AppState>()
+        .ok_or_else(|| "App state not available".to_string())?;
+    crate::database::repositories::setting::SettingsRepository::get_custom_vocabulary(
+        storage.db_manager.pool(),
+    )
+    .await
+    .map(|v| v.unwrap_or_default())
+    .map_err(|e| format!("DB error: {}", e))
+}
+
+#[tauri::command]
+async fn api_save_custom_vocabulary<R: Runtime>(
+    app: AppHandle<R>,
+    vocabulary: String,
+) -> Result<(), String> {
+    let storage = app
+        .try_state::<state::AppState>()
+        .ok_or_else(|| "App state not available".to_string())?;
+    crate::database::repositories::setting::SettingsRepository::save_custom_vocabulary(
+        storage.db_manager.pool(),
+        &vocabulary,
+    )
+    .await
+    .map_err(|e| format!("DB error: {}", e))?;
+    let prompt = build_whisper_prompt_from_vocabulary(&vocabulary);
+    if let Ok(mut p) = VOCABULARY_PROMPT.lock() {
+        *p = prompt;
+    }
+    Ok(())
 }
 
 pub fn run() {
@@ -418,6 +484,14 @@ pub fn run() {
         .manage(summary::summary_engine::ModelManagerState(Arc::new(tokio::sync::Mutex::new(None))))
         .setup(|_app| {
             log::info!("Application setup complete");
+
+            // ponytail: dev-only DevTools via MEETILY_DEVTOOLS=1. Ceiling: release
+            // builds without the env var skip this; upgrade path is a settings toggle.
+            if std::env::var("MEETILY_DEVTOOLS").map(|v| v == "1").unwrap_or(false) {
+                if let Some(window) = _app.get_webview_window("main") {
+                    let _ = window.open_devtools();
+                }
+            }
 
             // Initialize system tray
             if let Err(e) = tray::create_tray(_app.handle()) {
@@ -498,6 +572,9 @@ pub fn run() {
             })
             .expect("Failed to initialize database");
 
+            // Start MCP HTTP JSON-RPC server for external agents (normal startup path)
+            crate::mcp::server::spawn_from_app(&_app.handle());
+
             // F10: Initialize security module (OS keyring master key)
             log::info!("Initializing security module (encrypted key storage)...");
             if let Err(e) = security::init() {
@@ -513,6 +590,27 @@ pub fn run() {
             } else {
                 log::warn!("Failed to resolve resource directory for templates");
             }
+
+            // Load saved custom vocabulary from DB into the in-memory global so Whisper + summary pick it up
+            let app_for_vocab = _app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Some(state) = app_for_vocab.try_state::<state::AppState>() {
+                    match crate::database::repositories::setting::SettingsRepository::get_custom_vocabulary(
+                        state.db_manager.pool(),
+                    )
+                    .await
+                    {
+                        Ok(Some(raw)) if !raw.is_empty() => {
+                            let prompt = build_whisper_prompt_from_vocabulary(&raw);
+                            if let Ok(mut p) = VOCABULARY_PROMPT.lock() {
+                                *p = prompt;
+                            }
+                            log::info!("Loaded custom vocabulary from DB into memory");
+                        }
+                        _ => {}
+                    }
+                }
+            });
 
             Ok(())
         })
@@ -587,6 +685,7 @@ pub fn run() {
             audio::recording_commands::is_recording_paused,
             audio::recording_commands::get_recording_state,
             audio::recording_commands::get_meeting_folder_path,
+            audio::recording_commands::save_recording_notes,
             // Reload sync commands (retrieve transcript history and meeting name)
             audio::recording_commands::get_transcript_history,
             audio::recording_commands::get_recording_meeting_name,
@@ -611,18 +710,32 @@ pub fn run() {
             anthropic::anthropic::get_anthropic_models,
             groq::groq::get_groq_models,
             api::api_get_meetings,
+            api::folders::api_get_folders,
+            api::folders::api_create_folder,
+            api::folders::api_rename_folder,
+            api::folders::api_move_folder,
+            api::folders::api_delete_folder,
+            api::folders::api_set_meeting_folder,
             api::api_search_transcripts,
+            api::api_search_fts,
+            api::api_rebuild_fts_index,
+            api::api_build_context,
+            api::api_chat_with_meetings,
             api::api_get_profile,
             api::api_save_profile,
             api::api_update_profile,
             api::api_get_model_config,
             api::api_save_model_config,
+            api::api_get_chat_model_config,
+            api::api_save_chat_model_config,
             api::api_get_api_key,
             // api::api_get_auto_generate_setting,
             // api::api_save_auto_generate_setting,
             api::api_get_transcript_config,
             api::api_save_transcript_config,
             api::api_get_transcript_api_key,
+            api_get_custom_vocabulary,
+            api_save_custom_vocabulary,
             api::api_delete_meeting,
             api::api_get_meeting,
             api::api_get_meeting_metadata,
@@ -647,6 +760,8 @@ pub fn run() {
             summary::commands::api_save_meeting_detected_summary_language,
             summary::commands::api_detect_transcript_summary_language,
             summary::commands::api_cancel_summary,
+            summary::commands::api_list_meeting_summaries,
+            summary::commands::api_delete_meeting_summary,
             // Template commands
             summary::template_commands::api_list_templates,
             summary::template_commands::api_get_template_details,
@@ -713,6 +828,17 @@ pub fn run() {
             database::commands::get_meeting_notes,
             database::commands::save_meeting_notes,
             database::commands::delete_meeting_notes,
+            // F1: Template commands
+            database::commands::list_templates,
+            database::commands::list_user_templates,
+            database::commands::list_builtin_templates,
+            database::commands::get_template,
+            database::commands::create_template,
+            database::commands::update_template,
+            database::commands::delete_template,
+            // F2: PDF export
+            export::commands::export_meeting_pdf,
+            export::commands::save_meeting_pdf,
             whisper_engine::commands::open_models_folder,
             // Onboarding commands
             onboarding::get_onboarding_status,
@@ -767,4 +893,34 @@ pub fn run() {
                 _ => {}
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_whisper_prompt_from_vocabulary;
+
+    #[test]
+    fn flattens_newline_separated_words() {
+        let raw = "Kubernetes\nARIA\nTLDR";
+        let prompt = build_whisper_prompt_from_vocabulary(raw);
+        assert!(prompt.contains("Kubernetes"));
+        assert!(prompt.contains("ARIA"));
+        assert!(prompt.contains("TLDR"));
+    }
+
+    #[test]
+    fn empty_input_returns_empty() {
+        assert_eq!(build_whisper_prompt_from_vocabulary(""), "");
+        assert_eq!(build_whisper_prompt_from_vocabulary("  \n  \n"), "");
+    }
+
+    #[test]
+    fn respects_length_cap() {
+        let long = (0..50)
+            .map(|i| format!("SupercalifragilisticWord{}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prompt = build_whisper_prompt_from_vocabulary(&long);
+        assert!(prompt.len() <= 220); // cap + small slack for the trailing period
+    }
 }

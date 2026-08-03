@@ -1,6 +1,6 @@
-use anyhow::{anyhow, Result};
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
+use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine};
 
 pub const ENCRYPTION_PREFIX: &str = "enc:";

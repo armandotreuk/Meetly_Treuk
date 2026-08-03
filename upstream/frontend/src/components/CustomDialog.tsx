@@ -10,26 +10,26 @@ interface DialogProps {
     dialogTitle?: string;
 }
 
-export function CustomDialog({ triggerComponent, dialogContent, dialogTitle = "Dialog" }: DialogProps) {
+export function CustomDialog({
+    triggerComponent,
+    dialogContent,
+    dialogTitle = "Dialog",
+}: DialogProps) {
     // Clone the trigger component to ensure it can receive refs
     const clonedTrigger = React.cloneElement(triggerComponent, {
-        ...triggerComponent.props
+        ...triggerComponent.props,
     });
 
     return (
         <Dialog>
-            <DialogTrigger asChild>
-                {clonedTrigger}
-            </DialogTrigger>
+            <DialogTrigger asChild>{clonedTrigger}</DialogTrigger>
             <DialogContent aria-describedby={undefined}>
                 <VisuallyHidden>
                     <DialogTitle>{dialogTitle}</DialogTitle>
                 </VisuallyHidden>
-                {dialogContent}                  
-                <DialogFooter>
-                    
-                </DialogFooter>
+                {dialogContent}
+                <DialogFooter></DialogFooter>
             </DialogContent>
         </Dialog>
-    )
+    );
 }

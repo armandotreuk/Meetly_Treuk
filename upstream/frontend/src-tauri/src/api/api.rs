@@ -8,6 +8,7 @@ use crate::{
     database::{
         models::MeetingModel,
         repositories::{
+            fts::{FtsRepository, FtsSearchResult},
             meeting::MeetingsRepository, setting::SettingsRepository,
             transcript::TranscriptsRepository,
         },
@@ -88,6 +89,16 @@ pub struct SaveModelConfigRequest {
     #[serde(rename = "apiKey")]
     pub api_key: Option<String>,
     #[serde(rename = "ollamaEndpoint")]
+    pub ollama_endpoint: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChatModelConfig {
+    pub provider: String,
+    pub model: String,
+    #[serde(rename = "apiKey", skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(rename = "ollamaEndpoint", skip_serializing_if = "Option::is_none")]
     pub ollama_endpoint: Option<String>,
 }
 
@@ -570,6 +581,133 @@ pub async fn api_save_model_config<R: Runtime>(
     Ok(
         serde_json::json!({ "status": "success", "message": "Model configuration saved successfully" }),
     )
+}
+
+#[tauri::command]
+pub async fn api_search_fts<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    query: String,
+    limit: Option<u32>,
+    auth_token: Option<String>,
+) -> Result<Vec<FtsSearchResult>, String> {
+    log_info!(
+        "api_search_fts called with query: '{}', limit: {:?}, auth_token: {}",
+        query,
+        limit,
+        auth_token.is_some()
+    );
+    let pool = state.db_manager.pool();
+    FtsRepository::search(pool, &query, limit.unwrap_or(20))
+        .await
+        .map_err(|e| format!("Failed to search FTS index: {}", e))
+}
+
+#[tauri::command]
+pub async fn api_rebuild_fts_index<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    auth_token: Option<String>,
+) -> Result<u64, String> {
+    log_info!(
+        "api_rebuild_fts_index called, auth_token: {}",
+        auth_token.is_some()
+    );
+    let pool = state.db_manager.pool();
+    FtsRepository::rebuild_index(pool)
+        .await
+        .map_err(|e| format!("Failed to rebuild FTS index: {}", e))
+}
+
+#[tauri::command]
+pub async fn api_get_chat_model_config<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    _auth_token: Option<String>,
+) -> Result<Option<ChatModelConfig>, String> {
+    log_info!("api_get_chat_model_config called (native)");
+    let pool = state.db_manager.pool();
+
+    match SettingsRepository::get_chat_model_config(pool).await {
+        Ok(Some(config)) => {
+            let (provider, model, ollama_endpoint) =
+                SettingsRepository::resolve_chat_config(&config);
+            let api_key = match SettingsRepository::get_api_key(pool, &provider).await {
+                Ok(k) => k,
+                Err(e) => {
+                    log_error!("Failed to get API key for chat provider {}: {}", provider, e);
+                    None
+                }
+            };
+            log_info!(
+                "✅ Found chat model config: provider={}, model={}, ollamaEndpoint={:?}",
+                provider,
+                model,
+                ollama_endpoint
+            );
+            Ok(Some(ChatModelConfig {
+                provider,
+                model,
+                api_key,
+                ollama_endpoint,
+            }))
+        }
+        Ok(None) => {
+            log_warn!("⚠️ No chat model config found in database");
+            Ok(None)
+        }
+        Err(e) => {
+            log_error!("❌ Failed to get chat model config from database: {}", e);
+            Err(e.to_string())
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn api_save_chat_model_config<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    provider: String,
+    model: String,
+    api_key: Option<String>,
+    ollama_endpoint: Option<String>,
+    _auth_token: Option<String>,
+) -> Result<serde_json::Value, String> {
+    log_info!(
+        "💾 api_save_chat_model_config called: provider='{}', model='{}', ollamaEndpoint={:?}",
+        provider,
+        model,
+        ollama_endpoint
+    );
+    let pool = state.db_manager.pool();
+
+    if let Err(e) = SettingsRepository::save_chat_model_config(
+        pool,
+        &provider,
+        &model,
+        ollama_endpoint.as_deref(),
+    )
+    .await
+    {
+        log_error!("❌ Failed to save chat model config to database: {}", e);
+        return Err(e.to_string());
+    }
+
+    if let Some(key) = api_key {
+        if !key.is_empty() && provider != "custom-openai" {
+            log_info!("🔑 Chat API key provided, saving...");
+            if let Err(e) = SettingsRepository::save_api_key(pool, &provider, &key).await {
+                log_error!("❌ Failed to save chat API key: {}", e);
+                return Err(e.to_string());
+            }
+        }
+    }
+
+    log_info!("✅ Successfully saved chat model configuration to database");
+    Ok(serde_json::json!({
+        "status": "success",
+        "message": "Chat model configuration saved successfully"
+    }))
 }
 
 #[tauri::command]

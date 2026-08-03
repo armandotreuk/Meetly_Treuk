@@ -1,3 +1,4 @@
+use crate::database::templates_sync::sync_builtin_templates;
 use sqlx::{migrate::MigrateDatabase, Result, Sqlite, SqlitePool, Transaction};
 use std::fs;
 use std::path::Path;
@@ -33,6 +34,11 @@ impl DatabaseManager {
         let pool = SqlitePool::connect(tauri_db_path).await?;
 
         sqlx::migrate!("./migrations").run(&pool).await?;
+
+        // Sync built-in templates to database
+        if let Err(e) = sync_builtin_templates(&pool).await {
+            log::warn!("Failed to sync built-in templates: {}", e);
+        }
 
         Ok(DatabaseManager { pool })
     }
@@ -104,7 +110,10 @@ impl DatabaseManager {
                             Ok(db_manager)
                         }
                         Err(retry_err) => {
-                            log::error!("Database connection failed even after WAL cleanup: {}", retry_err);
+                            log::error!(
+                                "Database connection failed even after WAL cleanup: {}",
+                                retry_err
+                            );
                             Err(retry_err)
                         }
                     }

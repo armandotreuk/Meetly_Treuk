@@ -15,6 +15,8 @@ pub struct AnthropicModel {
 struct AnthropicApiModel {
     id: String,
     display_name: Option<String>,
+    // Populated by serde from Anthropic's /v1/models payload; kept so the
+    // UI can sort or filter by release date later.
     #[allow(dead_code)]
     created_at: Option<String>,
 }

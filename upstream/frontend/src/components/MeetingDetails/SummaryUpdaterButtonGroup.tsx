@@ -1,74 +1,76 @@
 "use client";
 
-import { Button } from '@/components/ui/button';
-import { ButtonGroup } from '@/components/ui/button-group';
-import { Copy, Save, Loader2, Search, FolderOpen } from 'lucide-react';
-import Analytics from '@/lib/analytics';
+import { Button } from "@/components/ui/button";
+import { ButtonGroup } from "@/components/ui/button-group";
+import { Copy, Save, Loader2, Search, FolderOpen } from "lucide-react";
+import Analytics from "@/lib/analytics";
 
 interface SummaryUpdaterButtonGroupProps {
-  isSaving: boolean;
-  isDirty: boolean;
-  onSave: () => Promise<void>;
-  onCopy: () => Promise<void>;
-  onFind?: () => void;
-  onOpenFolder: () => Promise<void>;
-  hasSummary: boolean;
+    isSaving: boolean;
+    isDirty: boolean;
+    onSave: () => Promise<void>;
+    onCopy: () => Promise<void>;
+    onFind?: () => void;
+    onOpenFolder: () => Promise<void>;
+    hasSummary: boolean;
+    compact?: boolean;
 }
 
 export function SummaryUpdaterButtonGroup({
-  isSaving,
-  isDirty,
-  onSave,
-  onCopy,
-  onFind,
-  onOpenFolder,
-  hasSummary
+    isSaving,
+    isDirty,
+    onSave,
+    onCopy,
+    onFind,
+    onOpenFolder,
+    hasSummary,
+    compact = false,
 }: SummaryUpdaterButtonGroupProps) {
-  return (
-    <ButtonGroup>
-      {/* Save button */}
-      <Button
-        variant="outline"
-        size="sm"
-        className={`${isDirty ? 'bg-green-200' : ""}`}
-        title={isSaving ? "Saving" : "Save Changes"}
-        onClick={() => {
-          Analytics.trackButtonClick('save_changes', 'meeting_details');
-          onSave();
-        }}
-        disabled={isSaving}
-      >
-        {isSaving ? (
-          <>
-            <Loader2 className="animate-spin" />
-            <span className="hidden lg:inline">Saving...</span>
-          </>
-        ) : (
-          <>
-            <Save />
-            <span className="hidden lg:inline">Save</span>
-          </>
-        )}
-      </Button>
+    return (
+        <ButtonGroup>
+            {/* Save button */}
+            <Button
+                variant="outline"
+                size="sm"
+                className={`${isDirty ? "bg-green-200" : ""}`}
+                title={isSaving ? "Saving" : "Save Changes"}
+                onClick={() => {
+                    Analytics.trackButtonClick("save_changes", "meeting_details");
+                    onSave();
+                }}
+                disabled={isSaving}
+            >
+                {isSaving ? (
+                    <>
+                        <Loader2 className="animate-spin" />
+                        <span className={compact ? "hidden" : "hidden lg:inline"}>Saving...</span>
+                    </>
+                ) : (
+                    <>
+                        <Save />
+                        <span className={compact ? "hidden" : "hidden lg:inline"}>Save</span>
+                    </>
+                )}
+            </Button>
 
-      {/* Copy button */}
-      <Button
-        variant="outline"
-        size="sm"
-        title="Copy Summary"
-        onClick={() => {
-          Analytics.trackButtonClick('copy_summary', 'meeting_details');
-          onCopy();
-        }}
-        disabled={!hasSummary}
-        className="cursor-pointer"
-      >
-        <Copy />
-        <span className="hidden lg:inline">Copy</span>
-      </Button>
+            {/* Copy button */}
+            <Button
+                variant="outline"
+                size="sm"
+                title="Copy Summary"
+                onClick={() => {
+                    Analytics.trackButtonClick("copy_summary", "meeting_details");
+                    onCopy();
+                }}
+                disabled={!hasSummary}
+                className="cursor-pointer"
+            >
+                <Copy />
+                <span className={compact ? "hidden" : "hidden lg:inline"}>Copy</span>
+            </Button>
 
-      {/* Find button */}
-      {/* {onFind && (
+            {/* Find button */}
+            {/* {onFind && (
         <Button
           variant="outline"
           size="sm"
@@ -84,6 +86,6 @@ export function SummaryUpdaterButtonGroup({
           <span className="hidden lg:inline">Find</span>
         </Button>
       )} */}
-    </ButtonGroup>
-  );
+        </ButtonGroup>
+    );
 }

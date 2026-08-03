@@ -1,6 +1,13 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from "react";
+import { logger } from "@/lib/logger";
+
 import { invoke } from "@tauri-apps/api/core";
-import { Transcript, MeetingMetadata, PaginatedTranscriptsResponse, TranscriptSegmentData } from "@/types";
+import {
+    Transcript,
+    MeetingMetadata,
+    PaginatedTranscriptsResponse,
+    TranscriptSegmentData,
+} from "@/types";
 
 const DEFAULT_PAGE_SIZE = 100;
 
@@ -31,7 +38,7 @@ interface UsePaginatedTranscriptsReturn {
  * Convert Transcript array to TranscriptSegmentData for virtualized display
  */
 function convertTranscriptsToSegments(transcripts: Transcript[]): TranscriptSegmentData[] {
-    return transcripts.map(t => ({
+    return transcripts.map((t) => ({
         id: t.id,
         timestamp: t.audio_start_time ?? 0,
         endTime: t.audio_end_time,
@@ -74,62 +81,62 @@ export function usePaginatedTranscripts({
         if (!meetingId) return null;
 
         try {
-            const data = await invoke<MeetingMetadata>('api_get_meeting_metadata', {
+            const data = await invoke<MeetingMetadata>("api_get_meeting_metadata", {
                 meetingId,
             });
             setMetadata(data);
             return data;
         } catch (err) {
-            console.error('Failed to load meeting metadata:', err);
-            setError('Failed to load meeting details');
+            logger.error("Failed to load meeting metadata:", err);
+            setError("Failed to load meeting details");
             return null;
         }
     }, [meetingId]);
 
     // Load transcripts at specific offset
-    const loadTranscriptsAtOffset = useCallback(async (
-        offset: number,
-        append: boolean = true
-    ): Promise<Transcript[]> => {
-        if (!meetingId) return [];
+    const loadTranscriptsAtOffset = useCallback(
+        async (offset: number, append: boolean = true): Promise<Transcript[]> => {
+            if (!meetingId) return [];
 
-        try {
-            const response = await invoke<PaginatedTranscriptsResponse>(
-                'api_get_meeting_transcripts',
-                {
-                    meetingId,
-                    limit: DEFAULT_PAGE_SIZE,
-                    offset,
+            try {
+                const response = await invoke<PaginatedTranscriptsResponse>(
+                    "api_get_meeting_transcripts",
+                    {
+                        meetingId,
+                        limit: DEFAULT_PAGE_SIZE,
+                        offset,
+                    }
+                );
+
+                const newTranscripts = response.transcripts;
+
+                if (append) {
+                    setTranscripts((prev) => {
+                        // Deduplicate by id
+                        const existingIds = new Set(prev.map((t) => t.id));
+                        const uniqueNew = newTranscripts.filter((t) => !existingIds.has(t.id));
+                        // Sort by audio_start_time
+                        return [...prev, ...uniqueNew].sort(
+                            (a, b) => (a.audio_start_time ?? 0) - (b.audio_start_time ?? 0)
+                        );
+                    });
+                } else {
+                    setTranscripts(newTranscripts);
                 }
-            );
 
-            const newTranscripts = response.transcripts;
+                setHasMore(response.has_more);
+                setTotalCount(response.total_count);
+                offsetRef.current = offset + newTranscripts.length;
 
-            if (append) {
-                setTranscripts(prev => {
-                    // Deduplicate by id
-                    const existingIds = new Set(prev.map(t => t.id));
-                    const uniqueNew = newTranscripts.filter(t => !existingIds.has(t.id));
-                    // Sort by audio_start_time
-                    return [...prev, ...uniqueNew].sort((a, b) =>
-                        (a.audio_start_time ?? 0) - (b.audio_start_time ?? 0)
-                    );
-                });
-            } else {
-                setTranscripts(newTranscripts);
+                return newTranscripts;
+            } catch (err) {
+                logger.error("Failed to load transcripts:", err);
+                setError("Failed to load transcripts");
+                return [];
             }
-
-            setHasMore(response.has_more);
-            setTotalCount(response.total_count);
-            offsetRef.current = offset + newTranscripts.length;
-
-            return newTranscripts;
-        } catch (err) {
-            console.error('Failed to load transcripts:', err);
-            setError('Failed to load transcripts');
-            return [];
-        }
-    }, [meetingId]);
+        },
+        [meetingId]
+    );
 
     // Load next page with debounce protection
     const loadMore = useCallback(async () => {
@@ -193,10 +200,7 @@ export function usePaginatedTranscripts({
     }, [meetingId, reset, loadMetadata, loadTranscriptsAtOffset]);
 
     // Convert to segments (memoized)
-    const segments = useMemo(() =>
-        convertTranscriptsToSegments(transcripts),
-        [transcripts]
-    );
+    const segments = useMemo(() => convertTranscriptsToSegments(transcripts), [transcripts]);
 
     return {
         metadata,

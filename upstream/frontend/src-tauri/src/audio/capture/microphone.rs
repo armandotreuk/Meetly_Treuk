@@ -1,4 +1,4 @@
-// Microphone audio capture implementation
-// TODO: Extract microphone AudioStream logic from core.rs
-
-// Placeholder for now - will be implemented in later phase
+// Microphone audio capture. Implementation lives alongside the
+// `system` capture module; this file is reserved for microphone-specific
+// backends (e.g. native CoreAudio device selection) that have not yet
+// been split out of `audio/core-old.rs`.

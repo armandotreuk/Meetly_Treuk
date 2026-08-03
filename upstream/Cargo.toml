@@ -16,3 +16,35 @@ anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.32.0", features = ["full"] }
+
+# Workspace-wide lints.
+#
+# Inherit these in member crates with:
+#   [lints]
+#   workspace = true
+#
+# Notes on the chosen policy:
+# - `correctness` is `deny` so the workspace never ships known-bad code
+#   (e.g. `clippy::await_holding_lock`, `clippy::borrow_interior_mutable_const`).
+# - `suspicious` and `complexity` are `warn` so existing code can still
+#   build, but reviewers see them and can fix incrementally.
+# - `style` is `warn` — most of these are informational but a steady stream
+#   of `needless_return` / `redundant_clone` reports is useful.
+# - `perf` is intentionally `allow` to start; the team can opt in to
+#   specific perf lints (e.g. `clippy::perf` package) when they want.
+# - `pedantic` / `nursery` / `restriction` are deliberately omitted; they
+#   are very noisy and would generate hundreds of warnings on day one.
+[workspace.lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+perf = "allow"
+
+# Don't trip the build on `cargo build` (e.g. when we are vendoring
+# whisper-rs-sys bindings or running CI on a branch that hasn't enabled
+# the workspace lints yet). Member crates must opt in with
+# `[lints] workspace = true` to actually enforce these.
+[patch.crates-io]
+# Patches live in frontend/src-tauri/Cargo.toml to avoid forcing workspace-wide
+# re-fetch of the patch sources on every cargo invocation.
