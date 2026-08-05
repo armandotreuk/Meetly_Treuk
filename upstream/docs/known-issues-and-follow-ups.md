@@ -90,6 +90,8 @@ These should be cleaned up or explicitly excluded before release gates are consi
 - Folder persistence needs manual verification after refetch and application restart.
 - CUDA release deployment must be repeated only after the final reviewed code is committed.
 - A production database backup is required before migration/deployment.
+- **Deferred**: `useActiveSummaryTemplate` lifecycle (meetingId reset, `summariesReady` gate, stored-row invalidation, `ready` gating) is untested. React Testing Library is not installed; adding 2 deps for small coverage gain violates the no-new-dependency rule. Deferred until the team invests in RTL for end-to-end IPC tests.
+- **Deferred**: `SummaryGeneratorButtonGroup.requestTemplateChange` dirty-gating (opens `ConfirmSwitchSummaryDialog` when `pendingEditsExist`) is untested. Same RTL deferral applies. The pure helpers (`fallbackAfterSummaryDelete`, `summaryPollKey`, `shouldApplySummaryPollResult`) ARE tested in `summary-selection.test.ts` and `summary-polling.test.ts`.
 
 ## Later Improvements
 
@@ -106,26 +108,9 @@ Priority order after the current restoration:
 9. Implement DOCX export or remove its disabled UI entry.
 10. Audit orphaned components (`LegacyDatabaseImport`, `BluetoothPlaybackWarning`, `ConsoleToggle`, `useAudioPlayer`, and `ModelDownloadProgress`) and either wire or delete them.
 
-## Scope Creep (S4 Review Finding)
+## Commit History Note
 
-### Summary polling refactoring mixed into S4 diff
-
-The S4 review found that `SidebarProvider.tsx` contains a major rewrite of `startSummaryPolling` and `stopSummaryPolling` that belongs to S2 (multi-template summary generation), not S4 (FTS5 + resize). Specifically, the diff introduces:
-
-- **New imports**: `buildSummaryCancelArgs`, `shouldApplySummaryPollResult`, `summaryPollKey` — extracted utility modules created for multi-template identity handling.
-- **New refs**: `activeSummaryPollsRef`, `activeSummaryPollKeysRef` — replaces the prior polling state with a keyed ref-based architecture.
-- **`startSummaryPolling` signature change**: 5 params `(meetingId, processId, templateId, generation, onUpdate)` instead of S2's originally planned 4 params. The `generation` parameter is an S1 identity feature.
-- **Null-separated compound keys**: `summaryPollKey` builds `meetingId\u0000templateId\u0000generation` — a new keying scheme not described in any S2 plan document.
-- **Refs-based dependency arrays**: `React.useCallback(..., [])` with no deps, relying on refs for mutable state — a pattern change beyond S2's scope.
-- **`stopSummaryPolling` signature change**: `(meetingId, templateId?, generation?)` with targeted prefix matching — new capability not in the original S2 plan.
-
-**Root cause**: The S2 multi-template implementation (Sprint B, items 24–27 per `multi-template-summaries-progress.md:250`) described a narrow "add 4th arg" change. The actual diff in `SidebarProvider.tsx` went further, rewriting the entire polling lifecycle to support per-template/per-generation identity tracking. This was committed as part of S4 rather than committed separately as an S2 follow-up.
-
-**Impact**: The S4 commit is larger than intended. It bundles S2 polling infrastructure with S4 FTS5 search and sidebar resize changes, making review and rollback harder.
-
-**Status**: Both `useSummaryGeneration.ts` and `meeting-details/page.tsx` correctly call the updated signatures. The code is internally consistent and functional — the issue is commit hygiene, not correctness.
-
-**Future cleanup**: A future commit could split the S2 polling refactoring (keyed refs, compound keys, `summaryPollKey`/`shouldApplySummaryPollResult` utilities) into its own commit with an S2 scope label, leaving the S4 commit with only FTS5 and resize changes.
+Commits `a332b1d`, `958f556`, and `0037f4f` collectively bundled the multi-template summaries, PDF export, FTS5 sidebar search, and sidebar resize work into a series of large milestone commits rather than per-sprint atomic commits. The code is internally consistent and functional. Future sprints should return to per-sprint commits per the Review Policy below. Retroactive splitting of pushed commits is not worth the disruption.
 
 ## Review Policy
 

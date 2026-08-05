@@ -333,6 +333,7 @@ $env:RUST_LOG="debug"; ./clean_run_windows.bat
 - **GPU**: CUDA (NVIDIA) or Vulkan (AMD/Intel) via Cargo features
 - **Build Tools**: Requires Visual Studio Build Tools with C++ workload
 - **System Audio**: Uses WASAPI loopback for system capture
+- **OneDrive target dir**: If the repo is cloned under OneDrive, `cargo test`/`cargo build` fail with "output path is not a writable directory" (autocfg build script). Set `CARGO_TARGET_DIR` to a local path outside OneDrive: `$env:CARGO_TARGET_DIR="C:\Users\<user>\cargo-target"` before building
 
 ### Linux
 - **Audio Capture**: ALSA/PulseAudio

@@ -106,13 +106,19 @@ export function useSummaryGeneration({
     const generationAttemptTemplateRef = useRef<string | null>(null);
 
     useEffect(() => {
-        // A generation identity belongs to one selected row. Never reuse an
-        // old row's identity if the user switches templates before polling
-        // or cancellation finishes.
-        activeGenerationRef.current = null;
-        generationAttemptTemplateRef.current = null;
-        setSummaryStatus("idle");
-        setSummaryError(null);
+        // ponytail: preserve in-flight generation identity across a template
+        // switch so the Stop button can still cancel the right backend process.
+        // Only reset status/error when there is no active generation; otherwise
+        // the user loses the cancel path and the 15-min poll timeout is the
+        // only safety net. Ceiling: a switched-away generation runs orphaned
+        // until cancelled or completed; upgrade path is a per-template
+        // generation registry (already exists at the polling layer via
+        // summaryPollKey). We don't null the refs here so Stop keeps working.
+        const hadActive = activeGenerationRef.current || generationAttemptTemplateRef.current;
+        if (!hadActive) {
+            setSummaryStatus("idle");
+            setSummaryError(null);
+        }
     }, [meeting.id, activeTemplateId]);
 
     const { startSummaryPolling, stopSummaryPolling } = useSidebar();
