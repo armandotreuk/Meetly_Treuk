@@ -1,7 +1,7 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import { logger } from "@/lib/logger";
 
-import { Meeting, Transcript, Summary, SummaryDataResponse, SummaryStatusResponse } from "@/types";
+import { Meeting, Transcript, Summary, SummaryDataResponse, SummaryStatusResponse, SummaryRevision } from "@/types";
 import { ModelConfig } from "@/components/ModelSettingsModal";
 import {
     CurrentMeeting,
@@ -17,6 +17,8 @@ import {
     readMeetingSummaryLanguage,
     readCachedDetectedSummaryLanguage,
 } from "@/lib/summary-language-preferences";
+import { buildSummaryCancelArgs, buildSummaryFetchArgs } from "@/lib/summary-command-args";
+import { normalizeTemplateId } from "@/lib/template-ids";
 
 async function resolveSummaryLanguage(
     meetingId: string,
@@ -61,10 +63,12 @@ interface UseSummaryGenerationProps {
     modelConfig: ModelConfig;
     isModelConfigLoading: boolean;
     selectedTemplate: string;
-    // ponytail: caller must supply the active row key; null means "no row
-    // selected yet" → falls back to selectedTemplate for generation and to
-    // backend "latest" semantics for get/cancel.
+    // The caller supplies the active row key when a stored summary is known;
+    // otherwise the selected template is used for a new generation.
     activeTemplateId?: string | null;
+    summaryRevision?: SummaryRevision | null;
+    isExternallyProcessing?: boolean;
+    onExternalProcessingChange?: (processing: boolean) => void;
     onMeetingUpdated?: () => Promise<void>;
     updateMeetingTitle: (title: string) => void;
     setAiSummary: (summary: Summary | null) => void;
@@ -73,6 +77,7 @@ interface UseSummaryGenerationProps {
     // terminates so the status badge reflects the new DB row state. Without
     // this the badge keeps the stale pre-run status (e.g. "failed").
     onSummariesChanged?: () => void | Promise<void>;
+    onSummaryRevisionChange?: (revision: SummaryRevision | null) => void;
 }
 
 export function useSummaryGeneration({
@@ -82,14 +87,33 @@ export function useSummaryGeneration({
     isModelConfigLoading,
     selectedTemplate,
     activeTemplateId,
+    summaryRevision,
+    isExternallyProcessing = false,
+    onExternalProcessingChange,
     onMeetingUpdated,
     updateMeetingTitle,
     setAiSummary,
     onOpenModelSettings,
     onSummariesChanged,
+    onSummaryRevisionChange,
 }: UseSummaryGenerationProps) {
     const [summaryStatus, setSummaryStatus] = useState<SummaryStatus>("idle");
     const [summaryError, setSummaryError] = useState<string | null>(null);
+    const activeGenerationRef = useRef<{
+        templateId: string;
+        generation: string;
+    } | null>(null);
+    const generationAttemptTemplateRef = useRef<string | null>(null);
+
+    useEffect(() => {
+        // A generation identity belongs to one selected row. Never reuse an
+        // old row's identity if the user switches templates before polling
+        // or cancellation finishes.
+        activeGenerationRef.current = null;
+        generationAttemptTemplateRef.current = null;
+        setSummaryStatus("idle");
+        setSummaryError(null);
+    }, [meeting.id, activeTemplateId]);
 
     const { startSummaryPolling, stopSummaryPolling } = useSidebar();
 
@@ -124,6 +148,29 @@ export function useSummaryGeneration({
             customPrompt?: string;
             isRegeneration?: boolean;
         }) => {
+            if (isExternallyProcessing) {
+                logger.debug("Summary generation is already active for this meeting");
+                return;
+            }
+
+            // ponytail: S2 claim 6 — never silently substitute `standard_meeting`
+            // when no active row is selected. `selectedTemplate` is the S1
+            // single-template picker and its seed is `"standard_meeting"`, so
+            // `activeTemplateId ?? selectedTemplate` routed generation to the
+            // default whenever the active row was null. Guard null explicitly:
+            // a null active row means the user has not picked a template to
+            // generate against, so refuse and surface it. The earlier mount
+            // path in `page.tsx` returns the loader until `activeTemplateId`
+            // is non-null, so this only fires on a transient null after mount
+            // (orphaned-active path or delete that nulls the active row); the
+            // toast tells the user to pick a template.
+            if (!activeTemplateId) {
+                logger.warn("Skipping summary generation: no active template selected");
+                toast.error("Select a template before generating a summary");
+                setSummaryStatus("idle");
+                return;
+            }
+
             setSummaryStatus(isRegeneration ? "regenerating" : "processing");
             setSummaryError(null);
 
@@ -132,7 +179,9 @@ export function useSummaryGeneration({
                     throw new Error("No transcript text available. Please add some text first.");
                 }
 
-                logger.debug("Processing transcript with template:", selectedTemplate);
+                const generationTemplateId = activeTemplateId;
+                generationAttemptTemplateRef.current = generationTemplateId;
+                logger.debug("Processing transcript with template:", generationTemplateId);
 
                 // Calculate time since recording
                 const timeSinceRecording =
@@ -164,7 +213,7 @@ export function useSummaryGeneration({
                 );
 
                 // Process transcript and get process_id
-                const result = await invokeTauri<{ process_id: string }>("api_process_transcript", {
+                const result = await invokeTauri<{ process_id: string; generation: string }>("api_process_transcript", {
                     text: transcriptText,
                     model: modelConfig.provider,
                     modelName: modelConfig.model,
@@ -172,20 +221,34 @@ export function useSummaryGeneration({
                     chunkSize: 40000,
                     overlap: 1000,
                     customPrompt: customPrompt,
-                    templateId: activeTemplateId ?? selectedTemplate,
+                    templateId: generationTemplateId,
                     summaryLanguage,
                 });
 
                 const process_id = result.process_id;
+                const generation = result.generation;
+                if (!generation) {
+                    throw new Error("Summary generation did not return a generation identity");
+                }
+                activeGenerationRef.current = {
+                    templateId: generationTemplateId,
+                    generation,
+                };
+                generationAttemptTemplateRef.current = null;
                 logger.debug("Process ID:", process_id);
 
-                // Start global polling via context.
-                // ponytail: 4th arg = row key polled. Must match the row
-                // `api_process_transcript` just wrote (activeTemplateId ??
-                // selectedTemplate); mismatch would silently fall back to
-                // "latest" and poll a different row.
-                startSummaryPolling(meeting.id, process_id, async (pollingResult) => {
+                // Poll the exact template/generation returned by the process
+                // command; a meeting-level "latest" lookup is unsafe here.
+                startSummaryPolling(meeting.id, process_id, generationTemplateId, generation, async (pollingResult) => {
                     logger.debug("Summary status:", pollingResult);
+
+                    if (pollingResult.template_id && pollingResult.updated_at) {
+                        onSummaryRevisionChange?.({
+                            templateId: normalizeTemplateId(pollingResult.template_id),
+                            startTime: pollingResult.start ?? generation,
+                            updatedAt: pollingResult.updated_at,
+                        });
+                    }
 
                     // ponytail: one refresh on terminal statuses keeps the
                     // zone-1 dropdown badge in sync with the DB row. The
@@ -213,10 +276,10 @@ export function useSummaryGeneration({
                         try {
                             const existingSummary = await invokeTauri<SummaryStatusResponse>(
                                 "api_get_summary",
-                                {
-                                    meetingId: meeting.id,
-                                    templateId: activeTemplateId ?? undefined,
-                                }
+                                buildSummaryFetchArgs(meeting.id, {
+                                    templateId: generationTemplateId,
+                                    generation,
+                                })
                             );
 
                             if (existingSummary?.data) {
@@ -247,10 +310,10 @@ export function useSummaryGeneration({
                             try {
                                 const existingSummary = await invokeTauri<SummaryStatusResponse>(
                                     "api_get_summary",
-                                    {
-                                        meetingId: meeting.id,
-                                        templateId: activeTemplateId ?? undefined,
-                                    }
+                                    buildSummaryFetchArgs(meeting.id, {
+                                        templateId: generationTemplateId,
+                                        generation,
+                                    })
                                 );
 
                                 if (existingSummary?.data) {
@@ -449,8 +512,11 @@ export function useSummaryGeneration({
                             await onMeetingUpdated();
                         }
                     }
-                }, activeTemplateId ?? selectedTemplate);
+                });
             } catch (error) {
+                if (generationAttemptTemplateRef.current === activeTemplateId) {
+                    generationAttemptTemplateRef.current = null;
+                }
                 logger.error(
                     `Failed to ${isRegeneration ? "regenerate" : "generate"} summary:`,
                     error
@@ -477,13 +543,14 @@ export function useSummaryGeneration({
             meeting.id,
             meeting.created_at,
             modelConfig,
-            selectedTemplate,
             activeTemplateId,
             startSummaryPolling,
             setAiSummary,
             updateMeetingTitle,
             onMeetingUpdated,
             onSummariesChanged,
+            onSummaryRevisionChange,
+            isExternallyProcessing,
         ]
     );
 
@@ -544,6 +611,11 @@ export function useSummaryGeneration({
     // Public API: Generate summary from transcripts
     const handleGenerateSummary = useCallback(
         async (customPrompt: string = "") => {
+            if (isExternallyProcessing) {
+                logger.debug("Summary generation is already active for this meeting");
+                return;
+            }
+
             // Check if model config is still loading
             if (isModelConfigLoading) {
                 logger.debug("⏳ Model configuration is still loading, please wait...");
@@ -718,11 +790,17 @@ export function useSummaryGeneration({
             isModelConfigLoading,
             selectedTemplate,
             activeTemplateId,
+            isExternallyProcessing,
         ]
     );
 
     // Public API: Regenerate summary from the current saved transcript
     const handleRegenerateSummary = useCallback(async () => {
+        if (isExternallyProcessing) {
+            logger.debug("Summary generation is already active for this meeting");
+            return;
+        }
+
         const allTranscripts = await fetchAllTranscripts(meeting.id);
 
         if (!allTranscripts.length) {
@@ -735,29 +813,71 @@ export function useSummaryGeneration({
             ...buildSummaryTranscriptPayload(allTranscripts),
             isRegeneration: true,
         });
-    }, [meeting.id, fetchAllTranscripts, buildSummaryTranscriptPayload, processSummary]);
+    }, [meeting.id, fetchAllTranscripts, buildSummaryTranscriptPayload, processSummary, isExternallyProcessing]);
 
     // Public API: Stop ongoing summary generation
     const handleStopGeneration = useCallback(async () => {
         logger.debug("Stopping summary generation for meeting:", meeting.id);
+        let cancellationRequestSucceeded = false;
+        const target = activeGenerationRef.current ??
+            (generationAttemptTemplateRef.current
+                ? null
+                : activeTemplateId && summaryRevision?.startTime
+                ? { templateId: activeTemplateId, generation: summaryRevision.startTime }
+                : null);
+
+        if (!target) {
+            logger.error("Cannot cancel summary without a template and generation identity");
+            toast.error("Cannot stop this summary safely", {
+                description: "The active summary generation identity is unavailable. Reload the meeting and try again.",
+            });
+            return;
+        }
 
         try {
             // Call backend to cancel the summary generation
-            await invokeTauri("api_cancel_summary", {
-                meetingId: meeting.id,
-                templateId: activeTemplateId ?? undefined,
-            });
+            await invokeTauri("api_cancel_summary", buildSummaryCancelArgs(meeting.id, target));
+            cancellationRequestSucceeded = true;
             logger.debug("✓ Backend cancellation request sent for meeting:", meeting.id);
+
+            // The command fences the same row synchronously. Reload that row
+            // only; never fall back to another active template after cancel.
+            const existingSummary = await invokeTauri<SummaryStatusResponse>(
+                "api_get_summary",
+                buildSummaryFetchArgs(meeting.id, target),
+            );
+            if (existingSummary?.data) {
+                setAiSummary(existingSummary.data as unknown as Summary);
+                setSummaryStatus("completed");
+                if (existingSummary.updated_at) {
+                        onSummaryRevisionChange?.({
+                            templateId: existingSummary.template_id
+                                ? normalizeTemplateId(existingSummary.template_id)
+                                : target.templateId,
+                        startTime: existingSummary.start ?? target.generation,
+                        updatedAt: existingSummary.updated_at,
+                    });
+                }
+            } else {
+                setSummaryStatus("idle");
+            }
         } catch (error) {
             logger.error("Failed to cancel summary generation:", error);
             // Continue with frontend cleanup even if backend call fails
+            setSummaryStatus("idle");
+        }
+
+        if (isExternallyProcessing && cancellationRequestSucceeded) {
+            // The page owns externally discovered state. Clear it after the
+            // backend accepted the safe cancellation so a stale row cannot
+            // leave the Stop action permanently visible.
+            onExternalProcessingChange?.(false);
         }
 
         // Stop polling
-        stopSummaryPolling(meeting.id);
+        stopSummaryPolling(meeting.id, target.templateId, target.generation);
+        activeGenerationRef.current = null;
 
-        // Reset status to idle
-        setSummaryStatus("idle");
         setSummaryError(null);
 
         // Show toast notification
@@ -765,7 +885,16 @@ export function useSummaryGeneration({
             description: "You can generate a new summary anytime",
             duration: 3000,
         });
-    }, [meeting.id, activeTemplateId, stopSummaryPolling]);
+    }, [
+        meeting.id,
+        activeTemplateId,
+        summaryRevision,
+        isExternallyProcessing,
+        onExternalProcessingChange,
+        onSummaryRevisionChange,
+        setAiSummary,
+        stopSummaryPolling,
+    ]);
 
     return {
         summaryStatus,

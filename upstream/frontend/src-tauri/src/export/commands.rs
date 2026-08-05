@@ -7,32 +7,32 @@
 //! The command is intentionally serializable end-to-end so the
 //! frontend can stream the bytes into a `dialog.save` file.
 
-use log::{info, warn};
+use log::info;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
 use tauri::{AppHandle, Runtime};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::database::repositories::meeting::MeetingsRepository;
-use crate::database::repositories::summary::SummaryProcessesRepository;
-use crate::database::repositories::templates::TemplatesRepository;
+use crate::database::repositories::summary::{
+    resolve_summary_storage_template_id, SummaryProcessesRepository,
+};
 use crate::export::pdf::{export_meeting_to_pdf, MeetingExportData, SectionContent};
 use crate::state::AppState;
-use crate::summary::templates::{self, Template};
+use crate::summary::templates::{self, Template, TemplateSection};
 use tauri::State;
 
 /// Request payload for the `export_meeting_pdf` command.
 ///
-/// `template_id` may be either a numeric database id (stringified) for
-/// user/builtin templates stored in the `templates` table, or a
-/// template identifier like `daily_standup` for templates resolved
-/// through the file/built-in pipeline.
+/// `template_id` is a file/built-in ID or a source-safe database ID such as
+/// `db:42`. Unprefixed numeric IDs remain accepted for persisted legacy rows.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExportPdfRequest {
     pub meeting_id: String,
     pub template_id: String,
+    #[serde(default)]
+    pub template_source: Option<String>,
 }
 
 /// Response payload: the rendered PDF bytes plus a suggested file name
@@ -75,18 +75,43 @@ pub async fn export_meeting_pdf<R: Runtime>(
     // 2) Look up the completed summary, if any. Scoped to the requested
     //    template — only the active template's summary is exported per
     //    decision #11 (plan).
-    let summary = SummaryProcessesRepository::get_summary_data(pool, &request.meeting_id, &request.template_id)
-        .await
-        .map_err(|e| format!("Failed to load summary: {}", e))?;
+    let summary = load_export_summary(pool, &request.meeting_id, &request.template_id).await?;
+    let template_reference =
+        resolve_export_template_reference(pool, &request.meeting_id, &request.template_id).await?;
 
-    // 3) Resolve the template (DB-stored or built-in).
-    let template = resolve_template(pool, &request.template_id).await?;
+    // 3) Resolve the template (DB-stored or built-in). A deleted template
+    // reference must not make the stored summary disappear from export.
+    let summary_result = summary.as_ref().and_then(|s| s.result.as_deref());
+    let template_source = if templates::parse_database_template_id(&template_reference).is_some() {
+        Some("database")
+    } else if template_reference
+        .parse::<i64>()
+        .ok()
+        .filter(|id| *id > 0)
+        .is_some()
+    {
+        // Raw numeric references are ambiguous legacy values. The resolver
+        // checks DB first and then the numeric file namespace.
+        None
+    } else {
+        request.template_source.as_deref()
+    };
+    let template =
+        match templates::resolve_template_with_source(pool, &template_reference, template_source)
+            .await
+        {
+            Ok(template) => template,
+            Err(error) => {
+                info!(
+                    "Using archived-summary PDF fallback for template {}: {}",
+                    template_reference, error
+                );
+                fallback_template(&template_reference, summary_result)
+            }
+        };
 
     // 4) Merge template sections with the stored summary content.
-    let sections = merge_sections(
-        &template,
-        summary.as_ref().and_then(|s| s.result.as_deref()),
-    );
+    let sections = merge_sections(&template, summary_result);
 
     // 5) Build the export payload.
     let duration = compute_duration(summary.as_ref());
@@ -112,9 +137,10 @@ pub async fn export_meeting_pdf<R: Runtime>(
     // is synchronous; offloading it to `spawn_blocking` keeps the
     // Tauri async runtime responsive.
     let data_for_render = export_data.clone();
-    let (bytes, page_count) = tokio::task::spawn_blocking(move || export_meeting_to_pdf(&data_for_render))
-        .await
-        .map_err(|e| format!("PDF render task failed: {}", e))??;
+    let (bytes, page_count) =
+        tokio::task::spawn_blocking(move || export_meeting_to_pdf(&data_for_render))
+            .await
+            .map_err(|e| format!("PDF render task failed: {}", e))??;
 
     let suggested_filename = build_filename(&export_data);
 
@@ -189,32 +215,45 @@ fn sanitize_filename(name: &str) -> String {
 
 // ---------- Helpers ----------
 
-/// Resolve a template identifier to a `Template` struct.
-///
-/// Tries, in order:
-/// 1. Numeric id → look in the `templates` table.
-/// 2. String id → file-based lookup via `templates::get_template`.
-async fn resolve_template(pool: &SqlitePool, template_id: &str) -> Result<Template, String> {
-    if let Ok(id) = template_id.parse::<i64>() {
-        match TemplatesRepository::get_by_id(pool, id).await {
-            Ok(Some(record)) => {
-                let parsed: Template = serde_json::from_str(&record.schema_json)
-                    .map_err(|e| format!("Stored template has invalid schema: {}", e))?;
-                return Ok(parsed);
-            }
-            Ok(None) => {
-                // Not a DB id; fall through to file-based lookup.
-            }
-            Err(e) => {
-                warn!(
-                    "TemplatesRepository::get_by_id failed: {}. Falling back to file lookup.",
-                    e
-                );
-            }
-        }
+async fn load_export_summary(
+    pool: &sqlx::SqlitePool,
+    meeting_id: &str,
+    template_id: &str,
+) -> Result<Option<crate::database::models::SummaryProcess>, String> {
+    SummaryProcessesRepository::get_summary_data(pool, meeting_id, template_id)
+        .await
+        .map_err(|e| format!("Failed to load summary: {}", e))
+}
+
+async fn resolve_export_template_reference(
+    pool: &sqlx::SqlitePool,
+    meeting_id: &str,
+    requested_template_id: &str,
+) -> Result<String, String> {
+    let storage_template_id =
+        resolve_summary_storage_template_id(pool, meeting_id, requested_template_id)
+            .await
+            .map_err(|e| format!("Failed to resolve summary template reference: {}", e))?;
+
+    // An explicit database reference stays in the strict DB namespace even
+    // when its archived summary is stored under the old numeric spelling.
+    // This lets the PDF fallback preserve the summary instead of selecting a
+    // colliding file template.
+    if templates::parse_database_template_id(requested_template_id).is_some() {
+        return Ok(requested_template_id.to_string());
     }
 
-    templates::get_template(template_id)
+    // Raw numeric references predate source-safe IDs and retain the old
+    // DB-first/file-second compatibility rule.
+    if storage_template_id
+        .parse::<i64>()
+        .ok()
+        .filter(|id| *id > 0)
+        .is_some()
+    {
+        return Ok(storage_template_id);
+    }
+    Ok(requested_template_id.to_string())
 }
 
 /// Split markdown by bold headings (`**Title**`).
@@ -230,9 +269,8 @@ async fn resolve_template(pool: &SqlitePool, template_id: &str) -> Result<Templa
 /// asterisks (capitalized first letter, 2-80 chars, no asterisks inside).
 /// This avoids false positives from inline bold text like `**Note:**`.
 fn split_markdown_by_bold_headings(markdown: &str) -> Vec<(String, String)> {
-    static HEADING_RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"(?m)^\*\*([A-ZÀ-Ý][^*]{2,80})\*\*\s*$").unwrap()
-    });
+    static HEADING_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?m)^\*\*([A-ZÀ-Ý][^*]{2,80})\*\*\s*$").unwrap());
 
     // (heading_start, heading_end, captured_title) for each bold heading.
     // `captures_iter` runs the regex once and gives us both the match
@@ -252,12 +290,25 @@ fn split_markdown_by_bold_headings(markdown: &str) -> Vec<(String, String)> {
     // Section N's content runs from the end of its heading to the START of
     // the next heading (not the end — that would swallow the next heading).
     let mut sections = Vec::new();
-    for (idx, (_, heading_end, heading_title)) in headings.iter().enumerate() {
+    for (idx, (heading_start, heading_end, heading_title)) in headings.iter().enumerate() {
         let content_end = headings
             .get(idx + 1)
             .map(|&(next_start, _, _)| next_start)
             .unwrap_or(markdown.len());
-        sections.push((heading_title.clone(), markdown[*heading_end..content_end].trim().to_string()));
+        let content = markdown[*heading_end..content_end].trim();
+        let leading_content = if idx == 0 {
+            markdown[..*heading_start].trim()
+        } else {
+            ""
+        };
+        let content = if leading_content.is_empty() {
+            content.to_string()
+        } else if content.is_empty() {
+            leading_content.to_string()
+        } else {
+            format!("{leading_content}\n\n{content}")
+        };
+        sections.push((heading_title.clone(), content));
     }
 
     // If no headings found, return the entire markdown as one section with
@@ -269,55 +320,284 @@ fn split_markdown_by_bold_headings(markdown: &str) -> Vec<(String, String)> {
     sections
 }
 
-fn merge_sections(template: &Template, summary_result: Option<&str>) -> Vec<SectionContent> {
-    let parsed_summary: Option<serde_json::Value> =
-        summary_result.and_then(|s| serde_json::from_str(s).ok());
+fn extract_meeting_notes_sections(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<(String, String)> {
+    let Some(sections) = object
+        .get("MeetingNotes")
+        .and_then(|notes| notes.get("sections"))
+        .and_then(|sections| sections.as_array())
+    else {
+        return Vec::new();
+    };
 
-    // Extract markdown from summary (either top-level or english_cache).
-    // Prefer the non-English `markdown` field so the PDF is rendered in
-    // the summary's actual language; fall back to `english_cache` only
-    // when no native-language markdown was stored.
-    let markdown = parsed_summary
-        .as_ref()
-        .and_then(|v| v.get("markdown").and_then(|m| m.as_str()))
-        .or_else(|| {
-            parsed_summary
-                .as_ref()
-                .and_then(|v| v.get("english_cache").and_then(|c| c.get("markdown").and_then(|m| m.as_str())))
-        });
-
-    // Split markdown by bold headings; each entry carries the actual
-    // (translated) heading title so the PDF renders the section heading
-    // in the summary's language instead of the English template title.
-    let markdown_sections: Vec<(String, String)> =
-        markdown.map(split_markdown_by_bold_headings).unwrap_or_default();
-
-    template
-        .sections
+    sections
         .iter()
         .enumerate()
-        .map(|(idx, tmpl_section)| {
-            let (md_title, content) = markdown_sections
+        .filter_map(|(index, section)| {
+            let section_object = section.as_object()?;
+            let key = section_object
+                .get("title")
+                .and_then(|value| value.as_str())
+                .filter(|title| !title.trim().is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("Section {}", index + 1));
+            let title = section_object
+                .get("title")
+                .and_then(|value| value.as_str())
+                .unwrap_or(&key)
+                .to_string();
+            let content = section_object
+                .get("blocks")
+                .and_then(|value| value.as_array())
+                .map(|blocks| {
+                    blocks
+                        .iter()
+                        .filter_map(|block| {
+                            block.get("content").map(|content| {
+                                content
+                                    .as_str()
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| content.to_string())
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .or_else(|| {
+                    section_object
+                        .get("content")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            Some((title, content))
+        })
+        .collect()
+}
+
+fn merge_summary_sources(
+    mut primary: Vec<(String, String)>,
+    notes: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    for note in notes {
+        if let Some(existing) = primary
+            .iter_mut()
+            .find(|(title, _)| title.trim().eq_ignore_ascii_case(note.0.trim()))
+        {
+            // MeetingNotes is the editor-owned representation; retain it
+            // when a cached markdown representation has the same heading.
+            *existing = note;
+        } else {
+            primary.push(note);
+        }
+    }
+    primary
+}
+
+fn extract_summary_sections(summary_result: Option<&str>) -> Vec<(String, String)> {
+    let Some(raw) = summary_result else {
+        return Vec::new();
+    };
+
+    let parsed_summary = match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(value) => value,
+        Err(_) => return vec![(String::new(), raw.trim().to_string())],
+    };
+
+    // Older rows can contain a JSON-encoded markdown string instead of an
+    // object. Treat it as markdown rather than exporting the JSON quotes.
+    if let Some(markdown) = parsed_summary.as_str() {
+        return split_markdown_by_bold_headings(markdown);
+    }
+
+    // Prefer the non-English markdown, then the cached English markdown, but
+    // do not return before merging editor-owned MeetingNotes.sections below.
+    let markdown_sections = parsed_summary
+        .get("markdown")
+        .and_then(|value| value.as_str())
+        .filter(|markdown| !markdown.trim().is_empty())
+        .map(split_markdown_by_bold_headings);
+    let cached_sections = parsed_summary
+        .get("english_cache")
+        .and_then(|cache| cache.get("markdown"))
+        .and_then(|value| value.as_str())
+        .filter(|markdown| !markdown.trim().is_empty())
+        .map(split_markdown_by_bold_headings);
+
+    // Legacy summaries store sections as `{ title, blocks }` objects.
+    let Some(object) = parsed_summary.as_object() else {
+        return markdown_sections
+            .or(cached_sections)
+            .unwrap_or_else(|| vec![(String::new(), raw.trim().to_string())]);
+    };
+    let notes_sections = extract_meeting_notes_sections(object);
+    if let Some(markdown_sections) = markdown_sections {
+        return merge_summary_sources(markdown_sections, notes_sections);
+    }
+    if let Some(cached_sections) = cached_sections {
+        return merge_summary_sources(cached_sections, notes_sections);
+    }
+
+    let mut sections_to_extract: Vec<(String, &serde_json::Value)> = Vec::new();
+    if let Some(sections) = object
+        .get("MeetingNotes")
+        .and_then(|notes| notes.get("sections"))
+        .and_then(|sections| sections.as_array())
+    {
+        // Legacy editor saves use MeetingNotes.sections instead of keyed
+        // top-level sections. Keep their stored order and block shape.
+        for (index, section) in sections.iter().enumerate() {
+            let key = section
+                .get("title")
+                .and_then(|value| value.as_str())
+                .filter(|title| !title.trim().is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("Section {}", index + 1));
+            sections_to_extract.push((key, section));
+        }
+    } else {
+        let mut keys = Vec::new();
+        if let Some(order) = object
+            .get("_section_order")
+            .and_then(|value| value.as_array())
+        {
+            keys.extend(
+                order
+                    .iter()
+                    .filter_map(|key| key.as_str().map(str::to_string)),
+            );
+        }
+        for key in object.keys() {
+            if key != "MeetingName"
+                && key != "_section_order"
+                && key != "english_cache"
+                && key != "MeetingNotes"
+                && !keys.contains(key)
+            {
+                keys.push(key.clone());
+            }
+        }
+        sections_to_extract.extend(
+            keys.into_iter()
+                .filter_map(|key| object.get(&key).map(|section| (key, section))),
+        );
+    }
+
+    let mut sections = Vec::new();
+    for (key, section) in sections_to_extract {
+        let Some(section_object) = section.as_object() else {
+            continue;
+        };
+        let title = section_object
+            .get("title")
+            .and_then(|value| value.as_str())
+            .unwrap_or(&key)
+            .to_string();
+        let content = section_object
+            .get("blocks")
+            .and_then(|value| value.as_array())
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter_map(|block| {
+                        block.get("content").map(|content| {
+                            content
+                                .as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| content.to_string())
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .or_else(|| {
+                section_object
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        sections.push((title, content));
+    }
+
+    if sections.is_empty() {
+        vec![(
+            String::new(),
+            serde_json::to_string_pretty(&parsed_summary).unwrap_or_else(|_| raw.to_string()),
+        )]
+    } else {
+        sections
+    }
+}
+
+fn fallback_template(template_id: &str, summary_result: Option<&str>) -> Template {
+    let summary_sections = extract_summary_sections(summary_result);
+    let sections = if summary_sections.is_empty() {
+        vec![TemplateSection {
+            title: "Summary".to_string(),
+            instruction: "Preserve the stored summary content".to_string(),
+            format: "paragraph".to_string(),
+            item_format: None,
+            example_item_format: None,
+        }]
+    } else {
+        summary_sections
+            .iter()
+            .enumerate()
+            .map(|(index, (title, _))| TemplateSection {
+                title: if title.is_empty() {
+                    format!("Summary {}", index + 1)
+                } else {
+                    title.clone()
+                },
+                instruction: "Preserve the stored summary content".to_string(),
+                format: "paragraph".to_string(),
+                item_format: None,
+                example_item_format: None,
+            })
+            .collect()
+    };
+
+    Template {
+        name: format!("Archived summary ({})", template_id),
+        description: "Fallback template for a legacy or deleted template reference".to_string(),
+        sections,
+    }
+}
+
+fn merge_sections(template: &Template, summary_result: Option<&str>) -> Vec<SectionContent> {
+    let summary_sections = extract_summary_sections(summary_result);
+
+    // Use the larger section count. A deleted/changed template must not make
+    // stored MeetingNotes sections disappear from an export.
+    let section_count = template.sections.len().max(summary_sections.len());
+    (0..section_count)
+        .map(|idx| {
+            let tmpl_section = template.sections.get(idx);
+            let (md_title, content) = summary_sections
                 .get(idx)
                 .cloned()
                 .unwrap_or((String::new(), "(summary not generated yet)".to_string()));
-            // Prefer the markdown-derived (translated) heading title; fall
-            // back to the English template title only when the markdown
-            // did not provide one (empty string, e.g. LLM omitted the
-            // heading or section count mismatch).
-            let title = if md_title.is_empty() {
+            let title = if !md_title.is_empty() {
+                md_title
+            } else if let Some(tmpl_section) = tmpl_section {
                 tmpl_section.title.clone()
             } else {
-                md_title
+                format!("Section {}", idx + 1)
             };
             SectionContent {
                 title,
-                format: tmpl_section.format.clone(),
+                format: tmpl_section
+                    .map(|section| section.format.clone())
+                    .unwrap_or_else(|| "paragraph".to_string()),
                 content,
-                item_format: tmpl_section
-                    .item_format
-                    .clone()
-                    .or_else(|| tmpl_section.example_item_format.clone()),
+                item_format: tmpl_section.and_then(|section| {
+                    section
+                        .item_format
+                        .clone()
+                        .or_else(|| section.example_item_format.clone())
+                }),
             }
         })
         .collect()
@@ -383,8 +663,118 @@ fn build_filename(data: &MeetingExportData) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::repositories::summary::canonical_summary_template_id;
     use crate::summary::templates::TemplateSection;
     use serde_json::json;
+
+    #[test]
+    fn summary_identity_canonicalizes_legacy_numeric_ids_without_touching_files() {
+        assert_eq!(canonical_summary_template_id("42"), "db:42");
+        assert_eq!(canonical_summary_template_id("db:42"), "db:42");
+        assert_eq!(canonical_summary_template_id("file:42"), "file:42");
+        assert_eq!(
+            canonical_summary_template_id("standard_meeting"),
+            "standard_meeting"
+        );
+        assert!(templates::parse_database_template_id("db:42").is_some());
+        assert!(templates::parse_database_template_id("file:42").is_none());
+    }
+
+    #[tokio::test]
+    async fn export_summary_lookup_bridges_numeric_legacy_row() {
+        let pool = sqlx::SqlitePool::connect(":memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        sqlx::query(
+            "CREATE TABLE summary_processes (meeting_id TEXT NOT NULL, template_id TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, error TEXT, result TEXT, start_time TEXT, end_time TEXT, chunk_count INTEGER DEFAULT 0, processing_time REAL DEFAULT 0.0, metadata TEXT, result_backup TEXT, result_backup_timestamp TEXT, PRIMARY KEY (meeting_id, template_id))",
+        )
+        .execute(&pool)
+        .await
+        .expect("create summary schema");
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO summary_processes (meeting_id, template_id, status, created_at, updated_at, result) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind("meeting-1")
+        .bind("42")
+        .bind("completed")
+        .bind(now)
+        .bind(now)
+        .bind(r#"{"MeetingNotes":{"sections":[]}}"#)
+        .execute(&pool)
+        .await
+        .expect("insert legacy summary");
+
+        let summary = load_export_summary(&pool, "meeting-1", "db:42")
+            .await
+            .expect("load export summary")
+            .expect("legacy export summary");
+        assert_eq!(summary.template_id, "db:42");
+    }
+
+    #[tokio::test]
+    async fn explicit_database_reference_uses_archived_fallback_instead_of_colliding_file() {
+        let pool = sqlx::SqlitePool::connect(":memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        sqlx::query(
+            "CREATE TABLE summary_processes (meeting_id TEXT NOT NULL, template_id TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, error TEXT, result TEXT, start_time TEXT, end_time TEXT, chunk_count INTEGER DEFAULT 0, processing_time REAL DEFAULT 0.0, metadata TEXT, result_backup TEXT, result_backup_timestamp TEXT, PRIMARY KEY (meeting_id, template_id))",
+        )
+        .execute(&pool)
+        .await
+        .expect("create summary schema");
+        sqlx::query(
+            "CREATE TABLE templates (id INTEGER PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL, stable_id TEXT, schema_json TEXT NOT NULL, is_builtin INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create template schema");
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO summary_processes (meeting_id, template_id, status, created_at, updated_at, result) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind("meeting-legacy-file")
+        .bind("987655")
+        .bind("completed")
+        .bind(now)
+        .bind(now)
+        .bind(r#"{"markdown":"Stored content"}"#)
+        .execute(&pool)
+        .await
+        .expect("insert legacy numeric summary");
+
+        let dir = tempfile::tempdir().expect("create bundled template directory");
+        std::fs::write(
+            dir.path().join("987655.json"),
+            r#"{
+                "name": "Legacy file template",
+                "description": "File fallback",
+                "sections": [{
+                    "title": "Summary",
+                    "instruction": "Preserve",
+                    "format": "paragraph"
+                }]
+            }"#,
+        )
+        .expect("write file template");
+        let _lock = crate::summary::templates::acquire_template_test_lock();
+        templates::set_bundled_templates_dir(dir.path().to_path_buf());
+
+        let reference =
+            resolve_export_template_reference(&pool, "meeting-legacy-file", "db:987655")
+                .await
+                .expect("resolve stored reference");
+        assert_eq!(reference, "db:987655");
+        let _ = templates::resolve_template(&pool, &reference)
+            .await
+            .expect_err("explicit DB reference must remain strict");
+        let _ = templates::resolve_template_with_source(&pool, &reference, Some("database"))
+            .await
+            .expect_err("export DB source must remain strict");
+        let template = fallback_template(&reference, Some(r#"{"markdown":"Stored content"}"#));
+        let sections = merge_sections(&template, Some(r#"{"markdown":"Stored content"}"#));
+        assert!(sections[0].content.contains("Stored content"));
+    }
 
     #[test]
     fn filename_strips_unsafe_chars() {
@@ -424,13 +814,179 @@ mod tests {
     }
 
     #[test]
+    fn fallback_template_is_valid_without_summary() {
+        let template = fallback_template("deleted", None);
+
+        assert!(template.validate().is_ok());
+        assert_eq!(template.sections.len(), 1);
+    }
+
+    #[test]
+    fn archived_legacy_summary_content_survives_template_fallback() {
+        let raw = json!({
+            "MeetingName": "Old meeting",
+            "_section_order": ["key_points", "actions"],
+            "key_points": {
+                "title": "Key points",
+                "blocks": [{"content": "Decision preserved"}]
+            },
+            "actions": {
+                "title": "Actions",
+                "blocks": [{"content": "Follow-up preserved"}]
+            }
+        })
+        .to_string();
+
+        let template = fallback_template("legacy", Some(&raw));
+        let sections = merge_sections(&template, Some(&raw));
+
+        assert_eq!(sections.len(), 2);
+        assert!(sections[0].content.contains("Decision preserved"));
+        assert!(sections[1].content.contains("Follow-up preserved"));
+    }
+
+    #[test]
+    fn archived_meeting_notes_sections_reach_pdf_input() {
+        let raw = json!({
+            "MeetingName": "Old meeting",
+            "MeetingNotes": {
+                "sections": [
+                    {
+                        "title": "Decisions",
+                        "blocks": [{"content": "Decision from notes"}]
+                    },
+                    {
+                        "title": "Actions",
+                        "blocks": [{"content": "Action from notes"}]
+                    }
+                ]
+            }
+        })
+        .to_string();
+
+        let sections = merge_sections(&fallback_template("deleted", Some(&raw)), Some(&raw));
+
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].title, "Decisions");
+        assert!(sections[0].content.contains("Decision from notes"));
+        assert_eq!(sections[1].title, "Actions");
+        assert!(sections[1].content.contains("Action from notes"));
+    }
+
+    #[test]
+    fn meeting_notes_sections_survive_markdown_and_english_cache_fields() {
+        let raw = json!({
+            "markdown": "**Summary**\nCached summary.",
+            "english_cache": {"markdown": "**Summary**\nEnglish cache."},
+            "MeetingNotes": {
+                "sections": [
+                    {
+                        "title": "Edited decisions",
+                        "blocks": [{"content": "Decision edited by user"}]
+                    }
+                ]
+            }
+        })
+        .to_string();
+
+        let sections = extract_summary_sections(Some(&raw));
+
+        assert!(sections
+            .iter()
+            .any(|(title, content)| { title == "Summary" && content.contains("Cached summary") }));
+        assert!(sections.iter().any(|(title, content)| {
+            title == "Edited decisions" && content.contains("Decision edited by user")
+        }));
+    }
+
+    #[test]
+    fn changed_embedded_template_preserves_extra_stored_meeting_notes_sections() {
+        let raw = json!({
+            "MeetingNotes": {
+                "sections": [
+                    {
+                        "title": "Stored first",
+                        "blocks": [{"content": "First section"}]
+                    },
+                    {
+                        "title": "Stored second",
+                        "blocks": [{"content": "Second section"}]
+                    }
+                ]
+            }
+        })
+        .to_string();
+        let template = Template {
+            name: "Current embedded schema".into(),
+            description: "Only one current section".into(),
+            sections: vec![TemplateSection {
+                title: "Current first".into(),
+                instruction: "Keep content".into(),
+                format: "paragraph".into(),
+                item_format: None,
+                example_item_format: None,
+            }],
+        };
+
+        let sections = merge_sections(&template, Some(&raw));
+
+        assert_eq!(sections.len(), 2);
+        assert!(sections.iter().any(|section| {
+            section.title == "Stored first" && section.content.contains("First section")
+        }));
+        assert!(sections.iter().any(|section| {
+            section.title == "Stored second" && section.content.contains("Second section")
+        }));
+    }
+
+    #[test]
+    fn deleted_template_fallback_preserves_all_markdown_sections() {
+        let raw = json!({
+            "markdown": "**Summary**\nKept summary.\n**Actions**\nKept action."
+        })
+        .to_string();
+
+        let template = fallback_template("42", Some(&raw));
+        let sections = merge_sections(&template, Some(&raw));
+
+        assert_eq!(sections.len(), 2);
+        assert!(sections
+            .iter()
+            .any(|section| section.content == "Kept summary."));
+        assert!(sections
+            .iter()
+            .any(|section| section.content == "Kept action."));
+    }
+
+    #[test]
+    fn fallback_preserves_json_encoded_markdown_and_leading_content() {
+        let markdown = "# Stored title\n\n**Summary**\nStored body.";
+        let raw = serde_json::to_string(markdown).expect("encode markdown");
+
+        let sections = merge_sections(&fallback_template("deleted", Some(&raw)), Some(&raw));
+
+        assert_eq!(sections.len(), 1);
+        assert!(sections[0].content.contains("# Stored title"));
+        assert!(sections[0].content.contains("Stored body."));
+    }
+
+    #[test]
     fn split_markdown_by_bold_headings_english() {
         let md = "**Summary**\nDiscussed the roadmap.\n**Key Decisions**\n- Decision 1\n**Action Items**\n- Task 1\n";
         let sections = split_markdown_by_bold_headings(md);
         assert_eq!(sections.len(), 3);
-        assert_eq!(sections[0], ("Summary".to_string(), "Discussed the roadmap.".to_string()));
-        assert_eq!(sections[1], ("Key Decisions".to_string(), "- Decision 1".to_string()));
-        assert_eq!(sections[2], ("Action Items".to_string(), "- Task 1".to_string()));
+        assert_eq!(
+            sections[0],
+            ("Summary".to_string(), "Discussed the roadmap.".to_string())
+        );
+        assert_eq!(
+            sections[1],
+            ("Key Decisions".to_string(), "- Decision 1".to_string())
+        );
+        assert_eq!(
+            sections[2],
+            ("Action Items".to_string(), "- Task 1".to_string())
+        );
     }
 
     #[test]
@@ -438,9 +994,21 @@ mod tests {
         let md = "**Resumo**\nA reunião focou no planejamento.\n**Decisões Principais**\n- Decisão 1\n**Itens de Ação**\n- Tarefa 1\n";
         let sections = split_markdown_by_bold_headings(md);
         assert_eq!(sections.len(), 3);
-        assert_eq!(sections[0], ("Resumo".to_string(), "A reunião focou no planejamento.".to_string()));
-        assert_eq!(sections[1], ("Decisões Principais".to_string(), "- Decisão 1".to_string()));
-        assert_eq!(sections[2], ("Itens de Ação".to_string(), "- Tarefa 1".to_string()));
+        assert_eq!(
+            sections[0],
+            (
+                "Resumo".to_string(),
+                "A reunião focou no planejamento.".to_string()
+            )
+        );
+        assert_eq!(
+            sections[1],
+            ("Decisões Principais".to_string(), "- Decisão 1".to_string())
+        );
+        assert_eq!(
+            sections[2],
+            ("Itens de Ação".to_string(), "- Tarefa 1".to_string())
+        );
     }
 
     #[test]
@@ -449,8 +1017,17 @@ mod tests {
         let sections = split_markdown_by_bold_headings(md);
         // Should find 2 headings, not 3 (the inline **Note:** should not match)
         assert_eq!(sections.len(), 2);
-        assert_eq!(sections[0], ("Summary".to_string(), "This is a **Note:** inline bold.".to_string()));
-        assert_eq!(sections[1], ("Key Decisions".to_string(), "- Decision 1".to_string()));
+        assert_eq!(
+            sections[0],
+            (
+                "Summary".to_string(),
+                "This is a **Note:** inline bold.".to_string()
+            )
+        );
+        assert_eq!(
+            sections[1],
+            ("Key Decisions".to_string(), "- Decision 1".to_string())
+        );
     }
 
     #[test]
@@ -459,7 +1036,10 @@ mod tests {
         let sections = split_markdown_by_bold_headings(md);
         assert_eq!(sections.len(), 2);
         assert_eq!(sections[0], ("Summary".to_string(), "".to_string())); // empty content between headings
-        assert_eq!(sections[1], ("Key Decisions".to_string(), "Content here".to_string()));
+        assert_eq!(
+            sections[1],
+            ("Key Decisions".to_string(), "Content here".to_string())
+        );
     }
 
     #[test]
@@ -468,7 +1048,13 @@ mod tests {
         let sections = split_markdown_by_bold_headings(md);
         assert_eq!(sections.len(), 1);
         // No heading found → empty title, full text as content
-        assert_eq!(sections[0], ("".to_string(), "Just some plain text without headings".to_string()));
+        assert_eq!(
+            sections[0],
+            (
+                "".to_string(),
+                "Just some plain text without headings".to_string()
+            )
+        );
     }
 
     #[test]

@@ -13,7 +13,7 @@ import { Button } from "@/components/ui/button";
 interface ChooseTemplateForLegacyDialogProps {
     open: boolean;
     onOpenChange: (open: boolean) => void;
-    availableTemplates: Array<{ id: string; name: string; description: string }>;
+    availableTemplates: Array<{ id: string; name: string; description: string; source?: string }>;
     onChoose: (templateId: string) => void;
 }
 

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Represents a single section in a meeting template
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TemplateSection {
     /// Section title (e.g., "Summary", "Action Items")
     pub title: String,
@@ -22,7 +22,7 @@ pub struct TemplateSection {
 }
 
 /// Represents a complete meeting template
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Template {
     /// Template display name
     pub name: String,

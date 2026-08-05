@@ -90,6 +90,9 @@ export interface SummaryDataResponse {
 // after cancel/regen failure.
 export interface SummaryStatusResponse {
     status: "idle" | "processing" | "summarizing" | "regenerating" | "completed" | "error" | "failed" | "cancelled";
+    template_id?: string;
+    start?: string | null;
+    updated_at?: string | null;
     data?: SummaryDataResponse | null;
     error?: string;
     meetingName?: string;
@@ -101,6 +104,7 @@ export interface MeetingMetadata {
     title: string;
     created_at: string;
     updated_at: string;
+    folder_id?: string | null;
     folder_path?: string;
 }
 
@@ -119,7 +123,14 @@ export interface MeetingSummaryInfo {
         | "failed"
         | "cancelled";
     updated_at: string;
+    generation?: string | null;
     error?: string | null;
+}
+
+export interface SummaryRevision {
+    templateId: string;
+    startTime: string | null;
+    updatedAt: string;
 }
 
 // Canonical meeting record. Mirrors the Rust MeetingModel and adds

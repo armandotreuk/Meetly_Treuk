@@ -3,7 +3,7 @@ import { useState, useEffect, useRef } from "react";
 import { logger } from "@/lib/logger";
 
 import { motion } from "framer-motion";
-import { Meeting, Summary, SummaryResponse, TranscriptSegmentData, MeetingSummaryInfo } from "@/types";
+import { Meeting, Summary, SummaryResponse, TranscriptSegmentData, MeetingSummaryInfo, SummaryRevision } from "@/types";
 import { useSidebar } from "@/components/Sidebar/SidebarProvider";
 import Analytics from "@/lib/analytics";
 import { invoke } from "@tauri-apps/api/core";
@@ -27,6 +27,8 @@ import { usePanelResize } from "@/hooks/usePanelResize";
 export default function PageContent({
     meeting,
     summaryData,
+    isSummaryProcessing = false,
+    onSummaryProcessingChange,
     shouldAutoGenerate = false,
     onAutoGenerateComplete,
     onMeetingUpdated,
@@ -35,6 +37,8 @@ export default function PageContent({
     summaries,
     setActiveTemplateId,
     onSummariesChanged,
+    summaryRevision,
+    onSummaryRevisionChange,
     // Pagination props for efficient transcript loading
     segments,
     hasMore,
@@ -45,6 +49,8 @@ export default function PageContent({
 }: {
     meeting: Meeting;
     summaryData: Summary | null;
+    isSummaryProcessing?: boolean;
+    onSummaryProcessingChange?: (processing: boolean) => void;
     shouldAutoGenerate?: boolean;
     onAutoGenerateComplete?: () => void;
     onMeetingUpdated?: () => Promise<void>;
@@ -54,6 +60,8 @@ export default function PageContent({
     summaries?: MeetingSummaryInfo[];
     setActiveTemplateId?: (templateId: string | null) => void;
     onSummariesChanged?: () => void | Promise<void>;
+    summaryRevision?: SummaryRevision | null;
+    onSummaryRevisionChange?: (revision: SummaryRevision | null) => void;
     // Pagination props
     segments?: TranscriptSegmentData[];
     hasMore?: boolean;
@@ -120,8 +128,30 @@ export default function PageContent({
     const { modelConfig, setModelConfig } = useConfig();
 
     // Custom hooks
-    const meetingData = useMeetingData({ meeting, summaryData, activeTemplateId, onMeetingUpdated });
     const templates = useTemplates();
+    // ponytail: `activeTemplateId` is the single source of truth for which
+    // summary row is active (S2 claim 6: "Never silently defaults to
+    // `standard_meeting`"). The previous `?? templates.selectedTemplate`
+    // substitution routed save/generation/export to `standard_meeting`
+    // whenever `activeTemplateId` was null (orphaned-active path, delete that
+    // nulls the active row, or pre-`summariesReady` mount). `useTemplates`
+    // seeds `selectedTemplate` with `"standard_meeting"`, so that fallback was
+    // the silent default the claim forbids. Downstream consumers now guard
+    // null explicitly: `buildSummarySaveArgs` already throws; generation and
+    // export skip when null. `templates.selectedTemplate` is only the S1
+    // single-template picker value and stays independent of the active row.
+    // Ceiling: while `activeTemplateId` is null the panel offers no row to
+    // save/generate/export against — that is the intended "no row selected"
+    // state, not a degraded default.
+    const effectiveTemplateId = activeTemplateId;
+    const meetingData = useMeetingData({
+        meeting,
+        summaryData,
+        activeTemplateId: effectiveTemplateId,
+        summaryRevision,
+        onSummaryRevisionChange,
+        onMeetingUpdated,
+    });
 
     // Normalize once: the in-memory transcripts field on Meeting is optional
     const transcripts = meetingData.transcripts ?? [];
@@ -171,13 +201,45 @@ export default function PageContent({
         modelConfig: modelConfig,
         isModelConfigLoading: false,
         selectedTemplate: templates.selectedTemplate,
-        activeTemplateId,
+        activeTemplateId: effectiveTemplateId,
+        summaryRevision,
+        isExternallyProcessing: isSummaryProcessing,
+        onExternalProcessingChange: onSummaryProcessingChange,
         onMeetingUpdated,
         updateMeetingTitle: meetingData.updateMeetingTitle,
         setAiSummary: meetingData.setAiSummary,
         onOpenModelSettings: handleOpenModelSettings,
         onSummariesChanged,
+        onSummaryRevisionChange,
     });
+
+    const activeSummaryRow = summaries?.find(
+        (summary) => summary.template_id === effectiveTemplateId,
+    );
+    const localGenerationIsActive =
+        summaryGeneration.summaryStatus === "processing" ||
+        summaryGeneration.summaryStatus === "summarizing" ||
+        summaryGeneration.summaryStatus === "regenerating";
+    const selectedSummaryStatus = activeSummaryRow?.status;
+    const panelSummaryStatus =
+        isSummaryProcessing || localGenerationIsActive
+            ? summaryGeneration.summaryStatus
+            : selectedSummaryStatus === "failed" || selectedSummaryStatus === "error"
+              ? "error"
+              : selectedSummaryStatus === "completed"
+                ? "completed"
+                : selectedSummaryStatus === "processing" || selectedSummaryStatus === "summarizing" || selectedSummaryStatus === "regenerating"
+                  ? "processing"
+                  : summaryGeneration.summaryStatus;
+
+    const handleTemplateSelect = (templateId: string, templateName: string) => {
+        // Existing single-template controls are the S1 selection path. Keep
+        // the chosen row key alongside the prompt selection for saves and
+        // generation; the page-level multi-row picker remains S2.
+        setActiveTemplateId?.(templateId);
+        if (templateId !== activeTemplateId) onSummaryRevisionChange?.(null);
+        templates.handleTemplateSelection(templateId, templateName);
+    };
 
     const copyOperations = useCopyOperations({
         meeting,
@@ -272,7 +334,8 @@ export default function PageContent({
                     onCopySummary={copyOperations.handleCopySummary}
                     onOpenFolder={meetingOperations.handleOpenMeetingFolder}
                     aiSummary={meetingData.aiSummary}
-                    summaryStatus={summaryGeneration.summaryStatus}
+                     summaryStatus={panelSummaryStatus}
+                    isExternallyProcessing={isSummaryProcessing}
                     transcripts={transcripts}
                     modelConfig={modelConfig}
                     setModelConfig={setModelConfig}
@@ -285,16 +348,17 @@ export default function PageContent({
                     onSummaryChange={meetingData.handleSummaryChange}
                     onDirtyChange={meetingData.setIsSummaryDirty}
                     summaryError={summaryGeneration.summaryError}
-                    onRegenerateSummary={summaryGeneration.handleRegenerateSummary}
-                    getSummaryStatusMessage={summaryGeneration.getSummaryStatusMessage}
-                    availableTemplates={templates.availableTemplates}
-                    selectedTemplate={templates.selectedTemplate}
-                    onTemplateSelect={templates.handleTemplateSelection}
-                    summaries={summaries}
-                    activeTemplateId={activeTemplateId}
-                    onActiveTemplateChange={setActiveTemplateId}
-                    onSummariesChanged={onSummariesChanged}
-                    isModelConfigLoading={false}
+                     onRegenerateSummary={summaryGeneration.handleRegenerateSummary}
+                     getSummaryStatusMessage={summaryGeneration.getSummaryStatusMessage}
+                     availableTemplates={templates.availableTemplates}
+                     selectedTemplate={templates.selectedTemplate}
+                     onTemplateSelect={handleTemplateSelect}
+                     summaries={summaries}
+                     activeTemplateId={effectiveTemplateId}
+                     onActiveTemplateChange={setActiveTemplateId}
+                     onSummariesChanged={onSummariesChanged}
+                      pendingEditsExist={meetingData.isSummaryDirty}
+                     isModelConfigLoading={false}
                     onOpenModelSettings={handleRegisterModalOpen}
                     containerRef={setSummaryContainer}
                     compact={isSummaryCompact}

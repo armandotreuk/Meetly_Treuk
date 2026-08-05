@@ -2,6 +2,13 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
+pub fn serialize_id_as_string<S>(id: &i64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&format!("db:{}", id))
+}
+
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct MeetingModel {
     pub id: String,
@@ -158,9 +165,11 @@ pub struct TranscriptSetting {
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct Template {
+    #[serde(serialize_with = "serialize_id_as_string")]
     pub id: i64,
     pub name: String,
     pub description: Option<String>,
+    pub stable_id: Option<String>,
     #[sqlx(rename = "schema_json")]
     #[serde(rename = "schema_json")]
     pub schema_json: String,
@@ -173,4 +182,26 @@ pub struct Template {
     #[sqlx(rename = "updated_at")]
     #[serde(rename = "updated_at")]
     pub updated_at: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Template;
+
+    #[test]
+    fn template_id_serializes_as_string() {
+        let template = Template {
+            id: 42,
+            name: "Custom".to_string(),
+            description: Some("Description".to_string()),
+            stable_id: None,
+            schema_json: "{}".to_string(),
+            is_builtin: 0,
+            created_at: "now".to_string(),
+            updated_at: "now".to_string(),
+        };
+
+        let json = serde_json::to_value(template).expect("serialize template");
+        assert_eq!(json["id"], "db:42");
+    }
 }

@@ -2,6 +2,8 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { logger } from "@/lib/logger";
+import { normalizeTemplateId } from "@/lib/template-ids";
+import { TEMPLATE_EDITOR_TAURI_ARGS } from "@/lib/template-editor-commands";
 
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
@@ -34,6 +36,11 @@ interface Template {
     description: string;
     is_builtin: boolean;
     source: string;
+    is_editable: boolean;
+}
+
+interface ApiTemplate extends Omit<Template, "id"> {
+    id: string | number;
 }
 
 interface TemplateDetails {
@@ -42,6 +49,9 @@ interface TemplateDetails {
     description: string;
     sections: string[];
     is_builtin: boolean;
+    source: string;
+    is_editable: boolean;
+    schema_json: string;
 }
 
 export function TemplateEditor() {
@@ -61,8 +71,13 @@ export function TemplateEditor() {
     const loadTemplates = useCallback(async () => {
         setIsLoading(true);
         try {
-            const result = await invoke<Template[]>("api_list_templates");
-            setTemplates(result);
+            const result = await invoke<ApiTemplate[]>("api_list_templates");
+            setTemplates(
+                result.map((template) => ({
+                    ...template,
+                    id: normalizeTemplateId(template.id, template.source),
+                }))
+            );
         } catch (error) {
             logger.error("Failed to load templates:", error);
             toast.error("Failed to load templates");
@@ -78,22 +93,21 @@ export function TemplateEditor() {
     const handleViewTemplate = async (template: Template) => {
         try {
             const details = await invoke<TemplateDetails>("api_get_template_details", {
-                templateId: template.id,
+                [TEMPLATE_EDITOR_TAURI_ARGS.templateId]: template.id,
+                [TEMPLATE_EDITOR_TAURI_ARGS.templateSource]: template.source,
             });
-            setSelectedTemplate(details);
-            if (!template.is_builtin) {
-                setEditingTemplate(details);
-                setFormName(details.name);
-                setFormDescription(details.description);
-                // Fetch full schema JSON from database
-                if (template.source === "database") {
-                    // We need to get the full schema - for now use a placeholder
-                    const dbTemplates = await invoke<any[]>("list_templates");
-                    const dbTemplate = dbTemplates.find((t) => t.id === template.id);
-                    if (dbTemplate) {
-                        setFormSchemaJson(dbTemplate.schema_json);
-                    }
-                }
+            const normalizedDetails = {
+                ...details,
+                id: normalizeTemplateId(details.id, details.source),
+            };
+            setSelectedTemplate(normalizedDetails);
+            if (template.is_editable && template.source === "database") {
+                setEditingTemplate(normalizedDetails);
+                setFormName(normalizedDetails.name);
+                setFormDescription(normalizedDetails.description);
+                setFormSchemaJson(normalizedDetails.schema_json);
+            } else {
+                setEditingTemplate(null);
             }
         } catch (error) {
             logger.error("Failed to load template details:", error);
@@ -126,8 +140,12 @@ export function TemplateEditor() {
     };
 
     const handleEditTemplate = (template: Template) => {
-        if (template.is_builtin) {
-            toast.error("Cannot edit built-in templates");
+        if (!template.is_editable || template.source !== "database") {
+            toast.error(
+                template.is_builtin
+                    ? "Cannot edit built-in templates"
+                    : "File-based templates are read-only"
+            );
             return;
         }
         handleViewTemplate(template);
@@ -135,17 +153,27 @@ export function TemplateEditor() {
     };
 
     const handleDeleteTemplate = async (template: Template) => {
-        if (template.is_builtin) {
-            toast.error("Cannot delete built-in templates");
+        if (!template.is_editable || template.source !== "database") {
+            toast.error(
+                template.is_builtin
+                    ? "Cannot delete built-in templates"
+                    : "File-based templates are read-only"
+            );
             return;
         }
         if (!confirm(`Delete template "${template.name}"? This cannot be undone.`)) return;
 
         try {
-            await invoke("delete_template", { id: parseInt(template.id) });
+            await invoke("delete_template", {
+                id: template.id,
+                [TEMPLATE_EDITOR_TAURI_ARGS.templateSource]: template.source,
+            });
             toast.success("Template deleted");
             loadTemplates();
-            if (selectedTemplate?.id === template.id) {
+            if (
+                selectedTemplate?.id === template.id &&
+                selectedTemplate.source === template.source
+            ) {
                 setSelectedTemplate(null);
                 setEditingTemplate(null);
             }
@@ -156,8 +184,19 @@ export function TemplateEditor() {
     };
 
     const handleSaveTemplate = async () => {
-        if (!formName.trim()) {
+        const name = formName.trim();
+        const description = formDescription.trim();
+
+        if (!name) {
             toast.error("Template name is required");
+            return;
+        }
+
+        if (
+            editingTemplate &&
+            (!editingTemplate.is_editable || editingTemplate.source !== "database")
+        ) {
+            toast.error("File-based templates are read-only");
             return;
         }
 
@@ -170,9 +209,18 @@ export function TemplateEditor() {
             return;
         }
 
+        // Form metadata is authoritative; keep the JSON editor's sections and other fields.
+        const schemaJson = JSON.stringify({
+            ...parsedSchema,
+            name,
+            description,
+        });
+
         // Validate against template schema
         try {
-            await invoke("api_validate_template", { templateJson: formSchemaJson });
+            await invoke("api_validate_template", {
+                [TEMPLATE_EDITOR_TAURI_ARGS.templateJson]: schemaJson,
+            });
         } catch (error) {
             toast.error(`Template validation failed: ${error}`);
             return;
@@ -183,18 +231,19 @@ export function TemplateEditor() {
             if (editingTemplate) {
                 // Update existing template
                 await invoke("update_template", {
-                    id: parseInt(editingTemplate.id),
-                    name: formName,
-                    description: formDescription,
-                    schema_json: formSchemaJson,
+                    id: editingTemplate.id,
+                    name,
+                    description,
+                    [TEMPLATE_EDITOR_TAURI_ARGS.schemaJson]: schemaJson,
+                    [TEMPLATE_EDITOR_TAURI_ARGS.templateSource]: editingTemplate.source,
                 });
                 toast.success("Template updated");
             } else {
                 // Create new template
                 await invoke("create_template", {
-                    name: formName,
-                    description: formDescription,
-                    schema_json: formSchemaJson,
+                    name,
+                    description,
+                    [TEMPLATE_EDITOR_TAURI_ARGS.schemaJson]: schemaJson,
                 });
                 toast.success("Template created");
             }
@@ -211,29 +260,27 @@ export function TemplateEditor() {
     const handleDuplicateTemplate = async (template: Template) => {
         try {
             const details = await invoke<TemplateDetails>("api_get_template_details", {
-                templateId: template.id,
+                [TEMPLATE_EDITOR_TAURI_ARGS.templateId]: template.id,
+                [TEMPLATE_EDITOR_TAURI_ARGS.templateSource]: template.source,
             });
+            const normalizedDetails = {
+                ...details,
+                id: normalizeTemplateId(details.id, details.source),
+            };
             setEditingTemplate(null);
-            setFormName(`${details.name} (Copy)`);
-            setFormDescription(details.description);
-            // Get full schema from database
-            const dbTemplates = await invoke<any[]>("list_templates");
-            const dbTemplate = dbTemplates.find((t) => t.id === template.id);
+            setFormName(`${normalizedDetails.name} (Copy)`);
+            setFormDescription(normalizedDetails.description);
             setFormSchemaJson(
-                dbTemplate?.schema_json ||
-                    JSON.stringify(
-                        {
-                            name: details.name,
-                            description: details.description,
-                            sections: details.sections.map((s) => ({
-                                title: s,
-                                instruction: "",
-                                format: "paragraph",
-                            })),
-                        },
-                        null,
-                        2
-                    )
+                normalizedDetails.schema_json ||
+                    JSON.stringify({
+                        name: normalizedDetails.name,
+                        description: normalizedDetails.description,
+                        sections: normalizedDetails.sections.map((s) => ({
+                            title: s,
+                            instruction: "Provide details for this section",
+                            format: "paragraph",
+                        })),
+                    })
             );
             setShowCreateDialog(true);
         } catch (error) {
@@ -287,9 +334,10 @@ export function TemplateEditor() {
                         <div className="space-y-2">
                             {templates.map((template) => (
                                 <div
-                                    key={template.id}
+                                    key={`${template.source}:${template.id}`}
                                     className={`p-3 rounded-lg cursor-pointer transition-colors ${
-                                        selectedTemplate?.id === template.id
+                                        selectedTemplate?.id === template.id &&
+                                        selectedTemplate.source === template.source
                                             ? "bg-blue-50 border border-blue-200"
                                             : "hover:bg-white hover:border-gray-200 border"
                                     }`}
@@ -306,8 +354,7 @@ export function TemplateEditor() {
                                                         Built-in
                                                     </span>
                                                 )}
-                                                {template.source === "database" &&
-                                                    !template.is_builtin && (
+                                                {template.is_editable && (
                                                         <span className="text-xs px-1.5 py-0.5 bg-green-100 text-green-700 rounded">
                                                             Custom
                                                         </span>
@@ -317,7 +364,7 @@ export function TemplateEditor() {
                                                 {template.description}
                                             </p>
                                         </div>
-                                        {!template.is_builtin && (
+                                        {template.is_editable && (
                                             <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
                                                 <Button
                                                     variant="ghost"
@@ -370,15 +417,17 @@ export function TemplateEditor() {
                                                 Built-in (read-only)
                                             </span>
                                         )}
-                                        {!editingTemplate && !selectedTemplate.is_builtin && (
+                                        {!selectedTemplate.is_builtin && !selectedTemplate.is_editable && (
+                                            <span className="text-xs px-2 py-1 bg-gray-100 text-gray-600 rounded-full">
+                                                Read-only
+                                            </span>
+                                        )}
+                                        {!editingTemplate && selectedTemplate.is_editable && (
                                             <Button
                                                 variant="outline"
                                                 size="sm"
                                                 onClick={() =>
-                                                    handleEditTemplate({
-                                                        ...selectedTemplate,
-                                                        is_builtin: false,
-                                                    } as any)
+                                                    handleEditTemplate(selectedTemplate)
                                                 }
                                             >
                                                 Edit
@@ -505,14 +554,11 @@ export function TemplateEditor() {
                                         </div>
 
                                         <div className="flex justify-end gap-2 pt-4 border-t border-gray-200">
-                                            {!selectedTemplate.is_builtin && (
+                                            {selectedTemplate.is_editable && (
                                                 <Button
                                                     variant="outline"
                                                     onClick={() =>
-                                                        handleEditTemplate({
-                                                            ...selectedTemplate,
-                                                            is_builtin: false,
-                                                        } as any)
+                                                        handleEditTemplate(selectedTemplate)
                                                     }
                                                 >
                                                     Edit Template

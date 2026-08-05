@@ -1,18 +1,21 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
-import { Transcript, Summary } from '@/types';
+import { Transcript, Summary, SummaryRevision } from '@/types';
 import { BlockNoteSummaryViewRef } from '@/components/AISummary/BlockNoteSummaryView';
 import { CurrentMeeting, useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { invoke as invokeTauri } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
+import { buildSummarySaveArgs } from '@/lib/summary-command-args';
 
 interface UseMeetingDataProps {
   meeting: any;
   summaryData: Summary | null;
   activeTemplateId?: string | null;
+  summaryRevision?: SummaryRevision | null;
+  onSummaryRevisionChange?: (revision: SummaryRevision | null) => void;
   onMeetingUpdated?: () => Promise<void>;
 }
 
-export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMeetingDataProps) {
+export function useMeetingData({ meeting, summaryData, activeTemplateId, summaryRevision, onSummaryRevisionChange, onMeetingUpdated }: UseMeetingDataProps) {
   // State
   // Use prop directly since summary generation fetches transcripts independently
   const transcripts = meeting.transcripts;
@@ -21,7 +24,7 @@ export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMe
   const [isTitleDirty, setIsTitleDirty] = useState(false);
   const [aiSummary, setAiSummary] = useState<Summary | null>(summaryData);
   const [isSaving, setIsSaving] = useState(false);
-  const [, setIsSummaryDirty] = useState(false);
+  const [isSummaryDirty, setIsSummaryDirty] = useState(false);
   const [, setError] = useState<string>('');
 
   // Ref for BlockNoteSummaryView
@@ -65,6 +68,7 @@ export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMe
         id: meeting.id,
         title: meetingTitle,
         created_at: meeting.created_at,
+        folder_id: meeting.folder_id ?? null,
       });
       return true;
     } catch (error) {
@@ -76,7 +80,7 @@ export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMe
       }
       return false;
     }
-  }, [meeting.id, meetingTitle, sidebarMeetings, setMeetings, setCurrentMeeting]);
+  }, [meeting.id, meeting.folder_id, meetingTitle, sidebarMeetings, setMeetings, setCurrentMeeting]);
 
   const handleSaveSummary = useCallback(async (summary: Summary | { markdown?: string; summary_json?: any[] }) => {
     console.log('📄 handleSaveSummary called with:', {
@@ -105,10 +109,19 @@ export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMe
         };
       }
 
-      await invokeTauri('api_save_meeting_summary', {
+      const savedRevision = await invokeTauri<{ start?: string | null; updated_at?: string }>('api_save_meeting_summary', buildSummarySaveArgs({
         meetingId: meeting.id,
         summary: formattedSummary,
-      });
+        templateId: activeTemplateId,
+        revision: summaryRevision,
+      }));
+      if (savedRevision?.updated_at && summaryRevision) {
+        onSummaryRevisionChange?.({
+          templateId: activeTemplateId ?? summaryRevision.templateId,
+          startTime: savedRevision.start ?? summaryRevision.startTime,
+          updatedAt: savedRevision.updated_at,
+        });
+      }
 
       console.log('✅ Save meeting summary success');
     } catch (error) {
@@ -118,8 +131,9 @@ export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMe
       } else {
         setError('Failed to save meeting summary: Unknown error');
       }
+      throw error;
     }
-  }, [meeting.id, meetingTitle]);
+  }, [meeting.id, meetingTitle, activeTemplateId, summaryRevision, onSummaryRevisionChange]);
 
   const saveAllChanges = useCallback(async () => {
     setIsSaving(true);
@@ -158,8 +172,9 @@ export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMe
       id: meeting.id,
       title: newTitle,
       created_at: meeting.created_at,
+      folder_id: meeting.folder_id ?? null,
     });
-  }, [meeting.id, sidebarMeetings, setMeetings, setCurrentMeeting]);
+  }, [meeting.id, meeting.folder_id, sidebarMeetings, setMeetings, setCurrentMeeting]);
 
   return {
     // State
@@ -169,6 +184,7 @@ export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMe
     isTitleDirty,
     aiSummary,
     isSaving,
+    isSummaryDirty,
     blockNoteSummaryRef,
 
     // Setters

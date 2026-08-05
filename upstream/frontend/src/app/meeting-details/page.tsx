@@ -1,7 +1,7 @@
 "use client"
 import { useSidebar } from "@/components/Sidebar/SidebarProvider";
 import { useState, useEffect, useCallback, Suspense } from "react";
-import { Transcript, Summary } from "@/types";
+import { Transcript, Summary, SummaryRevision } from "@/types";
 import PageContent from "./page-content";
 import { useRouter, useSearchParams } from "next/navigation";
 import Analytics from "@/lib/analytics";
@@ -9,12 +9,19 @@ import { invoke } from "@tauri-apps/api/core";
 import { LoaderIcon } from "lucide-react";
 import { useConfig } from "@/contexts/ConfigContext";
 import { usePaginatedTranscripts } from "@/hooks/usePaginatedTranscripts";
+import { canAutoGenerateSummary, isSummaryInProgress } from "@/lib/summary-status";
+import { normalizeTemplateId } from "@/lib/template-ids";
+import { buildSummaryLookupArgs } from "@/lib/summary-command-args";
+import { summaryResponseMatchesTemplate } from "@/lib/summary-selection";
+import { useMeetingSummaries } from "@/hooks/meeting-details/useMeetingSummaries";
+import { useActiveSummaryTemplate } from "@/hooks/useActiveSummaryTemplate";
 
 interface MeetingDetailsResponse {
   id: string;
   title: string;
   created_at: string;
   updated_at: string;
+  folder_id?: string | null;
   transcripts: Transcript[];
   folder_path?: string;
 }
@@ -23,15 +30,33 @@ function MeetingDetailsContent() {
   const searchParams = useSearchParams();
   const meetingId = searchParams.get('id');
   const source = searchParams.get('source'); // Check if navigated from recording
-  const { setCurrentMeeting, refetchMeetings, stopSummaryPolling } = useSidebar();
+  const { setCurrentMeeting, refetchMeetings, startSummaryPolling, stopSummaryPolling } = useSidebar();
   const { isAutoSummary } = useConfig(); // Get auto-summary toggle state
   const router = useRouter();
   const [meetingDetails, setMeetingDetails] = useState<MeetingDetailsResponse | null>(null);
   const [meetingSummary, setMeetingSummary] = useState<Summary | null>(null);
+  const [summaryRevision, setSummaryRevision] = useState<SummaryRevision | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [isSummaryProcessing, setIsSummaryProcessing] = useState<boolean>(false);
+  const [hasLoadedInitialSummary, setHasLoadedInitialSummary] = useState<boolean>(false);
   const [shouldAutoGenerate, setShouldAutoGenerate] = useState<boolean>(false);
   const [hasCheckedAutoGen, setHasCheckedAutoGen] = useState<boolean>(false);
+
+  const {
+    summaries,
+    ready: summariesReady,
+    refresh: refreshSummaries,
+  } = useMeetingSummaries(meetingId);
+  const {
+    activeTemplateId,
+    setActiveTemplateId,
+    ready: activeTemplateReady,
+  } = useActiveSummaryTemplate(
+    meetingId,
+    summaries,
+    summariesReady,
+  );
 
   // Use pagination hook for efficient transcript loading
   const {
@@ -132,6 +157,7 @@ function MeetingDetailsContent() {
         title: metadata.title,
         created_at: metadata.created_at,
         updated_at: metadata.updated_at,
+        folder_id: metadata.folder_id,
         transcripts: transcripts, // Paginated transcripts from hook
         folder_path: metadata.folder_path, // For retranscription feature
       });
@@ -141,6 +167,7 @@ function MeetingDetailsContent() {
         id: metadata.id,
         title: metadata.title,
         created_at: metadata.created_at,
+        folder_id: metadata.folder_id,
       });
     }
   }, [metadata, transcripts, meetingId, setCurrentMeeting]);
@@ -164,10 +191,29 @@ function MeetingDetailsContent() {
     console.log('fetchMeetingDetails called - pagination hook will handle refetch');
   }, [meetingId]);
 
+  const handleActiveTemplateChange = useCallback((templateId: string | null) => {
+    const normalizedTemplateId = templateId ? normalizeTemplateId(templateId) : null;
+    if (normalizedTemplateId === activeTemplateId) return;
+
+    // Clear the old row before the exact read completes. Switching is a read
+    // operation only; generation remains behind the primary button.
+    setMeetingSummary(null);
+    setSummaryRevision(null);
+    setIsSummaryProcessing(false);
+    setHasLoadedInitialSummary(false);
+    // Auto-generation is only a first-open behavior. An empty selected row
+    // must never cause a switch to start generation implicitly.
+    setHasCheckedAutoGen(true);
+    setActiveTemplateId(normalizedTemplateId);
+  }, [activeTemplateId, setActiveTemplateId]);
+
   // Reset states when meetingId changes (prevent race conditions)
   useEffect(() => {
     setMeetingDetails(null);
     setMeetingSummary(null);
+    setSummaryRevision(null);
+    setIsSummaryProcessing(false);
+    setHasLoadedInitialSummary(false);
     setError(null);
     setIsLoading(true);
     // Reset auto-generation state to allow new meeting to be checked
@@ -198,123 +244,215 @@ function MeetingDetailsContent() {
 
     console.log('Valid meeting ID found, fetching details for:', meetingId);
 
-    setMeetingDetails(null);
+    // The summary list resolves the active row first. Until then there is no
+    // safe template identity to use for a summary read.
+    if (!summariesReady || !activeTemplateReady || !activeTemplateId) return;
+    const requestedTemplateId = normalizeTemplateId(activeTemplateId);
+
     setMeetingSummary(null);
+    setSummaryRevision(null);
+    setIsSummaryProcessing(false);
+    setHasLoadedInitialSummary(false);
     setError(null);
-    setIsLoading(true);
+
+    let cancelled = false;
+    let pollGeneration: string | null = null;
+
+    const applySummaryResponse = (summary: any) => {
+      if (cancelled || !summary) return;
+      if (!summaryResponseMatchesTemplate(summary, requestedTemplateId)) {
+        console.warn('Ignoring summary response for a different template:', summary.template_id);
+        return;
+      }
+
+      const summaryIsProcessing = isSummaryInProgress(summary.status);
+      setIsSummaryProcessing(summaryIsProcessing);
+
+      const responseTemplateId = summary.template_id
+        ? normalizeTemplateId(summary.template_id)
+        : requestedTemplateId;
+      if (summary.updated_at && responseTemplateId) {
+        setSummaryRevision({
+          templateId: responseTemplateId,
+          startTime: summary.start ?? null,
+          updatedAt: summary.updated_at,
+        });
+      }
+
+      // A processing row may not have result data yet. Keep the current view
+      // intact and let the poll deliver the completed row.
+      if (summaryIsProcessing && !summary.data) {
+        return;
+      }
+
+      // Failed/cancelled rows may still contain restored backup data. Without
+      // data there is no editor content to display for any terminal state.
+      if (!summary.data) {
+        console.warn('Meeting summary not found or no summary generated yet:', summary.error || 'idle');
+        setMeetingSummary(null);
+        setSummaryRevision(null);
+        return;
+      }
+
+      const summaryData = summary.data || {};
+
+      // Parse if it's a JSON string (backend may return double-encoded JSON)
+      let parsedData = summaryData;
+      if (typeof summaryData === 'string') {
+        try {
+          parsedData = JSON.parse(summaryData);
+        } catch (e) {
+          parsedData = {};
+        }
+      }
+
+      console.log('🔍 FETCH SUMMARY: Parsed data:', parsedData);
+
+      // Priority 1: BlockNote JSON format
+      if (parsedData.summary_json) {
+        setMeetingSummary(parsedData as any);
+        return;
+      }
+
+      // Priority 2: Markdown format
+      if (parsedData.markdown) {
+        setMeetingSummary(parsedData as any);
+        return;
+      }
+
+      // Legacy format - apply formatting
+      console.log('LEGACY FORMAT: Detected legacy format, applying section formatting');
+
+      const { MeetingName, _section_order, ...restSummaryData } = parsedData;
+
+      // Format the summary data with consistent styling - PRESERVE ORDER
+      const formattedSummary: Summary = {};
+
+      // Use section order if available to maintain exact order and handle duplicates
+      const sectionKeys = _section_order || Object.keys(restSummaryData);
+
+      console.log('LEGACY FORMAT: Processing sections:', sectionKeys);
+
+      for (const key of sectionKeys) {
+        try {
+          const section = restSummaryData[key];
+          // Comprehensive null checks to prevent the error
+          if (section &&
+            typeof section === 'object' &&
+            'title' in section &&
+            'blocks' in section) {
+            const typedSection = section as { title?: string; blocks?: any[] };
+
+            // Ensure blocks is an array before mapping
+            if (Array.isArray(typedSection.blocks)) {
+              formattedSummary[key] = {
+                title: typedSection.title || key,
+                blocks: typedSection.blocks.map((block: any) => ({
+                  ...block,
+                  // type: 'bullet',
+                  color: 'default',
+                  content: block?.content?.trim() || ''
+                }))
+              };
+            } else {
+              // Handle case where blocks is not an array
+              console.warn(`LEGACY FORMAT: Section ${key} has invalid blocks:`, typedSection.blocks);
+              formattedSummary[key] = {
+                title: typedSection.title || key,
+                blocks: []
+              };
+            }
+          } else {
+            console.warn(`LEGACY FORMAT: Skipping invalid section ${key}:`, section);
+          }
+        } catch (error) {
+          console.warn(`LEGACY FORMAT: Error processing section ${key}:`, error);
+          // Continue processing other sections
+        }
+      }
+
+      console.log('LEGACY FORMAT: Formatted summary:', formattedSummary);
+      setMeetingSummary(formattedSummary);
+    };
+
+    const handlePollingResult = (pollingResult: any) => {
+      applySummaryResponse(pollingResult);
+      if (['completed', 'error', 'failed', 'cancelled', 'idle'].includes(pollingResult?.status)) {
+        void refreshSummaries().catch((error) => {
+          console.warn('Failed to refresh summary list after polling:', error);
+        });
+      }
+    };
 
     const fetchMeetingSummary = async () => {
       try {
-        const summary = await invoke('api_get_summary', {
-          meetingId: meetingId,
-        }) as any;
+        const summary = await invoke('api_get_summary', buildSummaryLookupArgs(
+          meetingId,
+          requestedTemplateId,
+        )) as any;
 
         console.log('FETCH SUMMARY: Raw response:', summary);
-
-        // Check if the summary request failed with 404 or error status, or if no summary exists yet (idle)
-        // Note: 'cancelled' and 'failed' statuses can still have data if backup was restored
-        if (summary.status === 'idle' || (!summary.data && summary.status === 'error')) {
-          console.warn('Meeting summary not found or no summary generated yet:', summary.error || 'idle');
-          setMeetingSummary(null);
-          return;
-        }
-
-        const summaryData = summary.data || {};
-
-        // Parse if it's a JSON string (backend may return double-encoded JSON)
-        let parsedData = summaryData;
-        if (typeof summaryData === 'string') {
-          try {
-            parsedData = JSON.parse(summaryData);
-          } catch (e) {
-            parsedData = {};
-          }
-        }
-
-        console.log('🔍 FETCH SUMMARY: Parsed data:', parsedData);
-
-        // Priority 1: BlockNote JSON format
-        if (parsedData.summary_json) {
-          setMeetingSummary(parsedData as any);
-          return;
-        }
-
-        // Priority 2: Markdown format
-        if (parsedData.markdown) {
-          setMeetingSummary(parsedData as any);
-          return;
-        }
-
-        // Legacy format - apply formatting
-        console.log('LEGACY FORMAT: Detected legacy format, applying section formatting');
-
-        const { MeetingName, _section_order, ...restSummaryData } = parsedData;
-
-        // Format the summary data with consistent styling - PRESERVE ORDER
-        const formattedSummary: Summary = {};
-
-        // Use section order if available to maintain exact order and handle duplicates
-        const sectionKeys = _section_order || Object.keys(restSummaryData);
-
-        console.log('LEGACY FORMAT: Processing sections:', sectionKeys);
-
-        for (const key of sectionKeys) {
-          try {
-            const section = restSummaryData[key];
-            // Comprehensive null checks to prevent the error
-            if (section &&
-              typeof section === 'object' &&
-              'title' in section &&
-              'blocks' in section) {
-              const typedSection = section as { title?: string; blocks?: any[] };
-
-              // Ensure blocks is an array before mapping
-              if (Array.isArray(typedSection.blocks)) {
-                formattedSummary[key] = {
-                  title: typedSection.title || key,
-                  blocks: typedSection.blocks.map((block: any) => ({
-                    ...block,
-                    // type: 'bullet',
-                    color: 'default',
-                    content: block?.content?.trim() || ''
-                  }))
-                };
-              } else {
-                // Handle case where blocks is not an array
-                console.warn(`LEGACY FORMAT: Section ${key} has invalid blocks:`, typedSection.blocks);
-                formattedSummary[key] = {
-                  title: typedSection.title || key,
-                  blocks: []
-                };
-              }
-            } else {
-              console.warn(`LEGACY FORMAT: Skipping invalid section ${key}:`, section);
-            }
-          } catch (error) {
-            console.warn(`LEGACY FORMAT: Error processing section ${key}:`, error);
-            // Continue processing other sections
-          }
-        }
-
-        console.log('LEGACY FORMAT: Formatted summary:', formattedSummary);
-        setMeetingSummary(formattedSummary);
+        applySummaryResponse(summary);
+        return summary;
       } catch (error) {
         console.error('FETCH SUMMARY: Error fetching meeting summary:', error);
         // Don't set error state for summary fetch failure, set to null to show generate button
-        setMeetingSummary(null);
+        if (!cancelled) {
+          setMeetingSummary(null);
+          setIsSummaryProcessing(false);
+        }
+        return null;
       }
     };
 
     const loadData = async () => {
       try {
-        await fetchMeetingSummary();
+        const summary = await fetchMeetingSummary();
+        if (!cancelled && !summary) {
+          // A failed initial read is not proof that no process exists.
+          setHasCheckedAutoGen(true);
+        } else if (!cancelled && summary && isSummaryInProgress(summary.status)) {
+          // An existing process must be allowed to finish; otherwise the
+          // auto-generation check can start a second process on page load.
+          setHasCheckedAutoGen(true);
+          const templateId = summary.template_id
+            ? normalizeTemplateId(summary.template_id)
+            : requestedTemplateId;
+          if (summary.start) {
+            pollGeneration = summary.start;
+            startSummaryPolling(
+              meetingId,
+              meetingId,
+              templateId,
+              summary.start,
+              handlePollingResult,
+            );
+          }
+        }
       } finally {
-        setIsLoading(false);
+        if (!cancelled) {
+          setHasLoadedInitialSummary(true);
+          setIsLoading(false);
+        }
       }
     };
 
     loadData();
-  }, [meetingId]);
+    return () => {
+      cancelled = true;
+      if (pollGeneration) {
+        stopSummaryPolling(meetingId, requestedTemplateId, pollGeneration);
+      }
+    };
+  }, [
+    meetingId,
+    activeTemplateId,
+    summariesReady,
+    activeTemplateReady,
+    refreshSummaries,
+    startSummaryPolling,
+    stopSummaryPolling,
+  ]);
 
   // Auto-generation check: runs when meeting is loaded with no summary
   useEffect(() => {
@@ -329,7 +467,12 @@ function MeetingDetailsContent() {
         meetingSummary === null &&
         meetingDetails.transcripts &&
         meetingDetails.transcripts.length > 0 &&
-        !hasCheckedAutoGen
+        canAutoGenerateSummary({
+          initialSummaryLoaded: hasLoadedInitialSummary,
+          isSummaryProcessing,
+          hasCheckedAutoGen,
+          hasTranscripts: meetingDetails.transcripts.length > 0,
+        })
       ) {
         console.log('No summary found, checking for auto-generation...');
         await setupAutoGeneration();
@@ -337,7 +480,7 @@ function MeetingDetailsContent() {
     };
 
     checkAutoGen();
-  }, [meetingDetails, meetingSummary, hasCheckedAutoGen, setupAutoGeneration]);
+  }, [meetingDetails, meetingSummary, hasLoadedInitialSummary, isSummaryProcessing, hasCheckedAutoGen, setupAutoGeneration]);
 
   if (error) {
     return (
@@ -365,6 +508,14 @@ function MeetingDetailsContent() {
   return <PageContent
     meeting={meetingDetails}
     summaryData={meetingSummary}
+    activeTemplateId={activeTemplateId}
+    setActiveTemplateId={handleActiveTemplateChange}
+    summaries={summaries}
+    onSummariesChanged={refreshSummaries}
+    summaryRevision={summaryRevision}
+    onSummaryRevisionChange={setSummaryRevision}
+    isSummaryProcessing={isSummaryProcessing}
+    onSummaryProcessingChange={setIsSummaryProcessing}
     shouldAutoGenerate={shouldAutoGenerate}
     onAutoGenerateComplete={() => setShouldAutoGenerate(false)}
     onMeetingUpdated={async () => {

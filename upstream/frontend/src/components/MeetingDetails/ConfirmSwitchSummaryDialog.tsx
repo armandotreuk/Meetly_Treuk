@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
     Dialog,
     DialogContent,
@@ -18,7 +18,9 @@ interface ConfirmSwitchSummaryDialogProps {
     onOpenChange: (open: boolean) => void;
     summaries: MeetingSummaryInfo[];
     currentTemplateId: string | null;
-    onConfirm: (newTemplateId: string) => void;
+    pendingTemplateId?: string | null;
+    onDiscard?: (newTemplateId: string) => void;
+    onSaveAndSwitch?: (newTemplateId: string) => void | Promise<void>;
     pendingEditsExist: boolean;
     templateNames?: Record<string, string>;
 }
@@ -39,21 +41,37 @@ export function ConfirmSwitchSummaryDialog({
     onOpenChange,
     summaries,
     currentTemplateId,
-    onConfirm,
+    pendingTemplateId,
+    onDiscard,
+    onSaveAndSwitch,
     pendingEditsExist,
     templateNames,
 }: ConfirmSwitchSummaryDialogProps) {
-    const [selected, setSelected] = useState<string | null>(currentTemplateId);
+    const [selected, setSelected] = useState<string | null>(pendingTemplateId ?? currentTemplateId);
+
+    useEffect(() => {
+        if (open) setSelected(pendingTemplateId ?? currentTemplateId);
+    }, [open, pendingTemplateId, currentTemplateId]);
 
     const displayName = (id: string) =>
         (templateNames && templateNames[id]) || id;
 
-    const handleConfirm = () => {
-        if (!selected || selected === currentTemplateId) {
+    const targetTemplateId = selected;
+
+    const handleDiscard = () => {
+        if (!targetTemplateId || targetTemplateId === currentTemplateId) {
             onOpenChange(false);
             return;
         }
-        onConfirm(selected);
+        onDiscard?.(targetTemplateId);
+    };
+
+    const handleSaveAndSwitch = async () => {
+        if (!targetTemplateId || targetTemplateId === currentTemplateId) {
+            onOpenChange(false);
+            return;
+        }
+        if (onSaveAndSwitch) await onSaveAndSwitch(targetTemplateId);
     };
 
     return (
@@ -112,18 +130,27 @@ export function ConfirmSwitchSummaryDialog({
                             </button>
                         );
                     })}
+                    {pendingTemplateId && !summaries.some((s) => s.template_id === pendingTemplateId) && (
+                        <div className="rounded-md border border-primary bg-accent px-3 py-2 text-sm">
+                            Switch to <span className="font-medium">{displayName(pendingTemplateId)}</span>
+                        </div>
+                    )}
                 </div>
 
                 <DialogFooter>
                     <Button variant="outline" onClick={() => onOpenChange(false)}>
                         Cancel
                     </Button>
-                    <Button
-                        onClick={handleConfirm}
-                        disabled={!selected || selected === currentTemplateId}
-                    >
-                        Switch
-                    </Button>
+                    {onDiscard && (
+                        <Button onClick={handleDiscard} disabled={!targetTemplateId || targetTemplateId === currentTemplateId}>
+                            Discard & switch
+                        </Button>
+                    )}
+                    {onSaveAndSwitch && (
+                        <Button onClick={() => void handleSaveAndSwitch()} disabled={!targetTemplateId || targetTemplateId === currentTemplateId}>
+                            Save & switch
+                        </Button>
+                    )}
                 </DialogFooter>
             </DialogContent>
         </Dialog>

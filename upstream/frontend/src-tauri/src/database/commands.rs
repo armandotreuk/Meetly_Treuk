@@ -321,13 +321,12 @@ pub async fn save_meeting_notes(
     .map_err(|e| format!("Failed to save meeting notes: {}", e))?;
 
     // Export notes.md to the meeting folder (fire-and-forget on IO error — DB is the source of truth).
-    let folder_path: Option<Option<String>> = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT folder_path FROM meetings WHERE id = ?",
-    )
-    .bind(&meeting_id)
-    .fetch_optional(pool)
-    .await
-    .unwrap_or(None);
+    let folder_path: Option<Option<String>> =
+        sqlx::query_scalar::<_, Option<String>>("SELECT folder_path FROM meetings WHERE id = ?")
+            .bind(&meeting_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None);
     if let Some(Some(path)) = folder_path {
         let notes_md = std::path::Path::new(&path).join("notes.md");
         let content = notes_markdown.clone().unwrap_or_default();
@@ -352,14 +351,13 @@ pub async fn delete_meeting_notes(
     let pool = state.db_manager.pool();
 
     // Look up folder before deleting the DB row.
-    let folder_path: Option<Option<String>> = sqlx::query_scalar(
-        "SELECT folder_path FROM meetings WHERE id = ?",
-    )
-    .bind(&meeting_id)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten();
+    let folder_path: Option<Option<String>> =
+        sqlx::query_scalar("SELECT folder_path FROM meetings WHERE id = ?")
+            .bind(&meeting_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
 
     super::repositories::meeting_notes::MeetingNotesRepository::delete_notes(pool, &meeting_id)
         .await
@@ -406,6 +404,47 @@ pub async fn list_builtin_templates(
         .map_err(|e| format!("Failed to list builtin templates: {}", e))
 }
 
+async fn ensure_database_template_mutation(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+    source: Option<&str>,
+) -> Result<i64, String> {
+    let database_id = crate::summary::templates::parse_database_template_id(id)
+        .or_else(|| {
+            (source == Some("database"))
+                .then(|| id.parse::<i64>().ok().filter(|id| *id > 0))
+                .flatten()
+        })
+        .ok_or_else(|| {
+            if source == Some("database") {
+                "Invalid database template ID".to_string()
+            } else {
+                "Database template mutations require an explicit database template ID".to_string()
+            }
+        })?;
+
+    if matches!(source, Some(value) if value != "database") {
+        return Err("File-based templates are read-only".to_string());
+    }
+
+    let template =
+        super::repositories::templates::TemplatesRepository::get_by_id(pool, database_id)
+            .await
+            .map_err(|e| format!("Failed to get template: {}", e))?
+            .ok_or_else(|| "Database template not found".to_string())?;
+    if template.is_builtin != 0 {
+        return Err("Cannot modify built-in template".to_string());
+    }
+    Ok(database_id)
+}
+
+fn validate_create_template_source(source: Option<&str>) -> Result<(), String> {
+    if matches!(source, Some(value) if value != "database") {
+        return Err("File-based templates are read-only".to_string());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn get_template(
     state: State<'_, AppState>,
@@ -423,7 +462,9 @@ pub async fn create_template(
     name: String,
     description: String,
     schema_json: String,
+    template_source: Option<String>,
 ) -> Result<super::repositories::templates::Template, String> {
+    validate_create_template_source(template_source.as_deref())?;
     let pool = state.db_manager.pool();
     super::repositories::templates::TemplatesRepository::create(
         pool,
@@ -440,12 +481,14 @@ pub async fn create_template(
 #[tauri::command]
 pub async fn update_template(
     state: State<'_, AppState>,
-    id: i64,
+    id: String,
     name: Option<String>,
     description: Option<String>,
     schema_json: Option<String>,
+    template_source: Option<String>,
 ) -> Result<super::repositories::templates::Template, String> {
     let pool = state.db_manager.pool();
+    let id = ensure_database_template_mutation(pool, &id, template_source.as_deref()).await?;
     super::repositories::templates::TemplatesRepository::update(
         pool,
         id,
@@ -460,9 +503,142 @@ pub async fn update_template(
 }
 
 #[tauri::command]
-pub async fn delete_template(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+pub async fn delete_template(
+    state: State<'_, AppState>,
+    id: String,
+    template_source: Option<String>,
+) -> Result<(), String> {
     let pool = state.db_manager.pool();
+    let id = ensure_database_template_mutation(pool, &id, template_source.as_deref()).await?;
     super::repositories::templates::TemplatesRepository::delete(pool, id)
         .await
         .map_err(|e| format!("Failed to delete template: {}", e))
+}
+
+#[cfg(test)]
+mod template_mutation_tests {
+    use super::{ensure_database_template_mutation, validate_create_template_source};
+    use sqlx::SqlitePool;
+
+    #[test]
+    fn non_database_sources_are_rejected() {
+        assert!(validate_create_template_source(Some("custom")).is_err());
+        assert!(validate_create_template_source(Some("bundled")).is_err());
+        assert!(validate_create_template_source(Some("builtin")).is_err());
+        assert!(validate_create_template_source(Some("database")).is_ok());
+        assert!(validate_create_template_source(None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn database_source_hint_cannot_mutate_a_builtin_row() {
+        let pool = SqlitePool::connect(":memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        sqlx::query(
+            r#"
+            CREATE TABLE templates (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL,
+                stable_id TEXT,
+                schema_json TEXT NOT NULL,
+                is_builtin INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create template schema");
+        sqlx::query(
+            "INSERT INTO templates (id, name, description, schema_json, is_builtin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(42_i64)
+        .bind("Builtin")
+        .bind("Builtin")
+        .bind("{}")
+        .bind(1_i64)
+        .bind("now")
+        .bind("now")
+        .execute(&pool)
+        .await
+        .expect("insert builtin template");
+
+        assert!(
+            ensure_database_template_mutation(&pool, "db:42", Some("database"))
+                .await
+                .is_err()
+        );
+        assert!(ensure_database_template_mutation(&pool, "db:42", None)
+            .await
+            .is_err());
+        assert!(ensure_database_template_mutation(&pool, "42", None)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_database_mutation_ignores_a_colliding_file_template() {
+        let pool = SqlitePool::connect(":memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        sqlx::query(
+            r#"
+            CREATE TABLE templates (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL,
+                stable_id TEXT,
+                schema_json TEXT NOT NULL,
+                is_builtin INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create template schema");
+        sqlx::query(
+            "INSERT INTO templates (id, name, description, schema_json, is_builtin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(77_i64)
+        .bind("Database template")
+        .bind("Database template")
+        .bind("{}")
+        .bind(0_i64)
+        .bind("now")
+        .bind("now")
+        .execute(&pool)
+        .await
+        .expect("insert database template");
+
+        let dir = tempfile::tempdir().expect("create bundled template directory");
+        std::fs::write(
+            dir.path().join("77.json"),
+            r#"{
+                "name": "File template",
+                "description": "File template",
+                "sections": [{
+                    "title": "Summary",
+                    "instruction": "Summarize",
+                    "format": "paragraph"
+                }]
+            }"#,
+        )
+        .expect("write colliding file template");
+        let _lock = crate::summary::templates::acquire_template_test_lock();
+        crate::summary::templates::set_bundled_templates_dir(dir.path().to_path_buf());
+
+        let id = ensure_database_template_mutation(&pool, "db:77", Some("database"))
+            .await
+            .expect("DB namespace must target the database row directly");
+        assert_eq!(id, 77);
+        assert!(
+            ensure_database_template_mutation(&pool, "file:77", Some("file"))
+                .await
+                .is_err()
+        );
+    }
 }

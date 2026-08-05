@@ -20,7 +20,7 @@ interface ConfirmDeleteSummaryDialogProps {
     meetingId: string;
     templateId: string;
     templateDisplayName?: string;
-    onDeleted: () => void;
+    onDeleted: () => void | Promise<void>;
 }
 
 export function ConfirmDeleteSummaryDialog({
@@ -38,8 +38,11 @@ export function ConfirmDeleteSummaryDialog({
         setIsDeleting(true);
         try {
             // ponytail: backend cancel-then-deletes (commands.rs), so no client-side cancel needed.
-            await invokeTauri("api_delete_meeting_summary", { meetingId, templateId });
-            onDeleted();
+            const result = await invokeTauri<{ removed?: boolean }>("api_delete_meeting_summary", {
+                meetingId,
+                templateId,
+            });
+            if (result?.removed !== false) await onDeleted();
             onOpenChange(false);
         } catch (err) {
             const msg =

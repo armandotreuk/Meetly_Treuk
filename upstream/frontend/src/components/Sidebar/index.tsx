@@ -130,7 +130,10 @@ const Sidebar: React.FC = () => {
     renameFolder,
     moveFolder,
     deleteFolder,
-    moveMeetingToFolder
+    moveMeetingToFolder,
+    sidebarWidth,
+    sidebarDragging,
+    resizeHandleProps,
   } = useSidebar();
 
   // Get recording state from RecordingStateContext (single source of truth)
@@ -343,7 +346,7 @@ const Sidebar: React.FC = () => {
   const searchFilteredMeetings = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     if (!q) return [];
-    const matchedIds = new Set(searchResults.map((r) => r.id));
+    const matchedIds = new Set(searchResults.map((r) => r.meeting_id));
     return meetings.filter((m) => matchedIds.has(m.id) || m.title.toLowerCase().includes(q));
   }, [meetings, searchQuery, searchResults]);
 
@@ -659,7 +662,7 @@ const Sidebar: React.FC = () => {
   // Find matching transcript snippet for a meeting item
   const findMatchingSnippet = (itemId: string) => {
     if (!searchQuery.trim() || !searchResults.length) return null;
-    return searchResults.find(result => result.id === itemId);
+    return searchResults.find(result => result.meeting_id === itemId);
   };
 
   // Shared meeting row renderer: used by the tree (FolderTreeItem children),
@@ -695,8 +698,9 @@ const Sidebar: React.FC = () => {
       </button>
 
       <div
-        className={`h-screen bg-white border-r shadow-sm flex flex-col transition-all duration-300 ${isCollapsed ? 'w-16' : 'w-64'
+        className={`h-screen bg-white border-r shadow-sm flex flex-col ${sidebarDragging ? '' : 'transition-all duration-300'} ${isCollapsed ? 'w-16' : ''
           }`}
+        style={isCollapsed ? undefined : { width: sidebarWidth }}
       >
         {/*  Header with traffic light spacing */}
         <div className="flex-shrink-0 h-22 flex items-center">
@@ -790,7 +794,7 @@ const Sidebar: React.FC = () => {
                           depth={0}
                           currentMeetingId={currentMeeting?.id}
                           createdAt={m.created_at}
-                          snippetContext={findMatchingSnippet(m.id)?.matchContext ?? null}
+                          snippetContext={findMatchingSnippet(m.id)?.snippet ?? null}
                           folderName={m.folder_id ? folderNameById.get(m.folder_id) ?? null : null}
                           onEditMeeting={handleEditStart}
                           onRequestDeleteMeeting={(id) => setDeleteModalState({ isOpen: true, itemId: id })}
@@ -884,6 +888,14 @@ const Sidebar: React.FC = () => {
           </div>
         )}
       </div>
+
+      {/* Resize handle — visible only when sidebar is expanded */}
+      {!isCollapsed && (
+        <div
+          {...resizeHandleProps}
+          className="absolute top-0 right-0 h-full w-1 cursor-col-resize hover:bg-blue-300 active:bg-blue-400 transition-colors z-50"
+        />
+      )}
 
       {/* Confirmation Modal for Delete */}
       <ConfirmationModal

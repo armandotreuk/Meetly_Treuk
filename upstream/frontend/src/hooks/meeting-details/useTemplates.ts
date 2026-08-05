@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { logger } from "@/lib/logger";
+import { normalizeTemplateId } from "@/lib/template-ids";
 
 import { invoke as invokeTauri } from "@tauri-apps/api/core";
 import { toast } from "sonner";
@@ -11,6 +12,7 @@ export function useTemplates() {
             id: string;
             name: string;
             description: string;
+            source?: string;
         }>
     >([]);
     const [selectedTemplate, setSelectedTemplate] = useState<string>("standard_meeting");
@@ -20,12 +22,20 @@ export function useTemplates() {
         const fetchTemplates = async () => {
             try {
                 const templates = (await invokeTauri("api_list_templates")) as Array<{
-                    id: string;
+                    id: string | number;
                     name: string;
                     description: string;
+                    source?: string;
                 }>;
                 logger.debug("Available templates:", templates);
-                setAvailableTemplates(templates);
+                setAvailableTemplates(
+                    templates.map((template) => ({
+                        id: normalizeTemplateId(template.id, template.source),
+                        name: template.name,
+                        description: template.description,
+                        source: template.source,
+                    }))
+                );
             } catch (error) {
                 logger.error("Failed to fetch templates:", error);
             }

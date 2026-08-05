@@ -17,11 +17,14 @@ import {
     DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import Analytics from "@/lib/analytics";
+import { buildExportPdfRequest } from "@/lib/export-summary";
 
 interface ExportMenuProps {
     meetingId: string;
-    /** Identifier of the template to render with. */
-    templateId: string;
+    /** Identifier of the template to render with. Null when no active row is selected. */
+    templateId: string | null;
+    /** Template listing, used to resolve source for raw numeric IDs. */
+    availableTemplates?: Array<{ id: string; name: string; source?: string }>;
     /** Display name of the template, used in the menu label. */
     templateName?: string;
     /** Disabled state (e.g. summary not ready). */
@@ -52,6 +55,7 @@ interface ExportPdfResponse {
 export function ExportMenu({
     meetingId,
     templateId,
+    availableTemplates,
     templateName,
     disabled = false,
     meetingTitle,
@@ -61,17 +65,26 @@ export function ExportMenu({
 }: ExportMenuProps) {
     const [isExporting, setIsExporting] = useState(false);
 
+    const templateSource = availableTemplates?.find((t) => t.id === templateId)?.source;
+
     const handleExportPdf = useCallback(async () => {
         if (isExporting) return;
+        // ponytail: trust-boundary guard. The trigger is `disabled` when
+        // `exportDisabled` is true (no active row), but the dropdown menu
+        // item can still be activated via keyboard or a stale DOM event.
+        // Refuse loudly rather than pass an empty template id to the backend
+        // (which would either throw or, worse, export the wrong row).
+        if (!templateId) {
+            logger.warn("Skipping PDF export: no active template selected");
+            toast.error("Select a template before exporting");
+            return;
+        }
         setIsExporting(true);
         try {
             Analytics.trackButtonClick("export_pdf", "meeting_details");
 
             const response = await invoke<ExportPdfResponse>("export_meeting_pdf", {
-                request: {
-                    meeting_id: meetingId,
-                    template_id: templateId,
-                },
+                request: buildExportPdfRequest(meetingId, templateId, templateSource),
             });
 
             // The backend returns the PDF as a `Vec<u8>` which Tauri's IPC
@@ -100,7 +113,7 @@ export function ExportMenu({
         } finally {
             setIsExporting(false);
         }
-    }, [meetingId, templateId, isExporting]);
+    }, [meetingId, templateId, templateSource, isExporting]);
 
     return (
         <DropdownMenu>

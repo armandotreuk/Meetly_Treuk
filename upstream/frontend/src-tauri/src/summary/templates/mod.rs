@@ -42,9 +42,12 @@ pub mod loader;
 mod types;
 
 // Re-export public API
+#[cfg(test)]
+pub(crate) use loader::acquire_template_test_lock;
 pub use loader::{
-    get_template, list_template_ids, list_templates, set_bundled_templates_dir,
-    validate_and_parse_template,
+    database_template_id, file_template_id, get_template, list_template_ids, list_templates,
+    parse_database_template_id, resolve_template, resolve_template_with_source,
+    set_bundled_templates_dir, template_origin, validate_and_parse_template, TemplateOrigin,
 };
 pub use types::{Template, TemplateSection};
 

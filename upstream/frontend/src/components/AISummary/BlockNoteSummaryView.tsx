@@ -17,7 +17,7 @@ const Editor = dynamic(() => import("../BlockNoteEditor/Editor"), { ssr: false }
 
 interface BlockNoteSummaryViewProps {
     summaryData: SummaryDataResponse | Summary | null;
-    onSave?: (data: { markdown?: string; summary_json?: BlockNoteBlock[] }) => void;
+    onSave?: (data: { markdown?: string; summary_json?: BlockNoteBlock[] }) => void | Promise<void>;
     onSummaryChange?: (summary: Summary) => void;
     status?: "idle" | "processing" | "summarizing" | "regenerating" | "completed" | "error";
     error?: string | null;
@@ -161,13 +161,14 @@ export const BlockNoteSummaryView = forwardRef<BlockNoteSummaryViewRef, BlockNot
                     saveData.markdown = markdownResult.markdown;
                 }
 
-                onSave(saveData);
+                await onSave(saveData);
 
                 setIsDirty(false);
                 logger.debug("✅ Save successful");
             } catch (err) {
                 logger.error("❌ Save failed:", err);
                 alert("Failed to save changes. Please try again.");
+                throw err;
             } finally {
                 setIsSaving(false);
             }

@@ -1,6 +1,8 @@
 use crate::database::repositories::{
-    meeting::MeetingsRepository, meeting_notes::MeetingNotesRepository, setting::SettingsRepository,
-    summary::SummaryProcessesRepository,
+    meeting::MeetingsRepository,
+    meeting_notes::MeetingNotesRepository,
+    setting::SettingsRepository,
+    summary::{SummaryProcessesRepository, SummaryRun},
 };
 use crate::ollama::metadata::ModelMetadataCache;
 use crate::summary::language_detection::detect_summary_language;
@@ -25,9 +27,26 @@ use tracing::{error, info, warn};
 static METADATA_CACHE: Lazy<ModelMetadataCache> =
     Lazy::new(|| ModelMetadataCache::new(Duration::from_secs(300)));
 
-// Global registry for cancellation tokens (thread-safe)
-static CANCELLATION_REGISTRY: Lazy<Arc<Mutex<HashMap<String, CancellationToken>>>> =
+// Global registry for cancellation tokens (thread-safe). A meeting can have
+// independent template runs, and a stale worker must not remove a newer run's
+// token during cleanup.
+static CANCELLATION_REGISTRY: Lazy<Arc<Mutex<HashMap<CancellationKey, CancellationToken>>>> =
     Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CancellationKey {
+    meeting_id: String,
+    template_id: String,
+    generation: String,
+}
+
+struct CancellationCleanup(CancellationKey);
+
+impl Drop for CancellationCleanup {
+    fn drop(&mut self) {
+        SummaryService::cleanup_cancellation_token(&self.0);
+    }
+}
 
 /// Strips the first `#` heading line; returns "" if no `#` is found.
 fn strip_leading_title(markdown: &str) -> String {
@@ -197,37 +216,79 @@ fn extract_cached_english_markdown(
 pub struct SummaryService;
 
 impl SummaryService {
-    /// Registers a new cancellation token for a meeting
-    fn register_cancellation_token(meeting_id: &str) -> CancellationToken {
-        let token = CancellationToken::new();
-        if let Ok(mut registry) = CANCELLATION_REGISTRY.lock() {
-            registry.insert(meeting_id.to_string(), token.clone());
-            info!("Registered cancellation token for meeting: {}", meeting_id);
+    fn cancellation_key(run: &SummaryRun, meeting_id: &str) -> CancellationKey {
+        CancellationKey {
+            meeting_id: meeting_id.to_string(),
+            template_id: run.template_id.clone(),
+            generation: run.expected_start_time.to_rfc3339(),
         }
-        token
     }
 
-    /// Cancels the summary generation for a meeting
-    pub fn cancel_summary(meeting_id: &str) -> bool {
-        if let Ok(registry) = CANCELLATION_REGISTRY.lock() {
-            if let Some(token) = registry.get(meeting_id) {
-                info!("Cancelling summary generation for meeting: {}", meeting_id);
-                token.cancel();
-                return true;
+    /// Registers a new cancellation token for one meeting/template/generation.
+    fn register_cancellation_token(
+        meeting_id: &str,
+        run: &SummaryRun,
+    ) -> (CancellationKey, CancellationToken) {
+        let token = CancellationToken::new();
+        let key = Self::cancellation_key(run, meeting_id);
+        if let Ok(mut registry) = CANCELLATION_REGISTRY.lock() {
+            registry.insert(key.clone(), token.clone());
+            info!(
+                "Registered cancellation token for meeting: {} template: {} generation: {}",
+                meeting_id, run.template_id, key.generation
+            );
+        }
+        (key, token)
+    }
+
+    /// Cancels exactly one generation. Without a generation, cancellation is
+    /// intentionally refused when multiple matching workers exist.
+    pub fn cancel_summary(
+        meeting_id: &str,
+        template_id: &str,
+        expected_start_time: Option<&chrono::DateTime<chrono::Utc>>,
+    ) -> bool {
+        let Ok(registry) = CANCELLATION_REGISTRY.lock() else {
+            return false;
+        };
+        let matches: Vec<CancellationKey> = registry
+            .keys()
+            .filter(|key| {
+                key.meeting_id == meeting_id
+                    && key.template_id == template_id
+                    && expected_start_time
+                        .map(|start| key.generation == start.to_rfc3339())
+                        .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        if matches.len() == 1 {
+            if let Some(key) = matches.first() {
+                if let Some(token) = registry.get(key) {
+                    info!(
+                        "Cancelling summary generation for meeting: {} template: {} generation: {}",
+                        meeting_id, template_id, key.generation
+                    );
+                    token.cancel();
+                    return true;
+                }
             }
         }
         warn!(
-            "No active summary generation found for meeting: {}",
-            meeting_id
+            "No uniquely-addressable summary generation found for meeting: {} template: {}",
+            meeting_id, template_id
         );
         false
     }
 
-    /// Cleans up the cancellation token after processing completes
-    fn cleanup_cancellation_token(meeting_id: &str) {
+    /// Cleans up only the token registered by this generation.
+    fn cleanup_cancellation_token(key: &CancellationKey) {
         if let Ok(mut registry) = CANCELLATION_REGISTRY.lock() {
-            if registry.remove(meeting_id).is_some() {
-                info!("Cleaned up cancellation token for meeting: {}", meeting_id);
+            if registry.remove(key).is_some() {
+                info!(
+                    "Cleaned up cancellation token for meeting: {} template: {} generation: {}",
+                    key.meeting_id, key.template_id, key.generation
+                );
             }
         }
     }
@@ -309,23 +370,27 @@ impl SummaryService {
         model_provider: String,
         model_name: String,
         custom_prompt: String,
-        template_id: String,
+        run: SummaryRun,
         summary_language: Option<String>,
     ) {
+        let template_id = run.template_id.clone();
         let start_time = Instant::now();
         info!(
             "Starting background processing for meeting_id: {}",
             meeting_id
         );
 
-        // Register cancellation token for this meeting
-        let cancellation_token = Self::register_cancellation_token(&meeting_id);
+        // Register cancellation for this exact generation. Drop cleanup is
+        // generation-aware, so an old worker cannot remove a newer token.
+        let (cancellation_key, cancellation_token) =
+            Self::register_cancellation_token(&meeting_id, &run);
+        let _cancellation_cleanup = CancellationCleanup(cancellation_key);
 
         // Parse provider
         let provider = match LLMProvider::from_str(&model_provider) {
             Ok(p) => p,
             Err(e) => {
-                Self::update_process_failed(&pool, &meeting_id, &template_id, &e).await;
+                Self::update_process_failed(&pool, &meeting_id, &run, &e).await;
                 return;
             }
         };
@@ -342,13 +407,13 @@ impl SummaryService {
                 Ok(Some(key)) if !key.is_empty() => key,
                 Ok(None) | Ok(Some(_)) => {
                     let err_msg = format!("API key not found for {}", &model_provider);
-                    Self::update_process_failed(&pool, &meeting_id, &template_id, &err_msg).await;
+                    Self::update_process_failed(&pool, &meeting_id, &run, &err_msg).await;
                     return;
                 }
                 Err(e) => {
                     let err_msg =
                         format!("Failed to retrieve API key for {}: {}", &model_provider, e);
-                    Self::update_process_failed(&pool, &meeting_id, &template_id, &err_msg).await;
+                    Self::update_process_failed(&pool, &meeting_id, &run, &err_msg).await;
                     return;
                 }
             }
@@ -389,12 +454,12 @@ impl SummaryService {
                 }
                 Ok(None) => {
                     let err_msg = "Custom OpenAI provider selected but no configuration found";
-                    Self::update_process_failed(&pool, &meeting_id, &template_id, err_msg).await;
+                    Self::update_process_failed(&pool, &meeting_id, &run, err_msg).await;
                     return;
                 }
                 Err(e) => {
                     let err_msg = format!("Failed to retrieve custom OpenAI config: {}", e);
-                    Self::update_process_failed(&pool, &meeting_id, &template_id, &err_msg).await;
+                    Self::update_process_failed(&pool, &meeting_id, &run, &err_msg).await;
                     return;
                 }
             }
@@ -473,11 +538,11 @@ impl SummaryService {
             info!("📝 Detected transcript summary language: {}", code);
         }
 
-        let template = match templates::get_template(&template_id) {
+        let template = match templates::resolve_template(&pool, &template_id).await {
             Ok(template) => template,
             Err(e) => {
                 let err_msg = format!("Failed to load template '{}': {}", template_id, e);
-                Self::update_process_failed(&pool, &meeting_id, &template_id, &err_msg).await;
+                Self::update_process_failed(&pool, &meeting_id, &run, &err_msg).await;
                 return;
             }
         };
@@ -486,17 +551,18 @@ impl SummaryService {
         // Fetch user notes taken during the meeting; non-empty markdown is injected into the
         // summary prompt as an additional important source. Cache key includes the notes
         // fingerprint so editing notes invalidates the cached English summary.
-        let user_notes: Option<String> = match MeetingNotesRepository::get_notes(&pool, &meeting_id).await {
-            Ok(Some(n)) => n.notes_markdown.filter(|m| !m.trim().is_empty()),
-            Ok(None) => None,
-            Err(e) => {
-                warn!(
+        let user_notes: Option<String> =
+            match MeetingNotesRepository::get_notes(&pool, &meeting_id).await {
+                Ok(Some(n)) => n.notes_markdown.filter(|m| !m.trim().is_empty()),
+                Ok(None) => None,
+                Err(e) => {
+                    warn!(
                     "Failed to load meeting notes for {} (summary will proceed without them): {}",
                     meeting_id, e
                 );
-                None
-            }
-        };
+                    None
+                }
+            };
         let user_notes_for_cache = user_notes.clone().unwrap_or_default();
 
         let cache_source = build_summary_cache_source(
@@ -569,9 +635,6 @@ impl SummaryService {
 
         let duration = start_time.elapsed().as_secs_f64();
 
-        // Clean up cancellation token regardless of outcome
-        Self::cleanup_cancellation_token(&meeting_id);
-
         match result {
             Ok((final_markdown, english_markdown, num_chunks)) => {
                 info!(
@@ -579,49 +642,6 @@ impl SummaryService {
                     num_chunks, meeting_id, duration
                 );
                 info!("Final markdown generated ({} chars)", final_markdown.len());
-
-                if let Some(name) =
-                    extract_meeting_name_from_markdown(&final_markdown).filter(|n| !n.is_empty())
-                {
-                    // Rename the meeting only when:
-                    //   (a) the meeting has no title yet — fresh recording, or
-                    //   (b) no other completed summary exists for this meeting
-                    //       EXCLUDING the row we just finished writing. So the
-                    //       FIRST generated summary wins the title; subsequent
-                    //       summaries (other templates) don't overwrite it.
-                    // This preserves pre-single-template behavior for the first
-                    // summary, while making multi-template generation avoid
-                    // clobbering the name from a different template.
-                    let current_title_empty = match MeetingsRepository::get_meeting(&pool, &meeting_id).await {
-                        Ok(Some(m)) => m.title.trim().is_empty(),
-                        _ => false, // meeting lookup failed: don't risk a no-op rename
-                    };
-                    let is_first_completed = !SummaryProcessesRepository::has_other_completed_summaries(
-                        &pool,
-                        &meeting_id,
-                        &template_id,
-                    )
-                    .await
-                    .unwrap_or(false);
-
-                    if current_title_empty || is_first_completed {
-                        info!(
-                            "Extracted meeting name from summary: '{}' (title_empty={}, first_completed={})",
-                            name, current_title_empty, is_first_completed
-                        );
-                        if let Err(e) =
-                            MeetingsRepository::update_meeting_name(&pool, &meeting_id, &name).await
-                        {
-                            error!("Failed to update meeting name for {}: {}", meeting_id, e);
-                        } else {
-                            info!("Successfully updated meeting name for {}", meeting_id);
-                        }
-                    } else {
-                        info!(
-                            "Skipping meeting rename: a title exists and another completed summary already set it"
-                        );
-                    }
-                }
 
                 let result_json = build_summary_result_json(
                     &final_markdown,
@@ -631,19 +651,70 @@ impl SummaryService {
                 );
 
                 // Update database with completed status
-                if let Err(e) = SummaryProcessesRepository::update_process_completed(
+                match SummaryProcessesRepository::update_process_completed(
                     &pool,
                     &meeting_id,
                     &template_id,
+                    &run.expected_start_time,
                     result_json,
                     num_chunks,
                     duration,
                 )
                 .await
                 {
-                    error!("Failed to save completed process for {}: {}", meeting_id, e);
-                } else {
-                    info!("Summary saved successfully for meeting_id: {} template_id: {}", meeting_id, template_id);
+                    Ok(true) => {
+                        // Only the generation that successfully claimed the
+                        // row may update meeting-level metadata.
+                        if let Some(name) = extract_meeting_name_from_markdown(&final_markdown)
+                            .filter(|n| !n.is_empty())
+                        {
+                            let current_title_empty =
+                                match MeetingsRepository::get_meeting(&pool, &meeting_id).await {
+                                    Ok(Some(m)) => m.title.trim().is_empty(),
+                                    _ => false,
+                                };
+                            let is_first_completed =
+                                !SummaryProcessesRepository::has_other_completed_summaries(
+                                    &pool,
+                                    &meeting_id,
+                                    &template_id,
+                                )
+                                .await
+                                .unwrap_or(false);
+
+                            if current_title_empty || is_first_completed {
+                                info!(
+                                    "Extracted meeting name from summary: '{}' (title_empty={}, first_completed={})",
+                                    name, current_title_empty, is_first_completed
+                                );
+                                if let Err(e) = MeetingsRepository::update_meeting_name(
+                                    &pool,
+                                    &meeting_id,
+                                    &name,
+                                )
+                                .await
+                                {
+                                    error!(
+                                        "Failed to update meeting name for {}: {}",
+                                        meeting_id, e
+                                    );
+                                }
+                            }
+                        }
+                        info!(
+                            "Summary saved successfully for meeting_id: {} template_id: {}",
+                            meeting_id, template_id
+                        );
+                    }
+                    Ok(false) => {
+                        info!(
+                            "Skipped stale summary completion for meeting_id: {} template_id: {}",
+                            meeting_id, template_id
+                        );
+                    }
+                    Err(e) => {
+                        error!("Failed to save completed process for {}: {}", meeting_id, e);
+                    }
                 }
             }
             Err(e) => {
@@ -653,9 +724,13 @@ impl SummaryService {
                         "Summary generation was cancelled for meeting_id: {} template_id: {}",
                         meeting_id, template_id
                     );
-                    if let Err(db_err) =
-                        SummaryProcessesRepository::update_process_cancelled(&pool, &meeting_id, &template_id)
-                            .await
+                    if let Err(db_err) = SummaryProcessesRepository::update_process_cancelled(
+                        &pool,
+                        &meeting_id,
+                        &template_id,
+                        &run.expected_start_time,
+                    )
+                    .await
                     {
                         error!(
                             "Failed to update DB status to cancelled for {} template {}: {}",
@@ -663,7 +738,7 @@ impl SummaryService {
                         );
                     }
                 } else {
-                    Self::update_process_failed(&pool, &meeting_id, &template_id, &e).await;
+                    Self::update_process_failed(&pool, &meeting_id, &run, &e).await;
                 }
             }
         }
@@ -674,29 +749,30 @@ impl SummaryService {
     /// # Arguments
     /// * `pool` - SQLx connection pool
     /// * `meeting_id` - Meeting identifier
-    /// * `template_id` - Template identifier (which row to mark failed)
+    /// * `run` - Template and generation identity (which row to mark failed)
     /// * `error_msg` - Error message to store
     async fn update_process_failed(
         pool: &SqlitePool,
         meeting_id: &str,
-        template_id: &str,
+        run: &SummaryRun,
         error_msg: &str,
     ) {
         error!(
             "Processing failed for meeting_id {} template_id {}: {}",
-            meeting_id, template_id, error_msg
+            meeting_id, run.template_id, error_msg
         );
         if let Err(e) = SummaryProcessesRepository::update_process_failed(
             pool,
             meeting_id,
-            template_id,
+            &run.template_id,
+            &run.expected_start_time,
             error_msg,
         )
         .await
         {
             error!(
                 "Failed to update DB status to failed for {} template {}: {}",
-                meeting_id, template_id, e
+                meeting_id, run.template_id, e
             );
         }
     }
@@ -705,6 +781,61 @@ impl SummaryService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_is_scoped_to_template_and_generation() {
+        let meeting_id = "cancellation-scope-test";
+        let file_run = SummaryRun {
+            template_id: "file:1".to_string(),
+            expected_start_time: chrono::Utc::now(),
+        };
+        let database_run = SummaryRun {
+            template_id: "db:2".to_string(),
+            expected_start_time: chrono::Utc::now(),
+        };
+        let (file_key, file_token) =
+            SummaryService::register_cancellation_token(meeting_id, &file_run);
+        let (database_key, database_token) =
+            SummaryService::register_cancellation_token(meeting_id, &database_run);
+
+        assert!(SummaryService::cancel_summary(
+            meeting_id,
+            "db:2",
+            Some(&database_run.expected_start_time)
+        ));
+        assert!(database_token.is_cancelled());
+        assert!(!file_token.is_cancelled());
+
+        SummaryService::cleanup_cancellation_token(&file_key);
+        SummaryService::cleanup_cancellation_token(&database_key);
+    }
+
+    #[test]
+    fn stale_cleanup_cannot_remove_a_newer_generation_token() {
+        let meeting_id = "cancellation-generation-test";
+        let old_run = SummaryRun {
+            template_id: "db:7".to_string(),
+            expected_start_time: chrono::Utc::now() - chrono::Duration::seconds(1),
+        };
+        let new_run = SummaryRun {
+            template_id: "db:7".to_string(),
+            expected_start_time: chrono::Utc::now(),
+        };
+        let (old_key, _) = SummaryService::register_cancellation_token(meeting_id, &old_run);
+        let (new_key, new_token) =
+            SummaryService::register_cancellation_token(meeting_id, &new_run);
+
+        SummaryService::cleanup_cancellation_token(&old_key);
+
+        assert!(SummaryService::cancel_summary(
+            meeting_id,
+            "db:7",
+            Some(&new_run.expected_start_time)
+        ));
+        assert!(new_token.is_cancelled());
+
+        SummaryService::cleanup_cancellation_token(&new_key);
+    }
 
     #[test]
     fn test_strip_leading_title_with_body() {

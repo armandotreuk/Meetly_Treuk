@@ -6,7 +6,9 @@ import Analytics from '@/lib/analytics';
 import { invoke } from '@tauri-apps/api/core';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 import { usePanelResize } from '@/hooks/usePanelResize';
-import type { MeetingFolder } from '@/types';
+import type { MeetingFolder, FtsSearchResult } from '@/types';
+import { buildSummaryCancelArgs } from '@/lib/summary-command-args';
+import { shouldApplySummaryPollResult, summaryPollKey } from '@/lib/summary-polling';
 
 
 interface SidebarItem {
@@ -23,14 +25,6 @@ export interface CurrentMeeting {
   folder_id?: string | null;
 }
 
-// Search result type for transcript search
-interface TranscriptSearchResult {
-  id: string;
-  title: string;
-  matchContext: string;
-  timestamp: string;
-};
-
 interface SidebarContextType {
   currentMeeting: CurrentMeeting | null;
   setCurrentMeeting: (meeting: CurrentMeeting | null) => void;
@@ -43,7 +37,7 @@ interface SidebarContextType {
   setIsMeetingActive: (active: boolean) => void;
   handleRecordingToggle: () => void;
   searchTranscripts: (query: string) => Promise<void>;
-  searchResults: TranscriptSearchResult[];
+  searchResults: FtsSearchResult[];
   isSearching: boolean;
   setServerAddress: (address: string) => void;
   serverAddress: string;
@@ -51,8 +45,8 @@ interface SidebarContextType {
   setTranscriptServerAddress: (address: string) => void;
   // Summary polling management
   activeSummaryPolls: Map<string, NodeJS.Timeout>;
-  startSummaryPolling: (meetingId: string, processId: string, onUpdate: (result: any) => void, templateId?: string) => void;
-  stopSummaryPolling: (meetingId: string) => void;
+  startSummaryPolling: (meetingId: string, processId: string, templateId: string, generation: string, onUpdate: (result: any) => void) => void;
+  stopSummaryPolling: (meetingId: string, templateId?: string, generation?: string) => void;
   // Refetch meetings from backend
   refetchMeetings: () => Promise<void>;
   // Meeting folders (pastas lógicas). Actions throw on backend error so
@@ -67,6 +61,7 @@ interface SidebarContextType {
   // Panel-resize (in-flight): sidebar width in px and active-drag flag
   sidebarWidth: number;
   sidebarDragging: boolean;
+  resizeHandleProps: { onMouseDown: (e: React.MouseEvent) => void };
 
 }
 
@@ -86,19 +81,20 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const [meetings, setMeetings] = useState<CurrentMeeting[]>([]);
   const [sidebarItems, setSidebarItems] = useState<SidebarItem[]>([]);
   const [isMeetingActive, setIsMeetingActive] = useState(false);
-  const [searchResults, setSearchResults] = useState<any[]>([]);
+  const [searchResults, setSearchResults] = useState<FtsSearchResult[]>([]);
   const [isSearching, setIsSearching] = useState(false);
   const [serverAddress, setServerAddress] = useState('');
   const [transcriptServerAddress, setTranscriptServerAddress] = useState('');
   const [activeSummaryPolls, setActiveSummaryPolls] = useState<Map<string, NodeJS.Timeout>>(new Map());
+  const activeSummaryPollsRef = React.useRef<Map<string, NodeJS.Timeout>>(new Map());
+  const activeSummaryPollKeysRef = React.useRef<Set<string>>(new Set());
   const [folders, setFolders] = useState<MeetingFolder[]>([]);
 
   // Use recording state from RecordingStateContext (single source of truth)
   const { isRecording } = useRecordingState();
 
   // ponytail: sidebar resize — initial 256 matches `w-64`, min 200, max 40% of viewport.
-  // handleProps is intentionally not attached to a resize handle yet; feature is in-flight.
-  const { width: sidebarWidth, isDragging: sidebarDragging } = usePanelResize({
+  const { width: sidebarWidth, isDragging: sidebarDragging, handleProps: resizeHandleProps } = usePanelResize({
     initial: 256,
     min: 200,
     maxFraction: 0.4,
@@ -231,7 +227,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     // The actual recording start/stop is handled in the Home component
   };
 
-  // Function to search through meeting transcripts
+  // Function to search through meeting transcripts via FTS5 index
   const searchTranscripts = async (query: string) => {
     if (!query.trim()) {
       setSearchResults([]);
@@ -242,7 +238,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       setIsSearching(true);
 
 
-      const results = await invoke('api_search_transcripts', { query }) as TranscriptSearchResult[];
+      const results = await invoke('api_search_fts', { query }) as FtsSearchResult[];
       setSearchResults(results);
     } catch (error) {
       console.error('Error searching transcripts:', error);
@@ -256,106 +252,141 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const startSummaryPolling = React.useCallback((
     meetingId: string,
     processId: string,
+    templateId: string,
+    generation: string,
     onUpdate: (result: any) => void,
-    templateId?: string
   ) => {
-    // Stop existing poll for this meeting if any
-    if (activeSummaryPolls.has(meetingId)) {
-      clearInterval(activeSummaryPolls.get(meetingId)!);
-    }
+    const key = summaryPollKey({ meetingId, templateId, generation });
 
-    console.log(`📊 Starting polling for meeting ${meetingId}, process ${processId}`);
+    // Summary generation is serialized for a meeting, but the map key still
+    // includes the row and generation so an old response cannot reach a new
+    // row after a restart.
+    for (const [existingKey, interval] of activeSummaryPollsRef.current) {
+      if (existingKey.startsWith(`${meetingId}\u0000`)) {
+        clearInterval(interval);
+        activeSummaryPollsRef.current.delete(existingKey);
+        activeSummaryPollKeysRef.current.delete(existingKey);
+      }
+    }
+    setActiveSummaryPolls(prev => {
+      const next = new Map(prev);
+      for (const existingKey of next.keys()) {
+        if (existingKey.startsWith(`${meetingId}\u0000`)) next.delete(existingKey);
+      }
+      return next;
+    });
+
+    console.log(`📊 Starting polling for meeting ${meetingId}, process ${processId}, template ${templateId}, generation ${generation}`);
 
     let pollCount = 0;
-    const MAX_POLLS = 200; // ~16.5 minutes at 5-second intervals (slightly longer than backend's 15-min timeout to avoid race conditions)
+    let latestRequest = 0;
+    const MAX_POLLS = 200;
+    let pollInterval: NodeJS.Timeout;
+    const finish = () => {
+      clearInterval(pollInterval);
+      if (activeSummaryPollsRef.current.get(key) === pollInterval) {
+        activeSummaryPollsRef.current.delete(key);
+      }
+      activeSummaryPollKeysRef.current.delete(key);
+      setActiveSummaryPolls(prev => {
+        const next = new Map(prev);
+        if (next.get(key) === pollInterval) next.delete(key);
+        return next;
+      });
+    };
 
-    const pollInterval = setInterval(async () => {
+    activeSummaryPollKeysRef.current.add(key);
+    pollInterval = setInterval(async () => {
+      if (!activeSummaryPollKeysRef.current.has(key)) return;
       pollCount++;
 
-      // Timeout safety: Stop after 10 minutes
       if (pollCount >= MAX_POLLS) {
-        console.warn(`⏱️ Polling timeout for ${meetingId} after ${MAX_POLLS} iterations`);
-        clearInterval(pollInterval);
-        setActiveSummaryPolls(prev => {
-          const next = new Map(prev);
-          next.delete(meetingId);
-          return next;
+        console.warn(`⏱️ Polling timeout for ${meetingId} / ${templateId}`);
+        finish();
+        void invoke('api_cancel_summary', buildSummaryCancelArgs(meetingId, { templateId, generation })).catch((error) => {
+          console.warn(`Failed to cancel timed-out summary for ${meetingId}:`, error);
         });
         onUpdate({
           status: 'error',
+          template_id: templateId,
+          start: generation,
           error: 'Summary generation timed out after 15 minutes. Please try again or check your model configuration.'
         });
         return;
       }
+
+      const requestId = ++latestRequest;
       try {
         const result = await invoke('api_get_summary', {
-          meetingId: meetingId,
+          meetingId,
           templateId,
+          generation,
         }) as any;
 
-        console.log(`📊 Polling update for ${meetingId}:`, result.status);
+        // An interval can have an in-flight request after it was replaced or
+        // stopped. Ignore that response before it can update React state.
+        if (!activeSummaryPollKeysRef.current.has(key) || requestId !== latestRequest) return;
+        if (!shouldApplySummaryPollResult(result, { templateId })) {
+          finish();
+          return;
+        }
 
-        // Call the update callback with result
+        console.log(`📊 Polling update for ${meetingId} / ${templateId}:`, result.status);
         onUpdate(result);
 
-        // Stop polling if completed, error, failed, cancelled, or idle (after initial processing)
         if (result.status === 'completed' || result.status === 'error' || result.status === 'failed' || result.status === 'cancelled') {
-          console.log(`Polling completed for ${meetingId}, status: ${result.status}`);
-          clearInterval(pollInterval);
-          setActiveSummaryPolls(prev => {
-            const next = new Map(prev);
-            next.delete(meetingId);
-            return next;
-          });
+          console.log(`Polling completed for ${meetingId} / ${templateId}, status: ${result.status}`);
+          finish();
         } else if (result.status === 'idle' && pollCount > 1) {
-          // If we get 'idle' after polling started, process completed/disappeared
-          console.log(`Process completed or not found for ${meetingId}, stopping poll`);
-          clearInterval(pollInterval);
-          setActiveSummaryPolls(prev => {
-            const next = new Map(prev);
-            next.delete(meetingId);
-            return next;
-          });
+          console.log(`Process ${generation} disappeared for ${meetingId} / ${templateId}, stopping poll`);
+          finish();
         }
       } catch (error) {
-        console.error(`Polling error for ${meetingId}:`, error);
-        // Report error to callback
+        if (!activeSummaryPollKeysRef.current.has(key) || requestId !== latestRequest) return;
+        console.error(`Polling error for ${meetingId} / ${templateId}:`, error);
         onUpdate({
           status: 'error',
+          template_id: templateId,
+          start: generation,
           error: error instanceof Error ? error.message : 'Unknown error'
         });
-        clearInterval(pollInterval);
-        setActiveSummaryPolls(prev => {
-          const next = new Map(prev);
-          next.delete(meetingId);
-          return next;
-        });
+        finish();
       }
-    }, 5000); // Poll every 5 seconds
+    }, 5000);
 
-    setActiveSummaryPolls(prev => new Map(prev).set(meetingId, pollInterval));
-  }, [activeSummaryPolls]);
+    activeSummaryPollsRef.current.set(key, pollInterval);
+    setActiveSummaryPolls(prev => new Map(prev).set(key, pollInterval));
+  }, []);
 
-  const stopSummaryPolling = React.useCallback((meetingId: string) => {
-    const pollInterval = activeSummaryPolls.get(meetingId);
-    if (pollInterval) {
-      console.log(`⏹️ Stopping polling for meeting ${meetingId}`);
-      clearInterval(pollInterval);
-      setActiveSummaryPolls(prev => {
-        const next = new Map(prev);
-        next.delete(meetingId);
-        return next;
-      });
+  const stopSummaryPolling = React.useCallback((meetingId: string, templateId?: string, generation?: string) => {
+    const prefix = templateId && generation
+      ? `${meetingId}\u0000${templateId}\u0000${generation}`
+      : `${meetingId}\u0000`;
+    for (const [key, interval] of activeSummaryPollsRef.current) {
+      if (key === prefix || (!templateId && key.startsWith(prefix))) {
+        clearInterval(interval);
+        activeSummaryPollsRef.current.delete(key);
+        activeSummaryPollKeysRef.current.delete(key);
+      }
     }
-  }, [activeSummaryPolls]);
+    setActiveSummaryPolls(prev => {
+      const next = new Map(prev);
+      for (const key of next.keys()) {
+        if (key === prefix || (!templateId && key.startsWith(prefix))) next.delete(key);
+      }
+      return next;
+    });
+  }, []);
 
   // Cleanup all polling intervals on unmount
   useEffect(() => {
     return () => {
       console.log('🧹 Cleaning up all summary polling intervals');
-      activeSummaryPolls.forEach(interval => clearInterval(interval));
+      activeSummaryPollsRef.current.forEach(interval => clearInterval(interval));
+      activeSummaryPollsRef.current.clear();
+      activeSummaryPollKeysRef.current.clear();
     };
-  }, [activeSummaryPolls]);
+  }, []);
 
 
 
@@ -391,6 +422,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       moveMeetingToFolder,
       sidebarWidth,
       sidebarDragging,
+      resizeHandleProps,
 
     }}>
       {children}

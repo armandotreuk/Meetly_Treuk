@@ -7,6 +7,8 @@ import { EmptyStateSummary } from '@/components/EmptyStateSummary';
 import { ModelConfig } from '@/components/ModelSettingsModal';
 import { SummaryGeneratorButtonGroup } from './SummaryGeneratorButtonGroup';
 import { SummaryUpdaterButtonGroup } from './SummaryUpdaterButtonGroup';
+import { ExportMenu } from './ExportMenu';
+import { findCompletedSummaryRow, LEGACY_TEMPLATE_DISPLAY_NAME, LEGACY_TEMPLATE_ID } from '@/lib/export-summary';
 import Analytics from '@/lib/analytics';
 import { useEffect, useRef, useState, RefObject } from 'react';
 import { toast } from 'sonner';
@@ -42,6 +44,7 @@ interface SummaryPanelProps {
   onOpenFolder: () => Promise<void>;
   aiSummary: Summary | null;
   summaryStatus: 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
+  isExternallyProcessing?: boolean;
   transcripts: Transcript[];
   modelConfig: ModelConfig;
   setModelConfig: (config: ModelConfig | ((prev: ModelConfig) => ModelConfig)) => void;
@@ -56,7 +59,7 @@ interface SummaryPanelProps {
   summaryError: string | null;
   onRegenerateSummary: () => Promise<void>;
   getSummaryStatusMessage: (status: 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error') => string;
-  availableTemplates: Array<{ id: string, name: string, description: string }>;
+  availableTemplates: Array<{ id: string, name: string, description: string, source?: string }>;
   selectedTemplate: string;
   onTemplateSelect: (templateId: string, templateName: string) => void;
   isModelConfigLoading?: boolean;
@@ -66,6 +69,7 @@ interface SummaryPanelProps {
   activeTemplateId?: string | null;
   onActiveTemplateChange?: (templateId: string | null) => void;
   onSummariesChanged?: () => void | Promise<void>;
+  pendingEditsExist?: boolean;
   containerRef?: (el: HTMLDivElement | null) => void;
   compact?: boolean;
 }
@@ -85,6 +89,7 @@ export function SummaryPanel({
   onOpenFolder,
   aiSummary,
   summaryStatus,
+  isExternallyProcessing = false,
   transcripts,
   modelConfig,
   setModelConfig,
@@ -102,8 +107,15 @@ export function SummaryPanel({
   availableTemplates,
   selectedTemplate,
   onTemplateSelect,
+  summaries = [],
+  activeTemplateId = null,
+  onActiveTemplateChange = () => {},
+  onSummariesChanged = () => {},
+  pendingEditsExist = false,
   isModelConfigLoading = false,
-  onOpenModelSettings
+  onOpenModelSettings,
+  containerRef,
+  compact = false,
 }: SummaryPanelProps) {
   const [summaryLang, setSummaryLang] = useState<string | null>(null);
   const [summaryLangStorage, setSummaryLangStorage] = useState<SummaryLanguageStorage>('metadata');
@@ -230,7 +242,28 @@ export function SummaryPanel({
     void persistLatestLanguageSelection();
   };
 
-  const isSummaryLoading = summaryStatus === 'processing' || summaryStatus === 'summarizing' || summaryStatus === 'regenerating';
+  const isSummaryLoading = isExternallyProcessing || summaryStatus === 'processing' || summaryStatus === 'summarizing' || summaryStatus === 'regenerating';
+
+  // ponytail: S2 claim 6 — never silently substitute `standard_meeting` when
+  // no active row is selected. The previous `activeTemplateId ?? selectedTemplate ??
+  // LEGACY_TEMPLATE_ID` chain routed export to the default (`selectedTemplate`
+  // seeds as `"standard_meeting"`) whenever the active row was null. With
+  // `activeTemplateId` as the single source of truth, a null active row means
+  // there is no row to export: `exportTemplateId` is null and the menu renders
+  // disabled via the existing `exportDisabled` path. `findCompletedSummaryRow`
+  // already returns undefined for a null templateId (no row matches), so
+  // `exportDisabled` stays true. We keep the explicit null/undefined check to
+  // short-circuit `templateName` resolution and avoid passing `null` to
+  // `buildExportPdfRequest` which would throw on `normalizeTemplateId`.
+  const exportTemplateId = activeTemplateId ?? null;
+  const completedExportRow = exportTemplateId
+    ? findCompletedSummaryRow(summaries, exportTemplateId)
+    : undefined;
+  const exportDisabled = !completedExportRow;
+  const exportTemplateName =
+    exportTemplateId === LEGACY_TEMPLATE_ID
+      ? LEGACY_TEMPLATE_DISPLAY_NAME
+      : availableTemplates.find((t) => t.id === exportTemplateId)?.name ?? undefined;
 
   const languageSlot = (
     <Popover open={langPickerOpen} onOpenChange={setLangPickerOpen}>
@@ -263,7 +296,7 @@ export function SummaryPanel({
   const formattedFullDate = formatMeetingDate(meeting.created_at, 'full');
 
   return (
-    <div className="flex-1 min-w-0 flex flex-col bg-white overflow-hidden">
+    <div ref={containerRef} className="flex-1 min-w-0 flex flex-col bg-white overflow-hidden">
       {/* Title area */}
       <div className="p-4 border-b border-gray-200">
         <EditableTitle
@@ -295,20 +328,40 @@ export function SummaryPanel({
                 onStopGeneration={onStopGeneration}
                 customPrompt={customPrompt}
                 summaryStatus={summaryStatus}
+                isExternallyProcessing={isExternallyProcessing}
                 availableTemplates={availableTemplates}
                 selectedTemplate={selectedTemplate}
                 onTemplateSelect={onTemplateSelect}
                 hasTranscripts={transcripts.length > 0}
-                hasSummary={!!aiSummary}
-                isModelConfigLoading={isModelConfigLoading}
-                onOpenModelSettings={onOpenModelSettings}
-                languageSlot={languageSlot}
+                 hasSummary={!!aiSummary}
+                 meetingId={meeting.id}
+                 summaries={summaries}
+                 activeTemplateId={activeTemplateId}
+                 onActiveTemplateChange={onActiveTemplateChange}
+                 onSummariesChanged={onSummariesChanged}
+                 onSaveAll={onSaveAll}
+                 pendingEditsExist={pendingEditsExist}
+                 onDirtyChange={onDirtyChange}
+                 isModelConfigLoading={isModelConfigLoading}
+                 onOpenModelSettings={onOpenModelSettings}
+                 compact={compact}
+                 languageSlot={languageSlot}
               />
             </div>
 
-            {/* Right-aligned: Summary Updater Button Group */}
+            {/* Right-aligned: Summary Updater Button Group + PDF export */}
             <div className="flex-shrink-0">
-              <SummaryUpdaterButtonGroup
+              <div className="flex items-center gap-2">
+                <ExportMenu
+                  meetingId={meeting.id}
+                  templateId={exportTemplateId}
+                  availableTemplates={availableTemplates}
+                  templateName={exportTemplateName}
+                  disabled={exportDisabled}
+                  meetingTitle={meetingTitle}
+                  compact={compact}
+                />
+                <SummaryUpdaterButtonGroup
                 isSaving={isSaving}
                 isDirty={isTitleDirty || (summaryRef.current?.isDirty || false)}
                 onSave={onSaveAll}
@@ -320,6 +373,7 @@ export function SummaryPanel({
                 onOpenFolder={onOpenFolder}
                 hasSummary={!!aiSummary}
               />
+              </div>
             </div>
           </div>
         )}
@@ -337,13 +391,23 @@ export function SummaryPanel({
               onStopGeneration={onStopGeneration}
               customPrompt={customPrompt}
               summaryStatus={summaryStatus}
+              isExternallyProcessing={isExternallyProcessing}
               availableTemplates={availableTemplates}
               selectedTemplate={selectedTemplate}
-              onTemplateSelect={onTemplateSelect}
-              hasTranscripts={transcripts.length > 0}
-              isModelConfigLoading={isModelConfigLoading}
-              onOpenModelSettings={onOpenModelSettings}
-            />
+               onTemplateSelect={onTemplateSelect}
+               hasTranscripts={transcripts.length > 0}
+               meetingId={meeting.id}
+               summaries={summaries}
+               activeTemplateId={activeTemplateId}
+               onActiveTemplateChange={onActiveTemplateChange}
+               onSummariesChanged={onSummariesChanged}
+               onSaveAll={onSaveAll}
+               pendingEditsExist={pendingEditsExist}
+               onDirtyChange={onDirtyChange}
+               isModelConfigLoading={isModelConfigLoading}
+               onOpenModelSettings={onOpenModelSettings}
+               compact={compact}
+             />
           </div>
           {/* Loading spinner */}
           <div className="flex items-center justify-center flex-1">
@@ -365,14 +429,24 @@ export function SummaryPanel({
               onStopGeneration={onStopGeneration}
               customPrompt={customPrompt}
               summaryStatus={summaryStatus}
+              isExternallyProcessing={isExternallyProcessing}
               availableTemplates={availableTemplates}
               selectedTemplate={selectedTemplate}
-              onTemplateSelect={onTemplateSelect}
-              hasTranscripts={transcripts.length > 0}
-              hasSummary={false}
-              isModelConfigLoading={isModelConfigLoading}
-              onOpenModelSettings={onOpenModelSettings}
-              languageSlot={transcripts.length > 0 ? languageSlot : undefined}
+               onTemplateSelect={onTemplateSelect}
+               hasTranscripts={transcripts.length > 0}
+               hasSummary={false}
+               meetingId={meeting.id}
+               summaries={summaries}
+               activeTemplateId={activeTemplateId}
+               onActiveTemplateChange={onActiveTemplateChange}
+               onSummariesChanged={onSummariesChanged}
+               onSaveAll={onSaveAll}
+               pendingEditsExist={pendingEditsExist}
+               onDirtyChange={onDirtyChange}
+               isModelConfigLoading={isModelConfigLoading}
+               onOpenModelSettings={onOpenModelSettings}
+               compact={compact}
+               languageSlot={transcripts.length > 0 ? languageSlot : undefined}
             />
           </div>
           {/* Empty state message */}
@@ -430,7 +504,8 @@ export function SummaryPanel({
             </div>
           )}
           <div className="p-6 w-full">
-            <BlockNoteSummaryView
+               <BlockNoteSummaryView
+               key={`${meeting.id}:${activeTemplateId ?? 'none'}`}
               ref={summaryRef}
               summaryData={aiSummary}
               onSave={onSaveSummary}

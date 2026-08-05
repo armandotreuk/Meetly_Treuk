@@ -38,7 +38,6 @@ interface FolderTreeItemProps {
     expanded: Set<string>;
     onToggle: (id: string) => void;
     currentMeetingId?: string;
-    findSnippet?: (meetingId: string) => { matchContext: string } | null;
     onEditMeeting: (meetingId: string, currentTitle: string) => void;
     onRequestDeleteMeeting: (meetingId: string) => void;
     onMoveMeeting: (meetingId: string, folderId: string | null) => void;
@@ -57,7 +56,6 @@ export function FolderTreeItem(props: FolderTreeItemProps) {
         expanded,
         onToggle,
         currentMeetingId,
-        findSnippet,
         onEditMeeting,
         onRequestDeleteMeeting,
         onMoveMeeting,
@@ -287,7 +285,6 @@ export function FolderTreeItem(props: FolderTreeItemProps) {
                             expanded={expanded}
                             onToggle={onToggle}
                             currentMeetingId={currentMeetingId}
-                            findSnippet={findSnippet}
                             onEditMeeting={onEditMeeting}
                             onRequestDeleteMeeting={onRequestDeleteMeeting}
                             onMoveMeeting={onMoveMeeting}

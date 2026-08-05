@@ -28,6 +28,7 @@ import type { MeetingSummaryInfo } from "@/types";
 import { ConfirmSwitchSummaryDialog } from "./ConfirmSwitchSummaryDialog";
 import { ConfirmDeleteSummaryDialog } from "./ConfirmDeleteSummaryDialog";
 import { ChooseTemplateForLegacyDialog } from "./ChooseTemplateForLegacyDialog";
+import { fallbackAfterSummaryDelete } from "@/lib/summary-selection";
 
 // Sentinel template_id used by the migration backfill for pre-multi-template
 // summaries (see summary/commands.rs).
@@ -62,7 +63,8 @@ interface SummaryGeneratorButtonGroupProps {
     onStopGeneration: () => void;
     customPrompt: string;
     summaryStatus: "idle" | "processing" | "summarizing" | "regenerating" | "completed" | "error";
-    availableTemplates: Array<{ id: string; name: string; description: string }>;
+    isExternallyProcessing?: boolean;
+    availableTemplates: Array<{ id: string; name: string; description: string; source?: string }>;
     onTemplateSelect: (templateId: string, templateName: string) => void;
     hasTranscripts?: boolean;
     isModelConfigLoading?: boolean;
@@ -76,6 +78,8 @@ interface SummaryGeneratorButtonGroupProps {
     activeTemplateId?: string | null;
     onActiveTemplateChange?: (templateId: string | null) => void;
     onSummariesChanged?: () => void | Promise<void>;
+    onSaveAll?: () => Promise<void>;
+    onDirtyChange?: (isDirty: boolean) => void;
     pendingEditsExist?: boolean;
     // Legacy callers still pass these; accept and ignore.
     selectedTemplate?: string;
@@ -90,6 +94,7 @@ export function SummaryGeneratorButtonGroup({
     onStopGeneration,
     customPrompt,
     summaryStatus,
+    isExternallyProcessing = false,
     availableTemplates,
     onTemplateSelect,
     hasTranscripts = true,
@@ -102,12 +107,15 @@ export function SummaryGeneratorButtonGroup({
     activeTemplateId = null,
     onActiveTemplateChange = () => {},
     onSummariesChanged = () => {},
+    onSaveAll,
+    onDirtyChange,
     pendingEditsExist = false,
 }: SummaryGeneratorButtonGroupProps) {
     const [isCheckingModels, setIsCheckingModels] = useState(false);
     const [settingsDialogOpen, setSettingsDialogOpen] = useState(false);
     const [templateMenuOpen, setTemplateMenuOpen] = useState(false);
     const [switchDialogOpen, setSwitchDialogOpen] = useState(false);
+    const [pendingSwitchTarget, setPendingSwitchTarget] = useState<string | null>(null);
     const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
     const [legacyDialogOpen, setLegacyDialogOpen] = useState(false);
 
@@ -287,6 +295,7 @@ export function SummaryGeneratorButtonGroup({
     };
 
     const isGenerating =
+        isExternallyProcessing ||
         summaryStatus === "processing" ||
         summaryStatus === "summarizing" ||
         summaryStatus === "regenerating";
@@ -298,6 +307,9 @@ export function SummaryGeneratorButtonGroup({
 
     const activeRow = summaries.find((s) => s.template_id === activeTemplateId) ?? null;
     const hasActiveRow = activeRow != null;
+    const isMissingTemplate = (templateId: string) =>
+        templateId !== LEGACY_TEMPLATE_ID && !availableTemplates.some((t) => t.id === templateId);
+    const activeTemplateMissing = activeRow != null && isMissingTemplate(activeRow.template_id);
 
     // ponytail: zone lists + name map recomputed per render; summaries and
     // templates are both tiny lists (<20 rows), so memoization is noise.
@@ -322,21 +334,39 @@ export function SummaryGeneratorButtonGroup({
     const isLocked =
         isGenerating || summaries.some((s) => GENERATING_STATUSES.includes(s.status));
 
-    const handleSelectSummaryRow = (templateId: string) => {
+    const applyTemplateChange = (templateId: string) => {
+        onActiveTemplateChange(templateId);
+        const template = availableTemplates.find((candidate) => candidate.id === templateId);
+        if (template) onTemplateSelect(template.id, template.name);
+    };
+
+    const requestTemplateChange = (templateId: string) => {
         if (templateId === activeTemplateId) return;
         if (pendingEditsExist) {
+            setPendingSwitchTarget(templateId);
             setSwitchDialogOpen(true);
             return;
         }
-        onActiveTemplateChange(templateId);
+        applyTemplateChange(templateId);
+    };
+
+    const handleSelectSummaryRow = (templateId: string) => {
+        requestTemplateChange(templateId);
     };
 
     const handlePrimaryClick = () => {
+        if (isExternallyProcessing) return;
         Analytics.trackButtonClick("generate_summary", "meeting_details");
         // Item 29: legacy rows are a read-only archive — never regenerate
         // into them; ask for a real template instead.
         if (activeTemplateId === LEGACY_TEMPLATE_ID) {
             setLegacyDialogOpen(true);
+            return;
+        }
+        if (activeTemplateMissing) {
+            toast.error("The selected template is no longer available", {
+                description: "Choose an available template before regenerating this summary.",
+            });
             return;
         }
         checkOllamaModelsAndGenerate();
@@ -366,9 +396,11 @@ export function SummaryGeneratorButtonGroup({
                     size="sm"
                     className="bg-gradient-to-r from-blue-50 to-purple-50 hover:from-blue-100 hover:to-purple-100 border-blue-200 xl:px-4"
                     onClick={handlePrimaryClick}
-                    disabled={isCheckingModels || isModelConfigLoading}
+                    disabled={isExternallyProcessing || isCheckingModels || isModelConfigLoading}
                     title={
-                        isModelConfigLoading
+                        isExternallyProcessing
+                            ? "Summary generation already in progress"
+                            : isModelConfigLoading
                             ? "Loading model configuration..."
                             : isCheckingModels
                               ? "Checking models..."
@@ -430,15 +462,20 @@ export function SummaryGeneratorButtonGroup({
                             size="sm"
                             disabled={isLocked}
                             title={
-                                isOrphanedActive
+                                isLocked
+                                    ? "A summary is already being generated"
+                                    : isOrphanedActive
                                     ? "Previously selected summary no longer exists"
                                     : "Select summary template"
                             }
                         >
                             <FileText />
-                            <span className={compact ? "hidden" : "hidden lg:inline"}>
-                                {activeTemplateId ? templateNameFor(activeTemplateId) : "Template"}
-                            </span>
+                            <span className={compact ? "hidden" : "hidden lg:inline"}>Summaries</span>
+                            {summaries.length > 0 && (
+                                <span className="rounded-full bg-gray-100 px-1.5 py-0.5 text-xs font-medium text-gray-700">
+                                    {summaries.length}
+                                </span>
+                            )}
                             {activeRow && (
                                 <span
                                     className={`hidden lg:inline rounded-full px-1.5 py-0.5 text-xs font-medium ${
@@ -469,6 +506,11 @@ export function SummaryGeneratorButtonGroup({
                                                 <span className="truncate">
                                                     {templateNameFor(s.template_id)}
                                                 </span>
+                                                {isMissingTemplate(s.template_id) && (
+                                                    <AlertTriangle
+                                                        className="h-3.5 w-3.5 shrink-0 text-amber-500"
+                                                    />
+                                                )}
                                                 {activeTemplateId === s.template_id && (
                                                     <Check className="h-4 w-4 shrink-0 text-green-600" />
                                                 )}
@@ -516,8 +558,7 @@ export function SummaryGeneratorButtonGroup({
                                     <DropdownMenuItem
                                         key={template.id}
                                         onClick={() => {
-                                            onActiveTemplateChange(template.id);
-                                            onTemplateSelect(template.id, template.name);
+                                            requestTemplateChange(template.id);
                                         }}
                                         title={template.description}
                                         className="flex items-center justify-between gap-2"
@@ -537,13 +578,26 @@ export function SummaryGeneratorButtonGroup({
 
         <ConfirmSwitchSummaryDialog
             open={switchDialogOpen}
-            onOpenChange={setSwitchDialogOpen}
+            onOpenChange={(open) => {
+                setSwitchDialogOpen(open);
+                if (!open) setPendingSwitchTarget(null);
+            }}
             summaries={summaries}
             currentTemplateId={activeTemplateId}
             pendingEditsExist={pendingEditsExist}
             templateNames={templateNames}
-            onConfirm={(newTemplateId) => {
-                onActiveTemplateChange(newTemplateId);
+            pendingTemplateId={pendingSwitchTarget}
+            onDiscard={(newTemplateId) => {
+                onDirtyChange?.(false);
+                applyTemplateChange(newTemplateId);
+                setPendingSwitchTarget(null);
+                setSwitchDialogOpen(false);
+            }}
+            onSaveAndSwitch={async (newTemplateId) => {
+                await onSaveAll?.();
+                onDirtyChange?.(false);
+                applyTemplateChange(newTemplateId);
+                setPendingSwitchTarget(null);
                 setSwitchDialogOpen(false);
             }}
         />
@@ -555,9 +609,29 @@ export function SummaryGeneratorButtonGroup({
             meetingId={meetingId}
             templateId={deleteTarget ?? ""}
             templateDisplayName={deleteTarget ? templateNameFor(deleteTarget) : undefined}
-            onDeleted={() => {
-                if (deleteTarget === activeTemplateId) onActiveTemplateChange(null);
-                void onSummariesChanged();
+            onDeleted={async () => {
+                const deletedTemplateId = deleteTarget;
+                if (!deletedTemplateId) return;
+                if (deletedTemplateId === activeTemplateId) {
+                    // `summaries` is the React state captured before the parent persists the
+                    // delete, so it still contains the just-removed row. `fallbackAfterSummaryDelete`
+                    // therefore finds the deleted entry and walks to a sibling — but when no
+                    // sibling exists it falls back to `DEFAULT_SUMMARY_TEMPLATE_ID`, which equals
+                    // the deleted id when the user deleted `standard_meeting` as the only row. In
+                    // that degenerate case the fallback would re-reference the very template we
+                    // just removed, so the `null` arm clears the active selection instead of
+                    // self-referencing the deleted template. `onSummariesChanged()` below refreshes
+                    // the array from the persisted store.
+                    const fallbackTemplateId = fallbackAfterSummaryDelete(
+                        summaries,
+                        deletedTemplateId,
+                    );
+                    onDirtyChange?.(false);
+                    onActiveTemplateChange(
+                        fallbackTemplateId === activeTemplateId ? null : fallbackTemplateId,
+                    );
+                }
+                await onSummariesChanged();
             }}
         />
         <ChooseTemplateForLegacyDialog
@@ -565,7 +639,13 @@ export function SummaryGeneratorButtonGroup({
             onOpenChange={setLegacyDialogOpen}
             availableTemplates={availableTemplates}
             onChoose={(templateId) => {
-                onActiveTemplateChange(templateId);
+                if (pendingEditsExist) {
+                    setLegacyDialogOpen(false);
+                    setPendingSwitchTarget(templateId);
+                    setSwitchDialogOpen(true);
+                    return;
+                }
+                applyTemplateChange(templateId);
                 setLegacyDialogOpen(false);
             }}
         />
