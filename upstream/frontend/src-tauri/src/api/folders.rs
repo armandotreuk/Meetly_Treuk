@@ -5,10 +5,7 @@
 use tauri::{AppHandle, Runtime, State};
 
 use crate::{
-    database::{
-        models::MeetingFolderModel,
-        repositories::folder::FolderRepository,
-    },
+    database::{models::MeetingFolderModel, repositories::folder::FolderRepository},
     state::AppState,
 };
 

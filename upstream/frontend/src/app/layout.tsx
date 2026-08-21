@@ -24,6 +24,7 @@ import { RecordingPostProcessingProvider } from "@/contexts/RecordingPostProcess
 import { ImportAudioDialog, ImportDropOverlay } from "@/components/ImportAudio";
 import { ImportDialogProvider } from "@/contexts/ImportDialogContext";
 import { isAudioExtension, getAudioFormatsDisplayList } from "@/constants/audioFormats";
+import { ChatHost } from "@/components/ChatPanel/ChatHost";
 
 const sourceSans3 = Source_Sans_3({
     subsets: ["latin"],
@@ -234,7 +235,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                             <OllamaDownloadProvider>
                                 <OnboardingProvider>
                                     <SidebarProvider>
-                                        <TooltipProvider>
+                                        <ChatHost><TooltipProvider>
                                             <RecordingPostProcessingProvider>
                                                 <ImportDialogProvider
                                                     onOpen={handleOpenImportDialog}
@@ -264,7 +265,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                                                     />
                                                 </ImportDialogProvider>
                                             </RecordingPostProcessingProvider>
-                                        </TooltipProvider>
+                                        </TooltipProvider></ChatHost>
                                     </SidebarProvider>
                                 </OnboardingProvider>
                             </OllamaDownloadProvider>

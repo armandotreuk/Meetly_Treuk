@@ -1,41 +1,31 @@
 "use client";
 
 import { useEffect } from "react";
-import { logger } from "@/lib/logger";
 
 import type { PartialBlock, Block } from "@blocknote/core";
 import { useCreateBlockNote } from "@blocknote/react";
 import { BlockNoteView } from "@blocknote/shadcn";
+import type { MarkdownCapableEditor } from "@/lib/blocknote-markdown";
 import "@blocknote/shadcn/style.css";
 import "@blocknote/core/fonts/inter.css";
 
 interface EditorProps {
     initialContent?: Block[];
     onChange?: (blocks: Block[]) => void;
+    onReady?: (editor: MarkdownCapableEditor) => void;
     editable?: boolean;
 }
 
-export default function Editor({ initialContent, onChange, editable = true }: EditorProps) {
-    logger.debug("📝 EDITOR: Initializing BlockNote editor with blocks:", {
-        hasContent: !!initialContent,
-        blocksCount: initialContent?.length || 0,
-        editable,
-    });
-
+export default function Editor({ initialContent, onChange, onReady, editable = true }: EditorProps) {
     const editor = useCreateBlockNote({
         initialContent: initialContent as PartialBlock[] | undefined,
     });
-
-    logger.debug("📝 EDITOR: BlockNote editor created successfully");
 
     // Handle content changes
     useEffect(() => {
         if (!onChange) return;
 
         const handleChange = () => {
-            logger.debug("📝 EDITOR: Content changed, notifying parent...", {
-                blocksCount: editor.document.length,
-            });
             onChange(editor.document);
         };
 
@@ -43,11 +33,14 @@ export default function Editor({ initialContent, onChange, editable = true }: Ed
 
         return () => {
             if (typeof unsubscribe === "function") {
-                logger.debug("📝 EDITOR: Cleaning up onChange listener");
                 unsubscribe();
             }
         };
     }, [editor, onChange]);
+
+    useEffect(() => {
+        onReady?.(editor);
+    }, [editor, onReady]);
 
     return <BlockNoteView editor={editor} editable={editable} theme="light" />;
 }

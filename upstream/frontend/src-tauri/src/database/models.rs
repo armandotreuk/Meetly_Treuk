@@ -17,6 +17,11 @@ pub struct MeetingModel {
     pub updated_at: DateTimeUtc,
     pub folder_path: Option<String>,
     pub folder_id: Option<String>,
+    // ponytail: only the meetings-list query produces this column; the other
+    // MeetingModel queries select explicit columns, so #[sqlx(default)] maps the
+    // missing column to false instead of a decode error.
+    #[sqlx(default)]
+    pub has_notes: bool,
 }
 
 /// Logical folder for grouping meetings (multi-level, in-DB only; disk layout is unaffected).

@@ -34,6 +34,7 @@ pub struct Meeting {
     pub title: String,
     pub created_at: String,
     pub folder_id: Option<String>,
+    pub has_notes: bool,
 }
 
 impl From<MeetingModel> for Meeting {
@@ -43,6 +44,7 @@ impl From<MeetingModel> for Meeting {
             title: meeting.title,
             created_at: meeting.created_at.0.to_rfc3339(),
             folder_id: meeting.folder_id,
+            has_notes: meeting.has_notes,
         }
     }
 }
@@ -606,7 +608,7 @@ pub async fn api_search_fts<R: Runtime>(
         auth_token.is_some()
     );
     let pool = state.db_manager.pool();
-    FtsRepository::search(pool, &query, limit.unwrap_or(20))
+    FtsRepository::search(pool, &query, limit.unwrap_or(20), None)
         .await
         .map_err(|e| format!("Failed to search FTS index: {}", e))
 }
@@ -1012,6 +1014,7 @@ mod tests {
             updated_at: DateTimeUtc(now),
             folder_path: None,
             folder_id: None,
+            has_notes: false,
         });
 
         let json = serde_json::to_value(meeting).expect("serialize meeting");
@@ -1028,6 +1031,7 @@ mod tests {
             updated_at: DateTimeUtc(now),
             folder_path: None,
             folder_id: Some("folder-1".to_string()),
+            has_notes: false,
         });
 
         assert_eq!(meeting.folder_id.as_deref(), Some("folder-1"));
@@ -1132,6 +1136,7 @@ pub async fn api_save_transcript<R: Runtime>(
     meeting_title: String,
     transcripts: Vec<serde_json::Value>,
     folder_path: Option<String>,
+    live_scope_key: Option<String>,
     auth_token: Option<String>,
 ) -> Result<serde_json::Value, String> {
     log_info!(
@@ -1180,6 +1185,7 @@ pub async fn api_save_transcript<R: Runtime>(
         &meeting_title,
         &transcripts_to_save,
         folder_path,
+        live_scope_key.as_deref(),
     )
     .await
     {

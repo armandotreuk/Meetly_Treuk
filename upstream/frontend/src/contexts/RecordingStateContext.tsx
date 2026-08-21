@@ -40,6 +40,7 @@ interface RecordingState {
     isActive: boolean; // Is actively recording (recording && !paused)
     recordingDuration: number | null; // Total duration including pauses
     activeDuration: number | null; // Active recording time (excluding pauses)
+    liveTranscriptScopeKey: string | null;
 
     // NEW: Lifecycle status
     status: RecordingStatus;
@@ -73,6 +74,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
         isActive: false,
         recordingDuration: null,
         activeDuration: null,
+        liveTranscriptScopeKey: null,
         status: RecordingStatus.IDLE, // NEW: Initialize with IDLE status
         statusMessage: undefined, // NEW: No message initially
     });
@@ -108,6 +110,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
                 isActive: backendState.is_active,
                 recordingDuration: backendState.recording_duration,
                 activeDuration: backendState.active_duration,
+                liveTranscriptScopeKey: backendState.live_transcript_scope_key ?? prev.liveTranscriptScopeKey,
             }));
 
             logger.debug("[RecordingStateContext] Synced with backend:", backendState);
@@ -150,13 +153,14 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
         const setupListeners = async () => {
             try {
                 // Recording started
-                const unlistenStarted = await recordingService.onRecordingStarted(() => {
+                const unlistenStarted = await recordingService.onRecordingStarted((payload) => {
                     logger.debug("[RecordingStateContext] Recording started event");
                     setState((prev) => ({
                         ...prev,
                         isRecording: true,
                         isPaused: false,
                         isActive: true,
+                        liveTranscriptScopeKey: payload.liveTranscriptScopeKey,
                         status: RecordingStatus.RECORDING, // NEW: Set status to RECORDING
                     }));
                     startPolling();

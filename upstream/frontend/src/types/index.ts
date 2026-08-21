@@ -188,6 +188,63 @@ export interface ChatMessage {
     role: "user" | "assistant";
     content: string;
     sources?: ChatSource[];
+    isError?: boolean;
+    isStreaming?: boolean;
+}
+
+/** Payload for `chat-stream-start` Tauri events. */
+export interface ChatStreamStartPayload {
+    streamId: string;
+    sources: ChatSource[];
+    meetingId: string | null;
+}
+
+export interface ChatConversation {
+    id: string;
+    meeting_id: string | null;
+    origin: string;
+    scope_kind: string;
+    scope_key: string;
+    scope_data: string | null;
+    title: string | null;
+    created_at: string;
+    updated_at: string;
+}
+
+export type ChatScope =
+    | { kind: "all"; key: "all"; data?: never }
+    | { kind: "meeting"; key: string; data?: never }
+    | { kind: "folder"; key: string; data?: never }
+    | { kind: "search_snapshot"; key: string; data: { result_ids: string[] } }
+    | { kind: "live_recording"; key: string; data?: never };
+
+export interface ChatMessageRow {
+    id: string;
+    conversation_id: string;
+    role: "user" | "assistant";
+    content: string;
+    sources_json: string | null;
+    is_error: boolean;
+    created_at: string;
+}
+
+/** Payload for `chat-stream-chunk` Tauri events. */
+export interface ChatStreamChunkPayload {
+    streamId: string;
+    text: string;
+}
+
+/** Payload for `chat-stream-done` Tauri events. */
+export interface ChatStreamDonePayload {
+    streamId: string;
+    answer: string;
+    sources: ChatSource[];
+}
+
+/** Payload for `chat-stream-error` Tauri events. */
+export interface ChatStreamErrorPayload {
+    streamId: string;
+    error: string;
 }
 
 export interface ChatSource {
@@ -196,6 +253,7 @@ export interface ChatSource {
     chunkType: string;
     snippet: string;
     folderName: string;
+    sourceKind?: "meeting" | "live_recording";
 }
 
 export interface ChatResponse {

@@ -11,7 +11,6 @@ import { toast } from "sonner";
 import { TranscriptPanel } from "@/components/MeetingDetails/TranscriptPanel";
 import { SummaryPanel } from "@/components/MeetingDetails/SummaryPanel";
 import { NotesPanel } from "@/components/MeetingDetails/NotesPanel";
-import { ChatPanel } from "@/components/ChatPanel";
 import { ModelConfig } from "@/components/ModelSettingsModal";
 import { StickyNote, MessageSquare } from "lucide-react";
 
@@ -23,6 +22,9 @@ import { useCopyOperations } from "@/hooks/meeting-details/useCopyOperations";
 import { useMeetingOperations } from "@/hooks/meeting-details/useMeetingOperations";
 import { useConfig } from "@/contexts/ConfigContext";
 import { usePanelResize } from "@/hooks/usePanelResize";
+import { togglePanelOnShortcut } from "@/lib/panel-shortcuts";
+import { t } from "@/lib/i18n";
+import { useChatHost } from "@/components/ChatPanel/ChatHost";
 
 export default function PageContent({
     meeting,
@@ -81,7 +83,7 @@ export default function PageContent({
     const [isRecording] = useState(false);
     const [summaryResponse] = useState<SummaryResponse | null>(null);
     const [showNotes, setShowNotes] = useState(false);
-    const [showChat, setShowChat] = useState(false);
+    const { openChat } = useChatHost();
 
     // Meeting-details notes panel — resizable from its left edge.
     const notesResize = usePanelResize({
@@ -89,6 +91,7 @@ export default function PageContent({
         min: 240,
         maxFraction: 0.6,
         side: "right",
+        storageKey: "meedly:meeting-notes-width",
     });
 
     // Transcript — resizable from its right edge (between transcript and summary).
@@ -97,6 +100,7 @@ export default function PageContent({
         min: 240,
         maxFraction: 0.5,
         side: "left",
+        storageKey: "meedly:meeting-transcript-width",
     });
 
     // ponytail: ResizeObserver to detect the SummaryPanel's rendered width so we can toggle
@@ -258,6 +262,16 @@ export default function PageContent({
         Analytics.trackPageView("meeting_details");
     }, []);
 
+    // ponytail: Ctrl/Cmd+Shift+N/M avoid Ctrl/Cmd+J downloads and Ctrl/Cmd+Shift+J DevTools, though host applications may reserve them.
+    useEffect(() => {
+        const onKey = (event: KeyboardEvent) => {
+            if (togglePanelOnShortcut(event, "n", () => setShowNotes((show) => !show))) return;
+            togglePanelOnShortcut(event, "m", () => openChat({ kind: "meeting", key: meeting.id }, meeting.title));
+        };
+        window.addEventListener("keydown", onKey);
+        return () => window.removeEventListener("keydown", onKey);
+    }, [meeting.id, openChat]);
+
     // Auto-generate summary when flag is set
     useEffect(() => {
         let cancelled = false;
@@ -378,31 +392,26 @@ export default function PageContent({
                     </>
                 )}
             </div>
-            {showChat && (
-                <div className="h-80 shrink-0 border-t border-gray-200">
-                    <ChatPanel onClose={() => setShowChat(false)} />
-                </div>
-            )}
             {/* F11: Notes toggle button — only shown when notes are hidden so it never overlaps the panel's Save/X buttons */}
             {!showNotes && (
                 <button
                     onClick={() => setShowNotes(true)}
                     className="absolute top-4 right-4 z-10 p-2 rounded-lg shadow-sm bg-white text-gray-400 hover:text-gray-600"
-                    title="Show notes"
+                    title="Show notes (Ctrl/Cmd+Shift+N)"
+                    aria-label={t("app.meetingDetails.showNotesAria")}
                 >
                     <StickyNote className="h-4 w-4" />
                 </button>
             )}
-            {/* Chat toggle button */}
-            {!showChat && (
-                <button
-                    onClick={() => setShowChat(true)}
-                    className="absolute top-4 right-12 z-10 p-2 rounded-lg shadow-sm bg-white text-gray-400 hover:text-gray-600"
-                    title="Chat with meetings"
-                >
-                    <MessageSquare className="h-4 w-4" />
-                </button>
-            )}
+{/* Chat toggle button */}
+            <button
+                onClick={() => openChat({ kind: "meeting", key: meeting.id }, meeting.title)}
+                className="absolute top-4 right-12 z-10 p-2 rounded-lg shadow-sm bg-white text-gray-400 hover:text-gray-600"
+                title={t("app.meetingDetails.showChatTitle")}
+                aria-label={t("app.meetingDetails.showChatAria")}
+            >
+                <MessageSquare className="h-4 w-4" />
+            </button>
         </motion.div>
     );
 }

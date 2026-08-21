@@ -1,3 +1,4 @@
+use futures_util::StreamExt;
 use reqwest::{header, Client};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -25,6 +26,8 @@ pub struct ChatRequest {
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
 }
 
 // Generic structure for OpenAI-compatible API chat responses
@@ -50,6 +53,8 @@ pub struct ClaudeRequest {
     pub max_tokens: u32,
     pub system: String,
     pub messages: Vec<ChatMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
 }
 
 // Claude-specific response structure
@@ -92,24 +97,6 @@ impl LLMProvider {
 }
 
 /// Generates a summary using the specified LLM provider
-///
-/// # Arguments
-/// * `client` - Reqwest HTTP client (reused for performance)
-/// * `provider` - The LLM provider to use
-/// * `model_name` - The specific model to use (e.g., "gpt-4", "claude-3-opus")
-/// * `api_key` - API key for the provider (not needed for Ollama)
-/// * `system_prompt` - System instructions for the LLM
-/// * `user_prompt` - User query/content to process
-/// * `ollama_endpoint` - Optional custom Ollama endpoint (defaults to localhost:11434)
-/// * `custom_openai_endpoint` - Optional custom OpenAI-compatible endpoint
-/// * `max_tokens` - Optional max tokens (for CustomOpenAI provider)
-/// * `temperature` - Optional temperature (for CustomOpenAI provider)
-/// * `top_p` - Optional top_p (for CustomOpenAI provider)
-/// * `app_data_dir` - Optional app data directory (for BuiltInAI provider)
-/// * `cancellation_token` - Optional token to cancel the request
-///
-/// # Returns
-/// The generated summary text or an error message
 pub async fn generate_summary(
     client: &Client,
     provider: &LLMProvider,
@@ -125,18 +112,15 @@ pub async fn generate_summary(
     app_data_dir: Option<&PathBuf>,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<String, String> {
-    // Check if cancelled before starting
     if let Some(token) = cancellation_token {
         if token.is_cancelled() {
             return Err("Summary generation was cancelled".to_string());
         }
     }
 
-    // Handle BuiltInAI provider separately (uses local sidecar, no HTTP API)
     if provider == &LLMProvider::BuiltInAI {
         let app_data_dir = app_data_dir
             .ok_or_else(|| "app_data_dir is required for BuiltInAI provider".to_string())?;
-
         return crate::summary::summary_engine::generate_with_builtin(
             app_data_dir,
             model_name,
@@ -148,6 +132,122 @@ pub async fn generate_summary(
         .map_err(|e| e.to_string());
     }
 
+    let (api_url, headers, request_body) = build_chat_request(
+        provider,
+        model_name,
+        api_key,
+        system_prompt,
+        user_prompt,
+        ollama_endpoint,
+        custom_openai_endpoint,
+        max_tokens,
+        temperature,
+        top_p,
+        None,
+    )?;
+
+    info!(
+        "🐞 LLM Request to {}: model={}",
+        provider_name(provider),
+        model_name
+    );
+
+    let request_future = client
+        .post(api_url)
+        .headers(headers)
+        .json(&request_body)
+        .timeout(REQUEST_TIMEOUT_DURATION)
+        .send();
+
+    let response = if let Some(token) = cancellation_token {
+        tokio::select! {
+            result = request_future => {
+                result.map_err(|e| {
+                    if e.is_timeout() {
+                        format!(
+                            "LLM request timed out after {} seconds",
+                            REQUEST_TIMEOUT_DURATION.as_secs()
+                        )
+                    } else {
+                        format!("Failed to send request to LLM: {}", e)
+                    }
+                })?
+            }
+            _ = token.cancelled() => {
+                return Err("Summary generation was cancelled".to_string());
+            }
+        }
+    } else {
+        request_future.await.map_err(|e| {
+            if e.is_timeout() {
+                format!(
+                    "LLM request timed out after {} seconds",
+                    REQUEST_TIMEOUT_DURATION.as_secs()
+                )
+            } else {
+                format!("Failed to send request to LLM: {}", e)
+            }
+        })?
+    };
+
+    if !response.status().is_success() {
+        let error_body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        return Err(format!("LLM API request failed: {}", error_body));
+    }
+
+    if provider == &LLMProvider::Claude {
+        let chat_response = response
+            .json::<ClaudeChatResponse>()
+            .await
+            .map_err(|e| format!("Failed to parse LLM response: {}", e))?;
+
+        info!("🐞 LLM Response received from Claude");
+
+        let content = chat_response
+            .content
+            .get(0)
+            .ok_or("No content in LLM response")?
+            .text
+            .trim();
+        Ok(content.to_string())
+    } else {
+        let chat_response = response
+            .json::<ChatResponse>()
+            .await
+            .map_err(|e| format!("Failed to parse LLM response: {}", e))?;
+
+        info!("🐞 LLM Response received from {}", provider_name(provider));
+
+        let content = chat_response
+            .choices
+            .get(0)
+            .ok_or("No content in LLM response")?
+            .message
+            .content
+            .trim();
+        Ok(content.to_string())
+    }
+}
+
+/// Builds the URL, headers, and JSON body shared by streaming and
+/// non-streaming chat requests. The only caller-controlled difference is the
+/// `stream` field injected into the request body.
+fn build_chat_request(
+    provider: &LLMProvider,
+    model_name: &str,
+    api_key: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    ollama_endpoint: Option<&str>,
+    custom_openai_endpoint: Option<&str>,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    stream: Option<bool>,
+) -> Result<(String, header::HeaderMap, serde_json::Value), String> {
     let (api_url, mut headers) = match provider {
         LLMProvider::OpenAI => (
             "https://api.openai.com/v1/chat/completions".to_string(),
@@ -198,12 +298,10 @@ pub async fn generate_summary(
             )
         }
         LLMProvider::BuiltInAI => {
-            // This case is handled earlier with early returns
             unreachable!("BuiltInAI is handled before this match statement")
         }
     };
 
-    // Add authorization header for non-Claude providers
     if provider != &LLMProvider::Claude {
         headers.insert(
             header::AUTHORIZATION,
@@ -219,9 +317,7 @@ pub async fn generate_summary(
             .map_err(|_| "Invalid content type".to_string())?,
     );
 
-    // Build request body based on provider
     let request_body = if provider != &LLMProvider::Claude {
-        // For CustomOpenAI, apply optional parameters if provided
         let (max_tokens_val, temperature_val, top_p_val) = if provider == &LLMProvider::CustomOpenAI
         {
             (max_tokens, temperature, top_p)
@@ -244,6 +340,7 @@ pub async fn generate_summary(
             max_tokens: max_tokens_val,
             temperature: temperature_val,
             top_p: top_p_val,
+            stream,
         })
     } else {
         serde_json::json!(ClaudeRequest {
@@ -253,17 +350,182 @@ pub async fn generate_summary(
             messages: vec![ChatMessage {
                 role: "user".to_string(),
                 content: user_prompt.to_string(),
-            }]
+            }],
+            stream,
         })
     };
 
+    Ok((api_url, headers, request_body))
+}
+
+/// Decoded SSE event classification.
+#[derive(Debug, PartialEq)]
+enum SseEvent {
+    Delta(String),
+    Done,
+    Ignore,
+}
+
+/// Parses a single SSE `data:` payload into a decoded event.
+fn parse_sse_line(provider: &LLMProvider, data: &str) -> SseEvent {
+    if provider == &LLMProvider::Claude {
+        let parsed: serde_json::Value = match serde_json::from_str(data) {
+            Ok(v) => v,
+            Err(_) => return SseEvent::Ignore,
+        };
+
+        match parsed.get("type").and_then(|t| t.as_str()) {
+            Some("message_stop") => return SseEvent::Done,
+            Some("content_block_delta") => {}
+            _ => return SseEvent::Ignore,
+        }
+
+        let delta = match parsed.get("delta") {
+            Some(d) => d,
+            None => return SseEvent::Ignore,
+        };
+
+        if delta.get("type").and_then(|t| t.as_str()) != Some("text_delta") {
+            return SseEvent::Ignore;
+        }
+
+        match delta.get("text").and_then(|t| t.as_str()) {
+            Some(text) => SseEvent::Delta(text.to_string()),
+            None => SseEvent::Ignore,
+        }
+    } else {
+        let trimmed = data.trim();
+        if trimmed == "[DONE]" {
+            return SseEvent::Done;
+        }
+
+        let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => return SseEvent::Ignore,
+        };
+
+        match parsed
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c0| c0.get("delta"))
+            .and_then(|d| d.get("content"))
+            .and_then(|c| c.as_str())
+        {
+            Some(text) => SseEvent::Delta(text.to_string()),
+            None => SseEvent::Ignore,
+        }
+    }
+}
+
+/// Byte buffer that reassembles HTTP chunks into complete SSE lines before
+/// converting to UTF-8, so a multi-byte codepoint split across chunks is not
+/// corrupted by lossy per-chunk decoding.
+struct SseLineBuffer {
+    bytes: Vec<u8>,
+}
+
+impl SseLineBuffer {
+    fn new() -> Self {
+        Self { bytes: Vec::new() }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        self.bytes.extend_from_slice(chunk);
+    }
+
+    /// Returns the next complete line (without the trailing newline) once a
+    /// `\n` byte is present. Handles both `\n` and `\r\n` line endings.
+    fn next_line(&mut self) -> Option<String> {
+        let newline_pos = self.bytes.iter().position(|&b| b == b'\n')?;
+        let remaining = self.bytes.split_off(newline_pos + 1);
+        let mut line_bytes = std::mem::replace(&mut self.bytes, remaining);
+        line_bytes.pop(); // remove '\n'
+        if line_bytes.last() == Some(&b'\r') {
+            line_bytes.pop();
+        }
+        Some(String::from_utf8_lossy(&line_bytes).into_owned())
+    }
+}
+
+/// Strips the SSE `data:` prefix with an optional single space, per the SSE
+/// spec (`data:` and `data: ` are both valid). Returns `None` for non-data lines.
+fn sse_data_payload(line: &str) -> Option<&str> {
+    line.strip_prefix("data:")
+        .map(|data| data.strip_prefix(' ').unwrap_or(data))
+}
+
+/// Generates a summary in streaming mode, invoking `on_chunk` for each
+/// content delta received from the LLM. Returns the full accumulated text.
+pub async fn generate_summary_stream<F>(
+    client: &Client,
+    provider: &LLMProvider,
+    model_name: &str,
+    api_key: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    ollama_endpoint: Option<&str>,
+    custom_openai_endpoint: Option<&str>,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    app_data_dir: Option<&PathBuf>,
+    cancellation_token: Option<&CancellationToken>,
+    mut on_chunk: F,
+) -> Result<String, String>
+where
+    F: FnMut(&str) + Send,
+{
+    if let Some(token) = cancellation_token {
+        if token.is_cancelled() {
+            return Err("Summary generation was cancelled".to_string());
+        }
+    }
+
+    // ponytail: BuiltInAI uses the sidecar's JSON-RPC protocol, which today
+    // does not expose token-by-token streaming. Fall back to the non-streaming
+    // path and emit the full answer as one chunk. Upgrade path: extend the
+    // sidecar protocol with streaming events.
+    if provider == &LLMProvider::BuiltInAI {
+        let text = generate_summary(
+            client,
+            provider,
+            model_name,
+            api_key,
+            system_prompt,
+            user_prompt,
+            ollama_endpoint,
+            custom_openai_endpoint,
+            max_tokens,
+            temperature,
+            top_p,
+            app_data_dir,
+            cancellation_token,
+        )
+        .await?;
+        on_chunk(&text);
+        return Ok(text);
+    }
+
+    let (api_url, headers, request_body) = build_chat_request(
+        provider,
+        model_name,
+        api_key,
+        system_prompt,
+        user_prompt,
+        ollama_endpoint,
+        custom_openai_endpoint,
+        max_tokens,
+        temperature,
+        top_p,
+        Some(true),
+    )?;
+
     info!(
-        "🐞 LLM Request to {}: model={}",
+        "🐞 LLM streaming request to {}: model={}",
         provider_name(provider),
         model_name
     );
 
-    // Send request with timeout and cancellation support
     let request_future = client
         .post(api_url)
         .headers(headers)
@@ -271,13 +533,15 @@ pub async fn generate_summary(
         .timeout(REQUEST_TIMEOUT_DURATION)
         .send();
 
-    // Use tokio::select to race between cancellation and request completion
     let response = if let Some(token) = cancellation_token {
         tokio::select! {
             result = request_future => {
                 result.map_err(|e| {
                     if e.is_timeout() {
-                        format!("LLM request timed out after 60 seconds")
+                        format!(
+                            "LLM request timed out after {} seconds",
+                            REQUEST_TIMEOUT_DURATION.as_secs()
+                        )
                     } else {
                         format!("Failed to send request to LLM: {}", e)
                     }
@@ -290,7 +554,10 @@ pub async fn generate_summary(
     } else {
         request_future.await.map_err(|e| {
             if e.is_timeout() {
-                format!("LLM request timed out after 60 seconds")
+                format!(
+                    "LLM request timed out after {} seconds",
+                    REQUEST_TIMEOUT_DURATION.as_secs()
+                )
             } else {
                 format!("Failed to send request to LLM: {}", e)
             }
@@ -305,38 +572,60 @@ pub async fn generate_summary(
         return Err(format!("LLM API request failed: {}", error_body));
     }
 
-    // Parse response based on provider
-    if provider == &LLMProvider::Claude {
-        let chat_response = response
-            .json::<ClaudeChatResponse>()
-            .await
-            .map_err(|e| format!("Failed to parse LLM response: {}", e))?;
+    let mut stream = response.bytes_stream();
+    let mut full_text = String::new();
+    let mut line_buffer = SseLineBuffer::new();
 
-        info!("🐞 LLM Response received from Claude");
+    loop {
+        let chunk_result = if let Some(token) = cancellation_token {
+            tokio::select! {
+                result = stream.next() => result,
+                _ = token.cancelled() => {
+                    return Err("Summary generation was cancelled".to_string());
+                }
+            }
+        } else {
+            stream.next().await
+        };
 
-        let content = chat_response
-            .content
-            .get(0)
-            .ok_or("No content in LLM response")?
-            .text
-            .trim();
-        Ok(content.to_string())
-    } else {
-        let chat_response = response
-            .json::<ChatResponse>()
-            .await
-            .map_err(|e| format!("Failed to parse LLM response: {}", e))?;
-
-        info!("🐞 LLM Response received from {}", provider_name(provider));
-
-        let content = chat_response
-            .choices
-            .get(0)
-            .ok_or("No content in LLM response")?
-            .message
-            .content
-            .trim();
-        Ok(content.to_string())
+        match chunk_result {
+            Some(Ok(bytes)) => {
+                line_buffer.push(&bytes);
+                while let Some(line) = line_buffer.next_line() {
+                    if line.is_empty() || line.starts_with(':') {
+                        continue;
+                    }
+                    if let Some(data) = sse_data_payload(&line) {
+                        match parse_sse_line(provider, data) {
+                            SseEvent::Delta(delta) => {
+                                on_chunk(&delta);
+                                full_text.push_str(&delta);
+                            }
+                            SseEvent::Done => {
+                                info!(
+                                    "🐞 LLM streaming response completed from {}: {} chars",
+                                    provider_name(provider),
+                                    full_text.len()
+                                );
+                                return Ok(full_text);
+                            }
+                            SseEvent::Ignore => {}
+                        }
+                    }
+                }
+            }
+            Some(Err(e)) => {
+                return Err(format!("Stream error: {}", e));
+            }
+            None => {
+                info!(
+                    "🐞 LLM streaming response completed from {}: {} chars",
+                    provider_name(provider),
+                    full_text.len()
+                );
+                return Ok(full_text);
+            }
+        }
     }
 }
 
@@ -350,5 +639,117 @@ fn provider_name(provider: &LLMProvider) -> &str {
         LLMProvider::BuiltInAI => "Built-in AI",
         LLMProvider::OpenRouter => "OpenRouter",
         LLMProvider::CustomOpenAI => "Custom OpenAI",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_sse_line_openai_compatible_delta() {
+        let data = r#"{"choices":[{"delta":{"content":"hello"}}]}"#;
+        assert_eq!(
+            parse_sse_line(&LLMProvider::OpenAI, data),
+            SseEvent::Delta("hello".to_string())
+        );
+        assert_eq!(
+            parse_sse_line(&LLMProvider::Groq, data),
+            SseEvent::Delta("hello".to_string())
+        );
+        assert_eq!(
+            parse_sse_line(&LLMProvider::Ollama, data),
+            SseEvent::Delta("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_sse_line_done_is_terminal() {
+        assert_eq!(
+            parse_sse_line(&LLMProvider::OpenAI, "[DONE]"),
+            SseEvent::Done
+        );
+        assert_eq!(
+            parse_sse_line(&LLMProvider::OpenAI, "  [DONE]  "),
+            SseEvent::Done
+        );
+    }
+
+    #[test]
+    fn parse_sse_line_empty_openai_delta_is_ignore() {
+        let data = r#"{"choices":[{"delta":{}}]}"#;
+        assert_eq!(parse_sse_line(&LLMProvider::OpenAI, data), SseEvent::Ignore);
+    }
+
+    #[test]
+    fn parse_sse_line_claude_text_delta() {
+        let data = r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"world"}}"#;
+        assert_eq!(
+            parse_sse_line(&LLMProvider::Claude, data),
+            SseEvent::Delta("world".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_sse_line_claude_non_text_delta_is_ignore() {
+        let data = r#"{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{}"}}"#;
+        assert_eq!(parse_sse_line(&LLMProvider::Claude, data), SseEvent::Ignore);
+    }
+
+    #[test]
+    fn parse_sse_line_claude_message_stop_is_done() {
+        let data = r#"{"type":"message_stop"}"#;
+        assert_eq!(parse_sse_line(&LLMProvider::Claude, data), SseEvent::Done);
+    }
+
+    #[test]
+    fn parse_sse_line_claude_ping_is_ignore() {
+        let data = r#"{"type":"ping"}"#;
+        assert_eq!(parse_sse_line(&LLMProvider::Claude, data), SseEvent::Ignore);
+    }
+
+    #[test]
+    fn sse_line_buffer_splits_lines_across_chunks() {
+        let mut buf = SseLineBuffer::new();
+        buf.push(b"data: hel");
+        assert_eq!(buf.next_line(), None);
+        buf.push(b"lo\ndata: world\n");
+        assert_eq!(buf.next_line(), Some("data: hello".to_string()));
+        assert_eq!(buf.next_line(), Some("data: world".to_string()));
+        assert_eq!(buf.next_line(), None);
+    }
+
+    #[test]
+    fn sse_line_buffer_handles_crlf() {
+        let mut buf = SseLineBuffer::new();
+        buf.push(b"data: hello\r\n: comment\r\n");
+        assert_eq!(buf.next_line(), Some("data: hello".to_string()));
+        assert_eq!(buf.next_line(), Some(": comment".to_string()));
+    }
+
+    #[test]
+    fn sse_line_buffer_reassembles_split_utf8() {
+        // "é" is encoded as [0xc3, 0xa9].
+        let mut buf = SseLineBuffer::new();
+        buf.push(b"data: \xc3");
+        assert_eq!(buf.next_line(), None);
+        buf.push(b"\xa9\n");
+        assert_eq!(buf.next_line(), Some("data: é".to_string()));
+    }
+
+    #[test]
+    fn sse_data_payload_with_space() {
+        assert_eq!(sse_data_payload("data: hello"), Some("hello"));
+    }
+
+    #[test]
+    fn sse_data_payload_without_space() {
+        assert_eq!(sse_data_payload("data:hello"), Some("hello"));
+    }
+
+    #[test]
+    fn sse_data_payload_non_data_line_returns_none() {
+        assert_eq!(sse_data_payload(": comment"), None);
+        assert_eq!(sse_data_payload("event: ping"), None);
     }
 }

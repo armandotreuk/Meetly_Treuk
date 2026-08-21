@@ -6,7 +6,7 @@ import { logger } from "@/lib/logger";
 import { motion } from "framer-motion";
 import { RecordingControls } from "@/components/RecordingControls";
 import { RecordingNotesPanel } from "@/components/RecordingNotesPanel";
-import { StickyNote } from "lucide-react";
+import { StickyNote, MessageSquare } from "lucide-react";
 import { useSidebar } from "@/components/Sidebar/SidebarProvider";
 import { usePermissionCheck } from "@/hooks/usePermissionCheck";
 import { useRecordingState, RecordingStatus } from "@/contexts/RecordingStateContext";
@@ -26,6 +26,9 @@ import { TranscriptRecovery } from "@/components/TranscriptRecovery";
 import { indexedDBService } from "@/services/indexedDBService";
 import { toast } from "sonner";
 import { useRouter } from "next/navigation";
+import { togglePanelOnShortcut } from "@/lib/panel-shortcuts";
+import { t } from "@/lib/i18n";
+import { LiveChatLauncher, useChatHost } from "@/components/ChatPanel/ChatHost";
 
 export default function Home() {
     // Local page state (not moved to contexts)
@@ -38,14 +41,19 @@ export default function Home() {
     const { meetingTitle } = useTranscripts();
     const { transcriptModelConfig, selectedDevices } = useConfig();
     const recordingState = useRecordingState();
+    const { openChat } = useChatHost();
 
     // Extract status from global state
     const { status, isStopping, isProcessing, isSaving } = recordingState;
 
     // Hooks
     const { hasMicrophone } = usePermissionCheck();
-    const { setIsMeetingActive, isCollapsed: sidebarCollapsed, refetchMeetings, sidebarWidth } =
-        useSidebar();
+    const {
+        setIsMeetingActive,
+        isCollapsed: sidebarCollapsed,
+        refetchMeetings,
+        sidebarWidth,
+    } = useSidebar();
 
     // Recording-screen notes panel — resizable from its left edge.
     const notesResize = usePanelResize({
@@ -53,6 +61,7 @@ export default function Home() {
         min: 240,
         maxFraction: 0.6,
         side: "right",
+        storageKey: "meedly:recording-notes-width",
     });
     const { modals, messages, showModal, hideModal } = useModalState(transcriptModelConfig);
     const { isRecordingDisabled, setIsRecordingDisabled } = useRecordingStateSync(
@@ -91,6 +100,16 @@ export default function Home() {
         if (recordingState.isRecording) {
             setShowRecordingNotes(true);
         }
+    }, [recordingState.isRecording]);
+
+    // ponytail: Ctrl/Cmd+Shift+N is consistent across recording and meeting views; it can conflict with browser new-window shortcuts outside Tauri.
+    useEffect(() => {
+        if (!recordingState.isRecording) return;
+
+        const onKey = (event: KeyboardEvent) =>
+            togglePanelOnShortcut(event, "n", () => setShowRecordingNotes((show) => !show));
+        window.addEventListener("keydown", onKey);
+        return () => window.removeEventListener("keydown", onKey);
     }, [recordingState.isRecording]);
 
     // Startup recovery check
@@ -229,6 +248,20 @@ export default function Home() {
         >
             {/* All Modals supported*/}
             <SettingsModals modals={modals} messages={messages} onClose={hideModal} />
+            {!recordingState.isRecording && (
+                <button
+                    onClick={() => openChat({ kind: "all", key: "all" })}
+                    className="fixed top-4 right-4 z-20 flex items-center gap-2 rounded-lg bg-white px-3 py-2 text-sm font-medium text-gray-600 shadow-sm hover:text-blue-600"
+                    aria-label={t("app.home.showChatAria")}
+                >
+                    <MessageSquare className="h-4 w-4" />
+                    {t("app.home.showChatAria")}
+                </button>
+            )}
+            <LiveChatLauncher
+                isRecording={recordingState.isRecording}
+                recordingScopeKey={recordingState.liveTranscriptScopeKey}
+            />
 
             {/* Recovery Dialog */}
             <TranscriptRecovery
@@ -314,7 +347,8 @@ export default function Home() {
                 <button
                     onClick={() => setShowRecordingNotes(true)}
                     className="fixed top-4 right-4 z-20 p-2 rounded-lg shadow-sm bg-blue-100 text-blue-600 hover:bg-blue-200"
-                    title="Show notes"
+                    title="Show notes (Ctrl/Cmd+Shift+N)"
+                    aria-label={t("app.recording.showNotesAria")}
                 >
                     <StickyNote className="h-4 w-4" />
                 </button>

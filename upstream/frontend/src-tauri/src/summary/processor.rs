@@ -766,7 +766,10 @@ mod tests {
 
         let mut p_empty = original.clone();
         append_user_notes_prompt(&mut p_empty, Some("   \n  "));
-        assert_eq!(p_empty, original, "whitespace-only notes must not be injected");
+        assert_eq!(
+            p_empty, original,
+            "whitespace-only notes must not be injected"
+        );
 
         let mut p_blank = original.clone();
         append_user_notes_prompt(&mut p_blank, Some(""));

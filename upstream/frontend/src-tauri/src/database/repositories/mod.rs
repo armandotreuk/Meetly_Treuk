@@ -1,3 +1,4 @@
+pub mod chat;
 pub mod folder;
 pub mod fts;
 pub mod meeting;

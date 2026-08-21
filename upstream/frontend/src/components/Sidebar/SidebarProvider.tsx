@@ -23,6 +23,7 @@ export interface CurrentMeeting {
   title: string;
   created_at?: string;
   folder_id?: string | null;
+  has_notes?: boolean;
 }
 
 interface SidebarContextType {
@@ -99,6 +100,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     min: 200,
     maxFraction: 0.4,
     side: 'left',
+    storageKey: 'meedly:sidebar-width',
   });
 
   const pathname = usePathname();
@@ -108,12 +110,13 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const fetchMeetings = React.useCallback(async () => {
     if (serverAddress) {
       try {
-        const meetings = await invoke('api_get_meetings') as Array<{ id: string, title: string, created_at?: string, folder_id?: string | null }>;
+        const meetings = await invoke('api_get_meetings') as Array<{ id: string, title: string, created_at?: string, folder_id?: string | null, has_notes?: boolean }>;
         const transformedMeetings = meetings.map((meeting: any) => ({
           id: meeting.id,
           title: meeting.title,
           created_at: meeting.created_at,
-          folder_id: meeting.folder_id ?? null
+          folder_id: meeting.folder_id ?? null,
+          has_notes: meeting.has_notes ?? false
         }));
         setMeetings(transformedMeetings);
         Analytics.trackBackendConnection(true);

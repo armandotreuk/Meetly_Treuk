@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
+use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use std::sync::LazyLock;
 use tracing::info;
 
@@ -28,6 +28,14 @@ pub struct FtsSearchResult {
     pub rank: f64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum MatchMode {
+    #[default]
+    Or,
+    And,
+    Phrase,
+}
+
 /// Parsed search query with optional folder filter extracted from
 /// `folder:"Name"` prefix syntax.
 struct ParsedQuery {
@@ -51,9 +59,10 @@ async fn parse_query(pool: &SqlitePool, raw: &str) -> ParsedQuery {
         // Resolve folder name to id
         match FolderRepository::get_all(pool).await {
             Ok(folders) => {
-                if let Some(folder) = folders.iter().find(|f| {
-                    f.name.eq_ignore_ascii_case(folder_name)
-                }) {
+                if let Some(folder) = folders
+                    .iter()
+                    .find(|f| f.name.eq_ignore_ascii_case(folder_name))
+                {
                     return ParsedQuery {
                         fts_query,
                         folder_id: Some(folder.id.clone()),
@@ -87,6 +96,17 @@ impl FtsRepository {
         pool: &SqlitePool,
         raw_query: &str,
         limit: u32,
+        meeting_id: Option<&str>,
+    ) -> Result<Vec<FtsSearchResult>, sqlx::Error> {
+        Self::search_with_mode(pool, raw_query, limit, meeting_id, MatchMode::Or).await
+    }
+
+    pub async fn search_with_mode(
+        pool: &SqlitePool,
+        raw_query: &str,
+        limit: u32,
+        meeting_id: Option<&str>,
+        match_mode: MatchMode,
     ) -> Result<Vec<FtsSearchResult>, sqlx::Error> {
         if raw_query.trim().is_empty() {
             return Ok(Vec::new());
@@ -98,14 +118,22 @@ impl FtsRepository {
             return Ok(Vec::new());
         }
 
-        // Escape FTS5 special chars in the user query to prevent syntax errors.
-        // Only allow simple term searches; no boolean operators or column filters.
-        let safe_query = sanitize_fts_query(&parsed.fts_query);
+        let safe_query = sanitize_fts_query(&parsed.fts_query, match_mode);
+        if safe_query.is_empty() {
+            return Ok(Vec::new());
+        }
 
         let rows: Vec<(
-            String, String, String, String, String,
-            Option<String>, Option<String>, Option<String>,
-            String, f64,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            f64,
         )> = if let Some(ref folder_id) = parsed.folder_id {
             sqlx::query_as(
                 r#"
@@ -122,14 +150,16 @@ impl FtsRepository {
                     bm25(meeting_fts, 1.0, 1.0, 1.0, 1.0, 0.5, 1.0, 0.5, 0.5) AS rank
                 FROM meeting_fts fts
                 JOIN meetings m ON fts.meeting_id = m.id
-                WHERE meeting_fts MATCH ?1
-                  AND fts.folder_id = ?2
-                ORDER BY rank
-                LIMIT ?3
+                 WHERE meeting_fts MATCH ?1
+                   AND fts.folder_id = ?2
+                   AND (?3 IS NULL OR fts.meeting_id = ?3)
+                 ORDER BY rank
+                 LIMIT ?4
                 "#,
             )
             .bind(&safe_query)
             .bind(folder_id)
+            .bind(meeting_id)
             .bind(limit)
             .fetch_all(pool)
             .await?
@@ -148,22 +178,35 @@ impl FtsRepository {
                     COALESCE(fts.folder_name, '') AS folder_name,
                     bm25(meeting_fts, 1.0, 1.0, 1.0, 1.0, 0.5, 1.0, 0.5, 0.5) AS rank
                 FROM meeting_fts fts
-                JOIN meetings m ON fts.meeting_id = m.id
-                WHERE meeting_fts MATCH ?1
-                ORDER BY rank
-                LIMIT ?2
+                 JOIN meetings m ON fts.meeting_id = m.id
+                 WHERE meeting_fts MATCH ?1
+                   AND (?2 IS NULL OR fts.meeting_id = ?2)
+                 ORDER BY rank
+                 LIMIT ?3
                 "#,
             )
             .bind(&safe_query)
+            .bind(meeting_id)
             .bind(limit)
             .fetch_all(pool)
             .await?
         };
 
-        let results: Vec<FtsSearchResult> = rows
+        let mut results: Vec<FtsSearchResult> = rows
             .into_iter()
             .map(
-                |(meeting_id, title, chunk_type, chunk_id, snippet, speaker, timestamp_label, folder_id, folder_name, rank)| {
+                |(
+                    meeting_id,
+                    title,
+                    chunk_type,
+                    chunk_id,
+                    snippet,
+                    speaker,
+                    timestamp_label,
+                    folder_id,
+                    folder_name,
+                    rank,
+                )| {
                     FtsSearchResult {
                         meeting_id,
                         meeting_title: title,
@@ -180,11 +223,140 @@ impl FtsRepository {
             )
             .collect();
 
+        expand_transcript_segments(pool, &mut results, 200).await?;
+
         info!(
-            "FTS search for '{}' (folder={:?}) returned {} results",
-            parsed.fts_query, parsed.folder_id, results.len()
+            "FTS search: query_len={} folder={:?} results={}",
+            parsed.fts_query.len(),
+            parsed.folder_id,
+            results.len()
         );
         Ok(results)
+    }
+
+    pub async fn search_transcripts_with_mode(
+        pool: &SqlitePool,
+        raw_query: &str,
+        limit: u32,
+        meeting_id: &str,
+        match_mode: MatchMode,
+    ) -> Result<Vec<FtsSearchResult>, sqlx::Error> {
+        if raw_query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let query = FOLDER_RE
+            .find(raw_query)
+            .map(|matched| raw_query[matched.end()..].trim())
+            .unwrap_or_else(|| raw_query.trim());
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let safe_query = sanitize_fts_query(query, match_mode);
+        if safe_query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<FtsRow> = sqlx::query_as(
+            r#"
+            SELECT fts.meeting_id, m.title, fts.chunk_type, fts.chunk_id,
+                   snippet(meeting_fts, 3, '<mark>', '</mark>', '...', 48),
+                   fts.speaker, fts.timestamp_label, fts.folder_id,
+                   COALESCE(fts.folder_name, ''),
+                   bm25(meeting_fts, 1.0, 1.0, 1.0, 1.0, 0.5, 1.0, 0.5, 0.5)
+            FROM meeting_fts fts
+            JOIN meetings m ON fts.meeting_id = m.id
+            WHERE meeting_fts MATCH ?1
+              AND fts.meeting_id = ?2
+              AND fts.chunk_type = 'transcript'
+            ORDER BY 10
+            LIMIT ?3
+            "#,
+        )
+        .bind(safe_query)
+        .bind(meeting_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+        Ok(rows_to_results(rows))
+    }
+
+    pub async fn search_with_folder_ids(
+        pool: &SqlitePool,
+        raw_query: &str,
+        limit: u32,
+        folder_ids: &[String],
+        match_mode: MatchMode,
+    ) -> Result<Vec<FtsSearchResult>, sqlx::Error> {
+        if raw_query.trim().is_empty() || folder_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let safe_query = sanitize_fts_query(raw_query, match_mode);
+        if safe_query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut query = QueryBuilder::<Sqlite>::new(
+            r#"
+            SELECT fts.meeting_id, m.title, fts.chunk_type, fts.chunk_id,
+                   snippet(meeting_fts, 3, '<mark>', '</mark>', '...', 48),
+                   fts.speaker, fts.timestamp_label, m.folder_id,
+                   COALESCE(folder.name, ''),
+                   bm25(meeting_fts, 1.0, 1.0, 1.0, 1.0, 0.5, 1.0, 0.5, 0.5)
+            FROM meeting_fts fts
+            JOIN meetings m ON fts.meeting_id = m.id
+            LEFT JOIN meeting_folders folder ON m.folder_id = folder.id
+            WHERE meeting_fts MATCH "#,
+        );
+        query.push_bind(safe_query);
+        query.push(" AND m.folder_id IN (");
+        let mut ids = query.separated(", ");
+        for folder_id in folder_ids {
+            ids.push_bind(folder_id);
+        }
+        drop(ids);
+        query.push(") ORDER BY 10 LIMIT ");
+        query.push_bind(limit);
+        let rows = query.build_query_as().fetch_all(pool).await?;
+        let mut results = rows_to_results(rows);
+        expand_transcript_segments(pool, &mut results, 200).await?;
+        Ok(results)
+    }
+
+    pub async fn get_by_meeting_ids(
+        pool: &SqlitePool,
+        meeting_ids: &[String],
+        per_meeting_limit: u32,
+        total_limit: u32,
+    ) -> Result<Vec<FtsSearchResult>, sqlx::Error> {
+        if meeting_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Deterministic slice: at most per_meeting_limit chunks per meeting
+        // (summaries and notes before transcript chunks) and total_limit chunks overall, so a large snapshot
+        // cannot flood chat events and sources_json.
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT meeting_id, title, chunk_type, chunk_id, snippet, speaker, timestamp_label, folder_id, folder_name, rank FROM (SELECT fts.meeting_id, m.title, fts.chunk_type, fts.chunk_id, substr(fts.text, 1, 400) AS snippet, fts.speaker, fts.timestamp_label, fts.folder_id, COALESCE(fts.folder_name, '') AS folder_name, 0.0 AS rank, ROW_NUMBER() OVER (PARTITION BY fts.meeting_id ORDER BY CASE fts.chunk_type WHEN 'summary' THEN 0 WHEN 'note' THEN 1 ELSE 2 END, fts.chunk_id) AS rn FROM meeting_fts fts JOIN meetings m ON fts.meeting_id = m.id WHERE fts.meeting_id IN (",
+        );
+        let mut ids = query.separated(", ");
+        for meeting_id in meeting_ids {
+            ids.push_bind(meeting_id);
+        }
+        drop(ids);
+        query.push(")) WHERE rn <= ");
+        query.push_bind(per_meeting_limit);
+        query.push(" ORDER BY meeting_id LIMIT ");
+        query.push_bind(total_limit);
+        let mut by_meeting: std::collections::HashMap<String, Vec<FtsSearchResult>> =
+            std::collections::HashMap::new();
+        for result in rows_to_results(query.build_query_as().fetch_all(pool).await?) {
+            by_meeting
+                .entry(result.meeting_id.clone())
+                .or_default()
+                .push(result);
+        }
+        Ok(meeting_ids
+            .iter()
+            .flat_map(|meeting_id| by_meeting.remove(meeting_id).unwrap_or_default())
+            .collect())
     }
 
     /// Delete all FTS rows for a meeting and re-insert from current data.
@@ -329,10 +501,7 @@ impl FtsRepository {
 
     /// Update folder_name in all FTS rows for a given folder_id.
     /// Called after folder rename.
-    pub async fn sync_folder(
-        pool: &SqlitePool,
-        folder_id: &str,
-    ) -> Result<(), sqlx::Error> {
+    pub async fn sync_folder(pool: &SqlitePool, folder_id: &str) -> Result<(), sqlx::Error> {
         // Fetch new folder name
         let folder = FolderRepository::get_by_id(pool, folder_id).await?;
         let new_name = match folder {
@@ -353,17 +522,60 @@ impl FtsRepository {
             .execute(pool)
             .await?;
 
-        info!("Synced FTS folder_name for folder {} -> '{}'", folder_id, new_name);
+        info!(
+            "Synced FTS folder_name for folder {} -> '{}'",
+            folder_id, new_name
+        );
         Ok(())
     }
 }
 
+type FtsRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    f64,
+);
+
+fn rows_to_results(rows: Vec<FtsRow>) -> Vec<FtsSearchResult> {
+    rows.into_iter()
+        .map(
+            |(
+                meeting_id,
+                meeting_title,
+                chunk_type,
+                chunk_id,
+                snippet,
+                speaker,
+                timestamp_label,
+                folder_id,
+                folder_name,
+                rank,
+            )| FtsSearchResult {
+                meeting_id,
+                meeting_title,
+                chunk_type,
+                chunk_id,
+                snippet,
+                speaker,
+                timestamp_label,
+                folder_id,
+                folder_name,
+                rank,
+            },
+        )
+        .collect()
+}
+
 /// Sanitize a user query string for FTS5 MATCH.
-/// Removes characters that could break FTS5 query syntax (quotes, operators,
-/// colons). AND/OR/NOT are preserved as literal search terms — they will be
-/// matched as regular words, not as FTS5 boolean operators.
-/// ponytail: intentionally naive — simple term matching only.
-fn sanitize_fts_query(query: &str) -> String {
+/// ponytail: terms are escaped before applying the selected OR, AND, or phrase mode; richer FTS5 syntax remains unsupported.
+fn sanitize_fts_query(query: &str, match_mode: MatchMode) -> String {
     // Remove FTS5 double-quote syntax to prevent injection
     let cleaned = query.replace('"', "");
     // Remove FTS5 prefix operators, colons, and parameter markers
@@ -373,14 +585,74 @@ fn sanitize_fts_query(query: &str) -> String {
         .replace('*', " ")
         .replace(':', " ")
         .replace('?', " ");
-    // Collapse whitespace, then join with OR so FTS5 matches any term
-    // instead of requiring all terms (AND semantics).
     let parts: Vec<&str> = cleaned.split_whitespace().collect();
-    parts
+    let terms = parts
         .iter()
         .map(|w| format!("\"{}\"", w))
-        .collect::<Vec<_>>()
-        .join(" OR ")
+        .collect::<Vec<_>>();
+    match match_mode {
+        MatchMode::Or => terms.join(" OR "),
+        MatchMode::And => terms.join(" AND "),
+        MatchMode::Phrase if !parts.is_empty() => format!("\"{}\"", parts.join(" ")),
+        MatchMode::Phrase => String::new(),
+    }
+}
+
+async fn expand_transcript_segments(
+    pool: &SqlitePool,
+    results: &mut [FtsSearchResult],
+    radius_chars: usize,
+) -> Result<(), sqlx::Error> {
+    let mut expanded_chars = 0;
+    for result in results
+        .iter_mut()
+        .filter(|result| result.chunk_type == "transcript")
+    {
+        let Some(transcript) =
+            sqlx::query_scalar::<_, String>("SELECT transcript FROM transcripts WHERE id = ?1")
+                .bind(&result.chunk_id)
+                .fetch_optional(pool)
+                .await?
+        else {
+            continue;
+        };
+        let needle = result
+            .snippet
+            .replace("<mark>", "")
+            .replace("</mark>", "")
+            .trim_matches('.')
+            .trim()
+            .to_string();
+        let Some(start) = transcript.find(&needle) else {
+            continue;
+        };
+        let end = start + needle.len();
+        let window_start = transcript[..start]
+            .char_indices()
+            .rev()
+            .nth(radius_chars.saturating_sub(1))
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        let window_end = transcript[end..]
+            .char_indices()
+            .nth(radius_chars)
+            .map(|(index, _)| end + index)
+            .unwrap_or(transcript.len());
+        let expanded = format!(
+            "{}{}{}",
+            &transcript[window_start..start],
+            result.snippet.trim_matches('.'),
+            &transcript[end..window_end]
+        );
+        let char_count = expanded.chars().count();
+        // ponytail: 8K expanded characters bounds retrieval globally; model metadata can replace this fixed ceiling.
+        if expanded_chars + char_count > 8_000 {
+            break;
+        }
+        expanded_chars += char_count;
+        result.snippet = expanded;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -391,26 +663,45 @@ mod tests {
     #[test]
     fn sanitize_removes_fts_operators() {
         assert_eq!(
-            sanitize_fts_query(r#"risk AND migration"#),
+            sanitize_fts_query(r#"risk AND migration"#, MatchMode::Or),
             "\"risk\" OR \"AND\" OR \"migration\""
         );
         assert_eq!(
-            sanitize_fts_query(r#"risk "quoted""#),
+            sanitize_fts_query(r#"risk "quoted""#, MatchMode::Or),
             "\"risk\" OR \"quoted\""
         );
         assert_eq!(
-            sanitize_fts_query(r#"-risk +migration"#),
+            sanitize_fts_query(r#"-risk +migration"#, MatchMode::Or),
             "\"risk\" OR \"migration\""
         );
         assert_eq!(
-            sanitize_fts_query(r#"folder:"Sprint 14" risk"#),
+            sanitize_fts_query(r#"folder:"Sprint 14" risk"#, MatchMode::Or),
             "\"folder\" OR \"Sprint\" OR \"14\" OR \"risk\""
         );
     }
 
     #[test]
     fn sanitize_collapses_whitespace() {
-        assert_eq!(sanitize_fts_query("  hello   world  "), "\"hello\" OR \"world\"");
+        assert_eq!(
+            sanitize_fts_query("  hello   world  ", MatchMode::Or),
+            "\"hello\" OR \"world\""
+        );
+    }
+
+    #[test]
+    fn sanitize_supports_match_modes() {
+        assert_eq!(
+            sanitize_fts_query("quick brown fox", MatchMode::Or),
+            "\"quick\" OR \"brown\" OR \"fox\""
+        );
+        assert_eq!(
+            sanitize_fts_query("quick brown fox", MatchMode::And),
+            "\"quick\" AND \"brown\" AND \"fox\""
+        );
+        assert_eq!(
+            sanitize_fts_query("quick brown fox", MatchMode::Phrase),
+            "\"quick brown fox\""
+        );
     }
 
     async fn setup_fts_db() -> SqlitePool {
@@ -490,24 +781,84 @@ mod tests {
             .unwrap();
 
         // Seed transcript
-        sqlx::query("INSERT INTO transcripts (id, meeting_id, transcript, timestamp) VALUES (?, ?, ?, ?)")
-            .bind("t1")
-            .bind("m1")
-            .bind("We discussed the migration risk and decided to use the outbox pattern for Kafka")
-            .bind("14:32")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp) VALUES (?, ?, ?, ?)",
+        )
+        .bind("t1")
+        .bind("m1")
+        .bind("We discussed the migration risk and decided to use the outbox pattern for Kafka")
+        .bind("14:32")
+        .execute(&pool)
+        .await
+        .unwrap();
 
         // Populate FTS
         FtsRepository::refresh_meeting(&pool, "m1").await.unwrap();
 
         // Search
-        let results = FtsRepository::search(&pool, "migration risk", 10).await.unwrap();
+        let results = FtsRepository::search(&pool, "migration risk", 10, None)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].meeting_id, "m1");
         assert_eq!(results[0].chunk_type, "transcript");
         assert!(results[0].snippet.contains("<mark>"));
+    }
+
+    #[tokio::test]
+    async fn transcript_search_does_not_spend_its_limit_on_notes_or_summaries() {
+        let pool = setup_fts_db().await;
+        sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES ('m1', 'Meeting', 'now', 'now')").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO meeting_fts (meeting_id, chunk_type, chunk_id, text) VALUES ('m1', 'summary', 's', 'needle'), ('m1', 'note', 'n', 'needle'), ('m1', 'transcript', 't', 'needle')").execute(&pool).await.unwrap();
+
+        let results =
+            FtsRepository::search_transcripts_with_mode(&pool, "needle", 1, "m1", MatchMode::Or)
+                .await
+                .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].chunk_type, "transcript");
+        assert_eq!(results[0].chunk_id, "t");
+    }
+
+    #[tokio::test]
+    async fn transcript_hit_expands_around_highlight() {
+        let pool = setup_fts_db().await;
+        sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)")
+            .bind("expanded")
+            .bind("Expanded context")
+            .bind("2026-07-27T10:00:00Z")
+            .bind("2026-07-27T10:00:00Z")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let transcript = format!(
+            "{} migration risk {}",
+            "context before ".repeat(40),
+            "context after ".repeat(40)
+        );
+        sqlx::query(
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp) VALUES (?, ?, ?, ?)",
+        )
+        .bind("expanded-transcript")
+        .bind("expanded")
+        .bind(&transcript)
+        .bind("14:32")
+        .execute(&pool)
+        .await
+        .unwrap();
+        FtsRepository::refresh_meeting(&pool, "expanded")
+            .await
+            .unwrap();
+
+        let results =
+            FtsRepository::search_with_mode(&pool, "migration risk", 10, None, MatchMode::And)
+                .await
+                .unwrap();
+
+        assert!(results[0].snippet.contains("<mark>migration</mark>"));
+        assert!(results[0].snippet.contains("context before"));
+        assert!(results[0].snippet.contains("context after"));
+        assert!(results[0].snippet.chars().count() > 300);
     }
 
     #[tokio::test]
@@ -523,7 +874,8 @@ mod tests {
             .await
             .unwrap();
 
-        let result_json = r#"{"markdown":"Decision: migrate to event-driven architecture with CQRS"}"#;
+        let result_json =
+            r#"{"markdown":"Decision: migrate to event-driven architecture with CQRS"}"#;
         sqlx::query("INSERT INTO summary_processes (meeting_id, template_id, status, created_at, updated_at, result) VALUES (?, ?, ?, ?, ?, ?)")
             .bind("m2")
             .bind("standard_meeting")
@@ -537,7 +889,9 @@ mod tests {
 
         FtsRepository::refresh_meeting(&pool, "m2").await.unwrap();
 
-        let results = FtsRepository::search(&pool, "event-driven CQRS", 10).await.unwrap();
+        let results = FtsRepository::search(&pool, "event-driven CQRS", 10, None)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].chunk_type, "summary");
     }
@@ -564,7 +918,9 @@ mod tests {
 
         FtsRepository::refresh_meeting(&pool, "m3").await.unwrap();
 
-        let results = FtsRepository::search(&pool, "budget approval", 10).await.unwrap();
+        let results = FtsRepository::search(&pool, "budget approval", 10, None)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].chunk_type, "note");
     }
@@ -593,14 +949,16 @@ mod tests {
             .await
             .unwrap();
 
-        sqlx::query("INSERT INTO transcripts (id, meeting_id, transcript, timestamp) VALUES (?, ?, ?, ?)")
-            .bind("t4")
-            .bind("m4")
-            .bind("Discussing migration strategy for the new microservice")
-            .bind("10:15")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp) VALUES (?, ?, ?, ?)",
+        )
+        .bind("t4")
+        .bind("m4")
+        .bind("Discussing migration strategy for the new microservice")
+        .bind("10:15")
+        .execute(&pool)
+        .await
+        .unwrap();
 
         // Meeting NOT in folder
         sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)")
@@ -612,30 +970,107 @@ mod tests {
             .await
             .unwrap();
 
-        sqlx::query("INSERT INTO transcripts (id, meeting_id, transcript, timestamp) VALUES (?, ?, ?, ?)")
-            .bind("t5")
-            .bind("m5")
-            .bind("Also discussing migration strategy for another project")
-            .bind("10:30")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp) VALUES (?, ?, ?, ?)",
+        )
+        .bind("t5")
+        .bind("m5")
+        .bind("Also discussing migration strategy for another project")
+        .bind("10:30")
+        .execute(&pool)
+        .await
+        .unwrap();
 
         FtsRepository::refresh_meeting(&pool, "m4").await.unwrap();
         FtsRepository::refresh_meeting(&pool, "m5").await.unwrap();
 
         // Search with folder filter
-        let results = FtsRepository::search(&pool, r#"folder:"Sprint 14" migration"#, 10).await.unwrap();
+        let results = FtsRepository::search(&pool, r#"folder:"Sprint 14" migration"#, 10, None)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].meeting_id, "m4");
         assert_eq!(results[0].folder_name, "Sprint 14");
+
+        let scoped_results =
+            FtsRepository::search(&pool, r#"folder:"Sprint 14" migration"#, 10, Some("m5"))
+                .await
+                .unwrap();
+        assert!(scoped_results.is_empty());
     }
 
     #[tokio::test]
     async fn search_empty_query_returns_empty() {
         let pool = setup_fts_db().await;
-        let results = FtsRepository::search(&pool, "", 10).await.unwrap();
+        let results = FtsRepository::search(&pool, "", 10, None).await.unwrap();
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_by_meeting_ids_respects_per_meeting_and_total_caps() {
+        let pool = setup_fts_db().await;
+        for meeting_id in ["m1", "m2", "m3"] {
+            sqlx::query(
+                "INSERT INTO meetings (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            )
+            .bind(meeting_id)
+            .bind(format!("Meeting {meeting_id}"))
+            .bind("2026-07-27T10:00:00Z")
+            .bind("2026-07-27T10:00:00Z")
+            .execute(&pool)
+            .await
+            .unwrap();
+            for chunk_index in 0..5 {
+                sqlx::query("INSERT INTO meeting_fts (meeting_id, chunk_type, chunk_id, text) VALUES (?, 'transcript', ?, ?)")
+                    .bind(meeting_id)
+                    .bind(format!("{meeting_id}-{chunk_index}"))
+                    .bind(format!("content {chunk_index}"))
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        }
+        sqlx::query("INSERT INTO meeting_fts (meeting_id, chunk_type, chunk_id, text) VALUES ('m1', 'summary', 'm1-summary', 'meeting summary')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let ids =
+            || -> Vec<String> { ["m1", "m2", "m3"].iter().map(|id| id.to_string()).collect() };
+
+        let preferred = FtsRepository::get_by_meeting_ids(&pool, &["m1".to_string()], 1, 1)
+            .await
+            .unwrap();
+        assert_eq!(preferred[0].chunk_type, "summary");
+
+        // Total cap dominates: 3 meetings × per-meeting 2 = 6 > 4.
+        let results = FtsRepository::get_by_meeting_ids(&pool, &ids(), 2, 4)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 4);
+
+        // Per-meeting cap: each meeting contributes at most 2 chunks.
+        let results = FtsRepository::get_by_meeting_ids(&pool, &ids(), 2, 100)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 6);
+        let mut per_meeting: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for result in &results {
+            *per_meeting.entry(result.meeting_id.as_str()).or_default() += 1;
+        }
+        assert!(per_meeting.values().all(|count| *count <= 2));
+
+        // Missing meetings (e.g. deleted snapshot members) are skipped.
+        let results = FtsRepository::get_by_meeting_ids(
+            &pool,
+            &["m1".to_string(), "missing".to_string(), "m2".to_string()],
+            10,
+            100,
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 11);
+        assert!(results.iter().all(|result| result.meeting_id != "missing"));
     }
 
     #[tokio::test]
@@ -651,20 +1086,31 @@ mod tests {
             .await
             .unwrap();
 
-        sqlx::query("INSERT INTO transcripts (id, meeting_id, transcript, timestamp) VALUES (?, ?, ?, ?)")
-            .bind("t6")
-            .bind("m6")
-            .bind("Some important text to search for")
-            .bind("10:00")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp) VALUES (?, ?, ?, ?)",
+        )
+        .bind("t6")
+        .bind("m6")
+        .bind("Some important text to search for")
+        .bind("10:00")
+        .execute(&pool)
+        .await
+        .unwrap();
 
         FtsRepository::refresh_meeting(&pool, "m6").await.unwrap();
-        assert_eq!(FtsRepository::search(&pool, "important", 10).await.unwrap().len(), 1);
+        assert_eq!(
+            FtsRepository::search(&pool, "important", 10, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
 
         FtsRepository::remove_meeting(&pool, "m6").await.unwrap();
-        assert!(FtsRepository::search(&pool, "important", 10).await.unwrap().is_empty());
+        assert!(FtsRepository::search(&pool, "important", 10, None)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -681,14 +1127,16 @@ mod tests {
             .await
             .unwrap();
 
-        sqlx::query("INSERT INTO transcripts (id, meeting_id, transcript, timestamp) VALUES (?, ?, ?, ?)")
-            .bind("t7")
-            .bind("m7")
-            .bind("Discussion about deployment strategy")
-            .bind("10:00")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp) VALUES (?, ?, ?, ?)",
+        )
+        .bind("t7")
+        .bind("m7")
+        .bind("Discussion about deployment strategy")
+        .bind("10:00")
+        .execute(&pool)
+        .await
+        .unwrap();
 
         sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)")
             .bind("m8")
@@ -699,23 +1147,39 @@ mod tests {
             .await
             .unwrap();
 
-        sqlx::query("INSERT INTO transcripts (id, meeting_id, transcript, timestamp) VALUES (?, ?, ?, ?)")
-            .bind("t8")
-            .bind("m8")
-            .bind("Review of deployment strategy for production")
-            .bind("11:00")
+        sqlx::query(
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp) VALUES (?, ?, ?, ?)",
+        )
+        .bind("t8")
+        .bind("m8")
+        .bind("Review of deployment strategy for production")
+        .bind("11:00")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Clear FTS and rebuild
+        sqlx::query("DELETE FROM meeting_fts")
             .execute(&pool)
             .await
             .unwrap();
-
-        // Clear FTS and rebuild
-        sqlx::query("DELETE FROM meeting_fts").execute(&pool).await.unwrap();
-        assert!(FtsRepository::search(&pool, "deployment", 10).await.unwrap().is_empty());
+        assert!(FtsRepository::search(&pool, "deployment", 10, None)
+            .await
+            .unwrap()
+            .is_empty());
 
         let count = FtsRepository::rebuild_index(&pool).await.unwrap();
         assert_eq!(count, 2);
 
-        let results = FtsRepository::search(&pool, "deployment", 10).await.unwrap();
+        let scoped_results = FtsRepository::search(&pool, "deployment", 10, Some("m7"))
+            .await
+            .unwrap();
+        assert_eq!(scoped_results.len(), 1);
+        assert_eq!(scoped_results[0].meeting_id, "m7");
+
+        let results = FtsRepository::search(&pool, "deployment", 10, None)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 2);
     }
 }

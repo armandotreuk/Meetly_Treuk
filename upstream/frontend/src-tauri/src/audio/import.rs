@@ -4,6 +4,8 @@ use crate::api::TranscriptSegment;
 use crate::audio::decoder::{decode_audio_file, decode_audio_file_with_progress};
 use crate::audio::vad::get_speech_chunks_with_progress;
 use crate::config::{DEFAULT_PARAKEET_MODEL, DEFAULT_WHISPER_MODEL};
+use crate::database::repositories::fts::FtsRepository;
+use crate::database::repositories::meeting_notes::MeetingNotesRepository;
 use crate::parakeet_engine::ParakeetEngine;
 use crate::state::AppState;
 use crate::whisper_engine::WhisperEngine;
@@ -347,6 +349,23 @@ async fn run_import<R: Runtime>(
         .map_err(|e| anyhow!("Failed to copy audio file: {}", e))?;
 
     info!("Copied audio to: {}", dest_path.display());
+
+    // Mirror any notes.md placed alongside the source audio into the meeting
+    // folder so the post-commit import step can pick it up.
+    if let Some(notes_src) = source.parent().map(|p| p.join("notes.md")) {
+        if notes_src.is_file() {
+            if let Err(e) = std::fs::copy(&notes_src, meeting_folder.join("notes.md")) {
+                warn!("Failed to copy notes.md into meeting folder: {}", e);
+            }
+        }
+    }
+    if let Some(notes_src) = source.parent().map(|p| p.join("notes.json")) {
+        if notes_src.is_file() {
+            if let Err(e) = std::fs::copy(&notes_src, meeting_folder.join("notes.json")) {
+                warn!("Failed to copy notes.json into meeting folder: {}", e);
+            }
+        }
+    }
 
     // Check for cancellation
     if IMPORT_CANCELLED.load(Ordering::SeqCst) {
@@ -724,11 +743,12 @@ async fn create_meeting_with_transcripts(
 
     // Insert meeting
     sqlx::query(
-        "INSERT INTO meetings (id, title, created_at, updated_at, folder_path)
-         VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO meetings (id, title, created_at, updated_at, saved_at, folder_path)
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(&meeting_id)
     .bind(title)
+    .bind(now)
     .bind(now)
     .bind(now)
     .bind(&folder_path)
@@ -757,6 +777,33 @@ async fn create_meeting_with_transcripts(
     tx.commit()
         .await
         .map_err(|e| anyhow!("Failed to commit transaction: {}", e))?;
+
+    // Import notes mirrored into the meeting folder (if any). Best-effort:
+    // the file remains on disk even if the DB copy fails.
+    if let Ok(notes) = std::fs::read_to_string(Path::new(&folder_path).join("notes.md")) {
+        let notes_json = std::fs::read_to_string(Path::new(&folder_path).join("notes.json")).ok();
+        if !notes.trim().is_empty() || notes_json.is_some() {
+            if let Err(e) = MeetingNotesRepository::save_notes(
+                pool,
+                &meeting_id,
+                Some(&notes),
+                notes_json.as_deref(),
+            )
+            .await
+            {
+                error!(
+                    "Failed to persist imported notes for meeting {}: {}",
+                    meeting_id, e
+                );
+            }
+        }
+    }
+
+    // Update FTS index — best-effort; a failure here doesn't invalidate
+    // the transcript data we just committed.
+    if let Err(e) = FtsRepository::refresh_meeting(pool, &meeting_id).await {
+        error!("Failed to refresh FTS for meeting {}: {}", meeting_id, e);
+    }
 
     info!(
         "Created meeting '{}' with {} transcripts",

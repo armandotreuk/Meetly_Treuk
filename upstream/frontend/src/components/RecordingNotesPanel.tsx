@@ -1,148 +1,199 @@
 "use client";
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import React, { useEffect, useCallback, useRef, useState } from "react";
+import type { Block } from "@blocknote/core";
+import { useCreateBlockNote } from "@blocknote/react";
 import { logger } from "@/lib/logger";
+import { useTranscripts } from "@/contexts/TranscriptContext";
+import { useRecordingState } from "@/contexts/RecordingStateContext";
 
 import { invoke } from "@tauri-apps/api/core";
-import { Loader2, Save } from "lucide-react";
-import { StickyNote, X } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { ScrollArea } from "@/components/ui/scroll-area";
+import { useNotesEditor } from "@/components/notes/useNotesEditor";
+import { NotesEditorShell } from "@/components/notes/NotesEditorShell";
+import { registerRecordingNotesFlush } from "@/lib/recording-notes-flush";
 
-const DRAFT_KEY = "recording_notes_draft";
+// Legacy pre-scoping key, kept only to sweep up leftovers from older versions.
+const LEGACY_DRAFT_KEY = "recording_notes_draft";
+
+export interface RecordingNotesDraft {
+	markdown: string;
+	blocksJson: string | null;
+}
+
+export function persistDraft(key: string, payload: RecordingNotesDraft): boolean {
+	try {
+		sessionStorage.setItem(key, JSON.stringify(payload));
+		return true;
+	} catch {
+		try {
+			sessionStorage.setItem(
+				key,
+				JSON.stringify({ markdown: payload.markdown, blocksJson: null })
+			);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+}
 
 interface RecordingNotesPanelProps {
-    onClose: () => void;
-    width?: number;
+	onClose: () => void;
+	width?: number;
 }
 
 /**
  * Notes panel shown automatically on the recording screen. Notes are mirrored to
  * `notes.md` in the current recording folder in real time (debounced 2s) so they
- * survive an app crash mid-meeting, and also kept in sessionStorage as the bridge
- * to persist them to the meetings_notes DB table on stop (see useRecordingStop).
+ * survive an app crash mid-meeting. When the meeting is saved (stop or recovery),
+	 * the Rust save path imports those files into the meeting_notes DB table
+ * (see TranscriptsRepository::save_transcript).
  */
 export function RecordingNotesPanel({ onClose, width }: RecordingNotesPanelProps) {
-    const [notes, setNotes] = useState("");
-    const [isSaving, setIsSaving] = useState(false);
-    const [isDirty, setIsDirty] = useState(false);
-    const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-    const lastSavedRef = useRef<string>("");
+	// ponytail: meetingTitle is unique per recording (timestamped at start), so
+	// keying the draft by it isolates sessions. Re-read when it changes (reload
+	// sync) so the draft follows a late title sync instead of splitting. Gated on
+	// hydration: until the reload-sync sets the real title, meetingTitle is the
+	// shared default "+ New Call", which must never key (read or write) a draft
+	// that could belong to another recording.
+	const { meetingTitle } = useTranscripts();
+	const { liveTranscriptScopeKey } = useRecordingState();
+	const recordingScopeKeyRef = useRef(liveTranscriptScopeKey);
+	recordingScopeKeyRef.current = liveTranscriptScopeKey;
+	const draftKey =
+		meetingTitle && meetingTitle !== "+ New Call"
+			? `recording_notes_draft:${meetingTitle}`
+			: null;
+	const draftKeyRef = useRef(draftKey);
+	draftKeyRef.current = draftKey;
 
-    // ponytail: threshold 320px hardcoded; upgrade path if reused = extract useCompactPanelHeader.
-    const isCompact = width !== undefined && width < 320;
+	const saveDraftToDisk = useCallback(async (markdown: string, blocksJson: string | null) => {
+		const key = draftKeyRef.current;
+		if (key) persistDraft(key, { markdown, blocksJson });
+		const recordingScopeKey = recordingScopeKeyRef.current;
+		if (!recordingScopeKey) throw new Error("Recording notes scope is not ready");
+		await invoke("save_recording_notes", { notes: markdown, blocksJson, recordingScopeKey });
+	}, []);
+	const parser = useCreateBlockNote({ initialContent: undefined });
+	const [content, setContent] = useState<{ markdown: string; blocks: Block[] | null }>({
+		markdown: "",
+		blocks: null,
+	});
 
-    useEffect(() => {
-        const draft = sessionStorage.getItem(DRAFT_KEY) ?? "";
-        setNotes(draft);
-        lastSavedRef.current = draft;
+	const editor = useNotesEditor({
+		save: saveDraftToDisk,
+		initialNotes: content.markdown,
+		initialBlocks: content.blocks,
+		onSaveError: (error) => {
+			logger.error("Failed to save recording notes to folder:", error);
+		},
+	});
 
-        return () => {
-            if (saveTimerRef.current) {
-                clearTimeout(saveTimerRef.current);
-            }
-        };
-    }, []);
+	const { flushPendingSave } = editor;
+	const draftGenerationRef = useRef(0);
 
-    const saveDraftToDisk = useCallback(async (markdown: string) => {
-        if (markdown === lastSavedRef.current) return;
-        setIsSaving(true);
-        try {
-            await invoke("save_recording_notes", { notes: markdown });
-            lastSavedRef.current = markdown;
-            setIsDirty(false);
-        } catch (error) {
-            logger.error("Failed to save recording notes to folder:", error);
-        } finally {
-            setIsSaving(false);
-        }
-    }, []);
+	useEffect(
+		() => registerRecordingNotesFlush(liveTranscriptScopeKey, flushPendingSave),
+		[liveTranscriptScopeKey, flushPendingSave]
+	);
 
-    const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-        const value = e.target.value;
-        setNotes(value);
-        setIsDirty(true);
-        sessionStorage.setItem(DRAFT_KEY, value);
+	useEffect(() => {
+		// One-time sweep of the legacy global key (idempotent).
+		sessionStorage.removeItem(LEGACY_DRAFT_KEY);
 
-        if (saveTimerRef.current) {
-            clearTimeout(saveTimerRef.current);
-        }
-        saveTimerRef.current = setTimeout(() => {
-            void saveDraftToDisk(value);
-        }, 2000);
-    };
+		// Only hydrate from the draft under the real title. While meetingTitle is
+		// still the shared default the key is null, so never read (or write, see
+		// handleChange) a draft that could belong to another recording; and when no
+		// draft exists for this meeting, keep the current notes (a title sync must
+		// not wipe text typed during the hydration window).
+		let cancelled = false;
+		if (draftKey) {
+			const draft = sessionStorage.getItem(draftKey);
+			if (draft !== null) {
+				const stored = (() => {
+					try {
+						const parsed = JSON.parse(draft) as {
+							markdown?: string;
+							blocksJson?: string | null;
+							blocks?: Block[];
+						};
+						const blocks = parsed.blocksJson
+							? JSON.parse(parsed.blocksJson)
+							: parsed.blocks;
+						return typeof parsed.markdown === "string" || Array.isArray(blocks)
+							? { markdown: parsed.markdown ?? "", blocks: Array.isArray(blocks) ? blocks : null }
+							: null;
+					} catch {
+						return null;
+					}
+				})();
+				if (stored) {
+					if (stored.blocks) {
+						setContent(stored);
+					} else if (stored.markdown) {
+						void parser
+							.tryParseMarkdownToBlocks(stored.markdown)
+							.then((blocks) => {
+								if (!cancelled) setContent({ markdown: stored.markdown, blocks });
+							})
+							.catch((error) => logger.error("Failed to parse recording notes markdown:", error));
+					}
+				} else {
+					void parser
+						.tryParseMarkdownToBlocks(draft)
+						.then((blocks) => {
+							if (!cancelled) setContent({ markdown: draft, blocks });
+						})
+						.catch((error) => logger.error("Failed to parse recording notes markdown:", error));
+				}
+			}
+		}
 
-    const handleManualSave = () => {
-        if (saveTimerRef.current) {
-            clearTimeout(saveTimerRef.current);
-        }
-        void saveDraftToDisk(notes);
-    };
+		return () => {
+			cancelled = true;
+			draftGenerationRef.current += 1;
+			void flushPendingSave().catch(() => {});
+		};
+	}, [draftKey, flushPendingSave, parser]);
 
-    return (
-        <div
-            className="flex flex-col h-full bg-white border-l border-gray-200 shrink-0"
-            style={width !== undefined ? { width } : { width: 320 }}
-        >
-            <div className="flex items-center justify-between px-4 py-2 border-b border-gray-200 bg-gray-50">
-                <div className="flex items-center gap-2">
-                    <StickyNote className="h-4 w-4 text-blue-600" />
-                    <h3 className="text-sm font-semibold text-gray-700">Notes</h3>
-                </div>
-                <div className="flex items-center gap-2">
-                    {isSaving && (
-                        <span className="text-xs text-gray-400 flex items-center gap-1">
-                            <Loader2 className="h-3 w-3 animate-spin" />
-                            {!isCompact && "Saving..."}
-                        </span>
-                    )}
-                    {isDirty && !isSaving && (
-                        <span className="text-xs text-amber-500">
-                            {!isCompact && "Unsaved"}
-                        </span>
-                    )}
-                    {!isDirty && !isSaving && notes.length > 0 && (
-                        <span className="text-xs text-green-500">
-                            {!isCompact && "Saved"}
-                        </span>
-                    )}
-                    <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={handleManualSave}
-                        disabled={!isDirty || isSaving}
-                        className={isCompact ? "h-7 w-7 p-0" : "h-7 text-xs"}
-                        title="Save"
-                    >
-                        <Save className="h-3 w-3" />
-                        {!isCompact && <>Save</>}
-                    </Button>
-                    <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={onClose}
-                        className="h-7 w-7 p-0 text-gray-400 hover:text-gray-600"
-                        title="Hide notes"
-                    >
-                        <X className="h-4 w-4" />
-                    </Button>
-                </div>
-            </div>
-            <ScrollArea className="flex-1">
-                <textarea
-                    value={notes}
-                    onChange={handleChange}
-                    onBlur={() => {
-                        if (saveTimerRef.current) {
-                            clearTimeout(saveTimerRef.current);
-                        }
-                        void saveDraftToDisk(notes);
-                    }}
-                    placeholder="Add your notes here..."
-                    className="w-full h-full min-h-[60vh] p-4 text-sm text-gray-800 resize-none border-0 outline-none"
-                    style={{ fontFamily: "inherit" }}
-                />
-            </ScrollArea>
-        </div>
-    );
+	const handleBlocksChange = (blocks: Block[]) => {
+		editor.setBlocks(blocks);
+		if (!draftKey) return;
+
+		const generation = ++draftGenerationRef.current;
+		const blocksJson = JSON.stringify(blocks);
+		const markdown = editor.notesRef.current;
+		if (!persistDraft(draftKey, { markdown, blocksJson })) {
+			logger.error("Failed to persist recording notes session draft");
+		}
+
+		void editor.markdownEditorRef.current
+			?.blocksToMarkdownLossy(blocks)
+			.then((freshMarkdown) => {
+				if (
+					generation === draftGenerationRef.current &&
+					!persistDraft(draftKey, { markdown: freshMarkdown, blocksJson })
+				) {
+					logger.error("Failed to persist recording notes session draft");
+				}
+			})
+			.catch((error) => logger.error("Failed to convert recording notes draft to markdown:", error));
+	};
+
+	return (
+		<NotesEditorShell
+			notes={editor.notes}
+			initialBlocks={content.blocks}
+			onBlocksChange={handleBlocksChange}
+			markdownEditorRef={editor.markdownEditorRef}
+			onBlur={editor.handleBlur}
+			onManualSave={editor.handleManualSave}
+			isSaving={editor.isSaving}
+			isDirty={editor.isDirty}
+			lastSavedAt={editor.lastSavedAt}
+			width={width}
+			onClose={onClose}
+			showHeaderIcon
+		/>
+	);
 }

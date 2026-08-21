@@ -390,11 +390,12 @@ impl SettingsRepository {
 
                 if let Some(json) = config_json {
                     // Parse JSON into CustomOpenAIConfig
-                    let mut config: CustomOpenAIConfig = serde_json::from_str(&json).map_err(|e| {
-                        sqlx::Error::Protocol(
-                            format!("Invalid JSON in customOpenAIConfig: {}", e).into(),
-                        )
-                    })?;
+                    let mut config: CustomOpenAIConfig =
+                        serde_json::from_str(&json).map_err(|e| {
+                            sqlx::Error::Protocol(
+                                format!("Invalid JSON in customOpenAIConfig: {}", e).into(),
+                            )
+                        })?;
 
                     // F10: save_custom_openai_config encrypts api_key — decrypt on read
                     if let Some(ref mut key) = config.api_key {

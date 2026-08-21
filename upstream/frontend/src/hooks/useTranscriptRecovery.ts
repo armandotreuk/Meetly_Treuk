@@ -124,12 +124,14 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
             meetingId?: string;
         }> => {
             setIsRecovering(true);
+            let liveChatScopeKey: string | undefined;
             try {
                 // 1. Load meeting metadata
                 const metadata = await indexedDBService.getMeetingMetadata(meetingId);
                 if (!metadata) {
                     throw new Error("Meeting metadata not found");
                 }
+                liveChatScopeKey = metadata.liveChatScopeKey;
 
                 // 2. Load all transcripts
                 const transcripts = await loadMeetingTranscripts(meetingId);
@@ -193,7 +195,8 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
                 const saveResponse = await storageService.saveMeeting(
                     metadata.title,
                     formattedTranscripts,
-                    folderPath ?? null
+                    folderPath ?? null,
+                    liveChatScopeKey
                 );
 
                 const savedMeetingId = saveResponse.meeting_id;
@@ -234,6 +237,11 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
                 };
             } catch (error) {
                 logger.error("Failed to recover meeting:", error);
+                if (liveChatScopeKey) {
+                    toast.warning("Meeting recovery needs attention", {
+                        description: "The transcript and live conversation were retained. Retry recovery to attach them safely.",
+                    });
+                }
                 throw error;
             } finally {
                 setIsRecovering(false);
@@ -247,6 +255,14 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
      */
     const deleteRecoverableMeeting = useCallback(async (meetingId: string): Promise<void> => {
         try {
+            const metadata = await indexedDBService.getMeetingMetadata(meetingId);
+            if (metadata?.liveChatScopeKey) {
+                // Best-effort: the unsaved live thread is unreachable once the
+                // recovery checkpoint is deleted, so GC it with the recording.
+                invoke("api_chat_discard_live_recording", {
+                    liveScopeKey: metadata.liveChatScopeKey,
+                }).catch(() => {});
+            }
             await indexedDBService.deleteMeeting(meetingId);
             setRecoverableMeetings((prev) => prev.filter((m) => m.meetingId !== meetingId));
         } catch (error) {

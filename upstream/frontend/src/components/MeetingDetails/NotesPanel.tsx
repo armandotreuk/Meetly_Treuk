@@ -1,192 +1,182 @@
 "use client";
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useCallback } from "react";
+import type { Block } from "@blocknote/core";
+import { useCreateBlockNote } from "@blocknote/react";
 import { logger } from "@/lib/logger";
 
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
-import { Loader2, Save, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { ScrollArea } from "@/components/ui/scroll-area";
+import { useNotesEditor } from "@/components/notes/useNotesEditor";
+import { NotesEditorShell } from "@/components/notes/NotesEditorShell";
+import { useSidebar } from "@/components/Sidebar/SidebarProvider";
+import { t } from "@/lib/i18n";
 
 interface MeetingNote {
-    meeting_id: string;
-    notes_markdown: string | null;
-    notes_json: string | null;
-    created_at: string;
-    updated_at: string;
+	meeting_id: string;
+	notes_markdown: string | null;
+	notes_json: string | null;
+	created_at: string;
+	updated_at: string;
 }
 
 interface NotesPanelProps {
-    meetingId: string;
-    width?: number;
-    onClose?: () => void;
+	meetingId: string;
+	width?: number;
+	onClose?: () => void;
 }
 
 export function NotesPanel({ meetingId, width, onClose }: NotesPanelProps) {
-    const [notes, setNotes] = useState("");
-    const [isLoading, setIsLoading] = useState(true);
-    const [isSaving, setIsSaving] = useState(false);
-    const [isDirty, setIsDirty] = useState(false);
-    const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-    const lastSavedRef = useRef<string>("");
+	const [isLoading, setIsLoading] = useState(true);
+	const [loadError, setLoadError] = useState<string | null>(null);
+	const [reloadKey, setReloadKey] = useState(0);
+	const [isDeleting, setIsDeleting] = useState(false);
+	const { refetchMeetings } = useSidebar();
 
-    // ponytail: threshold 320px hardcoded; upgrade path if reused = extract useCompactPanelHeader.
-    const effectiveWidth = width ?? 320;
-    const isCompact = width !== undefined && width < 320;
+	const saveNotes = useCallback(
+		async (markdown: string, blocksJson: string | null) => {
+			await invoke("save_meeting_notes", {
+				meetingId,
+				notesMarkdown: markdown,
+				notesJson: blocksJson,
+			});
+			// ponytail: refetch after each save so the sidebar's has-notes dot stays
+			// live; the list is a local SQLite read (~30 rows), cheap at the 2s
+			// debounce cadence.
+			await refetchMeetings();
+		},
+		[meetingId, refetchMeetings]
+	);
 
-    useEffect(() => {
-        let cancelled = false;
+	const parser = useCreateBlockNote({ initialContent: undefined });
+	const [content, setContent] = useState<{ markdown: string; blocks: Block[] | null }>({
+		markdown: "",
+		blocks: null,
+	});
+	const editor = useNotesEditor({
+		save: saveNotes,
+		initialNotes: content.markdown,
+		initialBlocks: content.blocks,
+		onSaveError: (error) => {
+			logger.error("Failed to save meeting notes:", error);
+			toast.error(t("notes.toast.saveFailed"));
+		},
+	});
 
-        const loadNotes = async () => {
-            setIsLoading(true);
-            try {
-                const result = await invoke<MeetingNote | null>("get_meeting_notes", {
-                    meetingId,
-                });
-                if (!cancelled && result) {
-                    const markdown = result.notes_markdown || "";
-                    setNotes(markdown);
-                    lastSavedRef.current = markdown;
-                } else if (!cancelled) {
-                    setNotes("");
-                    lastSavedRef.current = "";
-                }
-            } catch (error) {
-                logger.error("Failed to load meeting notes:", error);
-                if (!cancelled) {
-                    toast.error("Failed to load notes");
-                }
-            } finally {
-                if (!cancelled) setIsLoading(false);
-            }
-        };
+	const { notesRef, lastSavedRef, flushPendingSave } = editor;
 
-        loadNotes();
+	useEffect(() => {
+		let cancelled = false;
 
-        return () => {
-            cancelled = true;
-            if (saveTimerRef.current) {
-                clearTimeout(saveTimerRef.current);
-            }
-        };
-    }, [meetingId]);
+		const loadNotes = async () => {
+			setIsLoading(true);
+			setLoadError(null);
+			lastSavedRef.current = "";
+			try {
+				const result = await invoke<MeetingNote | null>("get_meeting_notes", {
+					meetingId,
+				});
+				if (!cancelled && result) {
+					const markdown = result.notes_markdown || "";
+					let blocks: Block[] | null = null;
+					if (result.notes_json) {
+						try {
+							const parsed = JSON.parse(result.notes_json);
+							blocks = Array.isArray(parsed) ? parsed : null;
+						} catch {
+							blocks = null;
+						}
+					}
+					// ponytail: notes_json is the rich-content source of truth; markdown only hydrates legacy rows.
+					if (!blocks && markdown) {
+						try {
+							blocks = await parser.tryParseMarkdownToBlocks(markdown);
+						} catch (error) {
+							logger.error("Failed to parse meeting notes markdown:", error);
+						}
+					}
+					if (!cancelled) setContent({ markdown, blocks });
+				} else if (!cancelled) {
+					setContent({ markdown: "", blocks: null });
+				}
+			} catch (error) {
+				logger.error("Failed to load meeting notes:", error);
+				if (!cancelled) {
+					setLoadError(error instanceof Error ? error.message : String(error));
+					toast.error(t("notes.toast.loadFailed"));
+				}
+			} finally {
+				if (!cancelled) setIsLoading(false);
+			}
+		};
 
-    const saveNotes = useCallback(
-        async (markdown: string) => {
-            if (markdown === lastSavedRef.current) return;
+		loadNotes();
 
-            setIsSaving(true);
-            try {
-                await invoke("save_meeting_notes", {
-                    meetingId,
-                    notesMarkdown: markdown,
-                    notesJson: null,
-                });
-                lastSavedRef.current = markdown;
-                setIsDirty(false);
-            } catch (error) {
-                logger.error("Failed to save meeting notes:", error);
-                toast.error("Failed to save notes");
-            } finally {
-                setIsSaving(false);
-            }
-        },
-        [meetingId]
-    );
+		return () => {
+			cancelled = true;
+			void flushPendingSave().catch(() => {});
+		};
+	}, [meetingId, reloadKey, notesRef, lastSavedRef, flushPendingSave, parser]);
 
-    const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-        const value = e.target.value;
-        setNotes(value);
-        setIsDirty(true);
+	const handleRetryLoad = () => {
+		setReloadKey((key) => key + 1);
+	};
 
-        if (saveTimerRef.current) {
-            clearTimeout(saveTimerRef.current);
-        }
+	const handleDeleteNotes = async () => {
+		if (isDeleting || !confirm(t("notes.delete.confirm"))) return;
+		// ponytail: cancel before the IPC invalidates an active save and drops its
+		// latest-only queue so deleted content cannot be re-saved afterward.
+		editor.cancelPendingSave();
+		setIsDeleting(true);
+		try {
+			await editor.flushPendingSave();
+			await invoke("delete_meeting_notes", { meetingId });
+			editor.resetContent("", null);
+			setContent({ markdown: "", blocks: null });
+			await refetchMeetings();
+			toast.success(t("notes.toast.deleted"));
+		} catch (error) {
+			logger.error("Failed to delete meeting notes:", error);
+			toast.error(t("notes.toast.deleteFailed"));
+		} finally {
+			setIsDeleting(false);
+		}
+	};
 
-        saveTimerRef.current = setTimeout(() => {
-            saveNotes(value);
-        }, 2000);
-    };
-
-    const handleManualSave = () => {
-        if (saveTimerRef.current) {
-            clearTimeout(saveTimerRef.current);
-        }
-        saveNotes(notes);
-    };
-
-    if (isLoading) {
-        return (
-            <div className="flex items-center justify-center h-full">
-                <Loader2 className="h-6 w-6 animate-spin text-gray-400" />
-            </div>
-        );
-    }
-
-    return (
-        <div
-            className="flex flex-col h-full bg-white border-l border-gray-200 shrink-0"
-            style={{ width: effectiveWidth }}
-        >
-            <div className="flex items-center justify-between px-4 py-2 border-b border-gray-200 bg-gray-50">
-                <h3 className="text-sm font-semibold text-gray-700">Notes</h3>
-                <div className="flex items-center gap-2">
-                    {isSaving && (
-                        <span className="text-xs text-gray-400 flex items-center gap-1">
-                            <Loader2 className="h-3 w-3 animate-spin" />
-                            {!isCompact && "Saving..."}
-                        </span>
-                    )}
-                    {isDirty && !isSaving && (
-                        <span className="text-xs text-amber-500">
-                            {!isCompact && "Unsaved"}
-                        </span>
-                    )}
-                    {!isDirty && !isSaving && notes.length > 0 && (
-                        <span className="text-xs text-green-500">
-                            {!isCompact && "Saved"}
-                        </span>
-                    )}
-                    <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={handleManualSave}
-                        disabled={!isDirty || isSaving}
-                        className={isCompact ? "h-7 w-7 p-0" : "h-7 text-xs"}
-                        title="Save"
-                    >
-                        <Save className="h-3 w-3" />
-                        {!isCompact && <>Save</>}
-                    </Button>
-                    {onClose && (
-                        <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={onClose}
-                            className="h-7 w-7 p-0 text-gray-400 hover:text-gray-600"
-                            title="Hide notes"
-                        >
-                            <X className="h-4 w-4" />
-                        </Button>
-                    )}
-                </div>
-            </div>
-            <ScrollArea className="flex-1">
-                <textarea
-                    value={notes}
-                    onChange={handleChange}
-                    onBlur={() => {
-                        if (saveTimerRef.current) {
-                            clearTimeout(saveTimerRef.current);
-                        }
-                        saveNotes(notes);
-                    }}
-                    placeholder="Add your notes here..."
-                    className="w-full h-full min-h-[60vh] p-4 text-sm text-gray-800 resize-none border-0 outline-none font-mono"
-                    style={{ fontFamily: "inherit" }}
-                />
-            </ScrollArea>
-        </div>
-    );
+	return (
+		<NotesEditorShell
+			notes={editor.notes}
+			initialBlocks={content.blocks}
+			onBlocksChange={editor.setBlocks}
+			markdownEditorRef={editor.markdownEditorRef}
+			onBlur={editor.handleBlur}
+			onManualSave={editor.handleManualSave}
+			isSaving={editor.isSaving}
+			isDeleting={isDeleting}
+			isDirty={editor.isDirty}
+			lastSavedAt={editor.lastSavedAt}
+			width={width}
+			onClose={onClose}
+			onDeleteNotes={handleDeleteNotes}
+			isLoading={isLoading}
+			errorState={
+				loadError ? (
+					<div className="text-center px-6">
+						<p className="text-sm text-red-600">{t("notes.header.loadError")}</p>
+						<p className="text-xs text-gray-500 mt-1">{loadError}</p>
+						<Button
+							variant="outline"
+							size="sm"
+							className="mt-4"
+							onClick={handleRetryLoad}
+							autoFocus
+						>
+							{t("notes.retry")}
+						</Button>
+					</div>
+				) : undefined
+			}
+		/>
+	);
 }

@@ -5,6 +5,7 @@ use super::constants::AUDIO_EXTENSIONS;
 use crate::audio::decoder::decode_audio_file;
 use crate::audio::vad::get_speech_chunks_with_progress;
 use crate::config::{DEFAULT_PARAKEET_MODEL, DEFAULT_WHISPER_MODEL};
+use crate::database::repositories::fts::FtsRepository;
 use crate::parakeet_engine::ParakeetEngine;
 use crate::state::AppState;
 use crate::whisper_engine::WhisperEngine;
@@ -533,6 +534,13 @@ async fn run_retranscription<R: Runtime>(
         segments.len(),
         meeting_id
     );
+
+    if let Err(error) = FtsRepository::refresh_meeting(pool, &meeting_id).await {
+        warn!(
+            "Retranscription saved for meeting {} but FTS refresh failed: {}",
+            meeting_id, error
+        );
+    }
 
     // Write updated transcripts.json and metadata.json to the meeting folder
     emit_progress(

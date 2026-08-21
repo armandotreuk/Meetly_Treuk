@@ -45,6 +45,7 @@ pub mod console_utils;
 pub mod database;
 pub mod export;
 pub mod groq;
+pub mod mcp;
 pub mod notifications;
 pub mod ollama;
 pub mod onboarding;
@@ -57,7 +58,6 @@ pub mod summary;
 pub mod tray;
 pub mod utils;
 pub mod whisper_engine;
-pub mod mcp;
 
 use audio::{list_audio_devices, trigger_audio_permission, AudioDevice};
 use log::{error as log_error, info as log_info};
@@ -388,7 +388,11 @@ pub fn get_language_preference_internal() -> Option<String> {
 
 // Internal helper to read the flattened vocabulary prompt for whisper initial_prompt and summary glossary
 pub fn get_vocabulary_prompt_internal() -> String {
-    VOCABULARY_PROMPT.lock().ok().map(|p| p.clone()).unwrap_or_default()
+    VOCABULARY_PROMPT
+        .lock()
+        .ok()
+        .map(|p| p.clone())
+        .unwrap_or_default()
 }
 
 // ponytail: flattens the user's newline-separated word list into a single whisper initial_prompt sentence.
@@ -482,6 +486,7 @@ pub fn run() {
         )) as NotificationManagerState<tauri::Wry>)
         .manage(audio::init_system_audio_state())
         .manage(summary::summary_engine::ModelManagerState(Arc::new(tokio::sync::Mutex::new(None))))
+        .manage(api::chat::ChatStreamState::new())
         .setup(|_app| {
             log::info!("Application setup complete");
 
@@ -721,6 +726,18 @@ pub fn run() {
             api::api_rebuild_fts_index,
             api::api_build_context,
             api::api_chat_with_meetings,
+            api::api_chat_with_scoped_conversation,
+            api::api_chat_with_meetings_stream,
+            api::api_chat_with_scoped_conversation_stream,
+            api::api_cancel_chat_stream,
+            api::api_chat_create_conversation,
+            api::api_chat_get_conversation,
+            api::api_chat_get_or_create_scoped_conversation,
+            api::api_chat_get_messages,
+            api::api_chat_save_message,
+            api::api_chat_clear_conversation,
+            api::api_chat_promote_live_recording,
+            api::api_chat_discard_live_recording,
             api::api_get_profile,
             api::api_save_profile,
             api::api_update_profile,

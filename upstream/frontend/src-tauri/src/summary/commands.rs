@@ -1,6 +1,6 @@
 use crate::database::repositories::summary::canonical_summary_template_id;
 use crate::database::repositories::{
-    meeting::MeetingsRepository, summary::SummaryProcessesRepository,
+    fts::FtsRepository, meeting::MeetingsRepository, summary::SummaryProcessesRepository,
     transcript_chunk::TranscriptChunksRepository,
 };
 use crate::state::AppState;
@@ -154,6 +154,13 @@ pub async fn api_save_meeting_summary<R: Runtime>(
     {
         Ok(true) => {
             log_info!("Summary saved successfully for meeting_id: {}", meeting_id);
+            if let Err(error) = FtsRepository::refresh_meeting(pool, &meeting_id).await {
+                log_warn!(
+                    "Summary saved for meeting {} but FTS refresh failed: {}",
+                    meeting_id,
+                    error
+                );
+            }
             let revision =
                 SummaryProcessesRepository::get_summary_data(pool, &meeting_id, &template_id)
                     .await
@@ -736,6 +743,15 @@ pub async fn api_delete_meeting_summary<R: Runtime>(
         meeting_id,
         template_id
     );
+    if removed {
+        if let Err(error) = FtsRepository::refresh_meeting(pool, &meeting_id).await {
+            log_warn!(
+                "Summary deleted for meeting {} but FTS refresh failed: {}",
+                meeting_id,
+                error
+            );
+        }
+    }
     Ok(serde_json::json!({
         "removed": removed,
         "meeting_id": meeting_id,

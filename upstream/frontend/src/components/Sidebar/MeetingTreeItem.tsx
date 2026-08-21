@@ -87,6 +87,7 @@ interface MeetingTreeItemProps {
     chunkType?: string | null;
     folderName?: string | null;
     createdAt?: string;
+    hasNotes?: boolean;
     onEditMeeting: (meetingId: string, currentTitle: string) => void;
     onRequestDeleteMeeting: (meetingId: string) => void;
     onRequestMoveMeeting: (meetingId: string) => void;
@@ -101,6 +102,7 @@ export function MeetingTreeItem({
     chunkType,
     folderName,
     createdAt,
+    hasNotes,
     onEditMeeting,
     onRequestDeleteMeeting,
     onRequestMoveMeeting,
@@ -243,7 +245,17 @@ export function MeetingTreeItem({
                 <div className="flex-shrink-0 flex items-center justify-center w-6 h-6 rounded-full mr-2 bg-blue-100">
                     <PlusOrFile isIntro={isIntro} />
                 </div>
-                <span className="flex-1 break-words">{title}</span>
+                <span className="flex-1 min-w-0 flex items-center gap-1.5">
+                    <span className="break-words">{title}</span>
+                    {hasNotes && (
+                        <span
+                            className="w-2 h-2 rounded-full bg-green-500 flex-shrink-0"
+                            title="Has notes"
+                            role="img"
+                            aria-label="Has notes"
+                        />
+                    )}
+                </span>
                 {!isIntro && (
                     <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-150">
                         <button

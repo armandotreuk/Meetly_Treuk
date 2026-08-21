@@ -340,6 +340,14 @@ pub async fn save_meeting_notes(
         }
     }
 
+    // Update FTS index — best-effort; a failure here doesn't invalidate
+    // the notes data we just committed.
+    if let Err(e) =
+        super::repositories::fts::FtsRepository::refresh_meeting(pool, &meeting_id).await
+    {
+        error!("Failed to refresh FTS for meeting {}: {}", meeting_id, e);
+    }
+
     Ok(())
 }
 
@@ -367,6 +375,14 @@ pub async fn delete_meeting_notes(
     if let Some(Some(path)) = folder_path {
         let notes_md = std::path::Path::new(&path).join("notes.md");
         let _ = std::fs::remove_file(&notes_md);
+    }
+
+    // Update FTS index — best-effort; a failure here doesn't invalidate
+    // the notes deletion we just committed.
+    if let Err(e) =
+        super::repositories::fts::FtsRepository::refresh_meeting(pool, &meeting_id).await
+    {
+        error!("Failed to refresh FTS for meeting {}: {}", meeting_id, e);
     }
 
     Ok(())

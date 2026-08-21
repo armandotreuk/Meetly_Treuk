@@ -20,6 +20,9 @@ import { FolderTreeItem } from './FolderTreeItem';
 import { MeetingTreeItem, type DragPayload } from './MeetingTreeItem';
 import { MoveToFolderModal } from './MoveToFolderModal';
 import { useSidebarTree, type MeetingLike, type MeetingNode } from '@/hooks/useSidebarTree';
+import { useChatHost } from '@/components/ChatPanel/ChatHost';
+import { createSearchSnapshotScope } from '@/components/ChatPanel/scope';
+import { t } from '@/lib/i18n';
 
 import {
   Dialog,
@@ -97,7 +100,7 @@ function UnfiledSection({ meetings, expanded, onToggle, onDropMeeting, onDropFol
       {expanded && (
         <div>
           {meetings.map((m) =>
-            renderMeeting({ kind: 'meeting', id: m.id, title: m.title, createdAt: m.created_at }, 1)
+            renderMeeting({ kind: 'meeting', id: m.id, title: m.title, createdAt: m.created_at, hasNotes: m.has_notes }, 1)
           )}
           {meetings.length === 0 && (
             <p className="text-xs text-gray-400 italic px-3 py-2" style={{ paddingLeft: '24px' }}>
@@ -135,6 +138,7 @@ const Sidebar: React.FC = () => {
     sidebarDragging,
     resizeHandleProps,
   } = useSidebar();
+  const { openChat } = useChatHost();
 
   // Get recording state from RecordingStateContext (single source of truth)
   const { isRecording } = useRecordingState();
@@ -335,7 +339,6 @@ const Sidebar: React.FC = () => {
     // Search through transcripts
     await searchTranscripts(value);
   }, [searchTranscripts]);
-
   // Folder tree (pastas lógicas): unfiled bucket + recursive folder roots.
   const { unfiled, roots } = useSidebarTree(folders, meetings);
 
@@ -349,6 +352,11 @@ const Sidebar: React.FC = () => {
     const matchedIds = new Set(searchResults.map((r) => r.meeting_id));
     return meetings.filter((m) => matchedIds.has(m.id) || m.title.toLowerCase().includes(q));
   }, [meetings, searchQuery, searchResults]);
+
+  const askSearchResults = useCallback(async () => {
+    const scope = await createSearchSnapshotScope(searchFilteredMeetings);
+    if (scope) openChat(scope);
+  }, [openChat, searchFilteredMeetings]);
 
   // Folder action handlers (backend errors surface as toasts)
   const handleMoveMeeting = useCallback(async (meetingId: string, folderId: string | null) => {
@@ -676,6 +684,7 @@ const Sidebar: React.FC = () => {
       depth={depth}
       currentMeetingId={currentMeeting?.id}
       createdAt={node.createdAt}
+      hasNotes={node.hasNotes}
       onEditMeeting={handleEditStart}
       onRequestDeleteMeeting={(id) => setDeleteModalState({ isOpen: true, itemId: id })}
       onRequestMoveMeeting={(id) => setMoveModalState({ isOpen: true, kind: 'meeting', id })}
@@ -763,8 +772,9 @@ const Sidebar: React.FC = () => {
             {!isCollapsed && (
               <div className="flex-shrink-0">
                 <div className="flex items-center transition-all duration-150 p-3 text-lg font-semibold h-10 mx-3 mt-3 rounded-lg group">
-                  <NotebookPen className="w-4 h-4 mr-2 text-gray-600" />
+<NotebookPen className="w-4 h-4 mr-2 text-gray-600" />
                   <span className="text-gray-700">Meeting Notes</span>
+                  {searchFilteredMeetings.length > 0 && <button onClick={askSearchResults} className="ml-auto text-xs text-blue-600 hover:text-blue-700">{t('app.sidebar.askSearchResults')}</button>}
                   {searchQuery && isSearching && (
                     <span className="ml-2 text-xs text-blue-500 animate-pulse">Searching...</span>
                   )}
@@ -794,6 +804,7 @@ const Sidebar: React.FC = () => {
                           depth={0}
                           currentMeetingId={currentMeeting?.id}
                           createdAt={m.created_at}
+                          hasNotes={m.has_notes}
                           snippetContext={findMatchingSnippet(m.id)?.snippet ?? null}
                           folderName={m.folder_id ? folderNameById.get(m.folder_id) ?? null : null}
                           onEditMeeting={handleEditStart}
@@ -830,7 +841,8 @@ const Sidebar: React.FC = () => {
                           onCreateSubfolder={openCreateFolderModal}
                           onRenameFolder={openRenameFolderModal}
                           onRequestDeleteFolder={(id) => setDeleteFolderModalState({ isOpen: true, folderId: id })}
-                          onRequestMoveFolder={(id) => setMoveModalState({ isOpen: true, kind: 'folder', id })}
+                           onRequestMoveFolder={(id) => setMoveModalState({ isOpen: true, kind: 'folder', id })}
+                           onAskFolder={(id) => openChat({ kind: 'folder', key: id }, folderNameById.get(id))}
                           renderMeeting={renderMeeting}
                         />
                       ))}

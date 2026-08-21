@@ -2,7 +2,7 @@ import type { Block } from "@blocknote/core";
 
 import { logger } from "@/lib/logger";
 
-interface MarkdownCapableEditor {
+export interface MarkdownCapableEditor {
     blocksToMarkdownLossy: (blocks: Block[]) => Promise<string>;
 }
 

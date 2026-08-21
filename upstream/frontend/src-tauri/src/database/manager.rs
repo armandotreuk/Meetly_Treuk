@@ -1,7 +1,12 @@
 use crate::database::templates_sync::sync_builtin_templates;
-use sqlx::{migrate::MigrateDatabase, Result, Sqlite, SqlitePool, Transaction};
+use sqlx::{
+    migrate::MigrateDatabase,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    Result, Sqlite, SqlitePool, Transaction,
+};
 use std::fs;
 use std::path::Path;
+use std::str::FromStr;
 use tauri::Manager;
 
 #[derive(Clone)]
@@ -31,7 +36,9 @@ impl DatabaseManager {
             }
         }
 
-        let pool = SqlitePool::connect(tauri_db_path).await?;
+        let pool = SqlitePoolOptions::new()
+            .connect_with(SqliteConnectOptions::from_str(tauri_db_path)?.foreign_keys(true))
+            .await?;
 
         sqlx::migrate!("./migrations").run(&pool).await?;
 

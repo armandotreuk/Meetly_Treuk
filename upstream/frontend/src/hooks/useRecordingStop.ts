@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
+import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
 import { useTranscripts } from '@/contexts/TranscriptContext';
@@ -8,6 +9,8 @@ import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateCon
 import { storageService } from '@/services/storageService';
 import { transcriptService } from '@/services/transcriptService';
 import Analytics from '@/lib/analytics';
+import { useChatHost } from '@/components/ChatPanel/ChatHost';
+import { flushRecordingNotes, releaseRecordingNotesFlush } from '@/lib/recording-notes-flush';
 import {
   applyPinnedSummaryLanguageToMeeting,
   detectAndCacheSummaryLanguage,
@@ -22,6 +25,25 @@ interface UseRecordingStopReturn {
   isSavingTranscript: boolean;
   summaryStatus: SummaryStatus;
   setIsStopping: (value: boolean) => void;
+}
+
+function readRecordingNotesDraft(meetingTitle: string | null): {
+  markdown: string;
+  blocksJson: string | null;
+} | null {
+  if (!meetingTitle || meetingTitle === '+ New Call') return null;
+  const draft = sessionStorage.getItem(`recording_notes_draft:${meetingTitle}`);
+  if (draft === null) return null;
+  try {
+    const parsed = JSON.parse(draft) as { markdown?: unknown; blocksJson?: unknown };
+    if (typeof parsed.markdown !== 'string') return null;
+    return {
+      markdown: parsed.markdown,
+      blocksJson: typeof parsed.blocksJson === 'string' ? parsed.blocksJson : null,
+    };
+  } catch {
+    return { markdown: draft, blocksJson: null };
+  }
 }
 
 /**
@@ -48,7 +70,8 @@ export function useRecordingStop(
     setStatus,
     isStopping,
     isProcessing: isProcessingTranscript,
-    isSaving: isSavingTranscript
+    isSaving: isSavingTranscript,
+    liveTranscriptScopeKey,
   } = recordingState;
 
   const {
@@ -56,6 +79,7 @@ export function useRecordingStop(
     flushBuffer,
     clearTranscripts,
     meetingTitle,
+    currentMeetingId,
     markMeetingAsSaved,
   } = useTranscripts();
 
@@ -68,6 +92,7 @@ export function useRecordingStop(
   } = useSidebar();
 
   const router = useRouter();
+  const { promoteLiveChat, prepareLiveChatPromotion } = useChatHost();
 
   // Guard to prevent duplicate/concurrent stop calls (e.g., from UI and tray simultaneously)
   const stopInProgressRef = useRef(false);
@@ -136,6 +161,21 @@ export function useRecordingStop(
     const stopStartTime = Date.now();
 
     try {
+      // A tray stop tears down the native manager before this renderer callback.
+      // Await the unmount-captured flush before importing notes into SQLite.
+      let notesFallback: ReturnType<typeof readRecordingNotesDraft> = null;
+      if (isCallApi) {
+        try {
+          await flushRecordingNotes(liveTranscriptScopeKey);
+        } catch (error) {
+          notesFallback =
+            readRecordingNotesDraft(meetingTitle) ??
+            readRecordingNotesDraft(sessionStorage.getItem('last_recording_meeting_name'));
+          if (!notesFallback) throw error;
+          console.warn('Recording notes disk flush failed; using the recovery draft:', error);
+        }
+      }
+
       console.log('Post-stop processing (new implementation)...', {
         stop_initiated_at: new Date(stopStartTime).toISOString(),
         current_transcript_count: transcriptsRef.current.length
@@ -253,10 +293,13 @@ export function useRecordingStop(
         });
 
         try {
+          const liveScopeKey = liveTranscriptScopeKey;
+          if (liveScopeKey) await prepareLiveChatPromotion();
           const responseData = await storageService.saveMeeting(
             savedMeetingName || meetingTitle || 'New Meeting',  // PREFER savedMeetingName (backend source)
             freshTranscripts,
-            folderPath
+            folderPath,
+            liveScopeKey ?? undefined
           );
 
           const meetingId = responseData.meeting_id;
@@ -264,6 +307,26 @@ export function useRecordingStop(
             console.error('No meeting_id in response:', responseData);
             throw new Error('No meeting ID received from save operation');
           }
+
+          if (notesFallback) {
+            await invoke('save_meeting_notes', {
+              meetingId,
+              notesMarkdown: notesFallback.markdown,
+              notesJson: notesFallback.blocksJson,
+            });
+          }
+
+          if (liveScopeKey) {
+            await promoteLiveChat(liveScopeKey, meetingId, true);
+          }
+
+          // The backend imports notes.md and notes.json as part of saveMeeting.
+          for (const title of [meetingTitle, savedMeetingName]) {
+            if (title && title !== '+ New Call') {
+              sessionStorage.removeItem(`recording_notes_draft:${title}`);
+            }
+          }
+          releaseRecordingNotesFlush(liveScopeKey);
 
           let shouldDetectSummaryLanguage = false;
           try {
@@ -405,7 +468,12 @@ export function useRecordingStop(
           throw saveError;
         }
       } else {
-        // No save needed, go back to IDLE
+        // No save needed, go back to IDLE. The recording was discarded, so the
+        // ephemeral live chat thread must not linger unreachable in the database.
+        if (liveTranscriptScopeKey) {
+          invoke('api_chat_discard_live_recording', { liveScopeKey: liveTranscriptScopeKey }).catch(() => {});
+        }
+        releaseRecordingNotesFlush(liveTranscriptScopeKey);
         setStatus(RecordingStatus.IDLE);
       }
 
@@ -429,7 +497,11 @@ export function useRecordingStop(
     flushBuffer,
     clearTranscripts,
     meetingTitle,
+    currentMeetingId,
+    liveTranscriptScopeKey,
     markMeetingAsSaved,
+    promoteLiveChat,
+    prepareLiveChatPromotion,
     refetchMeetings,
     setCurrentMeeting,
     setMeetings,

@@ -1,17 +1,24 @@
 use crate::api::{MeetingDetails, MeetingTranscript};
 use crate::database::models::{MeetingModel, Transcript};
+use crate::database::repositories::chat::ChatRepository;
 use chrono::Utc;
-use sqlx::{Connection, Error as SqlxError, SqliteConnection, SqlitePool};
+use sqlx::{Acquire, Error as SqlxError, SqliteConnection, SqlitePool};
 use tracing::{error, info};
 
 pub struct MeetingsRepository;
 
 impl MeetingsRepository {
     pub async fn get_meetings(pool: &SqlitePool) -> Result<Vec<MeetingModel>, sqlx::Error> {
-        let meetings =
-            sqlx::query_as::<_, MeetingModel>("SELECT * FROM meetings ORDER BY created_at DESC")
-                .fetch_all(pool)
-                .await?;
+        let meetings = sqlx::query_as::<_, MeetingModel>(
+            "SELECT m.*,
+                    CASE WHEN (n.notes_markdown IS NOT NULL AND n.notes_markdown != '')
+                       OR (n.notes_json IS NOT NULL AND n.notes_json != '') THEN 1 ELSE 0 END AS has_notes
+             FROM meetings m
+             LEFT JOIN meeting_notes n ON n.meeting_id = m.id
+             ORDER BY m.created_at DESC",
+        )
+        .fetch_all(pool)
+        .await?;
         Ok(meetings)
     }
 
@@ -22,8 +29,7 @@ impl MeetingsRepository {
             ));
         }
 
-        let mut conn = pool.acquire().await?;
-        let mut transaction = conn.begin().await?;
+        let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
 
         match delete_meeting_with_transaction(&mut transaction, meeting_id).await {
             Ok(success) => {
@@ -277,11 +283,189 @@ async fn delete_meeting_with_transaction(
         .execute(&mut *transaction)
         .await?;
 
-    // 6. Finally, delete the meeting
+    // 6. Remove denormalized snippets/navigation while preserving answer text.
+    ChatRepository::remove_meeting_sources_in_transaction(transaction, meeting_id)
+        .await
+        .map_err(|error| SqlxError::Protocol(error.to_string()))?;
+
+    // 7. Finally, delete the meeting
     let result = sqlx::query("DELETE FROM meetings WHERE id = ?")
         .bind(meeting_id)
         .execute(&mut *transaction)
         .await?;
 
     Ok(result.rows_affected() > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::repositories::chat::ChatMessageRow;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::str::FromStr;
+
+    async fn deletion_test_pool() -> SqlitePool {
+        let options = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        for statement in [
+            "CREATE TABLE meetings (id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL)",
+            "CREATE TABLE meeting_fts (meeting_id TEXT)",
+            "CREATE TABLE transcript_chunks (meeting_id TEXT)",
+            "CREATE TABLE summary_processes (meeting_id TEXT)",
+            "CREATE TABLE meeting_notes (meeting_id TEXT)",
+            "CREATE TABLE transcripts (meeting_id TEXT)",
+            "CREATE TABLE chat_conversations (id TEXT PRIMARY KEY NOT NULL, meeting_id TEXT REFERENCES meetings(id) ON DELETE SET NULL, origin TEXT NOT NULL, scope_kind TEXT NOT NULL, scope_key TEXT NOT NULL, scope_data TEXT, promoted_from_live_scope_key TEXT, title TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+            "CREATE TABLE chat_messages (id TEXT PRIMARY KEY NOT NULL, conversation_id TEXT NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE, role TEXT NOT NULL, content TEXT NOT NULL, sources_json TEXT, is_error INTEGER DEFAULT 0, created_at TEXT NOT NULL)",
+            "CREATE TRIGGER chat_conversations_orphan_deleted_meeting AFTER UPDATE OF meeting_id ON chat_conversations WHEN OLD.meeting_id IS NOT NULL AND NEW.meeting_id IS NULL AND NEW.origin != 'global' BEGIN UPDATE chat_conversations SET scope_kind = 'orphaned_meeting' WHERE id = NEW.id; END",
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+        pool
+    }
+
+    #[tokio::test]
+    async fn deletion_scrubs_chat_sources_and_fences_late_persistence() {
+        let pool = deletion_test_pool().await;
+        for (id, title) in [("delete-me", "Deleted"), ("keep-me", "Survivor")] {
+            sqlx::query("INSERT INTO meetings (id, title) VALUES ($1, $2)")
+                .bind(id)
+                .bind(title)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        for (id, meeting_id, origin, scope_kind, scope_key, promoted_key) in [
+            ("global", None, "global", "all", "all", None),
+            (
+                "promoted",
+                Some("delete-me"),
+                "meeting",
+                "meeting",
+                "delete-me",
+                Some("live-1"),
+            ),
+        ] {
+            sqlx::query("INSERT INTO chat_conversations (id, meeting_id, origin, scope_kind, scope_key, promoted_from_live_scope_key, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')")
+                .bind(id)
+                .bind(meeting_id)
+                .bind(origin)
+                .bind(scope_kind)
+                .bind(scope_key)
+                .bind(promoted_key)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let mixed_sources = serde_json::json!([
+            {"meetingId":"delete-me","meetingTitle":"Deleted","chunkType":"transcript","snippet":"private","sourceKind":"meeting"},
+            {"meetingId":"keep-me","meetingTitle":"Survivor","chunkType":"note","snippet":"keep","sourceKind":"meeting"}
+        ])
+        .to_string();
+        ChatRepository::save_message(
+            &pool,
+            "global",
+            "assistant",
+            "answer survives",
+            Some(&mixed_sources),
+            false,
+        )
+        .await
+        .unwrap();
+        let original_sources: String = sqlx::query_scalar(
+            "SELECT sources_json FROM chat_messages WHERE content = 'answer survives'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query("CREATE TRIGGER block_meeting_delete BEFORE DELETE ON meetings WHEN OLD.id = 'delete-me' BEGIN SELECT RAISE(ABORT, 'blocked'); END")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(MeetingsRepository::delete_meeting(&pool, "delete-me")
+            .await
+            .is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT sources_json FROM chat_messages WHERE content = 'answer survives'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            original_sources
+        );
+        sqlx::query("DROP TRIGGER block_meeting_delete")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(MeetingsRepository::delete_meeting(&pool, "delete-me")
+            .await
+            .unwrap());
+        let retained: ChatMessageRow =
+            sqlx::query_as("SELECT * FROM chat_messages WHERE content = 'answer survives'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(retained.content, "answer survives");
+        let retained_sources: serde_json::Value =
+            serde_json::from_str(retained.sources_json.as_deref().unwrap()).unwrap();
+        assert_eq!(retained_sources.as_array().unwrap().len(), 1);
+        assert_eq!(retained_sources[0]["meetingId"], "keep-me");
+
+        ChatRepository::save_message(
+            &pool,
+            "global",
+            "assistant",
+            "late answer",
+            Some(&mixed_sources),
+            false,
+        )
+        .await
+        .unwrap();
+        let late_sources: String = sqlx::query_scalar(
+            "SELECT sources_json FROM chat_messages WHERE content = 'late answer'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let late_sources: serde_json::Value = serde_json::from_str(&late_sources).unwrap();
+        assert_eq!(late_sources.as_array().unwrap().len(), 1);
+        assert_eq!(late_sources[0]["meetingId"], "keep-me");
+
+        let late_live = serde_json::json!([{
+            "meetingId":"live-1",
+            "meetingTitle":"Live recording",
+            "chunkType":"live_transcript",
+            "snippet":"private live text",
+            "sourceKind":"live_recording"
+        }])
+        .to_string();
+        ChatRepository::save_message(
+            &pool,
+            "promoted",
+            "assistant",
+            "late promoted answer",
+            Some(&late_live),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT sources_json FROM chat_messages WHERE content = 'late promoted answer'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            None
+        );
+    }
 }

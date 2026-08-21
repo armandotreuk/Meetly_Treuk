@@ -1,22 +1,16 @@
 use axum::{
-    extract::State as AxumState,
-    http::StatusCode,
-    response::IntoResponse,
-    routing::post,
-    Json, Router,
+    extract::State as AxumState, http::StatusCode, response::IntoResponse, routing::post, Json,
+    Router,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tokio::net::TcpListener;
 use tracing::info;
 
-use crate::database::repositories::{
-    fts::FtsRepository,
-    folder::FolderRepository,
-    setting::SettingsRepository,
-};
+use crate::api::chat::{prepare_chat_inputs, SYSTEM_PROMPT};
+use crate::database::repositories::{folder::FolderRepository, fts::FtsRepository};
 use crate::export::build_context_markdown;
-use crate::summary::llm_client::{generate_summary, LLMProvider};
+use crate::summary::llm_client::generate_summary;
 
 pub const DEFAULT_PORT: u16 = 5167;
 
@@ -113,6 +107,10 @@ fn tool_definitions() -> Vec<ToolDefinition> {
                     "query": {
                         "type": "string",
                         "description": "The question to answer from meeting data"
+                    },
+                    "meetingId": {
+                        "type": "string",
+                        "description": "Optional meeting ID to scope the answer to one meeting"
                     }
                 },
                 "required": ["query"]
@@ -142,7 +140,7 @@ async fn execute_search_meetings(
         .to_string();
     let limit = params["limit"].as_u64().unwrap_or(20).min(50) as u32;
 
-    let results = FtsRepository::search(pool, &query, limit)
+    let results = FtsRepository::search(pool, &query, limit, None)
         .await
         .map_err(|e| format!("Search failed: {}", e))?;
 
@@ -162,7 +160,7 @@ async fn execute_build_context(
         .to_string();
     let max_chunks = params["max_chunks"].as_u64().unwrap_or(20).min(100) as u32;
 
-    let results = FtsRepository::search(pool, &query, max_chunks)
+    let results = FtsRepository::search(pool, &query, max_chunks, None)
         .await
         .map_err(|e| format!("FTS search failed: {}", e))?;
     let context = build_context_markdown(&results);
@@ -184,14 +182,20 @@ async fn execute_chat_with_meetings(
         .ok_or("Missing 'query' parameter")?
         .to_string();
 
-    // 1. FTS search
-    let results = FtsRepository::search(pool, &query, 10)
-        .await
-        .map_err(|e| format!("FTS search failed: {}", e))?;
-    let context = build_context_markdown(&results);
+    let meeting_id = params["meetingId"].as_str().map(str::to_string);
+    let inputs = prepare_chat_inputs(
+        pool,
+        app_data_dir.clone(),
+        client,
+        &query,
+        None,
+        meeting_id,
+        None,
+    )
+    .await?;
 
-    // 2. Build sources
-    let sources: Vec<serde_json::Value> = results
+    let sources: Vec<serde_json::Value> = inputs
+        .sources
         .iter()
         .map(|r| {
             serde_json::json!({
@@ -204,84 +208,18 @@ async fn execute_chat_with_meetings(
         })
         .collect();
 
-    // 3. Get LLM config (chat-specific, falls back to summary config)
-    let model_config = SettingsRepository::get_chat_model_config(pool)
-        .await
-        .map_err(|e| format!("Failed to get model config: {}", e))?
-        .ok_or_else(|| "No model configured. Please set a model in Settings.".to_string())?;
-
-    let (model_provider_str, model_name, chat_ollama_endpoint) =
-        SettingsRepository::resolve_chat_config(&model_config);
-
-    let provider = LLMProvider::from_str(&model_provider_str)?;
-
-    // CustomOpenAI config (has its own API key + endpoint)
-    let (custom_openai_endpoint, custom_openai_api_key, custom_openai_max_tokens, custom_openai_temperature, custom_openai_top_p) =
-        if provider == LLMProvider::CustomOpenAI {
-            match SettingsRepository::get_custom_openai_config(pool).await {
-                Ok(Some(config)) => (
-                    Some(config.endpoint),
-                    config.api_key.unwrap_or_default(),
-                    config.max_tokens.map(|t| t as u32),
-                    config.temperature,
-                    config.top_p,
-                ),
-                _ => return Err("Custom OpenAI selected but no config found".to_string()),
-            }
-        } else {
-            (None, String::new(), None, None, None)
-        };
-
-    let api_key = if provider == LLMProvider::Ollama
-        || provider == LLMProvider::BuiltInAI
-    {
-        String::new()
-    } else if provider == LLMProvider::CustomOpenAI {
-        custom_openai_api_key
-    } else {
-        let key = match model_provider_str.as_str() {
-            "openai" => model_config.openai_api_key.as_deref(),
-            "claude" | "anthropic" => model_config.anthropic_api_key.as_deref(),
-            "groq" => model_config.groq_api_key.as_deref(),
-            "openrouter" => model_config.open_router_api_key.as_deref(),
-            "ollama" => model_config.ollama_api_key.as_deref(),
-            _ => None,
-        };
-        match key {
-            Some(k) if !k.is_empty() => k.to_string(),
-            _ => {
-                return Err(format!(
-                    "API key not found for provider '{}'. Go to Settings → Chat tab and enter your API key for {}.",
-                    model_provider_str, model_provider_str
-                ));
-            }
-        }
-    };
-
-    let ollama_endpoint = if provider == LLMProvider::Ollama {
-        chat_ollama_endpoint
-    } else {
-        None
-    };
-
-    let system_prompt = "You are a helpful meeting assistant. Answer the user's question based on the meeting context provided below. If the context doesn't contain enough information, say so. Be concise and cite specific meetings when relevant.";
-    let user_prompt = format!(
-        "User question: {}\n\nMeeting context:\n{}",
-        query, context
-    );
-
     let answer = generate_summary(
         client,
-        &provider,
-        &model_name,
-        &api_key,
-        system_prompt,
-        &user_prompt,
-        ollama_endpoint.as_deref(),
-        custom_openai_endpoint.as_deref(),
-        custom_openai_max_tokens,
-        custom_openai_temperature,
-        custom_openai_top_p,
+        &inputs.provider,
+        &inputs.model_name,
+        &inputs.api_key,
+        SYSTEM_PROMPT,
+        &inputs.user_prompt,
+        inputs.ollama_endpoint.as_deref(),
+        inputs.custom_openai_endpoint.as_deref(),
+        inputs.custom_openai_max_tokens,
+        inputs.custom_openai_temperature,
+        inputs.custom_openai_top_p,
         app_data_dir.as_ref(),
         None,
     )
@@ -294,9 +232,7 @@ async fn execute_chat_with_meetings(
     }))
 }
 
-async fn execute_list_folders(
-    pool: &SqlitePool,
-) -> Result<serde_json::Value, String> {
+async fn execute_list_folders(pool: &SqlitePool) -> Result<serde_json::Value, String> {
     let folders = FolderRepository::get_all(pool)
         .await
         .map_err(|e| format!("Failed to list folders: {}", e))?;
@@ -332,21 +268,19 @@ async fn handle_jsonrpc(
     info!("MCP request: method={}", request.method);
 
     let response = match request.method.as_str() {
-        "initialize" => {
-            JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id: request.id,
-                result: Some(serde_json::json!({
-                    "protocolVersion": "2025-03-26",
-                    "capabilities": { "tools": { "listChanged": false } },
-                    "serverInfo": {
-                        "name": "meetily-mcp",
-                        "version": env!("CARGO_PKG_VERSION")
-                    }
-                })),
-                error: None,
-            }
-        }
+        "initialize" => JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: request.id,
+            result: Some(serde_json::json!({
+                "protocolVersion": "2025-03-26",
+                "capabilities": { "tools": { "listChanged": false } },
+                "serverInfo": {
+                    "name": "meetily-mcp",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            })),
+            error: None,
+        },
         "notifications/initialized" => {
             return (StatusCode::OK, Json(serde_json::json!({}))).into_response();
         }
@@ -360,16 +294,20 @@ async fn handle_jsonrpc(
             }
         }
         "tools/call" => {
-            let tool_name = request.params["name"]
-                .as_str()
-                .unwrap_or("");
+            let tool_name = request.params["name"].as_str().unwrap_or("");
             let tool_args = &request.params["arguments"];
 
             let result = match tool_name {
                 "search_meetings" => execute_search_meetings(&state.pool, tool_args).await,
                 "build_context" => execute_build_context(&state.pool, tool_args).await,
                 "chat_with_meetings" => {
-                    execute_chat_with_meetings(&state.pool, tool_args, &state.app_data_dir, &state.client).await
+                    execute_chat_with_meetings(
+                        &state.pool,
+                        tool_args,
+                        &state.app_data_dir,
+                        &state.client,
+                    )
+                    .await
                 }
                 "list_folders" => execute_list_folders(&state.pool).await,
                 _ => Err(format!("Unknown tool: {}", tool_name)),
@@ -433,7 +371,11 @@ pub fn spawn_from_app<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     }
 }
 
-pub async fn start_server(pool: SqlitePool, app_data_dir: Option<std::path::PathBuf>, port: Option<u16>) {
+pub async fn start_server(
+    pool: SqlitePool,
+    app_data_dir: Option<std::path::PathBuf>,
+    port: Option<u16>,
+) {
     let port = port.unwrap_or(DEFAULT_PORT);
     let state = McpState {
         pool,

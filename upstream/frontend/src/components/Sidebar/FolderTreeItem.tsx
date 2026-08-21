@@ -31,6 +31,7 @@ import {
     removeGhost,
     findDropTargetAt,
 } from "./MeetingTreeItem";
+import { t } from "@/lib/i18n";
 
 interface FolderTreeItemProps {
     folder: FolderNode;
@@ -46,6 +47,7 @@ interface FolderTreeItemProps {
     onRenameFolder: (folderId: string, currentName: string) => void;
     onRequestDeleteFolder: (folderId: string) => void;
     onRequestMoveFolder: (folderId: string) => void;
+    onAskFolder: (folderId: string) => void;
     renderMeeting: (node: MeetingNode, depth: number) => React.ReactNode;
 }
 
@@ -64,6 +66,7 @@ export function FolderTreeItem(props: FolderTreeItemProps) {
         onRenameFolder,
         onRequestDeleteFolder,
         onRequestMoveFolder,
+        onAskFolder,
         renderMeeting,
     } = props;
 
@@ -245,6 +248,9 @@ export function FolderTreeItem(props: FolderTreeItemProps) {
                             </button>
                         </DropdownMenuTrigger>
                         <DropdownMenuContent align="end" className="w-48">
+                            <DropdownMenuItem onSelect={() => onAskFolder(folder.id)}>
+                                {t("app.sidebar.askFolder")}
+                            </DropdownMenuItem>
                             <DropdownMenuItem
                                 onSelect={() => onCreateSubfolder(folder.id)}
                             >
@@ -293,6 +299,7 @@ export function FolderTreeItem(props: FolderTreeItemProps) {
                             onRenameFolder={onRenameFolder}
                             onRequestDeleteFolder={onRequestDeleteFolder}
                             onRequestMoveFolder={onRequestMoveFolder}
+                            onAskFolder={onAskFolder}
                             renderMeeting={renderMeeting}
                         />
                     ))}

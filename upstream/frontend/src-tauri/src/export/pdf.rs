@@ -608,14 +608,24 @@ fn render_list(ctx: &mut RenderContext, content: &str, item_format: Option<&str>
         // header is baked into the synthesized table instead. Ceiling:
         // synthesized header is English ("Task | Owner | Due") and
         // isn't localized to the section's language; revisit if needed.
-        render_table_grid(ctx, &pipe_table, BODY_SIZE_PT, SECTION_HEADING_SIZE_PT, None);
+        render_table_grid(
+            ctx,
+            &pipe_table,
+            BODY_SIZE_PT,
+            SECTION_HEADING_SIZE_PT,
+            None,
+        );
         return;
     }
 
     // Detect structured bullet lists with field separators (|, :, or ,)
     // e.g., "- **Owner**: Ana | **Task**: Finish doc | **Due**: 2026-07-25"
     // or   "- Owner: Ana, Task: Finish doc, Due: 2026-07-25"
-    let lines: Vec<&str> = content.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+    let lines: Vec<&str> = content
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
     if lines.len() >= 2 && looks_like_structured_list(&lines) {
         render_structured_list_as_table(ctx, &lines);
         return;
@@ -638,7 +648,11 @@ fn render_list_segmented(ctx: &mut RenderContext, content: &str, item_format: Op
     let mut buf: Vec<&str> = Vec::new();
     let mut buf_kind: Option<SegmentKind> = None;
     for line in content.lines() {
-        let kind = if line.trim_start().starts_with('|') { SegmentKind::Table } else { SegmentKind::Prose };
+        let kind = if line.trim_start().starts_with('|') {
+            SegmentKind::Table
+        } else {
+            SegmentKind::Prose
+        };
         if buf_kind.as_ref() != Some(&kind) {
             flush_segment(ctx, &buf, buf_kind.as_ref(), item_format);
             buf.clear();
@@ -650,16 +664,30 @@ fn render_list_segmented(ctx: &mut RenderContext, content: &str, item_format: Op
 }
 
 #[derive(PartialEq)]
-enum SegmentKind { Prose, Table }
+enum SegmentKind {
+    Prose,
+    Table,
+}
 
-fn flush_segment(ctx: &mut RenderContext, lines: &[&str], kind: Option<&SegmentKind>, item_format: Option<&str>) {
+fn flush_segment(
+    ctx: &mut RenderContext,
+    lines: &[&str],
+    kind: Option<&SegmentKind>,
+    item_format: Option<&str>,
+) {
     if lines.is_empty() {
         return;
     }
     let joined = lines.join("\n");
     match kind {
         Some(SegmentKind::Table) => {
-            render_table_grid(ctx, &joined, BODY_SIZE_PT, SECTION_HEADING_SIZE_PT, item_format);
+            render_table_grid(
+                ctx,
+                &joined,
+                BODY_SIZE_PT,
+                SECTION_HEADING_SIZE_PT,
+                item_format,
+            );
         }
         _ => {
             for line in joined.lines() {
@@ -689,7 +717,9 @@ fn render_structured_list_as_table(ctx: &mut RenderContext, lines: &[&str]) {
     let mut rows: Vec<Vec<String>> = Vec::new();
 
     for line in lines {
-        let line = line.trim_start_matches(|c| c == '-' || c == '•' || c == '*').trim();
+        let line = line
+            .trim_start_matches(|c| c == '-' || c == '•' || c == '*')
+            .trim();
         if line.is_empty() {
             continue;
         }
@@ -754,9 +784,7 @@ fn looks_like_checkbox_list(content: &str) -> bool {
         .iter()
         .filter(|l| {
             let t = l.trim_start();
-            t.starts_with("- [ ]")
-                || t.starts_with("- [x]")
-                || t.starts_with("- [X]")
+            t.starts_with("- [ ]") || t.starts_with("- [x]") || t.starts_with("- [X]")
         })
         .count();
     checkbox_count * 2 >= non_empty.len() && checkbox_count >= 2
@@ -953,7 +981,10 @@ fn render_table_grid(
     }
 
     let measure_longest_word = |cell: &str| -> usize {
-        cell.split_whitespace().map(|w| w.chars().count()).max().unwrap_or(0)
+        cell.split_whitespace()
+            .map(|w| w.chars().count())
+            .max()
+            .unwrap_or(0)
     };
 
     let mut col_min_chars: Vec<usize> = vec![0; num_cols];
@@ -1018,7 +1049,12 @@ fn render_table_grid(
     // back to the line-by-line plain renderer instead. Upgrade path:
     // split oversized cells across pages with clipped borders.
     let page_content_mm = CONTENT_TOP_MM - CONTENT_BOTTOM_MM;
-    let header_height = compute_row_height(&header, &col_width_mm, header_font_size, TABLE_HEADER_PADDING_MM);
+    let header_height = compute_row_height(
+        &header,
+        &col_width_mm,
+        header_font_size,
+        TABLE_HEADER_PADDING_MM,
+    );
     if header_height > page_content_mm
         || data_rows.iter().any(|r| {
             compute_row_height(r, &col_width_mm, body_font_size, TABLE_CELL_PADDING_MM)
@@ -1055,7 +1091,12 @@ fn render_table_grid(
     // continues on the next page). The "doubled header" artifact needs
     // ≥2 rows because the trigger is the per-row pagination before N+1
     // triggering header-repeat.
-    let header_h = compute_row_height(&header, &col_width_mm, header_font_size, TABLE_HEADER_PADDING_MM);
+    let header_h = compute_row_height(
+        &header,
+        &col_width_mm,
+        header_font_size,
+        TABLE_HEADER_PADDING_MM,
+    );
     let want_room = if data_rows.len() >= 2 {
         let first_row_h = compute_row_height(
             &data_rows[0],
@@ -1112,7 +1153,12 @@ fn render_table_grid(
 
     // ---- Render data rows with pagination + header repeat ----
     for data_row in &data_rows {
-        let row_height = compute_row_height(data_row, &col_width_mm, body_font_size, TABLE_CELL_PADDING_MM);
+        let row_height = compute_row_height(
+            data_row,
+            &col_width_mm,
+            body_font_size,
+            TABLE_CELL_PADDING_MM,
+        );
         if ctx.cursor_y - row_height < CONTENT_BOTTOM_MM {
             ctx.new_page();
             if TABLE_HEADER_REPEAT {
@@ -1162,12 +1208,7 @@ fn render_table_grid(
 /// pessimistic) or a silently-dropped cell line (pre-check too
 /// optimistic). One runnable check lives in
 /// `draw_table_row_does_not_paginate_mid_cell_when_row_fits`.
-fn compute_row_height(
-    row: &[String],
-    col_width_mm: &[f64],
-    font_size: f64,
-    v_padding: f64,
-) -> f64 {
+fn compute_row_height(row: &[String], col_width_mm: &[f64], font_size: f64, v_padding: f64) -> f64 {
     // ponytail: 0.8em / 0.2em ascent/descent split matches the `cell_y`
     // heuristic in `draw_table_row`; font metrics would be tighter but
     // the heuristic keeps this free-function self-contained.
@@ -1433,7 +1474,7 @@ fn font_search_roots() -> Vec<PathBuf> {
             roots.push(parent.join("../Resources/fonts")); // macOS bundle
             roots.push(parent.join("../templates/fonts"));
             roots.push(parent.join("../Resources/templates/fonts")); // Tauri macOS bundle
-            roots.push(parent.join("resources/templates/fonts"));    // Tauri Windows/Linux bundle
+            roots.push(parent.join("resources/templates/fonts")); // Tauri Windows/Linux bundle
             roots.push(parent.join("../resources/templates/fonts")); // Tauri Linux AppImage
         }
     }
@@ -1611,7 +1652,13 @@ fn parse_ttf_metrics(bytes: &[u8]) -> Option<FontMetrics> {
     // Total glyph count comes from `maxp` (offset 4: u16 numGlyphs).
     let total_glyphs = table_offsets
         .get(b"maxp")
-        .and_then(|&(o, l)| if o + 4 <= bytes.len() && l >= 4 { u16_at(bytes, o + 4) } else { None })
+        .and_then(|&(o, l)| {
+            if o + 4 <= bytes.len() && l >= 4 {
+                u16_at(bytes, o + 4)
+            } else {
+                None
+            }
+        })
         .map(|n| n as usize)
         .unwrap_or(num_h_metrics);
     if total_glyphs > num_h_metrics {
@@ -1724,8 +1771,7 @@ impl FontMetrics {
             // (seg_count - i slots from slot i to one-past-end) gives the
             // array index into glyph_id_array.
             let idx = (offset as usize / 2)
-                + (cp as usize - start as usize)
-                .saturating_sub(self.seg_end.len() - i);
+                + (cp as usize - start as usize).saturating_sub(self.seg_end.len() - i);
             if idx >= self.glyph_id_array.len() {
                 return None;
             }
@@ -1788,7 +1834,12 @@ fn u32_at(b: &[u8], off: usize) -> Option<u32> {
     if off + 4 > b.len() {
         None
     } else {
-        Some(u32::from_be_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]]))
+        Some(u32::from_be_bytes([
+            b[off],
+            b[off + 1],
+            b[off + 2],
+            b[off + 3],
+        ]))
     }
 }
 
@@ -1856,12 +1907,7 @@ fn split_bold_segments(line: &str, base: FontWeight) -> Vec<(FontWeight, &str)> 
     out
 }
 
-fn wrap_to_width_real(
-    m: &FontMetrics,
-    text: &str,
-    max_width_mm: f64,
-    size_pt: f64,
-) -> Vec<String> {
+fn wrap_to_width_real(m: &FontMetrics, text: &str, max_width_mm: f64, size_pt: f64) -> Vec<String> {
     let space_w = m.text_width_mm(" ", size_pt);
     let mut lines: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -1895,7 +1941,11 @@ fn wrap_to_width_real(
             continue;
         }
 
-        let added_w = if current.is_empty() { word_w } else { current_w + space_w + word_w };
+        let added_w = if current.is_empty() {
+            word_w
+        } else {
+            current_w + space_w + word_w
+        };
         if added_w > max_width_mm {
             // Wrap: push current line, start new one with this word.
             lines.push(std::mem::take(&mut current));
@@ -2068,14 +2118,12 @@ mod tests {
             duration: Some("00:30:00".into()),
             attendees: Some("Ana, Bruno".into()),
             template_name: "Test Template".into(),
-            sections: vec![
-                SectionContent {
-                    title: "Action Items".into(),
-                    format: "list".into(),
-                    content: table_content.into(),
-                    item_format: None,
-                },
-            ],
+            sections: vec![SectionContent {
+                title: "Action Items".into(),
+                format: "list".into(),
+                content: table_content.into(),
+                item_format: None,
+            }],
         };
         let (bytes, page_count) = export_meeting_to_pdf(&data).expect("PDF should be generated");
         assert!(!bytes.is_empty());
@@ -2085,7 +2133,8 @@ mod tests {
     #[test]
     fn renders_markdown_table_without_header_in_pdf() {
         // Test table with only data rows (no header/separator)
-        let table_content = "| Ana | Finish doc | 2026-07-25 |\n| Bruno | Review budget | 2026-07-26 |";
+        let table_content =
+            "| Ana | Finish doc | 2026-07-25 |\n| Bruno | Review budget | 2026-07-26 |";
         let data = MeetingExportData {
             meeting_id: "test-123".into(),
             meeting_title: "Test Meeting".into(),
@@ -2093,14 +2142,12 @@ mod tests {
             duration: Some("00:30:00".into()),
             attendees: Some("Ana, Bruno".into()),
             template_name: "Test Template".into(),
-            sections: vec![
-                SectionContent {
-                    title: "Action Items".into(),
-                    format: "list".into(),
-                    content: table_content.into(),
-                    item_format: None,
-                },
-            ],
+            sections: vec![SectionContent {
+                title: "Action Items".into(),
+                format: "list".into(),
+                content: table_content.into(),
+                item_format: None,
+            }],
         };
         let (bytes, page_count) = export_meeting_to_pdf(&data).expect("PDF should be generated");
         assert!(!bytes.is_empty());
@@ -2118,14 +2165,12 @@ mod tests {
             duration: Some("00:30:00".into()),
             attendees: Some("Ana, Bruno".into()),
             template_name: "Test Template".into(),
-            sections: vec![
-                SectionContent {
-                    title: "Action Items".into(),
-                    format: "list".into(),
-                    content: table_content.into(),
-                    item_format: None,
-                },
-            ],
+            sections: vec![SectionContent {
+                title: "Action Items".into(),
+                format: "list".into(),
+                content: table_content.into(),
+                item_format: None,
+            }],
         };
         let (bytes, page_count) = export_meeting_to_pdf(&data).expect("PDF should be generated");
         assert!(!bytes.is_empty());
@@ -2137,12 +2182,8 @@ mod tests {
         // Sanity check for the grid renderer: a well-formed 3-col table
         // with a separator must return `true` (not fall back). Catches
         // the mm_per_char and measure_longest_word inertness bugs.
-        let (doc, page, layer) = PdfDocument::new(
-            "grid-test",
-            Mm(PAGE_WIDTH_MM),
-            Mm(PAGE_HEIGHT_MM),
-            "page-1",
-        );
+        let (doc, page, layer) =
+            PdfDocument::new("grid-test", Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), "page-1");
         let fonts = FontSet::load(&doc).expect("font load");
         let mut ctx = RenderContext::new(&doc, page, layer, fonts, "grid-test".into());
 
@@ -2150,8 +2191,12 @@ mod tests {
                      | --- | --- | --- |\n\
                      | Ana | Finish doc | 2026-07-25 |\n\
                      | Bruno | Review budget | 2026-07-26 |";
-        let rendered = render_table_grid(&mut ctx, table, BODY_SIZE_PT, SECTION_HEADING_SIZE_PT, None);
-        assert!(rendered, "render_table_grid should return true for a well-formed 3-col table");
+        let rendered =
+            render_table_grid(&mut ctx, table, BODY_SIZE_PT, SECTION_HEADING_SIZE_PT, None);
+        assert!(
+            rendered,
+            "render_table_grid should return true for a well-formed 3-col table"
+        );
     }
 
     #[test]
@@ -2165,26 +2210,65 @@ mod tests {
         let table = checkbox_list_to_pipe_table(content);
         let lines: Vec<&str> = table.lines().collect();
         // header + separator + 3 data rows
-        assert_eq!(lines.len(), 5, "expected 5 lines (header, sep, 3 rows), got: {:?}", lines);
+        assert_eq!(
+            lines.len(),
+            5,
+            "expected 5 lines (header, sep, 3 rows), got: {:?}",
+            lines
+        );
         assert_eq!(lines[0], "| Task | Owner | Due |");
         assert_eq!(lines[1], "| --- | --- | --- |");
         // row 1: Ana + Due 2026-07-25, task is "Finish quarterly report"
-        assert!(lines[2].contains("Ana Lopez"), "row1 missing owner: {}", lines[2]);
-        assert!(lines[2].contains("2026-07-25"), "row1 missing due: {}", lines[2]);
-        assert!(lines[2].contains("Finish quarterly report"), "row1 missing task: {}", lines[2]);
+        assert!(
+            lines[2].contains("Ana Lopez"),
+            "row1 missing owner: {}",
+            lines[2]
+        );
+        assert!(
+            lines[2].contains("2026-07-25"),
+            "row1 missing due: {}",
+            lines[2]
+        );
+        assert!(
+            lines[2].contains("Finish quarterly report"),
+            "row1 missing task: {}",
+            lines[2]
+        );
         // row 2: Bruno, checked item (`- [x]`) should still parse
-        assert!(lines[3].contains("Bruno"), "row2 missing owner: {}", lines[3]);
-        assert!(lines[3].contains("2026-07-30"), "row2 missing due: {}", lines[3]);
+        assert!(
+            lines[3].contains("Bruno"),
+            "row2 missing owner: {}",
+            lines[3]
+        );
+        assert!(
+            lines[3].contains("2026-07-30"),
+            "row2 missing due: {}",
+            lines[3]
+        );
         // row 3: no `[[Owner]]`, owner cell should be empty (between `| |`)
-        assert!(lines[4].contains("No owner here"), "row3 missing task: {}", lines[4]);
-        assert!(lines[4].contains("2026-08-01"), "row3 missing due: {}", lines[4]);
+        assert!(
+            lines[4].contains("No owner here"),
+            "row3 missing task: {}",
+            lines[4]
+        );
+        assert!(
+            lines[4].contains("2026-08-01"),
+            "row3 missing due: {}",
+            lines[4]
+        );
         // owner cell empty: `| ... |  | 2026-08-01 |` (the middle `|  |` pattern)
-        assert!(lines[4].matches('|').count() >= 4, "row3 should have empty owner cell: {}", lines[4]);
+        assert!(
+            lines[4].matches('|').count() >= 4,
+            "row3 should have empty owner cell: {}",
+            lines[4]
+        );
     }
 
     #[test]
     fn looks_like_checkbox_list_requires_majority() {
-        assert!(looks_like_checkbox_list("- [ ] a [[X]] Due: 1\n- [ ] b [[Y]] Due: 2"));
+        assert!(looks_like_checkbox_list(
+            "- [ ] a [[X]] Due: 1\n- [ ] b [[Y]] Due: 2"
+        ));
         assert!(looks_like_checkbox_list("- [x] a\n- [ ] b\n- [ ] c"));
         // minority checkboxes should NOT trigger
         assert!(!looks_like_checkbox_list("- [ ] stray\n- a\n- b\n- c\n- d"));
@@ -2198,22 +2282,24 @@ mod tests {
         // fall back (return false) rather than paginate mid-row, which
         // would leave borders on the old page and borderless overflow
         // text on the new one.
-        let (doc, page, layer) = PdfDocument::new(
-            "grid-test",
-            Mm(PAGE_WIDTH_MM),
-            Mm(PAGE_HEIGHT_MM),
-            "page-1",
-        );
+        let (doc, page, layer) =
+            PdfDocument::new("grid-test", Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), "page-1");
         let fonts = FontSet::load(&doc).expect("font load");
         let mut ctx = RenderContext::new(&doc, page, layer, fonts, "grid-test".into());
 
         let long_cell = "word ".repeat(2000);
-        let table = format!(
-            "| A | B |\n| --- | --- |\n| short | {} |",
-            long_cell.trim()
+        let table = format!("| A | B |\n| --- | --- |\n| short | {} |", long_cell.trim());
+        let rendered = render_table_grid(
+            &mut ctx,
+            &table,
+            BODY_SIZE_PT,
+            SECTION_HEADING_SIZE_PT,
+            None,
         );
-        let rendered = render_table_grid(&mut ctx, &table, BODY_SIZE_PT, SECTION_HEADING_SIZE_PT, None);
-        assert!(!rendered, "render_table_grid should fall back for a row taller than one page");
+        assert!(
+            !rendered,
+            "render_table_grid should fall back for a row taller than one page"
+        );
     }
 
     #[test]
@@ -2255,7 +2341,10 @@ mod tests {
         let cell_text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu";
         let row = vec![cell_text.to_string(), "short b".to_string()];
         let row_h = compute_row_height(&row, &col_widths, BODY_SIZE_PT, TABLE_CELL_PADDING_MM);
-        assert!(row_h > 6.70 && row_h < 30.0, "expected multi-line row (~25mm), got {row_h}mm");
+        assert!(
+            row_h > 6.70 && row_h < 30.0,
+            "expected multi-line row (~25mm), got {row_h}mm"
+        );
 
         // Position cursor so bottom_border == CONTENT_BOTTOM_MM exactly:
         // cursor_y - row_h = CONTENT_BOTTOM_MM  ->  cursor_y = CONTENT_BOTTOM_MM + row_h.
@@ -2301,12 +2390,8 @@ mod tests {
         // Templates bold header cells (`| **Owner** | ...`). The grid
         // draws headers bold already; the parsed header must not keep
         // literal asterisks. Assert via the synthesized header path.
-        let (doc, page, layer) = PdfDocument::new(
-            "grid-test",
-            Mm(PAGE_WIDTH_MM),
-            Mm(PAGE_HEIGHT_MM),
-            "page-1",
-        );
+        let (doc, page, layer) =
+            PdfDocument::new("grid-test", Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), "page-1");
         let fonts = FontSet::load(&doc).expect("font load");
         let mut ctx = RenderContext::new(&doc, page, layer, fonts, "grid-test".into());
 
@@ -2320,7 +2405,10 @@ mod tests {
             SECTION_HEADING_SIZE_PT,
             Some(item_format),
         );
-        assert!(rendered, "render_table_grid should render with a bold-marked item_format header");
+        assert!(
+            rendered,
+            "render_table_grid should render with a bold-marked item_format header"
+        );
     }
 
     #[test]
@@ -2337,12 +2425,8 @@ mod tests {
         //   body_h   (font 10.5pt) = 3.0 + 3.704 = 6.704
         //   total = 7.586 + 2*6.704 = 20.994
         // Pixel-level border verification is item 38 (visual export).
-        let (doc, page, layer) = PdfDocument::new(
-            "grid-test",
-            Mm(PAGE_WIDTH_MM),
-            Mm(PAGE_HEIGHT_MM),
-            "page-1",
-        );
+        let (doc, page, layer) =
+            PdfDocument::new("grid-test", Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), "page-1");
         let fonts = FontSet::load(&doc).expect("font load");
         let mut ctx = RenderContext::new(&doc, page, layer, fonts, "grid-test".into());
         let start_y = ctx.cursor_y;
@@ -2351,7 +2435,8 @@ mod tests {
                      | --- | --- | --- |\n\
                      | Ana | Finish doc | 2026-07-25 |\n\
                      | Bruno | Review budget | 2026-07-26 |";
-        let rendered = render_table_grid(&mut ctx, table, BODY_SIZE_PT, SECTION_HEADING_SIZE_PT, None);
+        let rendered =
+            render_table_grid(&mut ctx, table, BODY_SIZE_PT, SECTION_HEADING_SIZE_PT, None);
         assert!(rendered, "well-formed 3-col table should render as a grid");
         let advance = start_y - ctx.cursor_y;
         assert!(
@@ -2371,17 +2456,26 @@ mod tests {
 
         // Single-line row height under the new formula:
         // 2*v_pad + ascent + descent (span=0 for single line).
-        let single_line = 2.0 * TABLE_CELL_PADDING_MM
-            + BODY_SIZE_PT * 0.3528 * (0.8 + 0.2);
+        let single_line = 2.0 * TABLE_CELL_PADDING_MM + BODY_SIZE_PT * 0.3528 * (0.8 + 0.2);
 
-        let narrow = compute_row_height(&long_row, &[30.0, 40.0], BODY_SIZE_PT, TABLE_CELL_PADDING_MM);
+        let narrow = compute_row_height(
+            &long_row,
+            &[30.0, 40.0],
+            BODY_SIZE_PT,
+            TABLE_CELL_PADDING_MM,
+        );
         assert!(
             narrow > single_line + 0.001,
             "narrow column should wrap -> height > single-line ({narrow} vs {single_line})"
         );
 
         let short_row = vec!["x".to_string(), "hi".to_string()];
-        let wide = compute_row_height(&short_row, &[40.0, 120.0], BODY_SIZE_PT, TABLE_CELL_PADDING_MM);
+        let wide = compute_row_height(
+            &short_row,
+            &[40.0, 120.0],
+            BODY_SIZE_PT,
+            TABLE_CELL_PADDING_MM,
+        );
         assert!(
             (wide - single_line).abs() < 0.001,
             "short cell in wide column should fit one line ({wide} vs {single_line})"
@@ -2399,12 +2493,8 @@ mod tests {
         //   page 2: header repeat (7.586) + 5 rows (33.52) -> cursor = 277 - 41.11 = ~235.89
         //   WITHOUT header repeat, page-2 cursor would be 277 - 5*6.704 = ~243.5.
         //   Asserting cursor ≈ 235.89 pins BOTH pagination AND header repetition.
-        let (doc, page, layer) = PdfDocument::new(
-            "grid-test",
-            Mm(PAGE_WIDTH_MM),
-            Mm(PAGE_HEIGHT_MM),
-            "page-1",
-        );
+        let (doc, page, layer) =
+            PdfDocument::new("grid-test", Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), "page-1");
         let fonts = FontSet::load(&doc).expect("font load");
         let mut ctx = RenderContext::new(&doc, page, layer, fonts, "grid-test".into());
 
@@ -2412,9 +2502,18 @@ mod tests {
         for i in 0..40 {
             table.push_str(&format!("| r{i}a | r{i}b | r{i}c |\n"));
         }
-        let rendered = render_table_grid(&mut ctx, table.trim(), BODY_SIZE_PT, SECTION_HEADING_SIZE_PT, None);
+        let rendered = render_table_grid(
+            &mut ctx,
+            table.trim(),
+            BODY_SIZE_PT,
+            SECTION_HEADING_SIZE_PT,
+            None,
+        );
         assert!(rendered, "table should render as grid");
-        assert_eq!(ctx.page_number, 2, "should have created exactly one continuation page");
+        assert_eq!(
+            ctx.page_number, 2,
+            "should have created exactly one continuation page"
+        );
         let final_y = ctx.cursor_y;
         assert!(
             (final_y - 235.89).abs() < 0.05,
@@ -2460,12 +2559,16 @@ mod tests {
         let row_h = 2.0 * TABLE_CELL_PADDING_MM + BODY_SIZE_PT * 0.3528;
         ctx.cursor_y = CONTENT_BOTTOM_MM + header_h + row_h + 1.0; // ~45.29mm
 
-        let rendered = render_table_grid(&mut ctx, table, BODY_SIZE_PT, SECTION_HEADING_SIZE_PT, None);
+        let rendered =
+            render_table_grid(&mut ctx, table, BODY_SIZE_PT, SECTION_HEADING_SIZE_PT, None);
         assert!(rendered, "table should render as grid");
 
         // The guard must have fired: nothing should be on page 1, the
         // whole table (header + 3 rows) on page 2.
-        assert_eq!(ctx.page_number, 2, "guard should have paginated before drawing the table");
+        assert_eq!(
+            ctx.page_number, 2,
+            "guard should have paginated before drawing the table"
+        );
 
         // Page 2: header (~7.586) + 3 rows (3 * ~6.704 = 20.11mm) →
         // cursor = 277 - 27.70 = ~249.30mm.
@@ -2485,12 +2588,8 @@ mod tests {
         //   (a) col-count mismatch      -> false (fallback + warn)
         //   (b) item_format not pipe     -> false
         //   (c) no item_format, no sep   -> true (generic "Col N" header)
-        let (doc, page, layer) = PdfDocument::new(
-            "grid-test",
-            Mm(PAGE_WIDTH_MM),
-            Mm(PAGE_HEIGHT_MM),
-            "page-1",
-        );
+        let (doc, page, layer) =
+            PdfDocument::new("grid-test", Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), "page-1");
         let fonts = FontSet::load(&doc).expect("font load");
         let mut ctx = RenderContext::new(&doc, page, layer, fonts, "grid-test".into());
 
@@ -2523,7 +2622,10 @@ mod tests {
             SECTION_HEADING_SIZE_PT,
             None,
         );
-        assert!(rendered, "(c) generic synthesized header should render as grid");
+        assert!(
+            rendered,
+            "(c) generic synthesized header should render as grid"
+        );
     }
 
     #[test]
@@ -2533,12 +2635,8 @@ mod tests {
         // item_format to a 3-col table WITH a separator: with a separator
         // the grid renders (true); without one (test 4a) it falls back
         // (false) on the same data. This true result proves precedence.
-        let (doc, page, layer) = PdfDocument::new(
-            "grid-test",
-            Mm(PAGE_WIDTH_MM),
-            Mm(PAGE_HEIGHT_MM),
-            "page-1",
-        );
+        let (doc, page, layer) =
+            PdfDocument::new("grid-test", Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), "page-1");
         let fonts = FontSet::load(&doc).expect("font load");
         let mut ctx = RenderContext::new(&doc, page, layer, fonts, "grid-test".into());
 
@@ -2550,9 +2648,12 @@ mod tests {
             table,
             BODY_SIZE_PT,
             SECTION_HEADING_SIZE_PT,
-            Some("| **X** | **Y** |\n| --- | --- |"),  // 2-col, mismatches data
+            Some("| **X** | **Y** |\n| --- | --- |"), // 2-col, mismatches data
         );
-        assert!(rendered, "explicit header must win; matched-col-count item_format should be ignored");
+        assert!(
+            rendered,
+            "explicit header must win; matched-col-count item_format should be ignored"
+        );
     }
 
     #[test]
@@ -2562,12 +2663,8 @@ mod tests {
         // never silently dropped. Each case uses a fresh ctx so the cursor
         // delta is unambiguous (cursor starts at CONTENT_TOP_MM each time).
         let new_ctx = || -> RenderContext {
-            let (doc, page, layer) = PdfDocument::new(
-                "grid-test",
-                Mm(PAGE_WIDTH_MM),
-                Mm(PAGE_HEIGHT_MM),
-                "page-1",
-            );
+            let (doc, page, layer) =
+                PdfDocument::new("grid-test", Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), "page-1");
             // ponytail: keep the PdfDoc alive for the ctx's lifetime.
             // Constructed leak is fine for a test; the doc is small.
             let doc_box: &'static PdfDocumentReference = Box::leak(Box::new(doc));
@@ -2584,10 +2681,22 @@ mod tests {
             header_row.push_str(&format!(" h{i} |"));
             data_row.push_str(&format!(" d{i} |"));
         }
-        let table = format!("{header_row}\n|{sep}|\n{data_row}", sep = "---|".repeat(339) + "---");
+        let table = format!(
+            "{header_row}\n|{sep}|\n{data_row}",
+            sep = "---|".repeat(339) + "---"
+        );
         let before_a = ctx.cursor_y;
-        let rendered = render_table_grid(&mut ctx, &table, BODY_SIZE_PT, SECTION_HEADING_SIZE_PT, None);
-        assert!(!rendered, "340-col table should fall back via available_mm<=0 path");
+        let rendered = render_table_grid(
+            &mut ctx,
+            &table,
+            BODY_SIZE_PT,
+            SECTION_HEADING_SIZE_PT,
+            None,
+        );
+        assert!(
+            !rendered,
+            "340-col table should fall back via available_mm<=0 path"
+        );
         assert!(
             ctx.cursor_y < before_a,
             "fallback case A should have rendered content (cursor {before_a} -> {})",
@@ -2618,12 +2727,8 @@ mod tests {
         // render BOTH. Measured by cursor advance: mixed content advance
         // minus table-only advance should account for ~2 prose lines
         // (lead-in + trailing), i.e. >= 2 * LINE_HEIGHT_BODY.
-        let (doc, page, layer) = PdfDocument::new(
-            "grid-test",
-            Mm(PAGE_WIDTH_MM),
-            Mm(PAGE_HEIGHT_MM),
-            "page-1",
-        );
+        let (doc, page, layer) =
+            PdfDocument::new("grid-test", Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), "page-1");
         let fonts = FontSet::load(&doc).expect("font load");
 
         // Table-only baseline.
@@ -2693,7 +2798,10 @@ mod tests {
         let segs = split_bold_segments("foo **bar baz", FontWeight::Regular);
         assert_eq!(
             segs,
-            vec![(FontWeight::Regular, "foo "), (FontWeight::Regular, "bar baz")]
+            vec![
+                (FontWeight::Regular, "foo "),
+                (FontWeight::Regular, "bar baz")
+            ]
         );
     }
 
@@ -2759,32 +2867,54 @@ mod tests {
         // malformed, UPM missing, etc.) or if glyph-width relationships
         // are inverted (W narrower than i — sign of a wrong-table index).
         let m = font_metrics().expect("DejaVuSans metrics should load from templates/fonts/");
-        assert!(m.units_per_em > 0, "unitsPerEm must be positive (got {})", m.units_per_em);
+        assert!(
+            m.units_per_em > 0,
+            "unitsPerEm must be positive (got {})",
+            m.units_per_em
+        );
         assert_eq!(m.units_per_em, 2048, "DejaVuSans UPM is 2048");
         // Cmap must map at least the basic ASCII set and the Portuguese
         // accented vowels used in real meetings.
-        assert!(m.glyph_index('A' as u32).is_some(), "ASCII A must map to a glyph");
-        assert!(m.glyph_index('z' as u32).is_some(), "ASCII z must map to a glyph");
-        assert!(m.glyph_index('á' as u32).is_some(), "á must map to a glyph (PT-BR/ES content)");
+        assert!(
+            m.glyph_index('A' as u32).is_some(),
+            "ASCII A must map to a glyph"
+        );
+        assert!(
+            m.glyph_index('z' as u32).is_some(),
+            "ASCII z must map to a glyph"
+        );
+        assert!(
+            m.glyph_index('á' as u32).is_some(),
+            "á must map to a glyph (PT-BR/ES content)"
+        );
         assert!(m.glyph_index('ç' as u32).is_some(), "ç must map to a glyph");
         // Real-width wrap sanity: W is wider than i.
         let w_w = m.text_width_mm("W", BODY_SIZE_PT);
         let w_i = m.text_width_mm("i", BODY_SIZE_PT);
-        assert!(w_w > w_i, "W ({w_w}mm) should be wider than i ({w_i}mm) at {BODY_SIZE_PT}pt");
+        assert!(
+            w_w > w_i,
+            "W ({w_w}mm) should be wider than i ({w_i}mm) at {BODY_SIZE_PT}pt"
+        );
         // text_width_mm is monotonic in length: "aaaa" wider than "aa".
         assert!(m.text_width_mm("aaaa", BODY_SIZE_PT) > m.text_width_mm("aa", BODY_SIZE_PT));
         // A reasonable sentence must be measurable: width of "hello world"
         // at body size should be a few mm and longer than "hello".
         let s1 = m.text_width_mm("hello", BODY_SIZE_PT);
         let s2 = m.text_width_mm("hello world", BODY_SIZE_PT);
-        assert!(s1 > 0.0 && s2 > s1, "longer text must be wider ({s1} vs {s2})");
+        assert!(
+            s1 > 0.0 && s2 > s1,
+            "longer text must be wider ({s1} vs {s2})"
+        );
         // Bullet glyph (U+2022) is what `render_list`'s fallback path
         // emits on every line ("• {bullet_text}"); if it's missing from
         // the format-4 cmap, every bullet wraps with the fallback
         // advance and bullet lists mis-measure. ponytail: ceiling —
         // format-4 only covers BMP; if meeting notes ever contain
         // supplementary-plane chars (emoji), upgrade to format-12.
-        assert!(m.glyph_index(0x2022).is_some(), "U+2022 bullet must map to a glyph");
+        assert!(
+            m.glyph_index(0x2022).is_some(),
+            "U+2022 bullet must map to a glyph"
+        );
         // Bold metrics must load (we ship DejaVuSans-Bold.ttf alongside
         // DejaVuSans.ttf) and a Bold glyph must measure at least as wide
         // as the Regular glyph of the same char. `write_line_at_segments`

@@ -4,14 +4,17 @@ import { invoke } from "@tauri-apps/api/core";
 import { logger } from "@/lib/logger";
 
 import { appDataDir } from "@tauri-apps/api/path";
-import { useCallback, useEffect, useState, useRef } from "react";
+import React, { useCallback, useEffect, useState, useRef } from "react";
 import { Play, Pause, Square, Mic, AlertCircle, X } from "lucide-react";
 import { ProcessRequest, SummaryResponse } from "@/types/summary";
 import { listen } from "@tauri-apps/api/event";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import Analytics from "@/lib/analytics";
-import { useRecordingState } from "@/contexts/RecordingStateContext";
+import { RecordingStatus, useRecordingState } from "@/contexts/RecordingStateContext";
+import { flushRecordingNotes } from "@/lib/recording-notes-flush";
+import { toast } from "sonner";
+import { t } from "@/lib/i18n";
 
 interface RecordingControlsProps {
     isRecording: boolean;
@@ -44,8 +47,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
     meetingName,
 }) => {
     // Use global recording state context for pause state (syncs with tray operations)
-    const recordingState = useRecordingState();
-    const isPaused = recordingState.isPaused;
+    const { isPaused, setStatus, liveTranscriptScopeKey } = useRecordingState();
 
     const [showPlayback, setShowPlayback] = useState(false);
     const [recordingPath, setRecordingPath] = useState<string | null>(null);
@@ -160,8 +162,19 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
 
     const stopRecordingAction = useCallback(async () => {
         logger.debug("Executing stop recording...");
+        setIsProcessing(true);
         try {
-            setIsProcessing(true);
+            await flushRecordingNotes(liveTranscriptScopeKey);
+        } catch (error) {
+            logger.error("Failed to save notes before stopping:", error);
+            setIsProcessing(false);
+            setIsStopping(false);
+            setStatus(RecordingStatus.RECORDING);
+            toast.error(t("app.recording.notesFlushFailed"));
+            return;
+        }
+
+        try {
             const dataDir = await appDataDir();
             const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
             const savePath = `${dataDir}/recording-${timestamp}.wav`;
@@ -202,7 +215,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
         } finally {
             setIsStopping(false);
         }
-    }, [onRecordingStop]);
+    }, [liveTranscriptScopeKey, onRecordingStop, setStatus]);
 
     const handleStopRecording = useCallback(async () => {
         logger.debug(

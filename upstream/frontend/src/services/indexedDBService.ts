@@ -14,6 +14,7 @@ export interface MeetingMetadata {
     transcriptCount: number; // Number of transcript segments
     savedToSQLite: boolean; // Flag: saved to backend DB
     folderPath?: string; // Path to recording folder
+    liveChatScopeKey?: string;
 }
 
 export interface StoredTranscript {

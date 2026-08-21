@@ -7,6 +7,7 @@ import type { MeetingFolder, Meeting } from "@/types";
 // the type level; always present at runtime after fetchMeetings).
 export type MeetingLike = Pick<Meeting, "id" | "title" | "folder_id"> & {
     created_at?: string;
+    has_notes?: boolean;
 };
 
 export interface MeetingNode {
@@ -14,6 +15,7 @@ export interface MeetingNode {
     id: string;
     title: string;
     createdAt?: string;
+    hasNotes?: boolean;
 }
 
 export interface FolderNode {
@@ -70,6 +72,7 @@ export function useSidebarTree(folders: MeetingFolder[], meetings: MeetingLike[]
                     id: m.id,
                     title: m.title,
                     createdAt: m.created_at,
+                    hasNotes: m.has_notes,
                 })),
             ];
             return {

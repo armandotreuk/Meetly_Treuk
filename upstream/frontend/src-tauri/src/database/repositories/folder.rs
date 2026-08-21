@@ -27,7 +27,9 @@ impl FolderRepository {
         parent_id: Option<&str>,
     ) -> Result<MeetingFolderModel, SqlxError> {
         if name.trim().is_empty() {
-            return Err(SqlxError::Protocol("folder name cannot be empty".to_string()));
+            return Err(SqlxError::Protocol(
+                "folder name cannot be empty".to_string(),
+            ));
         }
         let id = format!("folder-{}", Uuid::new_v4());
         let now = Utc::now();
@@ -41,7 +43,10 @@ impl FolderRepository {
         .execute(pool)
         .await?;
 
-        info!("Created folder id={} name={:?} parent={:?}", id, name, parent_id);
+        info!(
+            "Created folder id={} name={:?} parent={:?}",
+            id, name, parent_id
+        );
         Self::get_by_id(pool, &id)
             .await?
             .ok_or_else(|| SqlxError::Protocol(format!("folder {} vanished after insert", id)))
@@ -59,9 +64,27 @@ impl FolderRepository {
         .await
     }
 
+    pub async fn get_subtree_ids(pool: &SqlitePool, id: &str) -> Result<Vec<String>, SqlxError> {
+        Ok(sqlx::query_scalar(
+            r#"
+            WITH RECURSIVE subtree(id) AS (
+                SELECT id FROM meeting_folders WHERE id = ?
+                UNION ALL
+                SELECT f.id FROM meeting_folders f JOIN subtree s ON f.parent_id = s.id
+            )
+            SELECT id FROM subtree
+            "#,
+        )
+        .bind(id)
+        .fetch_all(pool)
+        .await?)
+    }
+
     pub async fn rename(pool: &SqlitePool, id: &str, name: &str) -> Result<bool, SqlxError> {
         if name.trim().is_empty() {
-            return Err(SqlxError::Protocol("folder name cannot be empty".to_string()));
+            return Err(SqlxError::Protocol(
+                "folder name cannot be empty".to_string(),
+            ));
         }
         let r = sqlx::query("UPDATE meeting_folders SET name = ? WHERE id = ?")
             .bind(name.trim())
@@ -123,9 +146,7 @@ impl FolderRepository {
 
             if cycle.is_some() {
                 let _ = tx.rollback().await;
-                return Err(
-                    "Cannot move a folder into one of its own subfolders".to_string(),
-                );
+                return Err("Cannot move a folder into one of its own subfolders".to_string());
             }
         }
 
@@ -203,12 +224,16 @@ impl FolderRepository {
 
         // Clear folder_name in FTS for all affected folder_ids (best-effort)
         for (fid,) in &subtree {
-            if let Err(e) = sqlx::query("UPDATE meeting_fts SET folder_name = '' WHERE folder_id = ?")
-                .bind(fid)
-                .execute(pool)
-                .await
+            if let Err(e) =
+                sqlx::query("UPDATE meeting_fts SET folder_name = '' WHERE folder_id = ?")
+                    .bind(fid)
+                    .execute(pool)
+                    .await
             {
-                error!("Failed to clear FTS folder_name for deleted folder {}: {}", fid, e);
+                error!(
+                    "Failed to clear FTS folder_name for deleted folder {}: {}",
+                    fid, e
+                );
             }
         }
 
@@ -257,7 +282,10 @@ impl FolderRepository {
 
         // Refresh FTS for the meeting to update folder_id and folder_name (best-effort)
         if let Err(e) = FtsRepository::refresh_meeting(pool, meeting_id).await {
-            error!("Failed to refresh FTS for meeting {} after folder change: {}", meeting_id, e);
+            error!(
+                "Failed to refresh FTS for meeting {} after folder change: {}",
+                meeting_id, e
+            );
         }
 
         Ok(true)
@@ -298,16 +326,14 @@ mod tests {
 
     async fn seed_meeting(pool: &SqlitePool, id: &str) {
         let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            "INSERT INTO meetings (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
-        )
-        .bind(id)
-        .bind(format!("meeting {}", id))
-        .bind(&now)
-        .bind(&now)
-        .execute(pool)
-        .await
-        .expect("seed meeting");
+        sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)")
+            .bind(id)
+            .bind(format!("meeting {}", id))
+            .bind(&now)
+            .bind(&now)
+            .execute(pool)
+            .await
+            .expect("seed meeting");
     }
 
     async fn meeting_folder_id(pool: &SqlitePool, id: &str) -> Option<String> {
@@ -324,7 +350,9 @@ mod tests {
     async fn cycle_rejected() {
         let pool = setup().await;
         let a = FolderRepository::create(&pool, "A", None).await.unwrap();
-        let b = FolderRepository::create(&pool, "B", Some(&a.id)).await.unwrap();
+        let b = FolderRepository::create(&pool, "B", Some(&a.id))
+            .await
+            .unwrap();
         // Try to move A under B -> A is ancestor of B, must reject.
         let err = FolderRepository::move_folder(&pool, &a.id, Some(&b.id))
             .await
@@ -341,12 +369,16 @@ mod tests {
             .unwrap();
         seed_meeting(&pool, "m-1").await;
         seed_meeting(&pool, "m-2").await;
-        assert!(FolderRepository::set_meeting_folder(&pool, "m-1", Some(&parent.id))
-            .await
-            .unwrap());
-        assert!(FolderRepository::set_meeting_folder(&pool, "m-2", Some(&child.id))
-            .await
-            .unwrap());
+        assert!(
+            FolderRepository::set_meeting_folder(&pool, "m-1", Some(&parent.id))
+                .await
+                .unwrap()
+        );
+        assert!(
+            FolderRepository::set_meeting_folder(&pool, "m-2", Some(&child.id))
+                .await
+                .unwrap()
+        );
 
         let ok = FolderRepository::delete_with_cascade(&pool, &parent.id)
             .await
@@ -364,9 +396,13 @@ mod tests {
     async fn move_to_root_works() {
         let pool = setup().await;
         let a = FolderRepository::create(&pool, "A", None).await.unwrap();
-        let b = FolderRepository::create(&pool, "B", Some(&a.id)).await.unwrap();
+        let b = FolderRepository::create(&pool, "B", Some(&a.id))
+            .await
+            .unwrap();
         // Move B to root (parent None) — allowed.
-        FolderRepository::move_folder(&pool, &b.id, None).await.unwrap();
+        FolderRepository::move_folder(&pool, &b.id, None)
+            .await
+            .unwrap();
         let folders = FolderRepository::get_all(&pool).await.unwrap();
         let b_row = folders.iter().find(|f| f.id == b.id).unwrap();
         assert!(b_row.parent_id.is_none());
@@ -376,8 +412,9 @@ mod tests {
     async fn set_meeting_to_unknown_folder_no_op() {
         let pool = setup().await;
         seed_meeting(&pool, "m-1").await;
-        let ok =
-            FolderRepository::set_meeting_folder(&pool, "m-1", Some("nonexistent")).await.unwrap();
+        let ok = FolderRepository::set_meeting_folder(&pool, "m-1", Some("nonexistent"))
+            .await
+            .unwrap();
         assert!(!ok, "should refuse unknown folder id");
     }
 }

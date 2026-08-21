@@ -1289,27 +1289,51 @@ fn model_url_for(name: &str) -> Option<&'static str> {
         "base" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
         "small" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
         "medium" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin",
-        "large-v3-turbo" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
+        "large-v3-turbo" => {
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin"
+        }
         "large-v3" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin",
 
         // Q8_0 quantized models (best accuracy retention, ~50% smaller than f16)
-        "tiny-q8_0" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny-q8_0.bin",
-        "base-q8_0" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base-q8_0.bin",
-        "small-q8_0" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q8_0.bin",
-        "medium-q8_0" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium-q8_0.bin",
-        "large-v3-turbo-q8_0" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q8_0.bin",
+        "tiny-q8_0" => {
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny-q8_0.bin"
+        }
+        "base-q8_0" => {
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base-q8_0.bin"
+        }
+        "small-q8_0" => {
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q8_0.bin"
+        }
+        "medium-q8_0" => {
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium-q8_0.bin"
+        }
+        "large-v3-turbo-q8_0" => {
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q8_0.bin"
+        }
         // ponytail: large-v3 (non-turbo) has no upstream Q8_0 artifact in ggerganov/whisper.cpp;
         // Q5_1 is the only available quantization for the full large-v3 model.
 
         // Q5_1 quantized models
-        "tiny-q5_1" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny-q5_1.bin",
-        "base-q5_1" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base-q5_1.bin",
-        "small-q5_1" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin",
+        "tiny-q5_1" => {
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny-q5_1.bin"
+        }
+        "base-q5_1" => {
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base-q5_1.bin"
+        }
+        "small-q5_1" => {
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin"
+        }
 
         // Q5_0 quantized models
-        "medium-q5_0" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium-q5_0.bin",
-        "large-v3-turbo-q5_0" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
-        "large-v3-q5_0" => "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-q5_0.bin",
+        "medium-q5_0" => {
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium-q5_0.bin"
+        }
+        "large-v3-turbo-q5_0" => {
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin"
+        }
+        "large-v3-q5_0" => {
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-q5_0.bin"
+        }
 
         _ => return None,
     })

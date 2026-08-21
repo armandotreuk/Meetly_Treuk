@@ -6,9 +6,12 @@
 use anyhow::Result;
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+use std::{
+    collections::VecDeque,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::task::JoinHandle;
@@ -34,6 +37,10 @@ pub use super::transcription::TranscriptUpdate;
 
 // Simple recording state tracking
 static IS_RECORDING: AtomicBool = AtomicBool::new(false);
+static LIVE_TRANSCRIPT_SCOPE_KEY: Mutex<Option<String>> = Mutex::new(None);
+const MAX_RECORDING_NOTE_TARGETS: usize = 8;
+static RECORDING_NOTE_TARGETS: Mutex<VecDeque<(String, std::path::PathBuf)>> =
+    Mutex::new(VecDeque::new());
 
 // Global recording manager and transcription task to keep them alive during recording
 static RECORDING_MANAGER: Mutex<Option<RecordingManager>> = Mutex::new(None);
@@ -258,6 +265,8 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
 
     // Set recording flag and reset speech detection flag
     info!("🔍 Setting IS_RECORDING to true and resetting SPEECH_DETECTED_EMITTED");
+    let live_transcript_scope_key = issue_live_transcript_scope_key();
+    remember_recording_notes_target(&live_transcript_scope_key);
     IS_RECORDING.store(true, Ordering::SeqCst);
     drop(engine_lifecycle_guard);
     reset_speech_detected_flag(); // Reset for new recording session
@@ -311,7 +320,8 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         serde_json::json!({
             "message": "Recording started successfully with parallel processing",
             "devices": ["Default Microphone", "Default System Audio"],
-            "workers": 3
+            "workers": 3,
+            "liveTranscriptScopeKey": live_transcript_scope_key
         }),
     ) {
         error!("Failed to emit recording-started event: {}", e);
@@ -440,6 +450,8 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
 
     // Set recording flag and reset speech detection flag
     info!("🔍 Setting IS_RECORDING to true and resetting SPEECH_DETECTED_EMITTED");
+    let live_transcript_scope_key = issue_live_transcript_scope_key();
+    remember_recording_notes_target(&live_transcript_scope_key);
     IS_RECORDING.store(true, Ordering::SeqCst);
     drop(engine_lifecycle_guard);
     reset_speech_detected_flag(); // Reset for new recording session
@@ -497,7 +509,8 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
                 mic_device_name.unwrap_or_else(|| "Default Microphone".to_string()),
                 system_device_name.unwrap_or_else(|| "Default System Audio".to_string())
             ],
-            "workers": 3
+            "workers": 3,
+            "liveTranscriptScopeKey": live_transcript_scope_key
         }),
     ) {
         error!("Failed to emit recording-started event: {}", e);
@@ -783,6 +796,7 @@ pub async fn stop_recording<R: Runtime>(
     // Set recording flag to false
     info!("🔍 Setting IS_RECORDING to false");
     IS_RECORDING.store(false, Ordering::SeqCst);
+    *LIVE_TRANSCRIPT_SCOPE_KEY.lock().unwrap() = None;
 
     // Step 4.5: Prepare metadata for frontend (NO database save)
     // NOTE: We do NOT save to database here. The frontend will save after all transcripts are displayed.
@@ -933,6 +947,7 @@ pub async fn get_recording_state() -> serde_json::Value {
             "is_active": manager.is_active(),
             "recording_duration": manager.get_recording_duration(),
             "active_duration": manager.get_active_recording_duration(),
+            "live_transcript_scope_key": active_live_transcript_scope_key(),
             "total_pause_duration": manager.get_total_pause_duration(),
             "current_pause_duration": manager.get_current_pause_duration()
         })
@@ -943,6 +958,7 @@ pub async fn get_recording_state() -> serde_json::Value {
             "is_active": false,
             "recording_duration": null,
             "active_duration": null,
+            "live_transcript_scope_key": active_live_transcript_scope_key(),
             "total_pause_duration": 0.0,
             "current_pause_duration": null
         })
@@ -963,27 +979,113 @@ pub async fn get_meeting_folder_path() -> Result<Option<String>, String> {
     }
 }
 
-/// Write the user's in-meeting notes draft to `notes.md` in the current recording folder.
-/// Called (debounced) by the recording-screen notes panel so notes survive an app crash
-/// mid-meeting. No-op if no recording is active. The DB copy is persisted on stop via
-/// `save_meeting_notes`; this file is the real-time on-disk mirror.
+/// Write the user's in-meeting notes draft to the folder bound to its stable
+/// recording scope. Retaining recent bindings lets a tray-initiated stop finish
+/// an in-flight flush without crossing into a newer recording.
 #[tauri::command]
-pub async fn save_recording_notes(notes: String) -> Result<(), String> {
-    let folder = {
-        let manager_guard = RECORDING_MANAGER.lock().unwrap();
-        manager_guard
-            .as_ref()
-            .and_then(|m| m.get_meeting_folder())
-    };
+pub async fn save_recording_notes(
+    notes: String,
+    blocks_json: Option<String>,
+    recording_scope_key: String,
+) -> Result<(), String> {
+    let folder = RECORDING_NOTE_TARGETS
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|(scope_key, _)| scope_key == &recording_scope_key)
+        .map(|(_, folder)| folder.clone());
     let Some(folder) = folder else {
-        warn!("save_recording_notes called without an active recording folder");
-        return Ok(());
+        return Err("Recording notes target is no longer available".to_string());
     };
+    write_recording_notes(&folder, &notes, blocks_json.as_deref())?;
+    let notes_path = folder.join("notes.md");
+    info!(
+        "📝 Saved recording notes draft ({} bytes) to {}",
+        notes.len(),
+        notes_path.display()
+    );
+    Ok(())
+}
+
+fn remember_recording_notes_target(recording_scope_key: &str) {
+    let folder = RECORDING_MANAGER
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(RecordingManager::get_meeting_folder);
+    let Some(folder) = folder else {
+        return;
+    };
+
+    // ponytail: the app supports one active recording. Keep a small tail so a
+    // delayed renderer flush cannot cross-write into a newer recording; if
+    // concurrent recordings arrive, replace this with session-owned state.
+    let mut targets = RECORDING_NOTE_TARGETS.lock().unwrap();
+    targets.retain(|(scope_key, _)| scope_key != recording_scope_key);
+    targets.push_back((recording_scope_key.to_string(), folder));
+    while targets.len() > MAX_RECORDING_NOTE_TARGETS {
+        targets.pop_front();
+    }
+}
+
+fn write_recording_notes(
+    folder: &std::path::Path,
+    notes: &str,
+    blocks_json: Option<&str>,
+) -> Result<(), String> {
     let notes_path = folder.join("notes.md");
     std::fs::write(&notes_path, notes.as_bytes())
         .map_err(|e| format!("Failed to write notes.md: {}", e))?;
-    info!("📝 Saved recording notes draft ({} bytes) to {}", notes.len(), notes_path.display());
+    if let Some(json) = blocks_json {
+        std::fs::write(folder.join("notes.json"), json.as_bytes())
+            .map_err(|e| format!("Failed to write notes.json: {}", e))?;
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod recording_notes_tests {
+    use super::*;
+
+    #[test]
+    fn writes_markdown_and_json_recording_notes() {
+        let folder = tempfile::tempdir().unwrap();
+
+        write_recording_notes(folder.path(), "# Notes", Some(r#"[{"type":"paragraph"}]"#)).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(folder.path().join("notes.md")).unwrap(),
+            "# Notes"
+        );
+        assert_eq!(
+            std::fs::read_to_string(folder.path().join("notes.json")).unwrap(),
+            r#"[{"type":"paragraph"}]"#
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_scope_write_cannot_cross_into_a_newer_recording() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        *RECORDING_MANAGER.lock().unwrap() = None;
+        let mut targets = RECORDING_NOTE_TARGETS.lock().unwrap();
+        targets.clear();
+        targets.push_back(("scope-a".to_string(), first.path().to_path_buf()));
+        targets.push_back(("scope-b".to_string(), second.path().to_path_buf()));
+        drop(targets);
+
+        save_recording_notes("meeting a".to_string(), None, "scope-a".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(first.path().join("notes.md")).unwrap(),
+            "meeting a"
+        );
+        assert!(!second.path().join("notes.md").exists());
+        RECORDING_NOTE_TARGETS.lock().unwrap().clear();
+    }
 }
 
 /// Get accumulated transcript segments from current recording session
@@ -998,6 +1100,16 @@ pub async fn get_transcript_history(
     } else {
         Ok(Vec::new()) // No recording active, return empty
     }
+}
+
+pub(crate) fn issue_live_transcript_scope_key() -> String {
+    let key = uuid::Uuid::new_v4().to_string();
+    *LIVE_TRANSCRIPT_SCOPE_KEY.lock().unwrap() = Some(key.clone());
+    key
+}
+
+pub fn active_live_transcript_scope_key() -> Option<String> {
+    LIVE_TRANSCRIPT_SCOPE_KEY.lock().unwrap().clone()
 }
 
 /// Get meeting name from current recording session

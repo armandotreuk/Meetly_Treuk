@@ -40,11 +40,35 @@ console.log(''); // Empty line for spacing
 const platform = os.platform();
 const env = { ...process.env };
 
+if (platform === 'win32') {
+  // Next's recursive delete calls readlink on OneDrive placeholders and can
+  // fail with EINVAL. Native rmdir clears the disposable dev cache reliably.
+  execSync('cmd /c "if exist .next rmdir /s /q .next"', { stdio: 'inherit' });
+}
+
 if (platform === 'linux' && feature === 'cuda') {
   console.log('🐧 Linux/CUDA detected: Setting CMAKE flags for NVIDIA GPU');
   env.CMAKE_CUDA_ARCHITECTURES = '75';
   env.CMAKE_CUDA_STANDARD = '17';
   env.CMAKE_POSITION_INDEPENDENT_CODE = 'ON';
+}
+
+if (platform === 'win32' && feature === 'cuda') {
+  // CUDA 13's CCCL headers reject MSVC's legacy preprocessor.
+  env.CMAKE_CUDA_FLAGS = `${env.CMAKE_CUDA_FLAGS || ''} -Xcompiler=/Zc:preprocessor`.trim();
+  env.CMAKE_CUDA_STANDARD = '17';
+  env.CMAKE_CXX_STANDARD = '17';
+  try {
+    const capability = execSync('nvidia-smi --query-gpu=compute_cap --format=csv,noheader', {
+      encoding: 'utf8',
+    }).trim().split(/\r?\n/)[0].replace('.', '');
+    if (/^\d+$/.test(capability)) {
+      env.CMAKE_CUDA_ARCHITECTURES = capability;
+      console.log(`🪟 Windows/CUDA detected: targeting compute capability ${capability}`);
+    }
+  } catch (_) {
+    console.warn('⚠️  Could not detect CUDA compute capability; using whisper.cpp defaults');
+  }
 }
 
 // Build the tauri command
