@@ -1,0 +1,652 @@
+{
+  "schemaVersion": 2,
+  "purpose": "Task 1.3 model-selection evidence: admissibility pre-filter estimates, benchmark-measured outcomes, benchmark-leader contracts (blocked; NOT approved for production), and reference inference expectations for the Sprint 1 hybrid RAG program.",
+  "envelopes": {
+    "documentScaleGate": 250000,
+    "snapshotOverlapFactor": 2,
+    "autoPassBytes": 1073741824,
+    "approvalBandMaxBytes": 1342177280
+  },
+  "pairAdmissibilityNote": "All pair figures are PRE-FILTER ESTIMATES computed from published artifact sizes (dims x bytes_per_value x 250000 x 2 + embedding_session_artifact_bytes + reranker_session_artifact_bytes). Measured pair peaks with both ONNX sessions simultaneously resident are larger than artifact sizes; see measuredOutcome.measuredPairPeakMib.",
+  "biEncoderCandidates": [
+    {
+      "id": "intfloat/multilingual-e5-small",
+      "family": "XLM-RoBERTa contrastive (E5)",
+      "revision": "614241f622f53c4eeff9890bdc4f31cfecc418b3",
+      "license": "MIT",
+      "dimensions": 384,
+      "maxSequenceLength": 512,
+      "onnxSource": {
+        "repo": "Xenova/multilingual-e5-small",
+        "revision": "761b726dd34fb83930e26aab4e9ac3899aa1fa78",
+        "note": "Official upstream publishes AVX-512-VNNI-only static int8; the mirror's portable dynamic-int8/f32 exports pinned to one immutable revision are used."
+      },
+      "sessionArtifactBytes": { "f32": 470268533, "fp16": 235336732, "int8": 118054593 },
+      "benchmarked": true
+    },
+    {
+      "id": "intfloat/multilingual-e5-base",
+      "family": "XLM-RoBERTa contrastive (E5)",
+      "revision": "d128750597153bb5987e10b1c3493a34e5a4502a",
+      "license": "MIT",
+      "dimensions": 768,
+      "maxSequenceLength": 512,
+      "onnxSource": {
+        "repo": "Xenova/multilingual-e5-base",
+        "revision": "1ec9243030a27d1a115d5c340572074c125b58b2"
+      },
+      "sessionArtifactBytes": { "int8": 278184162 },
+      "artifactHashes": {
+        "model_int8.onnx": "sha256-9ddfd8b45086dabc59a7e1bb00463225dace8954962418b240840f2153bc87da"
+      },
+      "benchmarked": true
+    },
+    {
+      "id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+      "family": "XLM-RoBERTa paraphrase distillation (SBERT)",
+      "revision": "e8f8c211226b894fcb81acc59f3b34ba3efd5f42",
+      "license": "apache-2.0",
+      "dimensions": 384,
+      "maxSequenceLength": 128,
+      "onnxSource": {
+        "repo": "Xenova/paraphrase-multilingual-MiniLM-L12-v2",
+        "revision": "2c4055b12046f11709e9df2c122e59ffbdc2f900"
+      },
+      "sessionArtifactBytes": { "int8": 118054609 },
+      "benchmarked": true,
+      "functionalRejection": "128-token context cannot honor the required transcript window profiles (256/48, 384/64, 512/96); measured only as a second-family diagnostic."
+    },
+    {
+      "id": "nreimers/mMiniLMv2-L6-H384-distilled-from-XLMR-Large",
+      "rejectedBeforeBenchmark": "No ONNX export exists in the upstream repo and the model card carries no license field; unclear redistribution is a blocker, so this distinct family has no redistributable portable export (verified via HF API 2026-08-22)."
+    },
+    {
+      "id": "BAAI/bge-m3",
+      "dimensions": 1024,
+      "rejectedBeforeBenchmark": "1024-dim f32 storage is 2048000000 bytes at 250k x2; even int8 storage plus a >=1 GB session exceeds the band."
+    },
+    {
+      "id": "sentence-transformers/LaBSE",
+      "dimensions": 768,
+      "rejectedBeforeBenchmark": "768-dim f32 storage fails outright and the ~501M-parameter f32 session (~1.9 GB) cannot fit any admissible pairing."
+    },
+    {
+      "id": "sentence-transformers/distiluse-base-multilingual-cased-v2",
+      "revision": "bfe45d0732ca50787611c0fe107ba278c7f3f889 (upstream) / cad454171d918d9873a2701ba245054b6c1760dd (mirror)",
+      "license": "apache-2.0",
+      "rejectedBeforeFullBenchmark": "Both available exports (upstream quint8_avx2 and mirror dynamic-int8) output raw last_hidden_state without the required Dense(768->512)+normalize head, verified by probe (inputs [input_ids, attention_mask], outputs [last_hidden_state], dim 768). Mean-pooled hidden states are not distiluse embeddings, so faithful Rust preprocessing is impossible with redistributable portable exports."
+    },
+    {
+      "id": "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
+      "dimensions": 768,
+      "rejectedBeforeBenchmark": "768-dim f32 storage fails outright; no official portable int8 ONNX export exists."
+    },
+    {
+      "id": "jinaai/jina-embeddings-v2-base-multilingual (and v3)",
+      "rejectedBeforeBenchmark": "License CC-BY-NC-4.0 does not permit redistribution inside a distributed application."
+    },
+    {
+      "id": "Alibaba-NLP/gte-multilingual-base",
+      "rejectedBeforeBenchmark": "Requires trust_remote_code custom modeling code; exact preprocessing cannot be reproduced in pure Rust as the architecture requires."
+    }
+  ],
+  "crossEncoderCandidates": [
+    {
+      "id": "BAAI/bge-reranker-base",
+      "family": "XLM-RoBERTa sequence classifier",
+      "revision": "2cfc18c9415c912f9d8155881c133215df768a70",
+      "license": "MIT",
+      "maxSequenceLength": 512,
+      "cardLanguages": ["zh", "en"],
+      "metadataMultilingualConforming": false,
+      "metadataNote": "Card declares Chinese and English only. XLM-R architecture alone does not prove Portuguese coverage; any PT suitability claim rests solely on measured corpus behavior reported in measuredOutcome.rerankerCandidateResults.",
+      "onnxSource": {
+        "repo": "Xenova/bge-reranker-base",
+        "revision": "280bcc27a84e0b898c251e06fddb25171bd9b101"
+      },
+      "sessionArtifactBytes": { "f32": 1112459588, "fp16": 556462150, "int8": 278825308 },
+      "artifactHashes": {
+        "model_int8.onnx": "sha256-2059d8ef0b6e935b4845e11b38c9af9e9e2e7b91f69fc99efe03254e0a7da8d3",
+        "model_fp16.onnx": "sha256-abab42dea13b5245198d510469deceb45ac60e670a8b1cbd1a7dcb77d494c16e"
+      }
+    },
+    {
+      "id": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+      "family": "mMiniLMv2 (XLM-R Large distillation) mMARCO cross-encoder",
+      "revision": "1427fd652930e4ba29e8149678df786c240d8825",
+      "license": "apache-2.0",
+      "maxSequenceLength": 512,
+      "cardLanguages": ["multilingual (14 mMARCO languages incl. pt)"],
+      "metadataMultilingualConforming": true,
+      "onnxSource": {
+        "repo": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+        "revision": "1427fd652930e4ba29e8149678df786c240d8825",
+        "note": "ONNX exports published in the official sentence-transformers cross-encoder repo itself."
+      },
+      "sessionArtifactBytes": { "f32": 470883696, "quint8Avx2": 118620016 }
+    },
+    {
+      "id": "cross-encoder/mmarco-mMiniLMv2-L6-H384-v1 (smaller variant)",
+      "rejectedBeforeBenchmark": "No such repo exists under the official cross-encoder organization (HF API 2026-08-22). The nreimers L6 upstream ships no ONNX; the only L6 ONNX found (Slite/mmarco-mMiniLMv2-L6-H384-v1-onnx-o4) is an unlicensed community conversion and cannot satisfy the pinned-provenance requirement."
+    },
+    {
+      "id": "BAAI/bge-reranker-large",
+      "rejectedBeforeBenchmark": "f32 session is 2240184300 bytes (onnx/model.onnx plus external data); best pairing projects 2550238893 bytes > hard fail. No official portable int8 export exists; dominated by bge-reranker-base in the same family/license/tokenizer."
+    },
+    {
+      "id": "jinaai/jina-reranker-v2-base-multilingual",
+      "rejectedBeforeBenchmark": "License CC-BY-NC-4.0 does not permit redistribution inside a distributed application."
+    },
+    {
+      "id": "mixedbread-ai/mxbai-rerank-xsmall-v1",
+      "rejectedBeforeBenchmark": "Model card declares language: en only; fails the multilingual Portuguese/English requirement despite Apache-2.0 licensing and official ONNX exports."
+    },
+    {
+      "id": "Alibaba-NLP/gte-multilingual-reranker-base",
+      "rejectedBeforeBenchmark": "Requires trust_remote_code custom modeling code; preprocessing not reproducible in pure Rust."
+    },
+    {
+      "id": "Xenova/ms-marco-MiniLM-L-6-v2 (family)",
+      "rejectedBeforeBenchmark": "English-only training data; fails the multilingual requirement."
+    }
+  ],
+  "pairAdmissibilityEstimates": [
+    { "pair": "e5-small[int8 storage|int8 session] + bge-reranker-base[int8]", "vectorBytes": 192000000, "embeddingSessionBytes": 118054593, "rerankerSessionBytes": 278825308, "totalBytes": 588879901, "band": "admissible" },
+    { "pair": "e5-small[int8|f32 session] + bge-reranker-base[int8]", "vectorBytes": 192000000, "embeddingSessionBytes": 470268533, "rerankerSessionBytes": 278825308, "totalBytes": 941093841, "band": "admissible" },
+    { "pair": "e5-small[int8|int8 session] + mmarco[quint8_avx2]", "vectorBytes": 192000000, "embeddingSessionBytes": 118054593, "rerankerSessionBytes": 118620016, "totalBytes": 428674609, "band": "admissible" },
+    { "pair": "e5-small[int8|int8 session] + mmarco[f32]", "vectorBytes": 192000000, "embeddingSessionBytes": 118054593, "rerankerSessionBytes": 470883696, "totalBytes": 780938289, "band": "admissible" },
+    { "pair": "e5-base[int8|int8 session] + bge-reranker-base[int8]", "vectorBytes": 384000000, "embeddingSessionBytes": 278184162, "rerankerSessionBytes": 278825308, "totalBytes": 941009470, "band": "admissible" },
+    { "pair": "e5-base[int8|int8 session] + mmarco[quint8_avx2]", "vectorBytes": 384000000, "embeddingSessionBytes": 278184162, "rerankerSessionBytes": 118620016, "totalBytes": 780804178, "band": "admissible" },
+    { "pair": "para-MiniLM[int8|int8 session] + bge-reranker-base[int8]", "vectorBytes": 192000000, "embeddingSessionBytes": 118054609, "rerankerSessionBytes": 278825308, "totalBytes": 588879917, "band": "admissible", "functionalNote": "max-seq 128 non-conforming regardless of arithmetic" },
+    { "pair": "e5-small[f32|int8 session] + bge-reranker-base[int8]", "vectorBytes": 768000000, "embeddingSessionBytes": 118054593, "rerankerSessionBytes": 278825308, "totalBytes": 1164879901, "band": "approval-required" },
+    { "pair": "e5-small[f32|f32 session] + bge-reranker-base[int8]", "vectorBytes": 768000000, "embeddingSessionBytes": 470268533, "rerankerSessionBytes": 278825308, "totalBytes": 1517093841, "band": "inadmissible" },
+    { "pair": "any-admissible-biencoder + bge-reranker-base[f32]", "vectorBytes": 192000000, "embeddingSessionBytes": 118054593, "rerankerSessionBytes": 1112459588, "totalBytes": 1422514181, "band": "inadmissible" },
+    { "pair": "e5-small[int8|int8 session] + bge-reranker-large[f32]", "vectorBytes": 192000000, "embeddingSessionBytes": 118054593, "rerankerSessionBytes": 2240184300, "totalBytes": 2550238893, "band": "inadmissible" }
+  ],
+  "benchmarkLeader": {
+    "status": "blocked-quality-gates-pending-user-decision",
+    "embedding": {
+      "modelId": "intfloat/multilingual-e5-small",
+      "revision": "614241f622f53c4eeff9890bdc4f31cfecc418b3",
+      "license": "MIT",
+      "onnxRepo": "Xenova/multilingual-e5-small",
+      "onnxRevision": "761b726dd34fb83930e26aab4e9ac3899aa1fa78",
+      "dimensions": 384,
+      "maxSequenceLength": 512,
+      "queryPrefix": "query: ",
+      "documentPrefix": "passage: ",
+      "pooling": "masked-mean over attention_mask positions of last_hidden_state",
+      "normalization": "l2",
+      "tokenizer": {
+        "type": "XLM-RoBERTa unigram (tokenizer.json / sentencepiece.bpe.model)",
+        "revision": "761b726dd34fb83930e26aab4e9ac3899aa1fa78",
+        "truncationSide": "right",
+        "truncationStrategy": "LongestFirst across the encoded pair, preserving special tokens",
+        "maxLengthTokens": 512
+      },
+      "inputs": [
+        { "name": "input_ids", "dtype": "int64" },
+        { "name": "attention_mask", "dtype": "int64" }
+      ],
+      "outputs": [{ "name": "last_hidden_state", "dtype": "float32" }],
+      "sessionPrecision": "dynamic int8 (measured vs f32 session: mean cosine agreement 0.9919, min 0.9871)",
+      "vectorEncoding": "int8-storage (measured zero Evidence Recall@5 cost vs f32/fp16)",
+      "resourceNote": "Measured peaks: the card-multilingual-conforming e5-small-int8+mmarco-quint8 pair is 966.8 MiB (automatic pass) but fails NDCG/quality gates; the quality-leading e5-small-int8+bge-reranker-base-int8 pair is metadata-non-conforming and measures 1116.7 MiB (approval band).",
+      "artifactHashes": {
+        "model_int8.onnx": "sha256-4d24e2bc01a447951524466ef533e52944bf48509e6552810bcee1a2711cb02c",
+        "model.onnx(f32)": "sha256-4aa845c27760e06e9a686b9d8b5d440eae4b6612cd09e5b522b716d3941f77ff"
+      }
+    },
+    "reranker": {
+      "candidatesBenchmarked": [
+        "BAAI/bge-reranker-base via Xenova/bge-reranker-base @280bcc27 int8 export (card multilingual NON-conforming)",
+        "BAAI/bge-reranker-base fp16 export (budget-excluded under deterministic policy)",
+        "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1 @1427fd65 quint8_avx2 (card multilingual conforming)",
+        "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1 f32 export (budget-excluded under deterministic policy)"
+      ],
+      "leaderRationale": "BAAI/bge-reranker-base via Xenova/bge-reranker-base @280bcc27a84e0b898c251e06fddb25171bd9b101 int8 export - highest deterministic NDCG among budget-viable candidates, BUT metadata non-conforming (card zh/en); the metadata-conforming mmarco candidate degrades corpus NDCG. Reranker choice therefore also requires the user/architecture decision recorded in measuredOutcome.decision.",
+      "benchmarkModelDir": "bge-reranker-base-int8",
+      "pairFormat": "tokenizer pair encoding <s>query</s></s>evidence</s> with LongestFirst truncation across the pair at maxSequenceLength preserving the question and separators",
+      "inputs": [
+        { "name": "input_ids", "dtype": "int64" },
+        { "name": "attention_mask", "dtype": "int64" }
+      ],
+      "outputs": [{ "name": "logits", "dtype": "float32" }],
+      "outputLabelIndex": 0,
+      "scoreTransform": "sigmoid(logits[.,0])",
+      "artifactHashes": {
+        "model_int8.onnx": "sha256-2059d8ef0b6e935b4845e11b38c9af9e9e2e7b91f69fc99efe03254e0a7da8d3",
+        "model_fp16.onnx": "sha256-abab42dea13b5245198d510469deceb45ac60e670a8b1cbd1a7dcb77d494c16e"
+      }
+    },
+    "chunkPolicy": {
+      "transcriptWindowProfiles": [
+        { "windowTokens": 256, "overlapTokens": 48 },
+        { "windowTokens": 384, "overlapTokens": 64 },
+        { "windowTokens": 512, "overlapTokens": 96, "supported": true }
+      ],
+      "summaryPolicyVariants": ["latest-summary-only", "all-labeled-summary-templates"],
+      "selection": "384/64 default window; all three profiles produced identical chunk sets and metrics on the synthetic corpus, so profile choice is cost-driven; sections are separate chunks (merging measurably corrupts reranker scoring); latest-summary-only equals all-labeled-summary-templates because fixtures carry one latest-template summary per meeting"
+    },
+    "fusionAndRerankConstants": {
+      "rrfK": 5,
+      "channelWeightVector": 0.5,
+      "channelWeightLexical": 0.5,
+      "channelWeightTitle": 1.0,
+      "supportAlpha": 0,
+      "titleBeta": 0,
+      "rerankGamma": 8,
+      "supportCap": 3,
+      "rerankerDepthChat": 50,
+      "rerankerDepthSearch": 25,
+      "rerankerBatchSize": 1,
+      "ortIntraOpThreads": 4,
+      "transcriptWindowTokens": 384,
+      "overlapTokens": 64
+    }
+  },
+  "referenceExpectations": {
+    "note": "Platform-neutral reference values recorded from actual staged-artifact inference on the Windows x64 reference machine (Intel Core Ultra 7 255HX): e5-small dynamic-int8 session for embeddings; bge-reranker-base int8; mmarco-mMiniLMv2-L12-H384-v1 quint8_avx2 and f32. Replays must use the identical batch composition per group because dynamic-int8 activation scales depend on padded batch width.",
+    "tolerances": {
+      "normAbs": 0.01,
+      "dimValueAbs": 0.06,
+      "cosineAbs": 0.03,
+      "rerankerScoreAbs": 0.2
+    },
+    "embedding": [
+    {
+      "label": "pt_query",
+      "text": "query: quais os dias de comunicacao por whatsapp para o fluxo de retencao?",
+      "norm": 1.0000000351916525,
+      "sampleDims": {
+        "0": 0.037226516753435135,
+        "1": -0.009472645819187164,
+        "127": 0.005193729419261217,
+        "191": 0.029870817437767982,
+        "255": 0.07821279019117355,
+        "319": -0.021636102348566055,
+        "383": 0.05698583647608757,
+        "63": 0.026226505637168884
+      },
+      "cosineWith": [
+        {
+          "label": "en_doc",
+          "cosine": 0.7804592847824097
+        },
+        {
+          "label": "en_query",
+          "cosine": 0.907345175743103
+        },
+        {
+          "label": "pt_distractor",
+          "cosine": 0.9200301170349121
+        },
+        {
+          "label": "pt_mpv_doc",
+          "cosine": 0.8404842615127563
+        },
+        {
+          "label": "pt_reference_doc",
+          "cosine": 0.8670951724052429
+        }
+      ]
+    },
+    {
+      "label": "pt_reference_doc",
+      "text": "passage: A régua sintética de mensagens no aplicativo prevê contatos nos dias 1, 3, 7, 10 e 15.",
+      "norm": 0.9999998707865809,
+      "sampleDims": {
+        "0": 0.013496913947165012,
+        "1": -0.004647544585168362,
+        "127": 0.029932085424661636,
+        "191": 0.02163122221827507,
+        "255": 0.028339626267552376,
+        "319": -0.02089286595582962,
+        "383": 0.06809663772583008,
+        "63": 0.03154131770133972
+      },
+      "cosineWith": [
+        {
+          "label": "en_doc",
+          "cosine": 0.8299254775047302
+        },
+        {
+          "label": "en_query",
+          "cosine": 0.8047406077384949
+        },
+        {
+          "label": "pt_distractor",
+          "cosine": 0.9121924042701721
+        },
+        {
+          "label": "pt_mpv_doc",
+          "cosine": 0.8930982947349548
+        },
+        {
+          "label": "pt_query",
+          "cosine": 0.8670951724052429
+        }
+      ]
+    },
+    {
+      "label": "pt_mpv_doc",
+      "text": "passage: No dia um, a distinção MPV/non-MPV é sintética: unidades MPV enviam boas-vindas; unidades não MPV iniciam confirmação cadastral.",
+      "norm": 0.9999999877485025,
+      "sampleDims": {
+        "0": 0.04960881918668747,
+        "1": -0.05083054304122925,
+        "127": 0.04560241103172302,
+        "191": -0.010732496157288551,
+        "255": 0.03132854774594307,
+        "319": -0.05065061151981354,
+        "383": 0.08785008639097214,
+        "63": 0.020513035356998444
+      },
+      "cosineWith": [
+        {
+          "label": "en_doc",
+          "cosine": 0.8177880048751831
+        },
+        {
+          "label": "en_query",
+          "cosine": 0.7750805616378784
+        },
+        {
+          "label": "pt_distractor",
+          "cosine": 0.8927936553955078
+        },
+        {
+          "label": "pt_query",
+          "cosine": 0.8404842615127563
+        },
+        {
+          "label": "pt_reference_doc",
+          "cosine": 0.8930982947349548
+        }
+      ]
+    },
+    {
+      "label": "en_query",
+      "text": "query: What days are scheduled for WhatsApp retention contacts?",
+      "norm": 0.9999997678945521,
+      "sampleDims": {
+        "0": 0.036464057862758636,
+        "1": -0.027006719261407852,
+        "127": 0.024832380935549736,
+        "191": 0.013785334303975105,
+        "255": 0.06681691855192184,
+        "319": -0.026660829782485962,
+        "383": 0.05209921672940254,
+        "63": 0.013608123175799847
+      },
+      "cosineWith": [
+        {
+          "label": "en_doc",
+          "cosine": 0.7802740931510925
+        },
+        {
+          "label": "pt_distractor",
+          "cosine": 0.833412230014801
+        },
+        {
+          "label": "pt_mpv_doc",
+          "cosine": 0.7750805616378784
+        },
+        {
+          "label": "pt_query",
+          "cosine": 0.907345175743103
+        },
+        {
+          "label": "pt_reference_doc",
+          "cosine": 0.8047406077384949
+        }
+      ]
+    },
+    {
+      "label": "en_doc",
+      "text": "passage: Automated reminders prevent customer loss in the synthetic retention flow.",
+      "norm": 0.9999999975261361,
+      "sampleDims": {
+        "0": -0.0027062704320997,
+        "1": -0.035449955612421036,
+        "127": 0.05717838928103447,
+        "191": 0.012713252566754818,
+        "255": 0.027432356029748917,
+        "319": -0.04233396798372269,
+        "383": 0.06940434128046036,
+        "63": 0.01953881047666073
+      },
+      "cosineWith": [
+        {
+          "label": "en_query",
+          "cosine": 0.7802740931510925
+        },
+        {
+          "label": "pt_distractor",
+          "cosine": 0.8248995542526245
+        },
+        {
+          "label": "pt_mpv_doc",
+          "cosine": 0.8177880048751831
+        },
+        {
+          "label": "pt_query",
+          "cosine": 0.7804592847824097
+        },
+        {
+          "label": "pt_reference_doc",
+          "cosine": 0.8299254775047302
+        }
+      ]
+    },
+    {
+      "label": "pt_distractor",
+      "text": "passage: quais os dias de comunicacao por whatsapp para o fluxo de retencao: rascunho sintético dizia apenas 3 dias.",
+      "norm": 0.9999999040546992,
+      "sampleDims": {
+        "0": 0.0070707001723349094,
+        "1": -0.013539368286728859,
+        "127": 0.019844073802232742,
+        "191": 0.030993759632110596,
+        "255": 0.06300385296344757,
+        "319": -0.014485162682831287,
+        "383": 0.07741621881723404,
+        "63": 0.03809071332216263
+      },
+      "cosineWith": [
+        {
+          "label": "en_doc",
+          "cosine": 0.8248995542526245
+        },
+        {
+          "label": "en_query",
+          "cosine": 0.833412230014801
+        },
+        {
+          "label": "pt_mpv_doc",
+          "cosine": 0.8927936553955078
+        },
+        {
+          "label": "pt_query",
+          "cosine": 0.9200301170349121
+        },
+        {
+          "label": "pt_reference_doc",
+          "cosine": 0.9121924042701721
+        }
+      ]
+    }
+  ],
+    "rerankerPairs": [
+    {
+      "modelDir": "bge-reranker-base-int8/model_int8.onnx",
+      "pairs": [
+        {
+          "query": "quais os dias de comunicacao por whatsapp para o fluxo de retencao?",
+          "evidence": "A régua sintética de mensagens no aplicativo prevê contatos nos dias 1, 3, 7, 10 e 15.",
+          "score": 0.9959985017776489
+        },
+        {
+          "query": "quais os dias de comunicacao por whatsapp para o fluxo de retencao?",
+          "evidence": "quais os dias de comunicacao por whatsapp para o fluxo de retencao: rascunho sintético dizia apenas 3 dias.",
+          "score": 0.9787997007369995
+        },
+        {
+          "query": "quais os dias de comunicacao por whatsapp para o fluxo de retencao?",
+          "evidence": "The quarterly budget forecast was approved by the finance team.",
+          "score": 0.00003769869726966135
+        },
+        {
+          "query": "How will churn be reduced Cedar001",
+          "evidence": "Automated reminders prevent customer loss in the synthetic retention flow.",
+          "score": 0.00004226563032716513
+        },
+        {
+          "query": "How will churn be reduced Cedar001",
+          "evidence": "Nearby synthetic portfolio topics were discussed without decisions.",
+          "score": 0.000037677997170249
+        }
+      ]
+    },
+    {
+      "modelDir": "mmarco-reranker/model_quint8_avx2.onnx",
+      "pairs": [
+        {
+          "query": "quais os dias de comunicacao por whatsapp para o fluxo de retencao?",
+          "evidence": "A régua sintética de mensagens no aplicativo prevê contatos nos dias 1, 3, 7, 10 e 15.",
+          "score": 0.16227765381336212
+        },
+        {
+          "query": "quais os dias de comunicacao por whatsapp para o fluxo de retencao?",
+          "evidence": "quais os dias de comunicacao por whatsapp para o fluxo de retencao: rascunho sintético dizia apenas 3 dias.",
+          "score": 0.9999598264694214
+        },
+        {
+          "query": "quais os dias de comunicacao por whatsapp para o fluxo de retencao?",
+          "evidence": "The quarterly budget forecast was approved by the finance team.",
+          "score": 0.000184519580216147
+        },
+        {
+          "query": "How will churn be reduced Cedar001",
+          "evidence": "Automated reminders prevent customer loss in the synthetic retention flow.",
+          "score": 0.0001373904087813571
+        },
+        {
+          "query": "How will churn be reduced Cedar001",
+          "evidence": "Nearby synthetic portfolio topics were discussed without decisions.",
+          "score": 0.00005490282637765631
+        }
+      ]
+    },
+    {
+      "modelDir": "mmarco-reranker/model_f32.onnx",
+      "pairs": [
+        {
+          "query": "quais os dias de comunicacao por whatsapp para o fluxo de retencao?",
+          "evidence": "A régua sintética de mensagens no aplicativo prevê contatos nos dias 1, 3, 7, 10 e 15.",
+          "score": 0.15479756891727448
+        },
+        {
+          "query": "quais os dias de comunicacao por whatsapp para o fluxo de retencao?",
+          "evidence": "quais os dias de comunicacao por whatsapp para o fluxo de retencao: rascunho sintético dizia apenas 3 dias.",
+          "score": 0.9999653100967407
+        },
+        {
+          "query": "quais os dias de comunicacao por whatsapp para o fluxo de retencao?",
+          "evidence": "The quarterly budget forecast was approved by the finance team.",
+          "score": 0.00015394123329315335
+        },
+        {
+          "query": "How will churn be reduced Cedar001",
+          "evidence": "Automated reminders prevent customer loss in the synthetic retention flow.",
+          "score": 0.00011494356294861063
+        },
+        {
+          "query": "How will churn be reduced Cedar001",
+          "evidence": "Nearby synthetic portfolio topics were discussed without decisions.",
+          "score": 0.000060774837038479745
+        }
+      ]
+    }
+  ]
+  },
+  "measuredOutcome": {
+    "decision": "blocked-quality-gates",
+    "runtimePolicy": { "rerankerDepthChat": 50, "rerankerBatchSize": 1, "ortIntraOpThreads": 4 },
+    "heldOutSearch": {
+      "partition": "non-critical, non-reference (105 of 120 cases)",
+      "grid": {
+        "rrfK": [5, 10, 20, 60],
+        "wVector": [0.5, 1.0, 2.0],
+        "wLexical": [0.5, 1.0, 2.0],
+        "supportAlpha": [0, 0.5],
+        "titleBeta": [0, 1],
+        "rerankGammaPerCandidate": [0, 0.5, 1, 2, 4, 8]
+      },
+      "objective": "lexicographic ascending: exact-term violations, semantic Recall@3 misses, overall Recall@3 misses, MRR misses (micros); deterministic tie-break toward smaller constants",
+      "lockedFusion": { "rrfK": 5, "wVector": 0.5, "wLexical": 0.5, "supportAlpha": 0, "titleBeta": 0 },
+      "configsEvaluated": 144
+    },
+    "pairResults": [
+      {
+        "pair": "e5-small-int8+mmarco-quint8",
+        "cardMultilingualConforming": true,
+        "measuredPairPeakMib": 966.8,
+        "ramVerdict": "automatic pass",
+        "passedAllGates": false,
+        "lockedConstants": { "rrfK": 5, "wVector": 0.5, "wLexical": 0.5, "supportAlpha": 0, "titleBeta": 0, "rerankGamma": 0, "supportCap": 3, "rerankerDepthChat": 50, "rerankerBatchSize": 1, "ortIntraOpThreads": 4, "transcriptWindowTokens": 384, "overlapTokens": 64 },
+        "gateSummary": {
+          "referenceRecallAt1Pass": false,
+          "criticalRecallAt1Pass": false,
+          "exactTermNoRegressionPass": true,
+          "overallRecallAt3Pass": false,
+          "overallRecallAt5Pass": false,
+          "evidenceRecallAt10Pass": false,
+          "semanticDeltaPass": false,
+          "ndcgNonDegradationPass": false
+        },
+        "fullCorpus": { "overallRecallAt3": "66.67% (90/135)", "overallRecallAt5": "66.67% (90/135)", "evidenceRecallAt10": "60.00% (90/150)", "semanticRecallAt3": "0.00% (0/30)", "referenceRank": 7 }
+      },
+      {
+        "pair": "e5-small-int8+bge-reranker-base-int8",
+        "cardMultilingualConforming": false,
+        "measuredPairPeakMib": 1116.7,
+        "ramVerdict": "approval band",
+        "passedAllGates": false,
+        "lockedConstants": { "rrfK": 5, "wVector": 0.5, "wLexical": 0.5, "supportAlpha": 0, "titleBeta": 0, "rerankGamma": 8, "supportCap": 3, "rerankerDepthChat": 50, "rerankerBatchSize": 1, "ortIntraOpThreads": 4, "transcriptWindowTokens": 384, "overlapTokens": 64 },
+        "gateSummary": {
+          "referenceRecallAt1Pass": false,
+          "criticalRecallAt1Pass": false,
+          "exactTermNoRegressionPass": true,
+          "overallRecallAt3Pass": false,
+          "overallRecallAt5Pass": false,
+          "evidenceRecallAt10Pass": false,
+          "semanticDeltaPass": false,
+          "ndcgNonDegradationPass": true
+        },
+        "fullCorpus": { "overallRecallAt3": "77.78% (105/135)", "overallRecallAt5": "82.22% (111/135)", "evidenceRecallAt10": "84.00% (126/150)", "semanticRecallAt3": "0.00% (0/30)", "referenceRank": 2, "referenceFactsRetained": "2/2" }
+      }
+    ],
+    "cardMultilingualConformingPairs": [
+      "e5-small-int8+mmarco-quint8",
+      "e5-base-int8+mmarco-quint8"
+    ],
+    "measuredPairPeakMib": {
+      "e5-small-int8+mmarco-quint8": 966.8,
+      "e5-small-int8+bge-reranker-base-int8": 1116.7,
+      "e5-base-int8+mmarco-quint8": 1120.2,
+      "e5-base-int8+bge-reranker-base-int8": 1271.9
+    },
+    "topLevelGateSummary": {
+      "referenceRecallAt1Pass": false,
+      "criticalRecallAt1Pass": false,
+      "exactTermNoRegressionPass": true,
+      "overallRecallAt3Pass": false,
+      "overallRecallAt5Pass": false,
+      "evidenceRecallAt10Pass": false,
+      "semanticDeltaPass": false,
+      "ndcgNonDegradationPass": false
+    },
+    "notes": "Pair peaks measured in isolated fresh processes with both sessions simultaneously resident plus post-inference RSS delta, plus 192 MiB int8 vectors at 250k (command in report §4). The card-conforming pair passes RAM automatically but fails NDCG/quality gates (its tuned gamma is 0: reranking degrades its corpus NDCG). The quality-leading non-conforming pair reaches reference rank 2 with complete facts at gamma 8 but remains outside rank 1/contamination-free and would separately need risk approval for 1116.7 MiB."
+  }
+}

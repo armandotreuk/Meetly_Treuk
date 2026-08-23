@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "baseline": {
+    "id": "current-fts5-unicode61-and-then-or",
+    "candidateLimit": 10,
+    "evidenceK": 10,
+    "normalization": "SQLite FTS5 unicode61 tokenization with default diacritic folding; titles are not indexed.",
+    "queryPolicy": "Remove current FTS5 operators, quote every whitespace token, run AND then deduplicated OR fallback; do not remove high-frequency words. Rewritten query is used when present. Snapshot/today use the current ordered allow-list hydration path."
+  },
+  "gates": {
+    "criticalRecallAt1": 1.0,
+    "overallRecallAt3": 0.95,
+    "overallRecallAt5": 0.98,
+    "evidenceRecallAt10": 0.90,
+    "sourcePrecision": 1.0,
+    "criticalFactCoverage": 1.0,
+    "criticalForbiddenContamination": 0.0,
+    "semanticRecallAt3DeltaPoints": 10.0
+  },
+  "lexicalPolicy": {
+    "coreTermNormalization": "Split on non-alphanumeric Unicode characters, lowercase, fold common Portuguese diacritics, preserve names and numeric tokens, then remove only the fixed language-specific list.",
+    "selectionRule": "Fixed closed lists only; never infer stopwords per user corpus. Empty core queries fall back to the untouched query. Proper-name and numeric tokens are never removed unless they exactly equal a listed function word.",
+    "portugueseHighFrequency": ["a", "as", "o", "os", "de", "da", "das", "do", "dos", "e", "em", "no", "na", "nos", "nas", "para", "por", "que", "qual", "quais", "como", "foi"],
+    "englishHighFrequency": ["a", "an", "the", "of", "to", "and", "in", "on", "for", "by", "that", "what", "which", "how", "was", "were", "is", "are"]
+  },
+  "expectedBaseline": {
+    "meetingRecallAt1": { "numerator": 72, "denominator": 135 },
+    "meetingRecallAt3": { "numerator": 96, "denominator": 135 },
+    "meetingRecallAt5": { "numerator": 124, "denominator": 135 },
+    "mrrMicros": 695833,
+    "evidenceRecallAt10": { "numerator": 181, "denominator": 209 },
+    "factCoverage": { "numerator": 130, "denominator": 149 },
+    "forbiddenContamination": { "numerator": 25, "denominator": 121 },
+    "sourcePrecision": { "numerator": 471, "denominator": 471 }
+  }
+}
