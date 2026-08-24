@@ -172,10 +172,10 @@ would require.
 
 ## Program Status
 
-**Status:** Sprint 1 remediation in progress. Batch 3 Task `1.2R` completed
-independent verification and its baseline was approved on 2026-08-23. Batch 4
-Task `1.3` reran against that baseline and remains blocked with no production
-model pair selected. Sprint 6.1 is closed.
+**Status:** Sprint 1 remediation in progress. The Batch 4 Task `1.3` rerun is
+blocked on the critical-case gate surface; on 2026-08-23 the user approved
+the unblocking decisions and Task `1.3F` (gate closure) as the next dispatch
+(Batch 5). Sprint 6.1 is closed.
 
 Current execution state:
 
@@ -192,8 +192,20 @@ Current execution state:
 4. **Batch 4:** Task `1.3` rerun is complete with verdict
    `blocked-quality-gates`. Every evaluated pair fails Critical Recall@1 and
    critical forbidden contamination; citation/source precision is unevaluated.
-   No production model pair or constants are approved.
-5. **User decision on Deep-as-default** is deferred to Sprint 4 close and is
+   No production model pair or constants are approved. The block is
+   reattributed (2026-08-23) to instrument-closure gaps, not model findings:
+   the failing critical cases are provably winnable only via the
+   non-production `CONCEPT_LEXICON` channel, the contamination gate has no
+   admissibility proof, and citation precision is structurally unmeasurable
+   in the current simulation.
+5. **Batch 5 (next):** Task `1.3F` audits harness fidelity against the
+   architecture pipeline, adds per-gate admissibility invariants and the
+   citation-precision simulation, and delivers a per-blocker verdict table.
+   The final `1.3` selection run follows it. Standing decisions
+   (2026-08-23): the 1-1.25 GiB RAM band is approved for e5-base pairings;
+   `bge-reranker-base` is permanently retired; commit `7318c0c` is the
+   committed instrument baseline for `frontend/src-tauri/tests/`.
+6. **User decision on Deep-as-default** is deferred to Sprint 4 close and is
    not a Sprint 1 blocker. The open question remains recorded in
    `architecture.md`.
 

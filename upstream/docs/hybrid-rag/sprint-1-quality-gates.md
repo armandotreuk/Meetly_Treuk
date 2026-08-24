@@ -5,17 +5,59 @@
 Task `1.2R` completed independent verification on 2026-08-23 and replaces the
 invalid Task `1.2` corpus. Its baseline is approved. The Batch 4 Task `1.3`
 rerun completed with a blocked verdict and no production model pair selected.
-Task `1.1` is unaffected; Tasks `1.4` and `1.5` remain blocked on `1.3`.
+On 2026-08-23 the user approved three unblocking decisions (RAM band for
+e5-base pairings, permanent retirement of `bge-reranker-base`, creation of
+Task `1.3F`) recorded in the decision log below. **Task `1.3F` is the next
+dispatch (Batch 5).** Task `1.1` is unaffected; Tasks `1.4` and `1.5` remain
+blocked on `1.3`, which is blocked on `1.3F`.
 
-Task `1.3`'s *resource* findings survive the corpus defect and are retained —
-admissibility arithmetic, measured pair RAM, derived disk, per-pair reranker
-latency, quantization fidelity, and license screening. Its *quality* findings
-and its tuned fusion/aggregation/reranker constants are void.
+Task `1.3`'s *resource* findings survive and are retained — admissibility
+arithmetic, measured pair RAM, derived disk, per-pair reranker latency,
+quantization fidelity, and license screening. From the rerun, its *aggregate
+quality* findings on the `1.2R` corpus are sound evidence (models now
+discriminate; every aggregate gate passes); what remains unresolved is the
+critical-case gate surface described below.
 
 **The external prerequisite is satisfied:** Sprint 6.1 closed after the user
 confirmed all six Windows/Tauri smoke checks passed on 2026-08-22.
 
-### Why Task 1.3 blocked
+### Why the Task 1.3 rerun blocked (2026-08-23)
+
+The rerun's failure surface is not aggregate model quality — overall Recall@3
+is 100% (135/135), semantic Recall@3 is 100% (30/30) against a 0/30 baseline,
+and Evidence Recall@10 is 100% (209/209). Every failure concentrates on the
+five critical cases plus one unevaluated gate, and cross-checking the rerun
+report, the `1.2R` margin table, and `model_benchmark.rs` shows three
+structural problems that no model swap can resolve:
+
+1. **The three Critical-Recall@1 misses (`pt-ref-chaves-acesso`,
+   `pt-ref-sla-suporte`, `pt-ref-nps-detrator`) are "solvable" only via a
+   channel production does not have.** Each has a negative lexical margin, a
+   negative-or-zero title margin, and wins only on the hand-authored
+   `CONCEPT_LEXICON` channel — a solvability *diagnostic* with no production
+   counterpart. Its production analog is the vector channel itself, and
+   e5-base's raw vector ranks `chaves-acesso` at 5. The `1.2R` solvability
+   proof covered "some channel has positive margin", not "a
+   production-implementable channel can win at rank 1".
+2. **Zero critical forbidden contamination was never proven achievable, and
+   the 4/6 result is identical across all three rerankers — it is not a model
+   property.** `1.2R` pinned forbidden claims to be retrieved (for baseline
+   falsifiability) but no check asserts that *any* ordering keeps all required
+   evidence inside the retained top-10 (`HYDRATED_MEETINGS=5`, `EVIDENCE_K=10`)
+   while excluding every forbidden fact. Better retrieval mechanically worsens
+   this metric (hybrid 30/121 vs baseline 25/121). This is the `1.2` lesson —
+   a gate without an admissibility proof — recurring on a different gate.
+3. **Citation/source precision is unevaluated** because the benchmark stops
+   before ChatSource construction, and an unevaluated gate cannot support
+   selection.
+
+Task `1.3F` exists to close these three unknowns with evidence before the
+final `1.3` selection run. It classifies each blocker item as (a) a harness
+fidelity gap against the architecture's designed pipeline, (b) achievable but
+not at the held-out-tuned constants, or (c) unachievable at the retrieval
+stage by construction — each verdict having a different remedy owner.
+
+### Why the first Task 1.3 run blocked (corpus defect, resolved by 1.2R)
 
 The corpus is generated procedurally from four templates in
 `frontend/src-tauri/tests/fixtures/corpus.rs`. Two of them are unwinnable by
@@ -165,24 +207,32 @@ reviews use the standard configured `reviewer` and `arch-reviewer`.
 | 1.1 | Retrieval correctness | Fix today/list intersection, generic retained-source parity, and existing raw lexical query logging before semantic expansion. | M | `worker-l` (`ses_fd6904208ffef0bDNhO4huicTS`) | None | Passed: 41 Chat tests, 11 context tests, privacy-log regression, Cargo check, rustfmt, and diff check. | Revert localized resolver/context/log changes; no data change. |
 | 1.2 | Evaluation | Add a private-safe multilingual corpus, deterministic metrics, baseline runner, and the reference regression. | M | `worker-l` (`ses_fd69041d9ffe3Prh5s1KjcPHNL`) | None | **Superseded by `1.2R`:** harness and metrics retained; generated corpus and recorded baseline void. | Test/fixture tooling only; remove without production effect. |
 | 1.2R | Evaluation | Re-author the corpus as materially distinct hand-written cases; add the solvability invariant and its harness assertion. | M | `worker-l` (`ses_fd317c5a5ffe20snhqLcOtBV3h`) | 1.2 | Passed: 120-case solvable corpus, answer-key-free structural checks, supervised raw-text margins, deterministic baseline, privacy scan, compatibility tests, rustfmt, Cargo check, and diff check. Baseline awaits user approval before `1.3`. | Restore the prior corpus/harness; test tooling only, no production effect. |
-| 1.3 | Model selection | Benchmark and select the bundled multilingual embedding and reranker pair plus chunk policy. | L | `worker-l` (`ses_fd06da77cffeQmAh22R2sPO3Fz`); first run `ses_fd65db999ffe5gwCX1YNm12F5w` | 1.2R | **Blocked after rerun.** All three budget-viable pairs fail Critical Recall@1 and critical forbidden contamination; source precision is unevaluated. No production pair selected. | No production default changes before approval; remove benchmark artifacts. |
+| 1.3F | Gate closure | Audit harness fidelity against the architecture pipeline, prove or refute gate admissibility for the failing critical gates, add citation-precision simulation, and deliver a per-blocker verdict table. | L | Pending `worker-l` | 1.2R, 1.3 rerun evidence | Verdict table classifies every blocker item with evidence; admissibility invariant added in report mode; citation precision measured for pairs B/C; no gate, threshold, corpus-content, or constants change. | Tests/evidence only; restore committed `tests/` state; no production effect. |
+| 1.3 | Model selection | Benchmark and select the bundled multilingual embedding and reranker pair plus chunk policy. | L | `worker-l` (`ses_fd06da77cffeQmAh22R2sPO3Fz`); first run `ses_fd65db999ffe5gwCX1YNm12F5w` | 1.2R, 1.3F | **Blocked after rerun — final selection run pending `1.3F`.** All three budget-viable pairs fail Critical Recall@1 and critical forbidden contamination; source precision is unevaluated. No production pair selected. | No production default changes before approval; remove benchmark artifacts. |
 | 1.4 | Vector backend | Benchmark exact search and, only if needed, a pure-Rust HNSW candidate at 250k scale. | L | Pending `worker-l` | 1.3 | Report selects exact or exact+ANN and demonstrates the architecture performance/RAM gates. | Benchmark-only dependency/code can be removed; no persisted format ships. |
 | 1.5 | Model supply chain | Implement the small bundle manifest and reproducible hash/license verification pipeline; reconcile Rust MSRV. | M | Pending `worker-l` | 1.3 | Valid artifacts pass; tampered/missing artifacts fail before packaging; toolchain contract is explicit and checked. | Remove additive manifest/fetch verification; no runtime behavior yet. |
 
 ## Dependency Order
 
-`1.2 -> 1.2R -> 1.3 -> 1.4`
+`1.2 -> 1.2R -> 1.3F -> 1.3 -> 1.4`
 
 `1.3 -> 1.5`
 
 `1.1` and `1.2` are independent if the evaluation harness is kept outside
-`api/chat.rs` inline tests. Tasks `1.3` and `1.4` are L and run alone. Task
-`1.5` may start after `1.3`, but should not run concurrently with `1.4` if both
-need to change `Cargo.toml`, benchmark targets, or model artifact scripts.
+`api/chat.rs` inline tests. Tasks `1.3F`, `1.3`, and `1.4` are L and run
+alone. Task `1.5` may start after `1.3`, but should not run concurrently with
+`1.4` if both need to change `Cargo.toml`, benchmark targets, or model
+artifact scripts.
 
 `1.2R` is a hard blocker for `1.3`. No model, encoding, chunk, fusion, or
 reranker-depth decision may be made against the superseded corpus, and the
 `1.3` rerun may not begin until `1.2R`'s new baseline is recorded and approved.
+
+`1.3F` is a hard blocker for the final `1.3` selection run. The two failing
+critical gates must first be proven achievable (or re-specified with user
+approval on `1.3F` evidence), and the citation-precision gate must become
+measurable. Running selection again before that repeats the `1.2` mistake:
+benchmarking against an instrument whose gates have no admissibility proof.
 
 ## Task Specifications
 
@@ -473,6 +523,154 @@ against the case count. State the new baseline with denominators beside the
 superseded `1.2` figures. Name any gate the new baseline calls into question,
 without changing it.
 
+### 1.3F - Gate-stage fidelity, gate admissibility, and critical-case closure evidence [L]
+
+**Outcome:** Every remaining `1.3` blocker is classified with evidence into
+one of three verdicts, each with a different remedy owner, so the final `1.3`
+selection run happens exactly once against a closed instrument.
+
+**You must not re-derive:** The `1.3` rerun (`task-1.3-model-selection.md`) is
+blocked on exactly two quality gates — Critical Recall@1 (misses:
+`pt-ref-chaves-acesso`, `pt-ref-sla-suporte`, `pt-ref-nps-detrator`) and
+critical forbidden contamination (`4/6`) — with identical contamination
+results across all three rerankers, plus citation/source precision being
+unevaluated. The `1.2R` margin table shows the three missing critical cases
+win only on the `CONCEPT_LEXICON` channel (lexical and title margins
+negative), and the lexicon has no production counterpart. Nobody has proven
+the contamination gate is achievable by ANY ordering of this corpus. Your job
+is to close those unknowns with evidence — not to select a model, and not to
+make gates pass.
+
+**Standing user decisions you inherit (2026-08-23, decision log):** the
+1-1.25 GiB RAM band is approved for e5-base pairings; `bge-reranker-base` is
+permanently retired (do not evaluate it beyond reusing recorded figures); the
+candidate set is e5-base-int8 + mmarco-quint8 (production candidate) with
+mmarco-f32 as quantization-cost reference only.
+
+**Hard boundaries:**
+
+- Do NOT change any gate threshold, metric definition, corpus case content,
+  tuned fusion constant, tuning objective, or the held-out partition
+  (reference/critical cases stay uninspected by every tuning path).
+- Do NOT touch production files, sprint PRDs, or `architecture.md`.
+- Where a finding implies a corpus patch or a gate re-staging, REPORT it with
+  evidence; do not implement it. Both require user approval.
+- Work only inside `frontend/src-tauri/tests/` plus a new report
+  `docs/hybrid-rag/task-1.3f-gate-closure.md`.
+- Model inference is allowed only for the diagnostics below, using the
+  contracted e5-base-int8 and the mmarco rerankers.
+
+**Deliverable 1 — Harness fidelity audit (architecture-designed exclusions).**
+Audit `model_benchmark.rs` for pipeline stages the architecture mandates but
+the simulation omits or half-implements, and fix the simulation to
+architecture fidelity (fidelity fixes are in scope; gate changes are not).
+Verify at minimum:
+
+- *Deleted-state handling:* FTS rows are inserted for `Deleted` meetings in
+  the benchmark's pool builder (evidence-insert loop is not state-guarded)
+  while semantic docs skip them; production cascades FTS deletion with the
+  meeting. Determine whether any channel — lexical rank slots, interleave
+  limits, IDF/candidate counts — is affected even where `map_lexical` drops
+  the rows, and align to production.
+- *Dirty-state handling:* per the architecture failure-mode table, a dirty
+  meeting excludes its stale semantic rows while current FTS/hydration remain
+  allowed. Confirm the simulation embeds what production would actually have
+  indexed for dirty fixtures; if it embeds `authoritative_text` for dirty
+  meetings' semantic docs, it simulates an index state production never has.
+- *Hydration fidelity:* per `architecture.md` "Authoritative Hydration",
+  content-hash verification omits stale semantic evidence while the meeting
+  stays eligible through lexical/current data. Confirm the retained-evidence
+  construction in `score_case_hybrid` reflects this for stale/dirty fixtures.
+- *`rewritten_query`:* report which corpus cases carry one and whether the
+  production query-preparation stage would supply one where the fixture does
+  not (the terminological-gap critical case is the motivating example).
+
+Report every gap found, the fix, and the metric deltas it causes
+(before/after tables, all denominators). Re-run the canonical benchmark after
+fixes.
+
+**Deliverable 2 — Gate-admissibility invariant (extends the 1.2R supervised
+harness).** Add to `retrieval_evaluation.rs`'s supervised layer (answer-key
+use is legitimate there) a per-case existence check for the two failing
+gates, analogous to the `1.2R` margin check:
+
+- *Evidence admissibility:* for each critical case, does at least one
+  ordering of the case's indexable documents place all required evidence
+  inside the retained top-10 (given `HYDRATED_MEETINGS=5`, `EVIDENCE_K=10`,
+  profile docs excluded) while NO retained text contains a forbidden fact?
+  Compute it constructively (e.g., required docs first, forbidden-bearing
+  docs last, respecting the hydrated-meeting constraint), and record for each
+  forbidden fact whether it co-resides in a document that is itself required
+  evidence — if so, the gate is unachievable at the retrieval stage by
+  construction.
+- *Rank-1 admissibility:* for each critical case, report the margin per
+  production-implementable channel only — lexical, title, and the measured
+  e5-base raw vector rank. The `CONCEPT_LEXICON` is explicitly excluded from
+  this check.
+
+This check MUST NOT gate the corpus yet: assert-and-report mode, failures
+printed, test passes. Its verdicts feed a user decision, not an automatic
+corpus edit.
+
+**Deliverable 3 — Citation/source precision simulation.** Extend the
+benchmark with the architecture's source-emission stage: construct
+`ChatSource` entries from retained evidence exactly as the broad-retrieval
+contract specifies (scope revalidation before source emission; profile docs
+never cited; prompt-budget filtering), and score source precision (every
+emitted source present in the final retained context) for pairs B and C. This
+gate must produce a number. Record the stage's assumptions explicitly.
+
+**Deliverable 4 — Constants-feasibility probe (diagnostic, NOT tuning).**
+Over the existing 360-configuration fusion grid times the gamma grid, report
+whether ANY configuration passes Critical Recall@1 5/5 and critical forbidden
+0/6 (on the post-Deliverable-1 harness) without regressing the exact-term
+gate. Output: the count of passing configurations and three examples, or
+"none exists". This is feasibility evidence for the orchestrator and user;
+the tuned constants remain the held-out objective's output and MUST NOT be
+replaced by a grid point chosen on critical cases.
+
+**Deliverable 5 — Verdict table (the report's centerpiece).** One row per
+blocker item: the 3 critical rank misses, each of the 6 critical forbidden
+facts (naming which cases hold the 4 hits), and citation precision. Columns:
+verdict — (a) fidelity-gap-fixed / (b) achievable-but-not-at-tuned-constants /
+(c) unachievable-at-retrieval-stage — the evidence line, and the recommended
+remedy owner (harness / corpus patch / gate re-staging needing user approval /
+model). No blank cells.
+
+**Acceptance criteria:**
+
+- All five deliverables present; the verdict table has no blank cells and
+  every claim cites a measured number with its denominator.
+- The admissibility invariant exists in the supervised harness in report
+  mode, with `[SUPERVISED:…]`-style labeled output.
+- Citation/source precision is measured for pairs B and C.
+- No gate threshold, metric definition, corpus case content, or tuned
+  constant changed; `git diff` confirms the boundary.
+- Fixture and report privacy scan passes (same command as `1.2R`).
+
+**Required verification:**
+
+```powershell
+$env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA "meetily-cargo-target"
+$env:MEETLY_RAG_MODELS_DIR = "$env:TEMP\opencode\meetly-task13\models"
+cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --test retrieval_evaluation
+cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --test model_benchmark
+# canonical evidence run
+$env:MEETLY_RAG_BENCH = "1"
+cargo test --release --manifest-path "frontend/src-tauri/Cargo.toml" --test model_benchmark hybrid_corpus_and_resource_benchmark -- --nocapture
+Remove-Item Env:MEETLY_RAG_BENCH -ErrorAction SilentlyContinue
+cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check
+git diff --check
+```
+
+Re-stage model artifacts from the pinned manifest revisions/hashes if
+`%TEMP%\opencode\meetly-task13\models` has been cleared.
+
+**Worker report additions:** the verdict table; per-fidelity-gap before/after
+metric tables; the admissibility result per critical case including the
+co-residence analysis per forbidden fact; the feasibility-probe result; and
+rollback notes against the committed `tests/` baseline.
+
 ### 1.3 - Embedding, reranker, and chunk selection [L]
 
 **Outcome:** One exact, redistributable model pair and chunking contract are
@@ -531,6 +729,24 @@ declares zh/en on its model card and is metadata-nonconforming for a PT+EN
 product. A better corpus does not resolve this. If bge leads on quality again,
 report the conformity blocker separately and do not treat the quality result as
 resolving it.
+
+**Final selection run (post-`1.3F`) scope amendments (2026-08-23):**
+
+- The final run may not begin until `1.3F`'s verdict table is recorded and
+  any corpus patch or gate re-staging it recommends has been user-decided.
+- `bge-reranker-base` is permanently retired (user decision 2026-08-23):
+  zh/en metadata nonconformity, latency exclusion in 2 of 4 same-day runs,
+  and reference-case rank 2. Do not re-evaluate it. The candidate set is
+  e5-base-int8 + mmarco-quint8 (production candidate) with mmarco-f32 as
+  quantization-cost reference only.
+- The 1-1.25 GiB RAM band is pre-approved for e5-base pairings (user decision
+  2026-08-23; measured 1120.2 MiB for e5-base+mmarco-quint8). A RAM-band
+  result is no longer a blocker for e5-base selection; record the measured
+  figure against the approval in the report.
+- Citation/source precision must be evaluated using the `1.3F` simulation; an
+  unevaluated gate cannot support selection.
+- A clean-hardware latency re-probe (quiet machine state, release build) is
+  required before selection, per the rerun report §10.5.
 
 Re-staging note: artifacts were staged to `%TEMP%\opencode\meetly-task13\models`
 and have likely been cleared. Re-stage from the pinned revisions and hashes in
@@ -829,8 +1045,8 @@ license packaging, CI impact, and the exact Rust toolchain decision.
 
 ## Sprint Acceptance Criteria
 
-- All six task acceptance sets pass (`1.1`, `1.2R`, `1.3`, `1.4`, `1.5`; `1.2`
-  is superseded by `1.2R`).
+- All task acceptance sets pass (`1.1`, `1.2R`, `1.3F`, `1.3`, `1.4`, `1.5`;
+  `1.2` is superseded by `1.2R`).
 - The corpus satisfies solvability and falsifiability simultaneously, both
   asserted by the harness, on materially distinct cases.
 - `architecture.md` contains approved addenda for selected models, vector
@@ -875,6 +1091,18 @@ with a retrieval rewrite that has no measured problem to solve.
   `1.3` constants explicitly rather than carrying them into Sprint 2.
 - **Statistically meaningless gates:** percentage thresholds at small N are
   noise. Mitigated by corpus size floors and mandatory denominators.
+- **Gate without an admissibility proof (materialized twice: `1.2` corpus
+  solvability, `1.3` rerun critical contamination):** a gate can be
+  unachievable by construction while looking like a quality failure, wasting
+  L-sized benchmark tasks against it. Mitigated by `1.3F`'s per-gate
+  admissibility invariant in the supervised harness: every zero-tolerance
+  gate must carry an existence proof that some retrieval ordering satisfies
+  it before a model is benchmarked against it.
+- **Solvability proven on a non-production channel:** the `CONCEPT_LEXICON`
+  margin can certify a case "solvable" that no implementable channel
+  (lexical, title, vector) can win. Mitigated by `1.3F`'s rank-1
+  admissibility check, which excludes the lexicon and reports
+  production-implementable margins only.
 - **Model license ambiguity:** treat unclear redistribution as a blocker.
 - **Reference mismatch:** compare Rust tokenization/outputs with trusted model
   reference vectors.
@@ -926,6 +1154,12 @@ with a retrieval rewrite that has no measured problem to solve.
 | 2026-08-23 | Route the same Ox Alpha model through `openrouter/stealth/ox-alpha` for the Batch 4 remediation, superseding only the `opencode-go` provider route. | `opencode-go/ox-alpha-free` returned repeated provider `network_error` responses and left remediation incomplete. OpenRouter exposes the exact Ox Alpha model; changing transport preserves the model pin rather than authorizing a fallback. | Keep retrying the unavailable `opencode-go` endpoint; substitute a different model. | User |
 | 2026-08-23 | Restore the Batch 4 worker route to `opencode-go/ox-alpha-free`. | OpenRouter recognized `stealth/ox-alpha` but every worker and direct probe completed with empty output, so that route could not perform or report work. The model pin remains Ox Alpha and no fallback is authorized. | Keep the nonfunctional OpenRouter route; substitute another model. | User |
 | 2026-08-23 | Record the Batch 4 Task `1.3` rerun as blocked with no production pair selected. | Every budget-viable pair fails Critical Recall@1 and critical forbidden contamination `4/6`; bge also fails the pinned Reference Recall@1 and remains zh/en metadata-nonconforming. Citation/source precision is unevaluated, all conforming e5-base pairings require RAM-band approval, and latency viability varies with machine state. | Select the best aggregate pair despite failed/unevaluated gates; weaken critical gates; treat title-assisted aggregate recall as sufficient. | Main agent |
+| 2026-08-23 | Reattribute the `1.3` rerun block: the remaining failures are instrument-closure gaps, not model findings. | The three Critical-R@1 misses win only on the non-production `CONCEPT_LEXICON` channel (lexical/title margins negative; e5-base raw vector rank 5 on `chaves-acesso`); critical contamination `4/6` is identical across all three rerankers and has no admissibility proof; citation precision is structurally unevaluated. No model swap changes any of these. | Dispatch another selection rerun with new candidates; accept the blocked verdict as final; weaken the critical gates. | User |
+| 2026-08-23 | Approve the 1-1.25 GiB RAM band for e5-base pairings (measured 1120.2 MiB for e5-base+mmarco-quint8). | Every conforming pairing sits in the explicit-approval band; the auto-pass alternative (e5-small, 966.8 MiB) is measurably weaker (fused R@3 129/135 vs 131/135). The band exists exactly for this trade; approving it removes a standing blocker from every future verdict. | Require the automatic <=1 GiB pass and accept e5-small's weaker quality; defer the band decision to selection time. | User |
+| 2026-08-23 | Permanently retire `BAAI/bge-reranker-base` from the candidate set. | zh/en card metadata nonconformity for a PT+EN product, latency exclusion in 2 of 4 same-day runs, and pinned reference-case rank 2 — none of which further benchmarking changes. Candidate set narrows to e5-base-int8 + mmarco-quint8 (production) with mmarco-f32 as quantization-cost reference. | Keep bge as a comparison candidate; waive the metadata gate on quality evidence. | User |
+| 2026-08-23 | Add Task `1.3F` as a hard blocker for the final `1.3` selection run. | The two failing critical gates need per-case verdicts — harness-fidelity gap, achievable-not-at-tuned-constants, or unachievable-by-construction — plus a citation-precision simulation, before selection can run exactly once against a closed instrument. Corpus patches and gate re-staging remain user decisions on `1.3F` evidence. | Rerun selection directly; patch the corpus or re-stage gates now without evidence; treat the critical failures as final model findings. | User |
+| 2026-08-23 | Authorize the `1.3F` constants-feasibility probe as diagnostic evidence, explicitly not tuning. | Distinguishing "no configuration can pass the critical gates" from "the held-out objective misses a passing region" changes the remedy owner. The probe reports existence only; tuned constants remain the held-out objective's output and reference/critical cases stay outside every tuning path. | Omit the probe and keep verdict category (b) unmeasurable; allow tuning on critical cases. | User |
+| 2026-08-23 | Record commit `7318c0c` (on top of checkpoint `1e41b6b`) as the committed instrument baseline for `1.3F`. | The evaluation corpus, harnesses, and manifest are the program's measuring instrument; earlier worker sessions modified them with no tracked history (`1.2R` itself could not roll back). The tree is now fully committed; `1.3F` and later tasks diff and restore against `7318c0c`. | Continue with an untracked `tests/` directory and checkpoint stashes. | User |
 
 ## Task Execution Log
 
