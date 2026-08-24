@@ -1648,6 +1648,192 @@ fn corpus_structural_solvency_invariants_hold_without_the_answer_key() {
 /// Every margin, coverage decision, and shape hash is computed from fixture
 /// text; labels never score, never bypass retrieval, and never widen what the
 /// answer-key-free structural check accepts.
+/// SUPERVISED critical-gate admissibility (Task 1.3F Deliverable 2,
+/// assert-and-report mode: failures are PRINTED, this check never gates or
+/// edits the corpus). For each critical case it answers two questions the
+/// failing gates need closed before the final selection run:
+///
+/// 1. Evidence admissibility: does at least one ordering of the case's
+///    documents place every required evidence inside the retained top-10
+///    (given HYDRATED_MEETINGS=5 / EVIDENCE_K=10 as pinned by the benchmark)
+///    while no retained text contains a forbidden fact? Computed
+///    constructively (required docs first, forbidden-bearing docs last),
+///    respecting the hydrated-meeting constraint. Forbidden presence uses
+///    authoritative text, because production hydration retains current
+///    content after its content-hash verification.
+/// 2. Co-residence: for each forbidden fact, whether it lives in a document
+///    that is itself required evidence — if so the contamination gate is
+///    unachievable at the retrieval stage by construction.
+const ADMISSIBILITY_EVIDENCE_K: usize = 10;
+const ADMISSIBILITY_HYDRATED_MEETINGS: usize = 5;
+
+fn supervised_critical_gate_admissibility(cases: &[EvaluationCase]) {
+    struct AdmDoc<'a> {
+        meeting_id: &'a str,
+        evidence_id: &'a str,
+        is_required: bool,
+        forbidden_hits: Vec<usize>,
+    }
+    for case in cases.iter().filter(|case| case.critical) {
+        let mut docs: Vec<AdmDoc> = Vec::new();
+        for meeting in &case.meetings {
+            for evidence in &meeting.evidence {
+                let forbidden_hits = case
+                    .forbidden_facts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, fact)| {
+                        evidence
+                            .authoritative_text
+                            .to_lowercase()
+                            .contains(&fact.to_lowercase())
+                    })
+                    .map(|(index, _)| index)
+                    .collect();
+                docs.push(AdmDoc {
+                    meeting_id: &meeting.id,
+                    evidence_id: &evidence.id,
+                    is_required: case.required_evidence_ids.contains(&evidence.id),
+                    forbidden_hits,
+                });
+            }
+        }
+        // Co-residence analysis per forbidden fact.
+        let mut unachievable_by_coresidence = false;
+        for (fact_index, fact) in case.forbidden_facts.iter().enumerate() {
+            let carriers: Vec<&AdmDoc> = docs
+                .iter()
+                .filter(|d| d.forbidden_hits.contains(&fact_index))
+                .collect();
+            if carriers.is_empty() {
+                println!(
+                    "[SUPERVISED:co-residence] case={} fact=\"{fact}\" UNHITTABLE_BY_CONSTRUCTION: no document carries this fact in indexed or authoritative text",
+                    case.id
+                );
+                continue;
+            }
+            let required_co_residence = carriers.iter().any(|d| d.is_required);
+            unachievable_by_coresidence |= required_co_residence;
+            println!(
+                "[SUPERVISED:co-residence] case={} fact=\"{fact}\" carriers=[{}] required_co_residence={}",
+                case.id,
+                carriers
+                    .iter()
+                    .map(|d| d.evidence_id)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                required_co_residence
+            );
+        }
+
+        // Constructive existence proof under the benchmark's fixed retention
+        // semantics (HYDRATED_MEETINGS / EVIDENCE_K). Meetings carrying
+        // required evidence hydrate FIRST; clean alternatives follow ordered
+        // by fewest forbidden-bearing documents. The pooled candidate
+        // retained ordering is then constructed GLOBALLY across all hydrated
+        // documents — required clean documents first, other clean documents
+        // next, forbidden-bearing documents last (stable sort, so ties keep
+        // carrier-first meeting order and fixture order) — so a large first
+        // carrier meeting cannot push a later meeting's required document
+        // out of the retained window. The verdict is derived from that
+        // concrete global ordering: feasible only when it retains every
+        // required document AND zero forbidden-bearing documents — which
+        // additionally requires the required carrier meetings to fit inside
+        // the hydration cap, the distinct required documents to fit inside
+        // the retained window, and enough clean documents to fill the whole
+        // window ahead of any forbidden-bearing document.
+        let required_ids: std::collections::HashSet<&str> = case
+            .required_evidence_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let meeting_docs =
+            |id: &str| -> Vec<&AdmDoc> { docs.iter().filter(|d| d.meeting_id == id).collect() };
+        let mut meeting_order: Vec<String> = case.meetings.iter().map(|m| m.id.clone()).collect();
+        meeting_order.sort_by_key(|id| {
+            (
+                usize::from(
+                    !meeting_docs(id)
+                        .iter()
+                        .any(|d| required_ids.contains(d.evidence_id)),
+                ),
+                meeting_docs(id)
+                    .iter()
+                    .filter(|d| !d.forbidden_hits.is_empty())
+                    .count(),
+            )
+        });
+        let hydrated: std::collections::HashSet<&str> = meeting_order
+            .iter()
+            .take(ADMISSIBILITY_HYDRATED_MEETINGS)
+            .map(|id| id.as_str())
+            .collect();
+        let mut pool: Vec<&AdmDoc> = Vec::new();
+        for id in &meeting_order {
+            if hydrated.contains(id.as_str()) {
+                pool.extend(meeting_docs(id));
+            }
+        }
+        pool.sort_by_key(|d| {
+            (
+                usize::from(!required_ids.contains(d.evidence_id)),
+                usize::from(!d.forbidden_hits.is_empty()),
+            )
+        });
+        let required_carrier_meetings = case
+            .meetings
+            .iter()
+            .filter(|m| {
+                m.evidence
+                    .iter()
+                    .any(|e| required_ids.contains(e.id.as_str()))
+            })
+            .count();
+        let required_documents = required_ids.len();
+        let missing_required = required_ids
+            .iter()
+            .filter(|id| !pool.iter().any(|d| d.evidence_id == **id))
+            .count();
+        let window = ADMISSIBILITY_EVIDENCE_K.min(pool.len());
+        let constructive_retained = &pool[..window];
+        let retained_required = constructive_retained
+            .iter()
+            .filter(|d| required_ids.contains(d.evidence_id))
+            .count();
+        let retained_forbidden_bearing = constructive_retained
+            .iter()
+            .filter(|d| !d.forbidden_hits.is_empty())
+            .count();
+        let clean_in_pool = pool.iter().filter(|d| d.forbidden_hits.is_empty()).count();
+        let forbearing_in_pool = pool.len() - clean_in_pool;
+        let hydrated_pool_docs = pool.len();
+        let required_le_window = required_documents <= window;
+        let verdict = if unachievable_by_coresidence {
+            "UNACHIEVABLE_CO_RESIDENCE"
+        } else if missing_required > 0 || !required_le_window {
+            "UNACHIEVABLE_REQUIRED_OUTSIDE_WINDOW"
+        } else if retained_required == required_documents && retained_forbidden_bearing == 0 {
+            "FEASIBLE_BY_ORDERING"
+        } else {
+            // The best ordering still retains a forbidden-bearing document:
+            // with fewer clean documents than the retained window, every
+            // ordering does.
+            "UNACHIEVABLE_HYDRATION_WINDOW"
+        };
+        println!(
+            "[SUPERVISED:evidence-admissibility] case={} verdict={verdict} \
+             required_carrier_meetings={required_carrier_meetings}/{ADMISSIBILITY_HYDRATED_MEETINGS} \
+             required_documents={required_documents} required_le_window={required_le_window} \
+             required_missing_from_pool={missing_required} hydrated_pool_docs={hydrated_pool_docs} \
+             retained_window={window} clean_docs_in_pool={clean_in_pool} \
+             forbidden_bearing_docs={forbearing_in_pool} \
+             constructive_retained_required={retained_required}/{required_documents} \
+             constructive_retained_forbidden={retained_forbidden_bearing}",
+            case.id
+        );
+    }
+}
+
 #[test]
 fn corpus_supervised_labels_margin_coverage_and_distinctness_hold() {
     let cases = corpus::cases();
@@ -1682,6 +1868,11 @@ fn corpus_supervised_labels_margin_coverage_and_distinctness_hold() {
         }
     }
     println!("winning channel distribution: {channel_wins:?}");
+
+    // Task 1.3F: assert-and-report admissibility of the failing critical
+    // gates. Output is labeled `[SUPERVISED:…]`, never gates the corpus, and
+    // feeds a user decision rather than an automatic corpus edit.
+    supervised_critical_gate_admissibility(&cases);
 
     // Supervised distinctness: normalized question + required target evidence
     // text only (IDs label the target evidence), with numeric tokens collapsed.

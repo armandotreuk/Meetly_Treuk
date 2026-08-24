@@ -172,10 +172,11 @@ would require.
 
 ## Program Status
 
-**Status:** Sprint 1 remediation in progress. The Batch 4 Task `1.3` rerun is
-blocked on the critical-case gate surface; on 2026-08-23 the user approved
-the unblocking decisions and Task `1.3F` (gate closure) as the next dispatch
-(Batch 5). Sprint 6.1 is closed.
+**Status:** Sprint 1 remediation in progress. Batch 5 Task `1.3F` completed on
+2026-08-24 and the user resolved category (c) the same day with the hybrid
+remedy (corpus patches + carrier-source-state gate re-scope, approved
+`architecture.md` amendments). **Task `1.3G` is the next dispatch (Batch 6)**;
+the final Task `1.3` run follows it. Sprint 6.1 is closed.
 
 Current execution state:
 
@@ -198,14 +199,24 @@ Current execution state:
    non-production `CONCEPT_LEXICON` channel, the contamination gate has no
    admissibility proof, and citation precision is structurally unmeasurable
    in the current simulation.
-5. **Batch 5 (next):** Task `1.3F` audits harness fidelity against the
-   architecture pipeline, adds per-gate admissibility invariants and the
-   citation-precision simulation, and delivers a per-blocker verdict table.
-   The final `1.3` selection run follows it. Standing decisions
-   (2026-08-23): the 1-1.25 GiB RAM band is approved for e5-base pairings;
-   `bge-reranker-base` is permanently retired; commit `7318c0c` is the
-   committed instrument baseline for `frontend/src-tauri/tests/`.
-6. **User decision on Deep-as-default** is deferred to Sprint 4 close and is
+5. **Batch 5:** Task `1.3F` is complete. Citation precision passes `602/602`
+   for both retained pairs and fidelity fixes close one critical rank miss,
+   but the admissibility proof finds four forbidden carriers structurally
+   retained and two forbidden facts with no carrier; both rerankers have
+   `0/2160` jointly passing configurations. `pt-ref-chaves-acesso` also has no
+   production-implementable rank-1 channel. Standing decisions: the e5-base
+   RAM band is approved and `bge-reranker-base` is retired.
+6. **Batch 6 (next):** Task `1.3G` implements the 2026-08-24 category (c)
+   resolution — patch `pt-ref-chaves-acesso` (production-channel
+   discriminability, terminological gap preserved) and the two vacuous
+   WhatsApp forbidden carriers (superseded/neighbour sources only); re-scope
+   critical contamination by carrier source state (retrieval-stage gate over
+   superseded/stale/deleted carriers; the four current-note facts become
+   defined-but-deferred answer-stage facts for Sprint 3/4); promote the
+   admissibility invariant to enforcing; re-record the baseline and align the
+   baseline harness. The final `1.3` selection run follows on the post-`1.3G`
+   instrument.
+7. **User decision on Deep-as-default** is deferred to Sprint 4 close and is
    not a Sprint 1 blocker. The open question remains recorded in
    `architecture.md`.
 

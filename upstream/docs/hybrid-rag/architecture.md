@@ -1500,6 +1500,15 @@ neither may be satisfied at the other's expense.
   within a case. Identical titles, identical dates, or a folder allow-list that
   excludes nothing render title overlap, recency semantics, and scope isolation
   untestable while appearing to be covered.
+- Every zero-tolerance gate a case participates in MUST carry a supervised
+  admissibility proof: an existence check, computed from fixture text with
+  expected IDs used as labels only, that some retrieval ordering satisfies the
+  gate. Solvability proven only through a channel the production pipeline does
+  not implement (for example a hand-authored concept lexicon) does not count —
+  the discriminating margin must exist on a production-implementable channel
+  (lexical, title, or the measured vector channel). A forbidden fact whose
+  only carrier is current authoritative content inside the expected meeting is
+  not retrieval-admissible and MUST be classified as an answer-stage fact.
 
 **Diagnostic signal.** If two unrelated model families — different
 architectures, dimensions, or training corpora — produce identical aggregate
@@ -1539,7 +1548,9 @@ approval after baseline evidence, are:
 | Exact-term category | No case moves expected meeting below top 3; aggregate Recall@3 is not below FTS baseline |
 | Semantic/paraphrase category | At least +10 percentage points Recall@3 over FTS, or at least 95% when baseline is already above 85% |
 | Reranker designated cases | Improves pairwise/NDCG metric and causes no critical-case regression |
-| Forbidden-fact contamination in critical cases | 0 |
+| Forbidden-fact contamination in critical cases (retrieval stage) | 0 for forbidden facts carried by superseded, stale-derived, or deleted sources. Forbidden facts carried by current authoritative content inside a correctly retrieved meeting are answer-stage facts: retrieval delivers that content by design (hydration includes current notes wholesale), and the safety property is that the **answer** does not assert them — evaluated by the answer-stage non-assertion gate below, not by this row. Each critical forbidden fact is classified by its carrier's source state, computed from fixture text |
+| Answer-stage non-assertion (deferred evaluation) | The generated answer asserts no forbidden fact present in its retrieved context (the Reference Acceptance Case's "does not reduce the schedule to only 3 and 4 days" is this gate's pinned instance). Defined here so Sprint 1 can classify facts against it; **measured only when an answer pipeline exists (Sprint 3/4)**. Sprint 1 MUST NOT claim to have evaluated it |
+| Gate admissibility | Every zero-tolerance gate carries a supervised existence proof — computed from fixture text with expected IDs as labels only — that at least one retrieval ordering satisfies it, before any model is benchmarked against it. A gate without an admissibility proof is not a gate; it is an unfalsifiable trap (materialized twice: `1.2` corpus solvability, `1.3` rerun critical contamination) |
 | Retrieval RAM at 250k | `<=1 GiB` automatic pass; `>1 GiB` through `1.25 GiB` requires explicit user risk/quality approval; `>1.25 GiB` fails without a product scope change. Includes active sessions, ANN graph if selected, and old/new snapshot overlap. |
 | Derived disk at 250k | `<=2 GiB` steady state and `<=3 GiB` during shadow rebuild automatic pass; above either figure requires explicit user approval. Includes documents, staging, sidecars, and all retained generations. |
 | Baseline falsifiability | Reference and semantic-category cases demonstrably fail the FTS-only baseline; asserted by the harness |
@@ -1845,3 +1856,5 @@ Any failure to resolve one of these gates blocks Sprint 2 approval.
 | 2026-08-22 | Implement corpus solvability as an answer-key-free structural check plus a supervised raw-text margin check. | An unsupervised check cannot know which evidence is expected, while an oracle proves nothing. Expected IDs may label the target only; all scores and margins come from text. | User |
 | 2026-08-22 | Treat identical aggregate metrics across unrelated model families as a corpus-defect signal, not a model finding. | e5-small (384-d), e5-base (768-d), and paraphrase-MiniLM produced byte-identical corpus metrics in Task `1.3`. Architectures that differ in dimension and training data cannot agree to the digit unless the model is not the deciding variable. | User |
 | 2026-08-22 | Void the Task `1.3` fusion, aggregation, and reranker-weight constants; they do not carry into Sprint 2. | The 144-configuration grid ran against an objective whose first two terms were constant across every configuration (exact violations 0 everywhere, semantic misses 30 everywhere), so the search degenerated to its "prefer smaller constants" tie-break. The locked values are search artifacts, not measurements. | User |
+| 2026-08-24 | Re-scope the critical forbidden-contamination gate by carrier source state: retrieval stage owns zero contamination from superseded/stale/deleted sources; current-content contradictions move to a defined-but-deferred answer-stage non-assertion gate. | Task `1.3F` proved the flat gate unachievable as staged (four facts carried by current notes inside required meetings; hydrated pools of 6-8 docs below `EVIDENCE_K=10` retain the carrier under every ordering; `0/2160` configurations pass jointly). Hydration includes current notes wholesale by design, so requiring retrieval to erase them asks the wrong layer to censor authoritative content — the recorded production failure was an answer asserting the wrong value, which is answer-stage by nature. The fidelity-fixed harness shows the retrieval-stage half is real and achievable (contamination 30/121 → 15/121 once stale paths closed). | User |
+| 2026-08-24 | Require a supervised admissibility proof for every zero-tolerance gate, on production-implementable channels only, before any model is benchmarked against it. | The same defect shape consumed two L-sized benchmark tasks in one sprint: `1.2` shipped an unwinnable corpus past a falsifiability-only rule, and the `1.2R` corpus certified three critical cases "solvable" via a hand-authored concept lexicon no production channel implements. An existence proof from fixture text (expected IDs as labels only) makes the trap structurally impossible to re-author. | User |
