@@ -172,10 +172,15 @@ would require.
 
 ## Program Status
 
-**Status:** Sprint 1 remediation in progress. Batch 6 Task `1.3G` completed
-independent verification on 2026-08-24, closing the category (c) resolution.
-**The final Task `1.3` selection run (Batch 7) is next** on the closed
-post-`1.3G` instrument. Sprint 6.1 is closed.
+**Status:** **Task `1.3` is complete and the production model pair is
+approved** (2026-08-24). Batch 7's final selection run stopped at Critical
+Recall@1 `2/5`; the user resolved it by **splitting the critical gate** —
+hydration-window membership (`5/5`) is the Sprint 1 model-selection gate, and
+Recall@1 keeps its 100% threshold as a **Sprint 3 release gate** owned by the
+stages that decide ordinal position. Selected: **`e5-base-int8` +
+`mmarco-quint8`**, int8 vector storage, `k=5 w_vector=1 w_lexical=0.5
+alpha=0.5 beta=1 gamma=0`, chunk profile 384/64, 1118.3 MiB inside the
+approved band. Tasks `1.4` and `1.5` are unblocked. Sprint 6.1 is closed.
 
 Current execution state:
 
@@ -213,25 +218,34 @@ Current execution state:
    positive production-implementable rank-1 channel and the re-scoped critical
    contamination gate passes `0/2`. The final `1.3` selection run follows on
    this closed instrument.
-7. **Batch 7 (next):** the final Task `1.3` selection run, carrying
-   **amendment 5**. `1.3G` measured `79/2160` (mmarco-f32) and `78/2160`
-   (mmarco-quint8) configurations of the existing e5-base-int8 pair that
-   jointly pass every gate, while the held-out objective selects a `3/5`
-   configuration — so the remaining failure is constant selection, not model
-   capability or corpus content. The run admits the 10 non-critical
-   reference-category cases into the tuning partition (the 5 critical/pinned
-   cases stay isolated), adds a reference-category Recall@1 objective term,
-   and must disclose all tuned constants. Selecting constants by inspecting
-   critical-case results is forbidden. If the retune still yields `3/5`, the
-   run stops and reports; the resulting choice belongs to the user.
-8. **Deferred to Sprint 3 Task `3.6`:** single-turn query expansion, the
+7. **Batch 7:** final Task `1.3` is complete with the amendment-5 documented
+   stop. The 115-case tuning partition admitted ten non-critical reference
+   siblings while preserving all five critical/pinned cases; its objective
+   earned `k=5`, `w_vector=1`, `w_lexical=0.5`, `alpha=0.5`, `beta=1`,
+   `gamma=0`, but Critical Recall@1 is `2/5`. Quint8 still has `78/2160`
+   diagnostic joint-passing configurations, but the earned constants are
+   outside that region at better held-out objective value. Constants were not
+   chosen by inspecting critical cases, and no further Sprint 1
+   corpus/gate/partition/objective iteration may occur.
+8. **Resolution (2026-08-24):** the user split the critical gate rather than
+   granting a dated exception. Critical hydration-window membership (`5/5`,
+   with critical facts `9/9` and zero retrieval-stage contamination) is the
+   Sprint 1 gate; critical Recall@1 keeps its 100% threshold as a Sprint 3
+   release gate. The bi-encoder already ranks four of five critical targets
+   first, so the residual failure is ordinal position produced by fusion and
+   aggregation — Sprint 3's stages. Debt is attributed by measured cause:
+   `pt-ref-sla-suporte` and `pt-ref-nps-detrator` to Task `3.2`,
+   `pt-ref-chaves-acesso` to Task `3.6`. **Task `1.3` is complete; the pair,
+   encoding, and constants are approved and need an `architecture.md` addendum
+   before Sprint 2. Tasks `1.4` and `1.5` are unblocked.**
+9. **Deferred to Sprint 3 Task `3.6`:** single-turn query expansion, the
    architecturally correct remedy for `pt-ref-chaves-acesso`'s terminological
    gap. It is registered with its approach left as an open architecture
    question (hand-authored lexicon vs. local LLM expansion vs.
    pseudo-relevance feedback) and is blocked on a user decision.
-9. **User decision on Deep-as-default** is deferred to Sprint 4 close and is
-   not a Sprint 1 blocker. The open question remains recorded in
-   `architecture.md`.
+10. **User decision on Deep-as-default** is deferred to Sprint 4 close and is
+    not a Sprint 1 blocker. The open question remains recorded in
+    `architecture.md`.
 
 `architecture.md` now carries a **"Corpus Solvability"** section as the
 normative counterweight to "Baseline Failure Reproduction". A corpus may not

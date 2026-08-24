@@ -7,6 +7,25 @@ Planned, blocked by Sprint 2 approval and completion.
 Revised 2026-08-21 after pre-implementation critique: reranking sub-budget and a
 mandatory runtime kill switch added. Estimate: 8-12 working days.
 
+**Inherited from Sprint 1 (2026-08-24 gate split).** The **Reference/critical
+meeting Recall@1 = 100%** gate moved here as a **release gate** — its threshold
+is unchanged; only its owning sprint moved, because ordinal position is decided
+by fusion, meeting aggregation, and reranking, which this sprint builds. Sprint
+1's selected pair leaves it at `2/5`, with the three misses attributed by
+measured cause:
+
+| Case | Measured cause | Owner |
+|---|---|---|
+| `pt-ref-sla-suporte` | raw bi-encoder ranks the target **1**; fused aggregation demotes it to 3 | **Task 3.2** |
+| `pt-ref-nps-detrator` | raw bi-encoder ranks the target **1**; fused aggregation demotes it to 2 | **Task 3.2** |
+| `pt-ref-chaves-acesso` | terminological gap; raw bi-encoder rank 4 | **Task 3.6** |
+
+This gate MUST be re-measured at Sprint 3 close and MUST pass before release.
+It is retained, not waived: Sprint 1 established that all five critical
+meetings already land inside the hydration window with 100% required-fact
+coverage and zero retrieval-stage contamination, so what remains is ranking
+quality produced by this sprint's stages.
+
 ## Goal
 
 Replace folder/all-meetings global snippet ranking with meeting-aware hybrid
@@ -78,13 +97,23 @@ model, chunker, index backend, and status contracts from Sprints 1-2.
 - Context and source retention are one contract.
 - The reference case succeeds in Fast mode for folder and all scopes.
 - Existing streaming ownership and cancellation remain intact.
+- The inherited **critical Recall@1 = 100%** release gate MUST be re-measured
+  before sprint close, with the three named cases reported individually.
+- Any tuning of fusion, aggregation, or reranking constants in this sprint MUST
+  use **threshold semantics**: satisfy every gate threshold first, then
+  optimize quality inside the feasible set. Sprint 1's lexicographic
+  miss-minimizing objective was proven stricter than the gates themselves — it
+  could not trade two semantic misses (28/30, still far above the gate) for
+  three critical rank-1 hits, because the leading term dominated regardless of
+  whether any gate was actually at risk. Reproducing that objective shape here
+  would reproduce the same blind spot on real data.
 
 ## Task List
 
 | ID | Feature | Task | Size | Owner | Dependencies | Acceptance check | Rollback |
 |---|---|---|---|---|---|---|---|
 | 3.1 | Hybrid candidates | Add concrete persisted-scope retrieval requests and scope-safe FTS/vector candidate generation. | L | Pending `worker-l` | Sprint 2 | Tests prove all/folder allow-lists, query variants, cancellation, semantic fallback, and no out-of-scope candidates. | Route broad Chat back to existing `resolve_scope_results`; index remains unused. |
-| 3.2 | Ranking | Add RRF, stable dedupe, meeting aggregation/diversity, and local cross-encoder reranking. | L | Pending `worker-l` | 3.1 | Evaluation proves correct meeting ranking and reranker improvement without exact-term regression. | Disable reranking/fusion service and use ordered lexical candidates. |
+| 3.2 | Ranking | Add RRF, stable dedupe, meeting aggregation/diversity, and local cross-encoder reranking. **Owns the inherited critical Recall@1 debt for `pt-ref-sla-suporte` and `pt-ref-nps-detrator`**, whose targets the bi-encoder already ranks first. | L | Pending `worker-l` | 3.1 | Evaluation proves correct meeting ranking and reranker improvement without exact-term regression; both inherited cases reach rank 1; constants tuned with threshold semantics. | Disable reranking/fusion service and use ordered lexical candidates. |
 | 3.3 | Context | Add authoritative multi-meeting hydration, bounded allocation, coverage, and retained-source output. | L | Pending `worker-l` | 3.2 | Reference context contains complete schedule/MPV facts and all sources match retained evidence. | Keep old generic context builder and lexical path. |
 | 3.4 | Broad Chat rollout | Integrate Fast hybrid retrieval into all/folder streaming and non-streaming Chat through shared preparation, and ship the mandatory `force_lexical_retrieval` kill switch. | M | Pending `worker-m` | 3.1-3.3 | Product-path tests prove all/folder Fast behavior, lexical fallback, kill-switch behavior, cancellation, and source events. | Enable `force_lexical_retrieval` at runtime; no rebuild or reinstall required. |
 | 3.5 | Quality regression | Run/fix multilingual evaluation, context budgets, performance, and Windows native broad-Chat smoke. | M | Pending `worker-m` | 3.4 | Required quality deltas and reference answer facts pass; no context/latency gate regresses. | Test/threshold changes revert independently; production rollback is Task 3.4 flag/path. |
@@ -551,6 +580,8 @@ budget; and the failure/fallback behavior actually exercised.
 | 2026-08-21 | Reranking depth comes from Sprint 1's measured sub-budget, not the provisional 30-50 range. | The provisional range predates measurement and plausibly consumes the entire Fast budget on CPU. | Use the architecture's provisional range and adjust reactively. | Main agent, pending sprint approval |
 | 2026-08-21 | Adaptive reranking depth must be deterministic, never wall-clock driven. | Timing-driven depth makes evaluation results irreproducible and quality gates meaningless. | Allow a time-boxed reranking budget. | Main agent, pending sprint approval |
 | 2026-08-24 | Register Task `3.6` (single-turn query expansion) here rather than in Sprint 1, with its approach left as an open architecture question. | Sprint 1's `pt-ref-chaves-acesso` failure is a genuine vocabulary gap that no current stage bridges — the implemented rewrite is follow-up-only and the case is single-turn. Sprint 3 already carries the query-variant plumbing, so this is the natural home. It was kept out of Sprint 1 because Sprint 1 excludes production retrieval behavior, because building expansion to fix a gate case and then grading models on that case repeats the overfitting problem one stage upstream, and because model selection blocks Tasks `1.4`/`1.5` and all of Sprint 2 — putting a new feature in front of it inverts the dependency. | Build it inside Sprint 1 alongside the final model run; defer it informally without a registered task. | User |
+| 2026-08-24 | Inherit the critical Recall@1 = 100% gate from Sprint 1 as a Sprint 3 release gate, with its three misses attributed by measured cause to Tasks `3.2` and `3.6`. | Ordinal position is produced by fusion, aggregation, and reranking — this sprint's stages — not by the embedding pair Sprint 1 selects. The bi-encoder already ranks four of five critical targets first; `sla-suporte` and `nps-detrator` are demoted by fusion (Task `3.2`), while `chaves-acesso` is a genuine vocabulary gap (Task `3.6`). The threshold is unchanged at 100% and the gate must pass before release. | Waive the gate; leave it in Sprint 1 and block model selection indefinitely; assign all three misses to Task `3.6`. | User |
+| 2026-08-24 | Require threshold semantics for all constant tuning in this sprint. | Sprint 1's lexicographic miss-minimizing objective proved stricter than the gates it served: it could not trade two semantic misses (leaving 28/30, still far above the gate's floor) for three critical rank-1 hits, because the leading term dominated whether or not any gate was actually at risk. Tuning on real data with the same objective shape would reproduce the blind spot where it is harder to detect. | Reuse Sprint 1's objective shape unchanged. | User |
 | 2026-08-24 | Leave the expansion approach undecided and block Task `3.6` dispatch on an explicit user choice. | The three candidates differ materially in architecture: a hand-authored lexicon promotes the non-production `CONCEPT_LEXICON` pattern into the product, LLM expansion places a provider round-trip inside the retrieval path of a local-first product against a 2 s budget, and pseudo-relevance feedback would likely drift toward the very distractors that own the surface vocabulary. Choosing among them is a product decision, not an implementation detail. | Pre-select an approach in the task specification. | User |
 
 ## Task Execution Log

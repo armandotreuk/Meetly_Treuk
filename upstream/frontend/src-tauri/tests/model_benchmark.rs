@@ -1589,7 +1589,7 @@ async fn deleted_fts_rows_ranking_inertness(case: &EvaluationCase) -> bool {
 // Fusion, meeting aggregation, metrics
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct HybridConfig {
     rrf_k: f64,
     w_vector: f64,
@@ -2334,6 +2334,160 @@ fn rank1_admissibility_rejects_a_no_positive_channel_mutation() {
     assert!(enforce_rank1_admissibility(case, lexical, title, 2).is_err());
 }
 
+#[test]
+fn amendment5_partition_excludes_only_critical_and_pinned_cases() {
+    let cases = corpus::cases();
+    let designated = [
+        "fixture-whatsapp-retention",
+        "pt-ref-cobranca-regua",
+        "pt-ref-chaves-acesso",
+        "pt-ref-sla-suporte",
+        "pt-ref-nps-detrator",
+    ];
+    let excluded: Vec<&str> = cases
+        .iter()
+        .filter(|c| excluded_from_tuning(c))
+        .map(|c| c.id.as_str())
+        .collect();
+    assert_eq!(
+        excluded.len(),
+        5,
+        "exactly the five designated critical/pinned cases may be excluded, got {excluded:?}"
+    );
+    for id in designated {
+        assert!(excluded.contains(&id), "{id} must stay outside tuning");
+    }
+    // No tuning path may ever see a critical case.
+    assert!(cases
+        .iter()
+        .filter(|c| c.critical)
+        .all(|c| excluded_from_tuning(c)));
+    // Amendment 5 admits exactly the ten non-critical reference-category
+    // cases; the partition is otherwise the full corpus.
+    let admitted_reference: Vec<&str> = cases
+        .iter()
+        .filter(|c| !excluded_from_tuning(c))
+        .filter(|c| c.categories.iter().any(|v| v == corpus::REFERENCE_CATEGORY))
+        .map(|c| c.id.as_str())
+        .collect();
+    assert_eq!(
+        admitted_reference.len(),
+        10,
+        "amendment 5 admits exactly the 10 non-critical reference-category cases"
+    );
+    assert_eq!(
+        cases.iter().filter(|c| !excluded_from_tuning(c)).count(),
+        115
+    );
+}
+
+fn amendment5_case(id: &str, categories: &[&str]) -> EvaluationCase {
+    EvaluationCase {
+        id: id.to_string(),
+        language: Language::Portuguese,
+        question: String::new(),
+        history: vec![],
+        rewritten_query: None,
+        scope: Scope {
+            kind: ScopeKind::All,
+            folder_id: None,
+            meeting_id: None,
+            allowed_meeting_ids: vec![],
+        },
+        meetings: vec![],
+        expected_meeting_ids: vec!["mtg-x".to_string()],
+        order_constraints: vec![],
+        required_evidence_ids: vec![],
+        required_facts: vec![],
+        forbidden_facts: vec![],
+        answer_mode: String::new(),
+        categories: categories.iter().map(|v| (*v).to_string()).collect(),
+        critical: false,
+    }
+}
+
+#[test]
+fn amendment5_objective_orders_reference_r1_misses_between_semantic_and_overall() {
+    let ref_case = amendment5_case("ref", &[corpus::REFERENCE_CATEGORY]);
+    let sem_case = amendment5_case("sem", &["semantic_paraphrase"]);
+    let exact_case = amendment5_case("exact", &["exact_term"]);
+    let plain_case = amendment5_case("plain", &[]);
+    let ranks = BTreeMap::from([("mtg-x".to_string(), 2_usize)]);
+
+    // Scope: each term counts only its own category's cases; overall and MRR
+    // count everything. A rank-2 expected meeting misses Recall@1 but not
+    // Recall@3, so only reference_r1_misses and mrr move per case here.
+    let mut obj = TuneObjective::default();
+    for case in [&ref_case, &sem_case, &exact_case, &plain_case] {
+        obj.add_case(case, &ranks);
+    }
+    assert_eq!(obj.reference_r1_misses, 1);
+    assert_eq!(obj.semantic_r3_misses, 0);
+    assert_eq!(obj.exact_violations, 0);
+    assert_eq!(obj.overall_r3_misses, 0);
+    assert!(obj.mrr_deficit_micros > 0);
+    let mut at_rank_1 = TuneObjective::default();
+    at_rank_1.add_case(&ref_case, &BTreeMap::from([("mtg-x".to_string(), 1_usize)]));
+    assert_eq!(at_rank_1.reference_r1_misses, 0);
+
+    // Ordering (lexicographic; smaller key wins). For adjacent terms X then Y
+    // in the key, driving Y to its maximum must still lose to a single step of
+    // X: reducing X dominates any reduction of Y.
+    let key_exact_leads = TuneObjective {
+        semantic_r3_misses: u64::MAX,
+        ..Default::default()
+    }
+    .key();
+    let key_exact_one = TuneObjective {
+        exact_violations: 1,
+        ..Default::default()
+    }
+    .key();
+    assert!(
+        key_exact_leads < key_exact_one,
+        "reducing exact-term violations outranks any reduction of semantic misses"
+    );
+    let key_semantic_leads = TuneObjective {
+        reference_r1_misses: u64::MAX,
+        ..Default::default()
+    }
+    .key();
+    let key_semantic_one = TuneObjective {
+        semantic_r3_misses: 1,
+        ..Default::default()
+    }
+    .key();
+    assert!(
+        key_semantic_leads < key_semantic_one,
+        "reducing semantic misses outranks any number of reference misses"
+    );
+    let key_reference_leads = TuneObjective {
+        overall_r3_misses: u64::MAX,
+        ..Default::default()
+    }
+    .key();
+    let key_reference_one = TuneObjective {
+        reference_r1_misses: 1,
+        ..Default::default()
+    }
+    .key();
+    assert!(
+        key_reference_leads < key_reference_one,
+        "eliminating one reference R@1 miss outranks any reduction in overall R@3 misses"
+    );
+    // The reranked stage keeps the same relative order around its inserted
+    // NDCG flag (position 3), so reordering either array fails this test.
+    let rk = TuneObjective {
+        reference_r1_misses: 1,
+        overall_r3_misses: 7,
+        ..Default::default()
+    }
+    .rerank_key(true);
+    assert_eq!(rk[2], 1);
+    assert_eq!(rk[3], 1);
+    assert_eq!(rk[4], 7);
+}
+
 /// Raw bi-encoder ranks under the identical scoring run_case uses (best cosine
 /// over query variants, deterministic tie-break), before any fusion: rank of
 /// the best-ranked expected-meeting document and of the best-ranked required-
@@ -2830,6 +2984,8 @@ fn constants_feasibility_probe(
     docs: &[CaseDocs],
     lex_ranks: &[Vec<usize>],
     baseline_exact_r3: (usize, usize),
+    tuned_cfg: HybridConfig,
+    tuned_objective_key: [u64; 6],
 ) {
     let mut model = RerankModel::load(&root.join(dir), file, 512, 4)
         .unwrap_or_else(|e| panic!("probe load {dir}/{file}: {e}"));
@@ -2846,6 +3002,21 @@ fn constants_feasibility_probe(
     let vec_rank_per_case: Vec<Vec<usize>> = docs.iter().map(vector_ranking).collect();
     let (mut total, mut pass_count) = (0_usize, 0_usize);
     let mut examples: Vec<String> = Vec::new();
+    // Amendment 5 corroboration: is the held-out-tuned configuration inside
+    // the passing set, and if not, how far is its objective from the best
+    // passing configuration's objective?
+    let tuned_cfg_label = format!(
+        "k={} w_vector={} w_lexical={} alpha={} beta={} gamma={}",
+        tuned_cfg.rrf_k,
+        tuned_cfg.w_vector,
+        tuned_cfg.w_lexical,
+        tuned_cfg.support_alpha,
+        tuned_cfg.title_beta,
+        tuned_cfg.rerank_gamma
+    );
+    let mut tuned_passes: Option<bool> = None;
+    let mut tuned_probe_key: Option<[u64; 6]> = None;
+    let mut best_passing: Option<([u64; 6], String)> = None;
     for &k in &ks {
         let mut scores_by_ratio: HashMap<u64, Vec<HashMap<usize, f32>>> = HashMap::new();
         for &wl in &wls {
@@ -2899,6 +3070,8 @@ fn constants_feasibility_probe(
                             let (mut crit_hits, mut crit_expected, mut crit_forbidden) =
                                 (0_usize, 0_usize, 0_usize);
                             let (mut exact_hits, mut exact_total) = (0_usize, 0_usize);
+                            let mut obj = TuneObjective::default();
+                            let (mut ndcg_f, mut ndcg_u) = (0f64, 0f64);
                             for (ci, case) in cases.iter().enumerate() {
                                 let out = finish_case(
                                     case,
@@ -2930,12 +3103,21 @@ fn constants_feasibility_probe(
                                         );
                                     }
                                 }
+                                if !excluded_from_tuning(case) {
+                                    obj.add_case(case, &out.metrics.meeting_ranks);
+                                    ndcg_f += out.metrics.ndcg10_final;
+                                    ndcg_u += out.metrics.ndcg10_fused;
+                                }
                             }
                             let passes = crit_hits == crit_expected
                                 && crit_forbidden == 0
                                 && exact_hits as f64 / exact_total.max(1) as f64
                                     >= baseline_exact_r3.0 as f64
                                         / baseline_exact_r3.1.max(1) as f64;
+                            // Objective key over the held-out partition only;
+                            // critical results above are existence evidence and
+                            // never feed any tuning decision.
+                            let obj_key = obj.rerank_key(ndcg_u > ndcg_f);
                             if passes {
                                 pass_count += 1;
                                 if examples.len() < 3 {
@@ -2943,6 +3125,18 @@ fn constants_feasibility_probe(
                                         "k={k} w_vector={wv} w_lexical={wl} alpha={alpha} beta={beta} gamma={gamma}"
                                     ));
                                 }
+                                if best_passing.as_ref().map_or(true, |(bk, _)| obj_key < *bk) {
+                                    best_passing = Some((
+                                        obj_key,
+                                        format!(
+                                            "k={k} w_vector={wv} w_lexical={wl} alpha={alpha} beta={beta} gamma={gamma}"
+                                        ),
+                                    ));
+                                }
+                            }
+                            if cfg == tuned_cfg {
+                                tuned_passes = Some(passes);
+                                tuned_probe_key = Some(obj_key);
                             }
                         }
                     }
@@ -2959,6 +3153,122 @@ fn constants_feasibility_probe(
     }
     if pass_count == 0 {
         println!("[feasibility {label}] none exists");
+    }
+    // Amendment 5 corroboration: tuned configuration versus the passing set.
+    println!(
+        "[feasibility {label}] tuned configuration (held-out objective's output): {tuned_cfg_label} | winning objective vector [exact-viol, sem-miss, ref-r1-miss, ndcg-nondeg, all-miss, mrr-miss-u] = {tuned_objective_key:?}"
+    );
+    match (tuned_passes, tuned_probe_key) {
+        (Some(true), _) => {
+            println!(
+                "[feasibility {label}] corroboration: the tuned configuration IS inside the passing set"
+            );
+        }
+        (Some(false), Some(tuned_key)) => {
+            println!(
+                "[feasibility {label}] corroboration: the tuned configuration is OUTSIDE the passing set"
+            );
+            match &best_passing {
+                Some((best_key, best_cfg)) => {
+                    let deltas: Vec<i64> = tuned_key
+                        .iter()
+                        .zip(best_key.iter())
+                        .map(|(a, b)| *a as i64 - *b as i64)
+                        .collect();
+                    println!(
+                        "[feasibility {label}] objective distance (tuned minus best-passing componentwise): {deltas:?} | tuned key {tuned_key:?} | best-passing key {best_key:?} at {best_cfg}"
+                    );
+                }
+                None => println!("[feasibility {label}] no passing configuration exists"),
+            }
+        }
+        _ => {
+            println!(
+                "[feasibility {label}] corroboration unavailable: the tuned configuration is not on the probed grid"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Amendment 5 (final Task 1.3 selection run): tuning partition and objective
+// ---------------------------------------------------------------------------
+
+/// The pinned reference acceptance case stays fully isolated from every
+/// tuning path regardless of category flags.
+const PINNED_REFERENCE_CASE: &str = "fixture-whatsapp-retention";
+
+/// Amendment 5 partition: exclude ONLY the five designated critical/pinned
+/// cases (the `critical` flag plus the pinned reference case). The ten
+/// non-critical reference-category cases join held-out tuning so the split is
+/// drawn from the same distribution the gates grade. Critical-case results
+/// must never be inspected by any tuning decision.
+fn excluded_from_tuning(case: &EvaluationCase) -> bool {
+    case.critical || case.id == PINNED_REFERENCE_CASE
+}
+
+/// Amendment 5 held-out objective over the tuning partition. Lexicographic key
+/// order, smaller wins: exact-term Recall@3 violations, semantic Recall@3
+/// misses, reference-category Recall@1 misses (admitted siblings only),
+/// overall Recall@3 misses, MRR deficit in micros.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct TuneObjective {
+    exact_violations: u64,
+    semantic_r3_misses: u64,
+    reference_r1_misses: u64,
+    overall_r3_misses: u64,
+    mrr_deficit_micros: u64,
+}
+
+impl TuneObjective {
+    fn key(self) -> [u64; 5] {
+        [
+            self.exact_violations,
+            self.semantic_r3_misses,
+            self.reference_r1_misses,
+            self.overall_r3_misses,
+            self.mrr_deficit_micros,
+        ]
+    }
+
+    /// Reranked-stage key: the base key with the NDCG non-degradation flag
+    /// inserted between reference and overall misses.
+    fn rerank_key(self, ndcg_regression: bool) -> [u64; 6] {
+        let k = self.key();
+        [k[0], k[1], k[2], u64::from(ndcg_regression), k[3], k[4]]
+    }
+
+    /// Accumulate one case outcome. Category terms apply only to their own
+    /// categories; overall and MRR terms apply to every tuned case.
+    fn add_case(&mut self, case: &EvaluationCase, ranks: &BTreeMap<String, usize>) {
+        let misses = |ok: &dyn Fn(usize) -> bool| -> u64 {
+            case.expected_meeting_ids
+                .iter()
+                .filter(|mid| !ranks.get(*mid).is_some_and(|r| ok(*r)))
+                .count() as u64
+        };
+        if case.categories.iter().any(|v| v == "exact_term") {
+            self.exact_violations += misses(&|r| r <= 3);
+        }
+        if case.categories.iter().any(|v| v == "semantic_paraphrase") {
+            self.semantic_r3_misses += misses(&|r| r <= 3);
+        }
+        if case
+            .categories
+            .iter()
+            .any(|v| v == corpus::REFERENCE_CATEGORY)
+        {
+            self.reference_r1_misses += misses(&|r| r == 1);
+        }
+        self.overall_r3_misses += misses(&|r| r <= 3);
+        if let Some(best) = case
+            .expected_meeting_ids
+            .iter()
+            .filter_map(|m| ranks.get(m))
+            .min()
+        {
+            self.mrr_deficit_micros += ((1.0 - 1.0 / *best as f64) * 1.0e6) as u64;
+        }
     }
 }
 
@@ -3359,16 +3669,18 @@ async fn hybrid_corpus_and_resource_benchmark() {
     }
     let default_docs = family_results.swap_remove(eval_index).docs;
 
-    // ---- Stage C: held-out parameter search (fusion, no rerank). Tune
-    // partition only: non-critical, non-reference. Objective is a
-    // deterministic lexicographic key prioritizing the approved gates:
-    // exact-term violations, semantic Recall@3 misses, overall Recall@3
-    // misses, then MRR (micros); final ties resolve toward smaller/simpler
-    // constants. Reference/critical cases are never inspected here.----
+    // ---- Stage C: held-out parameter search (fusion, no rerank). Amendment
+    // 5 tune partition: everything except the five designated critical/pinned
+    // cases, so the ten non-critical reference-category cases join the split.
+    // Objective is the amendment-5 lexicographic key prioritizing the approved
+    // gates: exact-term violations, semantic Recall@3 misses,
+    // reference-category Recall@1 misses (admitted siblings), overall
+    // Recall@3 misses, then MRR (micros); final ties resolve toward
+    // smaller/simpler constants. Critical cases are never inspected here.----
     let tune_idx: Vec<usize> = cases
         .iter()
         .enumerate()
-        .filter(|(_, c)| !c.critical && !c.categories.iter().any(|v| v == "reference_whatsapp"))
+        .filter(|(_, c)| !excluded_from_tuning(c))
         .map(|(i, _)| i)
         .collect();
     let lex_ranks: Vec<Vec<usize>> = cases
@@ -3385,7 +3697,7 @@ async fn hybrid_corpus_and_resource_benchmark() {
         alpha: f64,
         beta: f64,
     }
-    let mut fusion_best: Option<(FusionCfg, [u64; 4])> = None;
+    let mut fusion_best: Option<(FusionCfg, [u64; 5])> = None;
     let mut fusion_rows: Vec<String> = Vec::new();
     for k in [5.0_f64, 10.0, 20.0, 60.0] {
         for wv in [0.5_f64, 1.0, 2.0] {
@@ -3405,52 +3717,14 @@ async fn hybrid_corpus_and_resource_benchmark() {
                             support_cap: 3,
                         };
                         // Objective components over the held-out partition.
-                        let (mut exact_viol, mut sem_miss, mut all_miss, mut mrr_miss_micros) =
-                            (0usize, 0usize, 0usize, 0u64);
+                        let mut obj = TuneObjective::default();
                         for &ci in &tune_idx {
                             let case = &cases[ci];
                             let lr = &lex_ranks[ci];
                             let out = run_case(case, &default_docs[ci], lr, hcfg, None);
-                            if exact_sel(case) {
-                                for mid in &case.expected_meeting_ids {
-                                    exact_viol += usize::from(
-                                        !out.metrics
-                                            .meeting_ranks
-                                            .get(mid)
-                                            .is_some_and(|r| *r <= 3),
-                                    );
-                                }
-                            }
-                            if semantic_sel(case) {
-                                for mid in &case.expected_meeting_ids {
-                                    sem_miss += usize::from(
-                                        !out.metrics
-                                            .meeting_ranks
-                                            .get(mid)
-                                            .is_some_and(|r| *r <= 3),
-                                    );
-                                }
-                            }
-                            for mid in &case.expected_meeting_ids {
-                                all_miss += usize::from(
-                                    !out.metrics.meeting_ranks.get(mid).is_some_and(|r| *r <= 3),
-                                );
-                            }
-                            if let Some(best) = case
-                                .expected_meeting_ids
-                                .iter()
-                                .filter_map(|m| out.metrics.meeting_ranks.get(m))
-                                .min()
-                            {
-                                mrr_miss_micros += ((1.0 - 1.0 / *best as f64) * 1.0e6) as u64;
-                            }
+                            obj.add_case(case, &out.metrics.meeting_ranks);
                         }
-                        let key = [
-                            exact_viol as u64,
-                            sem_miss as u64,
-                            all_miss as u64,
-                            mrr_miss_micros,
-                        ];
+                        let key = obj.key();
                         let better = match fusion_best {
                             None => true,
                             Some((_, bk)) => key < bk,
@@ -3468,7 +3742,8 @@ async fn hybrid_corpus_and_resource_benchmark() {
                             ));
                         }
                         fusion_rows.push(format!(
-                            "k={k} wv={wv} wl={wl} a={alpha} b={beta}: viol={exact_viol} sem-miss={sem_miss} all-miss={all_miss} mrr-miss={mrr_miss_micros}"
+                            "k={k} wv={wv} wl={wl} a={alpha} b={beta}: viol={} sem-miss={} ref-r1-miss={} all-miss={} mrr-miss={}",
+                            key[0], key[1], key[2], key[3], key[4]
                         ));
                     }
                 }
@@ -3479,7 +3754,7 @@ async fn hybrid_corpus_and_resource_benchmark() {
     let best_wv = fb.wv;
     let best_wl = fb.wl;
     println!(
-        "[tune-fusion] locked k={} w_vector={} w_lexical={} alpha={} beta={} | objective [exact-viol, sem-miss, all-miss, mrr-miss-u] = {fb_key:?} over {} held-out configs",
+        "[tune-fusion] locked k={} w_vector={} w_lexical={} alpha={} beta={} | objective [exact-viol, sem-miss, ref-r1-miss, all-miss, mrr-miss-u] = {fb_key:?} over {} held-out configs",
         fb.k, fb.wv, fb.wl, fb.alpha, fb.beta,
         fusion_rows.len()
     );
@@ -3556,6 +3831,7 @@ async fn hybrid_corpus_and_resource_benchmark() {
         ndcg_fused: f64,
         tune_r3: (usize, usize),
         tuned_gamma: f64,
+        tuned_objective_key: [u64; 6],
     }
     // metadata_multilingual reflects the model card only: mmarco-mMiniLMv2
     // trains on mMARCO Portuguese among 14 languages. bge-reranker-base is
@@ -3612,6 +3888,7 @@ async fn hybrid_corpus_and_resource_benchmark() {
             ndcg_fused: 0.0,
             tune_r3: (0, 0),
             tuned_gamma: 0.0,
+            tuned_objective_key: [0; 6],
         };
         if !viable {
             result.exclusion = Some(format!(
@@ -3630,11 +3907,12 @@ async fn hybrid_corpus_and_resource_benchmark() {
         }
 
         // Held-out gamma sub-grid under the deterministic runtime policy
-        // (batch=1, depth=RERANK_SET). Objective matches the fusion search:
-        // exact violations, semantic misses, NDCG non-degradation, overall
-        // misses, MRR misses; ties resolve toward smaller gamma.
+        // (batch=1, depth=RERANK_SET). Objective matches the fusion search
+        // with the NDCG non-degradation flag inserted: exact violations,
+        // semantic misses, reference Recall@1 misses, NDCG non-degradation,
+        // overall misses, MRR misses; ties resolve toward smaller gamma.
         let gammas = [0.0_f64, 0.5, 1.0, 2.0, 4.0, 8.0];
-        let mut best: Option<(f64, [u64; 5], usize, usize, f64, f64)> = None;
+        let mut best: Option<(f64, [u64; 6], usize, usize, f64, f64)> = None;
         for gamma in gammas {
             let cfg_g = HybridConfig {
                 rrf_k: best_k,
@@ -3646,7 +3924,7 @@ async fn hybrid_corpus_and_resource_benchmark() {
                 support_cap: 3,
             };
             let (mut pc, mut pt, mut nf, mut nu) = (0usize, 0usize, 0f64, 0f64);
-            let (mut ev, mut sm, mut am, mut mm) = (0usize, 0usize, 0usize, 0u64);
+            let mut obj = TuneObjective::default();
             for &ci in &tune_idx {
                 let case = &cases[ci];
                 let lr = &lex_ranks[ci];
@@ -3661,34 +3939,9 @@ async fn hybrid_corpus_and_resource_benchmark() {
                 pt += out.metrics.pairwise_total;
                 nf += out.metrics.ndcg10_final;
                 nu += out.metrics.ndcg10_fused;
-                if exact_sel(case) {
-                    for mid in &case.expected_meeting_ids {
-                        ev += usize::from(
-                            !out.metrics.meeting_ranks.get(mid).is_some_and(|r| *r <= 3),
-                        );
-                    }
-                }
-                if semantic_sel(case) {
-                    for mid in &case.expected_meeting_ids {
-                        sm += usize::from(
-                            !out.metrics.meeting_ranks.get(mid).is_some_and(|r| *r <= 3),
-                        );
-                    }
-                }
-                for mid in &case.expected_meeting_ids {
-                    am += usize::from(!out.metrics.meeting_ranks.get(mid).is_some_and(|r| *r <= 3));
-                }
-                if let Some(best) = case
-                    .expected_meeting_ids
-                    .iter()
-                    .filter_map(|m| out.metrics.meeting_ranks.get(m))
-                    .min()
-                {
-                    mm += ((1.0 - 1.0 / *best as f64) * 1.0e6) as u64;
-                }
+                obj.add_case(case, &out.metrics.meeting_ranks);
             }
-            let ndcg_bad = u64::from(nu > nf);
-            let key = [ev as u64, sm as u64, ndcg_bad, am as u64, mm];
+            let key = obj.rerank_key(nu > nf);
             let better = match best {
                 None => true,
                 Some((_, bk, _, _, _, _)) => key < bk,
@@ -3706,6 +3959,7 @@ async fn hybrid_corpus_and_resource_benchmark() {
         }
         let (tuned_gamma, gkey, gpc, gpt, gnf, gnu) = best.expect("gamma grid non-empty");
         result.tuned_gamma = tuned_gamma;
+        result.tuned_objective_key = gkey;
         result.pairwise_correct = gpc;
         result.pairwise_total = gpt;
         result.ndcg_final = gnf;
@@ -3825,8 +4079,7 @@ async fn hybrid_corpus_and_resource_benchmark() {
     // viable rerankers are evaluated under their own held-out-tuned gamma
     // with identical fusion constants; neither proxies the other.----
     let mut pair_reports: Vec<String> = Vec::new();
-    let mut conforming_pair_passed = false;
-    let mut evaluated_pairs: Vec<(String, bool, bool)> = Vec::new(); // key, conforming, passed
+    let mut production_candidate_passed: Option<bool> = None;
 
     for cand in &viable_results {
         let mut rr_pair = RerankModel::load(&root.join(&cand.dir), &cand.file, 512, 4)
@@ -3991,6 +4244,16 @@ async fn hybrid_corpus_and_resource_benchmark() {
             >= bs_n as f64 / bs_d.max(1) as f64 + 0.10;
         let g_ndcg = cm_all.ndcg_final_sum >= cm_all.ndcg_fused_sum;
 
+        // Amendment 5 mandatory constants disclosure: no gate result is
+        // reviewable without the configuration that produced it.
+        println!(
+            "[constants] {} locked configuration: k={} w_vector={} w_lexical={} alpha={} beta={} gamma={} support_cap=3 chat-depth={chat_depth} batch={chosen_batch}",
+            cand.name, best_k, best_wv, best_wl, best_alpha, best_beta, cand.tuned_gamma
+        );
+        println!(
+            "[constants] winning held-out objective vector [exact-viol, sem-miss, ref-r1-miss, ndcg-nondeg, all-miss, mrr-miss-u] = {:?}",
+            cand.tuned_objective_key
+        );
         println!("--- pair quality gates ---");
         println!(
             "[gate {}] Reference Recall@1: rank {ref_rank}, facts {}/{}, retrieval-stage forbidden {}/{}",
@@ -4183,17 +4446,21 @@ async fn hybrid_corpus_and_resource_benchmark() {
             && g_ndcg
             && src_num == src_den;
         let key = format!("{contracted_label}+{}", cand.name);
-        evaluated_pairs.push((key.clone(), cand.metadata_multilingual, passed));
-        if passed {
-            if cand.metadata_multilingual {
-                conforming_pair_passed = true;
-            }
+        // Final selection run roles: quint8 is the only production candidate;
+        // mmarco-f32 exists to quantify quantization cost and cannot select.
+        let role = if cand.name == "mmarco-quint8" {
+            "PRODUCTION CANDIDATE"
+        } else {
+            "quantization-cost reference only"
+        };
+        if cand.name == "mmarco-quint8" {
+            production_candidate_passed = Some(passed);
         }
         // Self-contained verdict: every evaluated gate carries its observed
         // value so no failed or unevaluated gate can silently support a
         // selection decision.
         pair_reports.push(format!(
-            "{key}: {} | card-multilingual={} tuned-beta={best_beta} tuned-gamma={} chat-depth={chat_depth} batch={chosen_batch} solo-p95={:.1}ms session-RAM=+{:.1}MiB",
+            "{key} [{role}]: {} | card-multilingual={} tuned-beta={best_beta} tuned-gamma={} chat-depth={chat_depth} batch={chosen_batch} solo-p95={:.1}ms session-RAM=+{:.1}MiB",
             if passed { "PASS" } else { "BLOCKED" },
             cand.metadata_multilingual,
             cand.tuned_gamma,
@@ -4251,6 +4518,15 @@ async fn hybrid_corpus_and_resource_benchmark() {
     // NOT tuning) over the 360-configuration fusion grid x gamma grid for
     // every budget-viable reranker on the post-fidelity harness.----
     for cand in candidate_results.iter().filter(|c| c.viable) {
+        let tuned_cfg = HybridConfig {
+            rrf_k: best_k,
+            w_vector: best_wv,
+            w_lexical: best_wl,
+            support_alpha: best_alpha,
+            title_beta: best_beta,
+            rerank_gamma: cand.tuned_gamma,
+            support_cap: 3,
+        };
         constants_feasibility_probe(
             &cand.name,
             &root,
@@ -4260,6 +4536,8 @@ async fn hybrid_corpus_and_resource_benchmark() {
             &default_docs,
             &lex_ranks,
             (be_n, be_d),
+            tuned_cfg,
+            cand.tuned_objective_key,
         );
     }
 
@@ -4268,19 +4546,26 @@ async fn hybrid_corpus_and_resource_benchmark() {
         println!("[pair] {line}");
     }
 
-    // Decision: COMPLETE requires the metadata-conforming pair to pass every
-    // gate AND its measured RAM peak to sit inside the automatic envelope.
-    let conforming_key = evaluated_pairs
-        .iter()
-        .find(|(_, conforming, _)| *conforming)
-        .map(|(k, _, _)| k.clone());
-    let conforming_peak = conforming_key
-        .as_deref()
-        .and_then(|k| bundle.measured_outcome.measured_pair_peak_mib.get(k))
+    // Decision (final selection run): the production candidate is fixed
+    // (e5-base-int8 + mmarco-quint8, card-multilingual-conforming); the
+    // mmarco-f32 reference cannot select. COMPLETE additionally requires the
+    // measured pair peak to sit inside the automatic envelope or the
+    // pre-approved 1-1.25 GiB e5-base band (user decisions 2026-08-23);
+    // otherwise the run stays blocked on quality gates.
+    let production_key = format!(
+        "{}+mmarco-quint8",
+        bundle.benchmark_leader.embedding.benchmark_artifact_dir
+    );
+    let production_peak = bundle
+        .measured_outcome
+        .measured_pair_peak_mib
+        .get(&production_key)
         .copied();
-    let decision = if conforming_pair_passed {
-        match conforming_peak {
+    let band_max_mib = bundle.envelopes.approval_band_max_bytes as f64 / (1024.0 * 1024.0);
+    let decision = if production_candidate_passed.unwrap_or(false) {
+        match production_peak {
             Some(mib) if mib <= 1024.0 => "complete",
+            Some(mib) if mib <= band_max_mib => "complete-band-approved",
             _ => "blocked-risk-approval",
         }
     } else {
@@ -4361,9 +4646,14 @@ async fn hybrid_corpus_and_resource_benchmark() {
     );
 
     println!("=== TASK 1.3 DECISION: {decision} ===");
+    if decision == "complete-band-approved" {
+        println!(
+            "The production candidate passes every gate; its measured peak sits in the 1-1.25 GiB band pre-approved for e5-base pairings (2026-08-23 user decision). Selection remains pending user approval."
+        );
+    }
     if decision == "blocked-risk-approval" {
         println!(
-            "The metadata-conforming pair passes every quality gate but its measured peak is in the approval band; explicit user risk approval is required."
+            "The production candidate passes every quality gate but its measured peak exceeds the approved envelopes; explicit user risk approval is required."
         );
     }
     println!("=== benchmark complete ===");

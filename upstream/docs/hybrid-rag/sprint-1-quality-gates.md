@@ -17,17 +17,28 @@ the baseline is re-recorded, and every critical case now has a positive
 production-implementable rank-1 channel with a feasible retrieval-stage
 contamination gate.
 
-**The instrument is now closed and the remaining gap is constant selection, not
-capability.** `1.3G`'s feasibility probe measures **79/2160** (mmarco-f32) and
-**78/2160** (mmarco-quint8) configurations of the existing e5-base-int8 pair
-that jointly pass Critical Recall@1 `5/5`, critical retrieval-stage
-contamination `0`, and exact-term no-regression — up from `0/2160` at `1.3F`.
-The held-out objective selects a configuration scoring `3/5` because none of
-those cases, nor any case exercising their failure modes, is visible to it.
-**The final Task `1.3` selection run (Batch 7) is next**, amended to correct
-that blindness; the amendment-4 escalation rule for `pt-ref-sla-suporte`
-applies at its retune. Task `1.1` is unaffected; Tasks `1.4` and `1.5` remain
-blocked on `1.3`.
+**The instrument is closed. Batch 7's final Task `1.3` run is complete with a
+documented stop, not a model selection.** Amendment 5 admitted the ten
+non-critical reference siblings and added their Recall@1 term, while keeping
+the five critical/pinned cases fully isolated. Its held-out objective earned
+`k=5`, `w_vector=1`, `w_lexical=0.5`, `alpha=0.5`, `beta=1`, and `gamma=0`, but
+the resulting production candidate scores Critical Recall@1 **`2/5`**. The
+diagnostic probe still finds **78/2160** (mmarco-quint8) and **79/2160**
+(mmarco-f32) jointly passing configurations; the earned configuration is
+outside that set at strictly better held-out objective value. This is stronger
+than the anticipated `3/5` stop evidence: the passing region is not reached by
+generalizable signal, and no constants were selected by inspecting critical
+results. `pt-ref-sla-suporte` remains the amendment-4 open item (rank 3).
+**The user resolved that stop on 2026-08-24 by splitting the critical gate**
+(approved `architecture.md` amendment): critical *hydration-window membership*
+is the Sprint 1 model-selection gate and passes `5/5`; critical *Recall@1*
+keeps its 100% threshold and moves to Sprint 3 as a release gate, owned by
+Task `3.2` for `pt-ref-sla-suporte` and `pt-ref-nps-detrator` and by Task
+`3.6` for `pt-ref-chaves-acesso`. **Task `1.3` is therefore complete and
+`e5-base-int8` + `mmarco-quint8` is the approved production pair** at the
+earned constants above, int8 vector encoding, measured 1118.3 MiB inside the
+pre-approved band. Tasks `1.4` and `1.5` are unblocked. Task `1.1` is
+unaffected. No further Sprint 1 instrument iteration is permitted.
 
 Task `1.3`'s *resource* findings survive and are retained — admissibility
 arithmetic, measured pair RAM, derived disk, per-pair reranker latency,
@@ -325,7 +336,7 @@ reviews use the standard configured `reviewer` and `arch-reviewer`.
 | 1.2R | Evaluation | Re-author the corpus as materially distinct hand-written cases; add the solvability invariant and its harness assertion. | M | `worker-l` (`ses_fd317c5a5ffe20snhqLcOtBV3h`) | 1.2 | Passed: 120-case solvable corpus, answer-key-free structural checks, supervised raw-text margins, deterministic baseline, privacy scan, compatibility tests, rustfmt, Cargo check, and diff check. Baseline awaits user approval before `1.3`. | Restore the prior corpus/harness; test tooling only, no production effect. |
 | 1.3F | Gate closure | Audit harness fidelity against the architecture pipeline, prove or refute gate admissibility for the failing critical gates, add citation-precision simulation, and deliver a per-blocker verdict table. | L | `worker-l` (`ses_fce6f62e3ffekuqxK1x52fEwoT`) | 1.2R, 1.3 rerun evidence | **Passed:** all five deliverables, constructive admissibility report, production-typed citation precision `602/602` for pairs B/C, falsifiability mutation, `0/2160` feasibility result, privacy and boundary checks. | Tests/evidence only; restore committed `tests/` state; no production effect. |
 | 1.3G | Corpus patch + gate re-scope | Implement the 2026-08-24 category (c) decision: patch `pt-ref-chaves-acesso` and the two vacuous WhatsApp forbidden carriers; re-scope critical contamination by carrier source state; promote the admissibility invariant to enforcing for retrieval-stage facts; re-record the baseline and align the baseline harness. | M | `worker-l` (primary `ses_fcbf894c0ffe0XwFSDMSavxqDj`; residual fix `ses_fcb41049cffefT5nm7rG3j6sNE`) | 1.3F | **Passed:** rank-1 admissibility positive for `chaves-acesso` on the title channel with baseline still failing; both WhatsApp facts carried in superseded sources and `FEASIBLE_BY_ORDERING`; classification `107/14` pinned by test; enforcing admissibility plus five rejecting mutations; new baseline recorded (`26/121`); structural/margin/distinctness/mutation/privacy checks pass. | Restore fixtures/harness from `e209b5d`; test tooling only, no production effect. |
-| 1.3 | Model selection | Benchmark and select the bundled multilingual embedding and reranker pair plus chunk policy. | L | `worker-l` (`ses_fd06da77cffeQmAh22R2sPO3Fz`); first run `ses_fd65db999ffe5gwCX1YNm12F5w` | 1.2R, 1.3F, 1.3G | **Unblocked — final selection run next (Batch 7)** on the post-`1.3G` instrument. Retunes held-out constants from scratch; evaluates re-scoped gates; amendment-4 escalation applies if `pt-ref-sla-suporte` stays below rank 1. No production pair selected yet. | No production default changes before approval; remove benchmark artifacts. |
+| 1.3 | Model selection | Benchmark and select the bundled multilingual embedding and reranker pair plus chunk policy. | L | `worker-l` (`ses_fcaf0a683ffeJQbDb2utDAyIQW`); earlier runs `ses_fd06da77cffeQmAh22R2sPO3Fz`, `ses_fd65db999ffe5gwCX1YNm12F5w` | 1.2R, 1.3F, 1.3G | **Complete — pair selected (2026-08-24).** Amendment-5 retune with the five critical/pinned cases isolated earned fully disclosed constants; every Sprint 1 gate passes, including critical hydration `5/5`, critical facts `9/9`, critical retrieval-stage contamination `0/2`, citation precision `602/602`. Critical Recall@1 `2/5` is retained at 100% as a Sprint 3 release gate per the approved gate split. Selected: `e5-base-int8` + `mmarco-quint8`, int8 encoding, 1118.3 MiB in the approved band. | Revert the approved addendum and re-block `1.4`/`1.5`; no production default ships until Sprint 2. |
 | 1.4 | Vector backend | Benchmark exact search and, only if needed, a pure-Rust HNSW candidate at 250k scale. | L | Pending `worker-l` | 1.3 | Report selects exact or exact+ANN and demonstrates the architecture performance/RAM gates. | Benchmark-only dependency/code can be removed; no persisted format ships. |
 | 1.5 | Model supply chain | Implement the small bundle manifest and reproducible hash/license verification pipeline; reconcile Rust MSRV. | M | Pending `worker-l` | 1.3 | Valid artifacts pass; tampered/missing artifacts fail before packaging; toolchain contract is explicit and checked. | Remove additive manifest/fetch verification; no runtime behavior yet. |
 
@@ -1462,6 +1473,10 @@ with a retrieval rewrite that has no measured problem to solve.
 | 2026-08-24 | Forbid selecting constants by inspecting critical-case results, in this and every later run, and require constants disclosure beside every gate table. | A configuration that passes only because it was chosen on the gate makes the gate self-fulfilling and would retroactively invalidate the whole benchmark program. A gate result reported without its constants is not reviewable — `1.3G` omitted them while gating a case whose only positive channel may have carried zero weight. | Permit selection from the diagnostic passing set; keep constants disclosure optional. | User |
 | 2026-08-24 | Bound the final `1.3` run: if the retune still yields Critical Recall@1 `3/5`, stop and report rather than iterating further on the instrument. | Five instrument-side tasks have run (`1.2`, `1.2R`, `1.3F`, `1.3G`, and the final retune). `1.3F` and `1.3G` each found something real, but the remaining question is narrow enough to answer once; a `3/5` outcome is itself evidence that the passing region is not reachable from generalizable signal, and the resulting choice — gate split versus dated exception against Sprint 3 Task `3.6` — belongs to the user. | Allow further partition or objective iteration; permit a gate change inside the run. | User |
 | 2026-08-24 | Register single-turn query expansion as Sprint 3 Task `3.6` rather than adding it to Sprint 1. | It is the architecturally correct remedy for `pt-ref-chaves-acesso` and does not exist anywhere in this program — the implemented rewrite path is follow-up-only and `chaves` is single-turn. But it is a genuine architecture decision (hand-authored lexicon reintroduces the non-production `CONCEPT_LEXICON` pattern; LLM expansion puts a provider round-trip inside the retrieval path of a local-first product; pseudo-relevance feedback would likely drift toward the distractors that own the surface vocabulary), Sprint 1 excludes production retrieval behavior, and building it to fix a gate case then grading the models on that case repeats the overfitting problem one stage upstream. Sprint 3 already carries the query-variant plumbing. | Build expansion inside Sprint 1 alongside the final run; defer it without registering a task. | User |
+| 2026-08-24 | Resolve the documented stop by splitting the critical gate (option 1, refined), not by a dated exception (option 2). | The final run shows the raw bi-encoder ranking the expected meeting **first for four of the five critical cases** (only `chaves` at 4): the demotions come from fusion and meeting aggregation, which Sprint 3 Task 3.2 builds and tunes and which Sprint 1 cannot fix by choosing a different embedding pair. All five critical meetings sit inside the hydration window (ranks 1,1,2,3,2) with critical facts 9/9 and zero retrieval-stage contamination, so the product outcome is already correct and the residual failure is ordinal position. Option 2 was rejected on its own premise: query expansion addresses only `chaves`; `sla-suporte` and `nps-detrator` already have raw vector rank 1, so a Task `3.6`-contingent exception would expire unredeemed. | Option 2 (dated exception contingent on Task `3.6`); keep Recall@1 as a Sprint 1 gate and leave selection blocked; lower the threshold below 100%. | User |
+| 2026-08-24 | Approve `intfloat/multilingual-e5-base` (dynamic int8, 768-d, MIT) + `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` (quint8_avx2, Apache-2.0) with int8 vector storage as the production pair, at the earned constants `k=5, w_vector=1, w_lexical=0.5, alpha=0.5, beta=1, gamma=0`, support cap 3, chat depth 50, search depth 25, batch 1, ORT intra-op 4; chunk profile 384/64. | Every Sprint 1 gate passes under the split: critical hydration 5/5, critical facts 9/9, critical retrieval-stage contamination 0/2, pinned reference rank 1, exact-term 90/90, overall R@3 135/135, R@5 135/135, EV@10 209/209, semantic 30/30 vs 0/30 baseline, NDCG non-degraded, citation precision 602/602, RAM 1118.3 MiB inside the pre-approved band, reranker depth-50 cost 720 ms inside the 900 ms sub-budget. Constants are the held-out objective's output with the five critical/pinned cases never inspected. | Select the f32 reranker variant (reference-only, no quality gain); defer selection pending Sprint 3 fusion work. | User |
+| 2026-08-24 | Record the title dependence of the selected configuration in the architecture addendum. | The mandatory ablation shows reference-category Recall@1 falling 12/15 → 7/15 and overall MRR 0.9681 → 0.9451 when title scoring is removed, while semantic Recall@3 holds at 30/30. The embedding channel is independently strong, but reference-family gate performance is materially title-assisted and must not be attributed solely to the embedding model. | Report the tuned aggregate only and omit the dependence. | User |
+| 2026-08-24 | Accept final Task `1.3` as a documented-stop outcome; select no production pair and request the gate-split versus dated-exception decision. | Independent release rerun reproduces the amendment-5 tuning result: the five critical/pinned cases remain isolated, objective `[0,0,0,0,0,2166666]` earns `k=5`, `w_vector=1`, `w_lexical=0.5`, `alpha=0.5`, `beta=1`, `gamma=0`, yet Critical Recall@1 is `2/5`. The quint8 feasibility probe proves `78/2160` joint-passing configurations exist but the earned configuration lies outside them at strictly better held-out objective value; selecting a passing configuration by inspection remains forbidden. `pt-ref-sla-suporte` is explicit amendment-4 open item at rank 3. | Iterate the corpus/gates/partition/objective again; select from the passing set by inspecting critical outcomes; approve a pair despite the failed critical gate. | Main agent |
 
 ## Task Execution Log
 
@@ -1846,6 +1861,103 @@ are not edited; this entry records what later evidence changed about them.)
 - Follow-up owned by Sprint 3 Task `3.6`: single-turn query expansion, the
   architecturally correct remedy for `pt-ref-chaves-acesso`'s terminological
   gap, which no stage in this program currently implements.
+
+### 1.3 - Final model selection (amendment 5)
+
+**Status:** Complete - documented stop; no production pair selected
+**Owner:** `worker-l` (`ses_fcaf0a683ffeJQbDb2utDAyIQW`, `openrouter/stealth/ox-alpha`)
+**Completed:** 2026-08-24
+**Implemented:**
+- Applied amendment 5 only: tuning excludes precisely the five critical/pinned
+  cases and admits the ten non-critical reference-category siblings; two
+  regression tests pin the partition and the objective's lexicographic order.
+- Added the reference-category Recall@1 miss term after semantic misses and
+  before overall Recall@3 misses in both fusion and gamma tuning, with the full
+  objective key and all constants printed beside every gate table.
+- Extended the feasibility probe to compare the held-out-tuned configuration
+  against the full-corpus passing set without using that set for selection.
+- Produced `docs/hybrid-rag/task-1.3-final-selection.md`, including the clean
+  release latency reprobe, citation/source precision, title ablation, resource
+  evidence, candidate provenance, and explicit amendment-4 escalation.
+**Implementation:**
+- Files: `frontend/src-tauri/tests/model_benchmark.rs` and
+  `docs/hybrid-rag/task-1.3-final-selection.md`.
+- Approach: retune solely on the 115-case amendment-5 partition and grade the
+  isolated critical cases only after constants are earned.
+**Not implemented:**
+- No production model selection, corpus/gate/partition iteration beyond
+  amendment 5, production implementation, dependency change, or manifest
+  promotion.
+**Why not implemented:**
+- The earned production-candidate configuration fails Critical Recall@1 at
+  `2/5`; amendment 5 forbids selecting a diagnostic passing configuration by
+  inspection and requires a documented stop rather than another iteration.
+**Verification:**
+- Independent `cargo test --test model_benchmark` - pass, 11/11 including both amendment-5 regressions.
+- Independent `cargo test --test retrieval_evaluation` - pass, 6/6.
+- Independent release `hybrid_corpus_and_resource_benchmark` - pass; quint8
+  earned constants `k=5`, `w_vector=1`, `w_lexical=0.5`, `alpha=0.5`, `beta=1`,
+  `gamma=0`; objective `[0,0,0,0,0,2166666]`; Critical Recall@1 `2/5`,
+  retrieval-stage contamination `0/2`, citation precision `602/602`,
+  feasibility `78/2160`, tuned configuration outside the passing set.
+- Worker ran library suite (394 pass, 2 ignored), Cargo checks, formatter,
+  diff check, release RAM probe, and privacy/model-weight scan; all passed.
+**Rollback:**
+- Restore `frontend/src-tauri/tests/model_benchmark.rs` from `6bba48b` and
+  remove `docs/hybrid-rag/task-1.3-final-selection.md`. Production, corpus,
+  gates, manifest, and persisted data are unaffected.
+**Decisions and follow-ups:**
+- User decision required: split the critical gate or grant a dated exception
+  against Sprint 3 Task `3.6`; do not run another Sprint 1 instrument iteration.
+- `pt-ref-sla-suporte` remains an explicit amendment-4 open item (rank 3).
+
+### 1.3 - Amendment: critical-gate split and pair selection
+
+**Status:** Amendment (the final-selection entry above remains immutable and is
+not edited; this entry records the user decision that resolved its stop.)
+**Owner:** Main agent
+**Recorded:** 2026-08-24
+**Decision:**
+- The user resolved the documented stop by **splitting the critical gate**
+  (`architecture.md` amendment, approved 2026-08-24), not by a dated exception.
+  Critical *hydration-window membership* is the Sprint 1 model-selection gate
+  and passes `5/5`; critical *Recall@1* keeps its 100% threshold and becomes a
+  **Sprint 3 release gate**.
+- Sprint 3 debt is attributed by measured cause, not assigned wholesale:
+  `pt-ref-sla-suporte` (raw vector rank 1, fused rank 3) and
+  `pt-ref-nps-detrator` (raw vector rank 1, fused rank 2) belong to Task `3.2`
+  fusion/aggregation/reranking; `pt-ref-chaves-acesso` (raw vector rank 4,
+  terminological gap) belongs to Task `3.6` query expansion.
+- Option 2 was rejected on its premise: query expansion addresses only
+  `chaves`. The other two misses have raw vector rank 1, so a Task
+  `3.6`-contingent exception would have expired unredeemed.
+**Effect on the record:**
+- Task `1.3` status changes from *documented stop* to **Complete — pair
+  selected**. The selected pair, encoding, and constants are recorded in the
+  decision log above and require an `architecture.md` addendum before Sprint 2
+  implementation.
+- Tasks `1.4` and `1.5` are unblocked.
+- Critical Recall@1 `2/5` is not waived. It is re-measured at Sprint 3 close
+  and must pass before release.
+**Not changed:**
+- No corpus, gate threshold, tuned constant, partition, or objective was
+  altered by this decision. Nothing was selected by inspecting critical-case
+  results; the constants remain the held-out objective's output.
+**Follow-ups:**
+- Sprint 3 Task `3.2` inherits the critical Recall@1 release gate plus the
+  recorded finding that a lexicographic-minimizing objective is stricter than a
+  threshold gate; it must gate on thresholds and optimize inside the feasible
+  set.
+- Sprint 3 Task `3.6` inherits `pt-ref-chaves-acesso` and remains blocked on
+  the user's expansion-approach decision.
+- Unverified and stated as such: the feasibility probe checked only three
+  conditions for its 78 passing configurations (critical Recall@1, critical
+  retrieval-stage contamination, exact-term no-regression). Whether any of them
+  passes *every* gate was never evaluated, so no claim that a fully-passing
+  configuration exists is on the record.
+- The selected configuration's title dependence (reference-category Recall@1
+  12/15 at `beta=1` versus 7/15 at `beta=0`) must appear in the architecture
+  addendum.
 
 ### Task Entry Template
 
