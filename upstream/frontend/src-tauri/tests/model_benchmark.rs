@@ -45,7 +45,10 @@ mod corpus;
 mod corpus_types;
 
 use concept_lexicon::CONCEPT_LEXICON;
-use corpus_types::{EvaluationCase, Evidence, Language, Meeting, MeetingState, Scope, ScopeKind};
+use corpus_types::{
+    classify_forbidden_fact, EvaluationCase, Evidence, ForbiddenFactStage, Language, Meeting,
+    MeetingState, Scope, ScopeKind,
+};
 
 const MANIFEST_JSON: &str = include_str!("fixtures/model_bundle_manifest.json");
 const EVIDENCE_K: usize = 10;
@@ -1724,6 +1727,10 @@ struct HybridCaseMetrics {
     fact_total: usize,
     forbidden_hits: usize,
     forbidden_total: usize,
+    retrieval_forbidden_hits: usize,
+    retrieval_forbidden_total: usize,
+    answer_forbidden_hits: usize,
+    answer_forbidden_total: usize,
     ndcg10_final: f64,
     ndcg10_fused: f64,
     pairwise_correct: usize,
@@ -1873,9 +1880,20 @@ fn score_case_hybrid(
         }
     }
     for fact in &case.forbidden_facts {
+        let classification =
+            classify_forbidden_fact(case, fact).expect("forbidden fact carrier classification");
+        let hit = retained_text.contains(&fact.to_lowercase());
         m.forbidden_total += 1;
-        if retained_text.contains(&fact.to_lowercase()) {
-            m.forbidden_hits += 1;
+        m.forbidden_hits += usize::from(hit);
+        match classification.stage {
+            ForbiddenFactStage::Retrieval => {
+                m.retrieval_forbidden_total += 1;
+                m.retrieval_forbidden_hits += usize::from(hit);
+            }
+            ForbiddenFactStage::Answer => {
+                m.answer_forbidden_total += 1;
+                m.answer_forbidden_hits += usize::from(hit);
+            }
         }
     }
     m.ndcg10_final = ndcg_at_10(case, final_order, entries);
@@ -2242,6 +2260,80 @@ fn case_production_channel_margins(case: &EvaluationCase, policy: &PolicyLite) -
     )
 }
 
+fn enforce_rank1_admissibility(
+    case: &EvaluationCase,
+    lexical_margin: f64,
+    title_margin: f64,
+    vector_meeting_rank: usize,
+) -> Result<(), String> {
+    if lexical_margin > 0.0 || title_margin > 0.0 || vector_meeting_rank == 1 {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} has no positive lexical/title/raw-vector rank-1 production channel",
+            case.id
+        ))
+    }
+}
+
+fn print_forbidden_fact_classifications(cases: &[EvaluationCase]) {
+    let (mut retrieval, mut answer) = (0, 0);
+    for case in cases {
+        for fact in &case.forbidden_facts {
+            let classification =
+                classify_forbidden_fact(case, fact).expect("fixture-derived carrier state");
+            match classification.stage {
+                ForbiddenFactStage::Retrieval => retrieval += 1,
+                ForbiddenFactStage::Answer => answer += 1,
+            }
+            println!(
+                "[forbidden-classification] case={} fact={fact:?} stage={} carriers=[{}]",
+                case.id,
+                classification.stage.label(),
+                classification
+                    .carriers
+                    .iter()
+                    .map(|carrier| format!(
+                        "{}/{}:{}",
+                        carrier.meeting_id,
+                        carrier.evidence_id,
+                        carrier.state.label()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
+    }
+    println!(
+        "[forbidden-classification-counts] retrieval-stage={retrieval}/{} answer-stage-deferred={answer}/{} total={}/{}",
+        retrieval + answer,
+        retrieval + answer,
+        retrieval + answer,
+        retrieval + answer
+    );
+}
+
+#[test]
+fn rank1_admissibility_rejects_a_no_positive_channel_mutation() {
+    let mut cases = corpus::cases();
+    let policy = policy_lite();
+    let case = cases
+        .iter_mut()
+        .find(|case| case.id == "pt-ref-chaves-acesso")
+        .expect("chaves case");
+    let (lexical, title) = case_production_channel_margins(case, &policy);
+    enforce_rank1_admissibility(case, lexical, title, 2)
+        .expect("patched corpus surface has a positive production channel");
+
+    case.meetings
+        .iter_mut()
+        .find(|meeting| case.expected_meeting_ids.contains(&meeting.id))
+        .expect("target meeting")
+        .title = "Segurança de acesso — políticas de credenciais".to_string();
+    let (lexical, title) = case_production_channel_margins(case, &policy);
+    assert!(enforce_rank1_admissibility(case, lexical, title, 2).is_err());
+}
+
 /// Raw bi-encoder ranks under the identical scoring run_case uses (best cosine
 /// over query variants, deterministic tie-break), before any fusion: rank of
 /// the best-ranked expected-meeting document and of the best-ranked required-
@@ -2559,6 +2651,8 @@ struct CorpusMetrics {
     ev10: (usize, usize),
     facts: (usize, usize),
     forbidden: (usize, usize),
+    retrieval_forbidden: (usize, usize),
+    answer_forbidden: (usize, usize),
     ndcg_final_sum: f64,
     ndcg_fused_sum: f64,
     ndcg_cases: usize,
@@ -2592,6 +2686,10 @@ impl CorpusMetrics {
         self.facts.1 += out.metrics.fact_total;
         self.forbidden.0 += out.metrics.forbidden_hits;
         self.forbidden.1 += out.metrics.forbidden_total;
+        self.retrieval_forbidden.0 += out.metrics.retrieval_forbidden_hits;
+        self.retrieval_forbidden.1 += out.metrics.retrieval_forbidden_total;
+        self.answer_forbidden.0 += out.metrics.answer_forbidden_hits;
+        self.answer_forbidden.1 += out.metrics.answer_forbidden_total;
         self.ndcg_final_sum += out.metrics.ndcg10_final;
         self.ndcg_fused_sum += out.metrics.ndcg10_fused;
         self.ndcg_cases += 1;
@@ -2628,9 +2726,20 @@ fn score_rows_baseline(case: &EvaluationCase, rows: &[LexRow]) -> HybridCaseMetr
         }
     }
     for fact in &case.forbidden_facts {
+        let classification =
+            classify_forbidden_fact(case, fact).expect("forbidden fact carrier classification");
+        let hit = retained_text.contains(&fact.to_lowercase());
         m.forbidden_total += 1;
-        if retained_text.contains(&fact.to_lowercase()) {
-            m.forbidden_hits += 1;
+        m.forbidden_hits += usize::from(hit);
+        match classification.stage {
+            ForbiddenFactStage::Retrieval => {
+                m.retrieval_forbidden_total += 1;
+                m.retrieval_forbidden_hits += usize::from(hit);
+            }
+            ForbiddenFactStage::Answer => {
+                m.answer_forbidden_total += 1;
+                m.answer_forbidden_hits += usize::from(hit);
+            }
         }
     }
     m
@@ -2808,7 +2917,7 @@ fn constants_feasibility_probe(
                                                 .is_some_and(|r| *r == 1),
                                         );
                                     }
-                                    crit_forbidden += out.metrics.forbidden_hits;
+                                    crit_forbidden += out.metrics.retrieval_forbidden_hits;
                                 }
                                 if case.categories.iter().any(|v| v == "exact_term") {
                                     for mid in &case.expected_meeting_ids {
@@ -2842,7 +2951,7 @@ fn constants_feasibility_probe(
         }
     }
     println!(
-        "[feasibility {label}] configurations passing Critical Recall@1 {}/{} + critical forbidden 0 + exact-term no-regression: {pass_count}/{total}",
+        "[feasibility {label}] configurations passing Critical Recall@1 {}/{} + critical retrieval-stage forbidden 0 + exact-term no-regression: {pass_count}/{total}",
         5, 5
     );
     for example in &examples {
@@ -2867,6 +2976,7 @@ async fn hybrid_corpus_and_resource_benchmark() {
     let cases = corpus::cases();
     assert_eq!(cases.len(), 120, "Task 1.2 corpus floor");
     let pol = policy_lite();
+    print_forbidden_fact_classifications(&cases);
 
     println!("=== Task 1.3 hybrid corpus + resource benchmark ===");
     println!(
@@ -3164,6 +3274,8 @@ async fn hybrid_corpus_and_resource_benchmark() {
                 }
                 let (lex_m, title_m) = case_production_channel_margins(case, &pol);
                 let (m_rank, e_rank) = raw_vector_ranks(&fam_docs[ci], case);
+                enforce_rank1_admissibility(case, lex_m, title_m, m_rank)
+                    .expect("critical rank-1 gate admissibility");
                 println!(
                     "  case={:40} lexical={lex_m:+.3} title={title_m:+.3} vector_rank(mtg/ev)={}/{} any_positive_channel={}",
                     case.id,
@@ -3196,11 +3308,16 @@ async fn hybrid_corpus_and_resource_benchmark() {
             .map(|f| format!("{}[{:.3}]", f.label, f.mrr))
             .collect::<Vec<_>>()
     );
-    let best_r3 = family_results[0].r3.0;
+    let best_r3 = family_results
+        .iter()
+        .filter(|family| family.metadata_conforming)
+        .map(|family| family.r3.0)
+        .max()
+        .expect("metadata-conforming embedding family");
     let eval_index = family_results
         .iter()
         .enumerate()
-        .filter(|(_, f)| f.r3.0 == best_r3)
+        .filter(|(_, family)| family.metadata_conforming && family.r3.0 == best_r3)
         .min_by_key(|(_, f)| f.dims)
         .map(|(i, _)| i)
         .unwrap_or(0);
@@ -3801,6 +3918,14 @@ async fn hybrid_corpus_and_resource_benchmark() {
             pct(cm_all.forbidden.0, cm_all.forbidden.1)
         );
         println!(
+            "forbidden by stage: retrieval-stage {} | answer-stage context presence {} (informational; not evaluated/gated in Sprint 1)",
+            pct(
+                cm_all.retrieval_forbidden.0,
+                cm_all.retrieval_forbidden.1
+            ),
+            pct(cm_all.answer_forbidden.0, cm_all.answer_forbidden.1)
+        );
+        println!(
             "pt:      R@1 {} R@3 {} R@5 {}",
             pct(cm_pt.r1.0, cm_pt.r1.1),
             pct(cm_pt.r3.0, cm_pt.r3.1),
@@ -3820,8 +3945,16 @@ async fn hybrid_corpus_and_resource_benchmark() {
             bs_d
         );
         println!(
-            "critical: R@1 {} | pairwise accuracy: {}",
+            "critical: R@1 {} | retrieval-stage forbidden {} | answer-stage context presence {} (informational; not evaluated/gated in Sprint 1) | pairwise accuracy: {}",
             pct(cm_critical.r1.0, cm_critical.r1.1),
+            pct(
+                cm_critical.retrieval_forbidden.0,
+                cm_critical.retrieval_forbidden.1
+            ),
+            pct(
+                cm_critical.answer_forbidden.0,
+                cm_critical.answer_forbidden.1
+            ),
             pct(cm_all.pairwise_correct, cm_all.pairwise_total)
         );
         println!(
@@ -3845,10 +3978,10 @@ async fn hybrid_corpus_and_resource_benchmark() {
         // Gates for this pair.
         let g_ref = ref_rank == 1
             && ref_out.metrics.fact_hits == ref_out.metrics.fact_total
-            && ref_out.metrics.forbidden_hits == 0;
+            && ref_out.metrics.retrieval_forbidden_hits == 0;
         let g_crit = cm_critical.r1.0 == cm_critical.r1.1;
         let g_crit_facts = cm_critical.facts.0 == cm_critical.facts.1;
-        let g_crit_forbidden = cm_critical.forbidden.0 == 0;
+        let g_crit_forbidden = cm_critical.retrieval_forbidden.0 == 0;
         let g_exact =
             cm_exact.r3.0 as f64 / cm_exact.r3.1.max(1) as f64 >= be_n as f64 / be_d.max(1) as f64;
         let g_r3 = cm_all.r3.0 as f64 / cm_all.r3.1 as f64 >= 0.95;
@@ -3860,12 +3993,12 @@ async fn hybrid_corpus_and_resource_benchmark() {
 
         println!("--- pair quality gates ---");
         println!(
-            "[gate {}] Reference Recall@1: rank {ref_rank}, facts {}/{}, forbidden {}/{}",
+            "[gate {}] Reference Recall@1: rank {ref_rank}, facts {}/{}, retrieval-stage forbidden {}/{}",
             if g_ref { "PASS" } else { "FAIL" },
             ref_out.metrics.fact_hits,
             ref_out.metrics.fact_total,
-            ref_out.metrics.forbidden_hits,
-            ref_out.metrics.forbidden_total
+            ref_out.metrics.retrieval_forbidden_hits,
+            ref_out.metrics.retrieval_forbidden_total
         );
         println!(
             "[gate {}] Critical Recall@1: {}",
@@ -3878,9 +4011,19 @@ async fn hybrid_corpus_and_resource_benchmark() {
             pct(cm_critical.facts.0, cm_critical.facts.1)
         );
         println!(
-            "[gate {}] Critical forbidden contamination = 0: {}",
+            "[gate {}] Critical retrieval-stage forbidden contamination = 0: {}",
             if g_crit_forbidden { "PASS" } else { "FAIL" },
-            pct(cm_critical.forbidden.0, cm_critical.forbidden.1)
+            pct(
+                cm_critical.retrieval_forbidden.0,
+                cm_critical.retrieval_forbidden.1
+            )
+        );
+        println!(
+            "[deferred:not-evaluated] Critical answer-stage non-assertion: context presence only {} (Sprint 1 does not evaluate or gate generated answers)",
+            pct(
+                cm_critical.answer_forbidden.0,
+                cm_critical.answer_forbidden.1
+            )
         );
         println!(
             "[gate {}] Exact-term no-regression: {}",
@@ -4058,18 +4201,25 @@ async fn hybrid_corpus_and_resource_benchmark() {
             cand.ram_delta_mib
         ));
         pair_reports.push(format!(
-            "  gates: reference-rank+facts+forbidden {} (rank {ref_rank}, facts {}/{}, forbidden {}/{} at beta {best_beta}) | critical-R@1 {} {} | critical-facts=100% {} {} | critical-forbidden=0 {} {} | exact-no-regression {} {} >= baseline {}/{} | overall-R@3 {} {} | overall-R@5 {} {} | EV@10 {} {} | semantic-delta {} {} vs baseline {}/{} | NDCG {} {:.4} vs fused {:.4}",
+            "  gates: reference-rank+facts+retrieval-forbidden {} (rank {ref_rank}, facts {}/{}, retrieval-forbidden {}/{} at beta {best_beta}) | critical-R@1 {} {} | critical-facts=100% {} {} | critical-retrieval-forbidden=0 {} {} | answer-stage context presence DEFERRED_NOT_EVALUATED {} | exact-no-regression {} {} >= baseline {}/{} | overall-R@3 {} {} | overall-R@5 {} {} | EV@10 {} {} | semantic-delta {} {} vs baseline {}/{} | NDCG {} {:.4} vs fused {:.4}",
             if g_ref { "PASS" } else { "FAIL" },
             ref_out.metrics.fact_hits,
             ref_out.metrics.fact_total,
-            ref_out.metrics.forbidden_hits,
-            ref_out.metrics.forbidden_total,
+            ref_out.metrics.retrieval_forbidden_hits,
+            ref_out.metrics.retrieval_forbidden_total,
             if g_crit { "PASS" } else { "FAIL" },
             pct(cm_critical.r1.0, cm_critical.r1.1),
             if g_crit_facts { "PASS" } else { "FAIL" },
             pct(cm_critical.facts.0, cm_critical.facts.1),
             if g_crit_forbidden { "PASS" } else { "FAIL" },
-            pct(cm_critical.forbidden.0, cm_critical.forbidden.1),
+            pct(
+                cm_critical.retrieval_forbidden.0,
+                cm_critical.retrieval_forbidden.1
+            ),
+            pct(
+                cm_critical.answer_forbidden.0,
+                cm_critical.answer_forbidden.1
+            ),
             if g_exact { "PASS" } else { "FAIL" },
             pct(cm_exact.r3.0, cm_exact.r3.1),
             be_n,

@@ -30,7 +30,7 @@
     "mrrMicros": 695833,
     "evidenceRecallAt10": { "numerator": 181, "denominator": 209 },
     "factCoverage": { "numerator": 130, "denominator": 149 },
-    "forbiddenContamination": { "numerator": 25, "denominator": 121 },
+    "forbiddenContamination": { "numerator": 26, "denominator": 121 },
     "sourcePrecision": { "numerator": 471, "denominator": 471 }
   }
 }

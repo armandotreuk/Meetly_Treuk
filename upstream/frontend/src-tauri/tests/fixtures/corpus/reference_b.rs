@@ -15,7 +15,7 @@ fn chaves_acesso() -> EvaluationCase {
     sibling_case(
         "pt-ref-chaves-acesso",
         "quando trocar as chaves de acesso dos ambientes?",
-        "Segurança de acesso — políticas de credenciais",
+        "Governança de chaves em ambientes — controle de acesso",
         "2026-07-21",
         Some("plataforma"),
         ScopeKind::All,

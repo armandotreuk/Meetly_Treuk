@@ -10,9 +10,24 @@ gate is unachievable as staged and one rank-1 case is unachievable as authored.
 **On 2026-08-24 the user resolved category (c) with the hybrid remedy** (corpus
 patches for `pt-ref-chaves-acesso` and the two vacuous WhatsApp forbidden
 facts; carrier-source-state re-scope of the contamination gate, recorded as an
-approved `architecture.md` amendment). **Task `1.3G` implements that decision
-and is the next dispatch (Batch 6); the final Task `1.3` run follows it.**
-Task `1.1` is unaffected; Tasks `1.4` and `1.5` remain blocked on `1.3`.
+approved `architecture.md` amendment). **Batch 6 Task `1.3G` completed
+independent verification on 2026-08-24**: both corpus surfaces are patched with
+all four proof families asserted by the harness, the re-scoped gate is enforced,
+the baseline is re-recorded, and every critical case now has a positive
+production-implementable rank-1 channel with a feasible retrieval-stage
+contamination gate.
+
+**The instrument is now closed and the remaining gap is constant selection, not
+capability.** `1.3G`'s feasibility probe measures **79/2160** (mmarco-f32) and
+**78/2160** (mmarco-quint8) configurations of the existing e5-base-int8 pair
+that jointly pass Critical Recall@1 `5/5`, critical retrieval-stage
+contamination `0`, and exact-term no-regression — up from `0/2160` at `1.3F`.
+The held-out objective selects a configuration scoring `3/5` because none of
+those cases, nor any case exercising their failure modes, is visible to it.
+**The final Task `1.3` selection run (Batch 7) is next**, amended to correct
+that blindness; the amendment-4 escalation rule for `pt-ref-sla-suporte`
+applies at its retune. Task `1.1` is unaffected; Tasks `1.4` and `1.5` remain
+blocked on `1.3`.
 
 Task `1.3`'s *resource* findings survive and are retained — admissibility
 arithmetic, measured pair RAM, derived disk, per-pair reranker latency,
@@ -98,6 +113,65 @@ admissibility check turning positive while the FTS baseline still fails;
 (4) `pt-ref-sla-suporte` stays category (b) and escalates back to the user if
 the final held-out retune still lands it below rank 1. Task `1.3G` implements
 (1)-(3) plus the baseline re-record and baseline-harness alignment.
+
+### What Task 1.3G established, and the one remaining gap (2026-08-24)
+
+Verified independently by the orchestrator (corpus diff is exactly three
+content lines across the two approved surfaces; `retrieval_evaluation` passes
+6/6 including both new mutation tests):
+
+- Both WhatsApp forbidden facts now have real carriers in *neighbour* meetings
+  as explicitly superseded drafts, and the case reports
+  `FEASIBLE_BY_ORDERING` with `forbidden_bearing_docs=0`. Amendment 2 holds:
+  no new trapped carrier was created.
+- The re-scoped contamination gate is falsifiable and does real work: the FTS
+  baseline fails it at `17/107` while the hybrid pipeline reaches `1/107`
+  overall and `0/2` on criticals.
+- The baseline re-record moves exactly one numerator (`25/121` → `26/121`),
+  attributed to the one new carrier reaching retained context; the chaves
+  title is FTS-invisible and deleted-row alignment measured inert (`15/15`).
+- Every critical case now has a positive production-implementable rank-1
+  channel, and admissibility is enforcing rather than report-only.
+
+**The remaining gap is the tuning objective, not the models.** The held-out
+partition (`model_benchmark.rs` `tune_idx`) excludes all 15 reference-category
+cases plus every critical case, and the objective's four terms — exact-term
+violations, semantic Recall@3 misses, overall Recall@3 misses, MRR — contain
+no term that rewards solving a terminological-gap, stale-version, or
+cross-section case. The tuner therefore optimizes on a distribution from which
+the phenomena the critical gates measure have been removed, and is then graded
+on them. With 78-79 configurations of the same pair passing every gate
+jointly, the passing region demonstrably exists and the objective cannot see
+it. The final `1.3` run is amended accordingly (see its "Final-run amendments
+(2026-08-24, post-`1.3G`)").
+
+Four items recorded for the register, none blocking:
+
+1. The `1.3G` report omits the tuned constants. Because chaves's only positive
+   production channel is `title` and `1.3F` tuned `title_beta` to `0`, the run
+   may have gated a case on a channel the fused configuration switched off.
+   The final run MUST print `k`, `w_vector`, `w_lexical`, `alpha`, `beta`, and
+   per-candidate `gamma` beside the gate table.
+2. `0/2160` → `79/2160` is not attributable to the corpus patch alone: the
+   probe's gate definition also changed (all-facts `0/6` → retrieval-stage
+   `0/2`). The two figures are not directly comparable.
+3. 74 of the 107 retrieval-stage forbidden facts have no fixture carrier at
+   all — the same vacuity `1.3F` found, fixed only for the two critical facts
+   that were in the approved scope. Percentage forms of retrieval-stage
+   contamination are therefore diluted and must not be read as rates; the
+   critical gate is count-based and unaffected.
+4. `1.3G` added a `metadata_conforming` filter to embedding-family selection.
+   It formalizes existing intent (paraphrase-MiniLM's max-seq 128 was already
+   non-conforming) and is correct, but it was not in the `1.3G` specification.
+
+Recorded plainly: the chaves title now carries three of the question's content
+terms, so that case's discriminating signal is title-token overlap rather than
+semantic bridging. The terminological gap survives where it is documented (the
+evidence text: *trocar/chaves* versus *rotação/credenciais*) and baseline
+falsifiability is intact because titles are not FTS-indexed, but the case
+tests something narrower than it did. The architecturally correct remedy —
+single-turn query expansion — does not exist anywhere in this program and is
+registered as Sprint 3 Task `3.6`.
 
 ### Why the first Task 1.3 run blocked (corpus defect, resolved by 1.2R)
 
@@ -250,8 +324,8 @@ reviews use the standard configured `reviewer` and `arch-reviewer`.
 | 1.2 | Evaluation | Add a private-safe multilingual corpus, deterministic metrics, baseline runner, and the reference regression. | M | `worker-l` (`ses_fd69041d9ffe3Prh5s1KjcPHNL`) | None | **Superseded by `1.2R`:** harness and metrics retained; generated corpus and recorded baseline void. | Test/fixture tooling only; remove without production effect. |
 | 1.2R | Evaluation | Re-author the corpus as materially distinct hand-written cases; add the solvability invariant and its harness assertion. | M | `worker-l` (`ses_fd317c5a5ffe20snhqLcOtBV3h`) | 1.2 | Passed: 120-case solvable corpus, answer-key-free structural checks, supervised raw-text margins, deterministic baseline, privacy scan, compatibility tests, rustfmt, Cargo check, and diff check. Baseline awaits user approval before `1.3`. | Restore the prior corpus/harness; test tooling only, no production effect. |
 | 1.3F | Gate closure | Audit harness fidelity against the architecture pipeline, prove or refute gate admissibility for the failing critical gates, add citation-precision simulation, and deliver a per-blocker verdict table. | L | `worker-l` (`ses_fce6f62e3ffekuqxK1x52fEwoT`) | 1.2R, 1.3 rerun evidence | **Passed:** all five deliverables, constructive admissibility report, production-typed citation precision `602/602` for pairs B/C, falsifiability mutation, `0/2160` feasibility result, privacy and boundary checks. | Tests/evidence only; restore committed `tests/` state; no production effect. |
-| 1.3G | Corpus patch + gate re-scope | Implement the 2026-08-24 category (c) decision: patch `pt-ref-chaves-acesso` and the two vacuous WhatsApp forbidden carriers; re-scope critical contamination by carrier source state; promote the admissibility invariant to enforcing for retrieval-stage facts; re-record the baseline and align the baseline harness. | M | Pending `worker-l` | 1.3F | Rank-1 admissibility positive for `chaves-acesso` on a production channel with baseline still failing; both WhatsApp facts carried and `FEASIBLE_BY_ORDERING`; re-scoped gate admissible everywhere; new baseline recorded with denominators; structural/margin/distinctness/mutation/privacy checks pass. | Restore fixtures/harness from the pre-`1.3G` commit; test tooling only, no production effect. |
-| 1.3 | Model selection | Benchmark and select the bundled multilingual embedding and reranker pair plus chunk policy. | L | `worker-l` (`ses_fd06da77cffeQmAh22R2sPO3Fz`); first run `ses_fd65db999ffe5gwCX1YNm12F5w` | 1.2R, 1.3F, 1.3G | **Blocked — final selection run pending `1.3G`.** Category (c) is user-resolved (hybrid remedy); the final run retains category (a) fixes, retunes held-out constants, and evaluates the re-scoped gates. No production pair selected yet. | No production default changes before approval; remove benchmark artifacts. |
+| 1.3G | Corpus patch + gate re-scope | Implement the 2026-08-24 category (c) decision: patch `pt-ref-chaves-acesso` and the two vacuous WhatsApp forbidden carriers; re-scope critical contamination by carrier source state; promote the admissibility invariant to enforcing for retrieval-stage facts; re-record the baseline and align the baseline harness. | M | `worker-l` (primary `ses_fcbf894c0ffe0XwFSDMSavxqDj`; residual fix `ses_fcb41049cffefT5nm7rG3j6sNE`) | 1.3F | **Passed:** rank-1 admissibility positive for `chaves-acesso` on the title channel with baseline still failing; both WhatsApp facts carried in superseded sources and `FEASIBLE_BY_ORDERING`; classification `107/14` pinned by test; enforcing admissibility plus five rejecting mutations; new baseline recorded (`26/121`); structural/margin/distinctness/mutation/privacy checks pass. | Restore fixtures/harness from `e209b5d`; test tooling only, no production effect. |
+| 1.3 | Model selection | Benchmark and select the bundled multilingual embedding and reranker pair plus chunk policy. | L | `worker-l` (`ses_fd06da77cffeQmAh22R2sPO3Fz`); first run `ses_fd65db999ffe5gwCX1YNm12F5w` | 1.2R, 1.3F, 1.3G | **Unblocked — final selection run next (Batch 7)** on the post-`1.3G` instrument. Retunes held-out constants from scratch; evaluates re-scoped gates; amendment-4 escalation applies if `pt-ref-sla-suporte` stays below rank 1. No production pair selected yet. | No production default changes before approval; remove benchmark artifacts. |
 | 1.4 | Vector backend | Benchmark exact search and, only if needed, a pure-Rust HNSW candidate at 250k scale. | L | Pending `worker-l` | 1.3 | Report selects exact or exact+ANN and demonstrates the architecture performance/RAM gates. | Benchmark-only dependency/code can be removed; no persisted format ships. |
 | 1.5 | Model supply chain | Implement the small bundle manifest and reproducible hash/license verification pipeline; reconcile Rust MSRV. | M | Pending `worker-l` | 1.3 | Valid artifacts pass; tampered/missing artifacts fail before packaging; toolchain contract is explicit and checked. | Remove additive manifest/fetch verification; no runtime behavior yet. |
 
@@ -926,6 +1000,44 @@ resolving it.
   user — it is not a silent gate failure and not a reason to touch the corpus
   or constants outside the held-out objective.
 
+**Final-run amendments (2026-08-24, post-`1.3G`) — amendment 5:**
+
+`1.3G` proved the gates reachable by this pair (78-79 of 2160 configurations
+pass jointly) while the held-out objective selects a `3/5` configuration. The
+cause is a distribution-shifted split, not model capability. The final run
+therefore changes the tuning partition and objective, and nothing else:
+
+- **Partition.** Admit the **10 non-critical reference-category cases** into
+  the held-out tuning partition. The 5 designated critical/pinned cases
+  (`fixture-whatsapp-retention`, `pt-ref-cobranca-regua`,
+  `pt-ref-chaves-acesso`, `pt-ref-sla-suporte`, `pt-ref-nps-detrator`) remain
+  fully isolated and MUST NOT be inspected by any tuning path. The current
+  filter excludes every case carrying the `reference_whatsapp` category; it
+  must exclude only `critical` cases and the pinned reference case.
+- **Objective.** Add a reference-category Recall@1 miss term over those 10
+  admitted cases, ranked after semantic misses and before overall Recall@3
+  misses. Record the full lexicographic key in the report.
+- **Rationale to carry into the report.** This trades a small reduction in the
+  gate's independence — the admitted cases are structural siblings of the gate
+  cases — for a train/test split drawn from the same distribution, which is
+  the sound arrangement. Selecting constants by inspecting critical-case
+  results remains forbidden: a configuration that passes only because it was
+  chosen on the gate is overfitting, and would retroactively invalidate the
+  benchmark.
+- **Mandatory constants disclosure.** Print `k`, `w_vector`, `w_lexical`,
+  `alpha`, `beta`, and per-candidate `gamma` beside every gate table, plus the
+  objective vector of the winning configuration. A gate result reported
+  without its constants is not reviewable.
+- **Feasibility corroboration.** Re-run the diagnostic probe and report both
+  the passing-configuration count and whether the tuned configuration falls
+  inside the passing set. If it does not, state the objective distance between
+  them.
+- **If the retune still yields `3/5`:** stop and report. Do not adjust the
+  partition again, do not select from the passing set by inspection, and do
+  not weaken a gate. That outcome is evidence that the passing region is not
+  reachable from generalizable signal, and the decision — gate split versus
+  dated exception against Sprint 3 Task `3.6` — belongs to the user.
+
 Re-staging note: artifacts were staged to `%TEMP%\opencode\meetly-task13\models`
 and have likely been cleared. Re-stage from the pinned revisions and hashes in
 the manifest before rerunning.
@@ -1341,8 +1453,15 @@ with a retrieval rewrite that has no measured problem to solve.
 | 2026-08-24 | Accept Task `1.3F` as complete evidence and keep the final Task `1.3` run blocked for a user decision on category (c). | Independent checks pass; citation precision and two fidelity findings are closed, but `pt-ref-chaves-acesso` has no production-implementable rank-1 channel and the critical contamination gate is unachievable as staged. Running selection before choosing corpus patches or gate re-staging would knowingly benchmark against an impossible instrument. | Rerun selection with the impossible gates; patch the corpus or gates without user approval; treat all findings as model failures. | Main agent |
 | 2026-08-24 | Resolve category (c) with the hybrid remedy: patch `pt-ref-chaves-acesso` and the two vacuous WhatsApp carriers; re-scope the contamination gate by carrier source state. | Requiring retrieval to erase a current note inside the correct meeting asks the wrong layer to censor authoritative content — hydration includes current notes wholesale by design, and the recorded production failure was an *answer* asserting the wrong value. Corpus-only patching would sanitize the realistic contradictory-notes structure the corpus exists to reproduce; gate-restaging-only would abandon rank-1 where evidence shows it achievable (4/5 post-fix) and leave two facts measuring nothing. | Option 2 (corpus patches only); option 3 (gate re-staging only); keep the gates as staged and accept a permanently blocked program. | User |
 | 2026-08-24 | Bind four amendments to the hybrid remedy. | (1) Retrieval keeps a real contamination gate over superseded/stale/deleted carriers — achievable and already measured (30/121 → 15/121 when the stale path closed); the answer-stage non-assertion gate is defined now, measured only when an answer pipeline exists (Sprint 3/4), and Sprint 1 may not claim it. (2) New WhatsApp carriers go in superseded/neighbour sources so the patch cannot recreate the trapped-carrier structure. (3) The `chaves-acesso` patch keeps its terminological gap and is accepted only when the production-channel rank-1 admissibility check turns positive with the baseline still failing. (4) `pt-ref-sla-suporte` stays category (b) and escalates to the user if the final retune leaves it below rank 1. | Adopt the remedy without proof obligations; patch `sla-suporte` too; drop the retrieval-stage half of the gate entirely. | User |
+| 2026-08-24 | Reroute the Batch 6 worker to the same Ox Alpha model via `openrouter/stealth/ox-alpha` after `opencode-go` returned provider `Insufficient balance` for the fresh `1.3G` dispatch. | This is a transport change preserving the model pin, not a fallback; the alternative was pausing Sprint 1 on billing. The route completed the residual classifier correction successfully this time (unlike its empty-output failure during Batch 4). | Keep retrying the unavailable `opencode-go` endpoint; substitute another model. | User |
+| 2026-08-24 | Accept Task `1.3G` as complete and unblock the final Task `1.3` selection run. | Independent reruns pass (`retrieval_evaluation` 6/6, `model_benchmark` 9/9), the corpus-content diff touches exactly the two approved surfaces (three content lines), all four proof families are harness assertions with rejecting mutations, the re-scoped critical contamination gate passes `0/2`, and every critical case has a positive production-implementable rank-1 channel. Remaining critical-rank misses are model/aggregation evidence owned by the final run. | Keep `1.3` blocked despite the closed instrument; reopen the corpus decision; accept the patch without independent verification. | Main agent |
 | 2026-08-24 | Approve the `architecture.md` amendments: carrier-source-state gate re-scope, answer-stage non-assertion row, gate-admissibility requirement, and the Corpus Solvability admissibility bullet. | Gate definitions live in `architecture.md` and require user approval to change; the admissibility requirement generalizes the lesson that consumed two L-sized benchmark tasks — a zero-tolerance gate without an existence proof on production-implementable channels is an unfalsifiable trap, not a gate. | Record the re-scope only in this sprint document; leave admissibility as a sprint convention rather than an architecture invariant. | User |
 | 2026-08-24 | Add Task `1.3G` (M) as a hard blocker for the final `1.3` selection run, and fold the baseline re-record plus baseline-harness deleted-row alignment into it. | The remedy changes corpus content and a gate definition, so every figure the final run produces must come from the post-patch instrument and its re-recorded baseline; the `1.3F` spillover alignment rides along because the re-record unpins the frozen numbers. | Fold the patch into the final `1.3` run itself; dispatch the alignment separately; skip re-recording the baseline. | User |
+| 2026-08-24 | Accept Task `1.3G` after orchestrator verification, and record four non-blocking register items. | The corpus diff is three content lines on the two approved surfaces, `retrieval_evaluation` passes 6/6 independently, the re-scoped gate is falsifiable (baseline `17/107` fails, hybrid `1/107`), and the baseline moved by exactly one attributable numerator. The register items — undisclosed tuned constants, the non-comparable `0`→`79/2160` figures, 74 carrierless facts diluting percentages, and the unspecified `metadata_conforming` filter — affect reporting and interpretation, not correctness. | Reject for the unspecified family filter; require a further corpus pass for the carrierless facts. | User |
+| 2026-08-24 | Amend the final `1.3` run (amendment 5): admit the 10 non-critical reference-category cases into the held-out tuning partition and add a reference-category Recall@1 term to the objective; keep the 5 critical/pinned cases fully isolated. | `1.3G` measures `78-79/2160` configurations of the existing pair passing every gate jointly while the tuned configuration scores `3/5`. The partition excludes all 15 reference cases and the objective has no term for gap-type retrieval, so the tuner optimizes on a distribution with the graded phenomena removed. Admitting non-gate siblings converts a distribution-shifted split into a same-distribution one; the 5 designated cases stay isolated. | Select constants from the passing set by inspection (overfitting on the gate); change nothing and accept `3/5`; benchmark a larger embedding model. | User |
+| 2026-08-24 | Forbid selecting constants by inspecting critical-case results, in this and every later run, and require constants disclosure beside every gate table. | A configuration that passes only because it was chosen on the gate makes the gate self-fulfilling and would retroactively invalidate the whole benchmark program. A gate result reported without its constants is not reviewable — `1.3G` omitted them while gating a case whose only positive channel may have carried zero weight. | Permit selection from the diagnostic passing set; keep constants disclosure optional. | User |
+| 2026-08-24 | Bound the final `1.3` run: if the retune still yields Critical Recall@1 `3/5`, stop and report rather than iterating further on the instrument. | Five instrument-side tasks have run (`1.2`, `1.2R`, `1.3F`, `1.3G`, and the final retune). `1.3F` and `1.3G` each found something real, but the remaining question is narrow enough to answer once; a `3/5` outcome is itself evidence that the passing region is not reachable from generalizable signal, and the resulting choice — gate split versus dated exception against Sprint 3 Task `3.6` — belongs to the user. | Allow further partition or objective iteration; permit a gate change inside the run. | User |
+| 2026-08-24 | Register single-turn query expansion as Sprint 3 Task `3.6` rather than adding it to Sprint 1. | It is the architecturally correct remedy for `pt-ref-chaves-acesso` and does not exist anywhere in this program — the implemented rewrite path is follow-up-only and `chaves` is single-turn. But it is a genuine architecture decision (hand-authored lexicon reintroduces the non-production `CONCEPT_LEXICON` pattern; LLM expansion puts a provider round-trip inside the retrieval path of a local-first product; pseudo-relevance feedback would likely drift toward the distractors that own the surface vocabulary), Sprint 1 excludes production retrieval behavior, and building it to fix a gate case then grading the models on that case repeats the overfitting problem one stage upstream. Sprint 3 already carries the query-variant plumbing. | Build expansion inside Sprint 1 alongside the final run; defer it without registering a task. | User |
 
 ## Task Execution Log
 
@@ -1657,6 +1776,76 @@ are not edited; this entry records what later evidence changed about them.)
 - Carry category (b) `pt-ref-sla-suporte` into the final held-out retune.
 - Keep final Task `1.3`, Tasks `1.4`, and `1.5` blocked until the user chooses
   corpus patches or gate re-staging for category (c).
+
+### 1.3G - Corpus patch and contamination gate re-scope
+
+**Status:** Complete
+**Owner:** `worker-l` (primary `ses_fcbf894c0ffe0XwFSDMSavxqDj`, `opencode-go/ox-alpha-free`; residual classifier fix `ses_fcb41049cffefT5nm7rG3j6sNE`, `openrouter/stealth/ox-alpha`; first dispatch attempt `ses_fcc04d762ffeil2zISYe19N0AH` failed on provider insufficient balance)
+**Completed:** 2026-08-24
+**Implemented:**
+- Patched exactly the two approved corpus surfaces: the `pt-ref-chaves-acesso`
+  target title (`Governança de chaves em ambientes — controle de acesso`,
+  terminological gap preserved) and real superseded/draft carriers for
+  `"apenas 3 dias"` / `"apenas 4 dias"` in topical-neighbour meetings outside
+  the expected meeting.
+- Added fixture-derived carrier-source-state classification
+  (`classify_forbidden_fact`) with fact-level precedence — deleted,
+  expected-authoritative, indexed-only stale, explicit superseded marker,
+  otherwise reject — and re-scoped the critical contamination gate to
+  retrieval-stage facts only; answer-stage facts are reported with denominators
+  and never gated in Sprint 1 (`107/14` split pinned by test).
+- Promoted admissibility to enforcing with five rejecting mutations
+  (no-positive-channel title revert, trapped carrier, removed carrier,
+  expected-current reclassification, differing-texts-both-carrying rejection)
+  and aligned `setup_case` deleted-meeting FTS insertion with production
+  cascade semantics.
+- Re-recorded the baseline honestly: only forbidden contamination moved,
+  `25/121` to `26/121` (+1 from the new superseded WhatsApp carrier); all other
+  approved figures unchanged.
+**Implementation:**
+- Files: `frontend/src-tauri/tests/fixtures/corpus/reference_a.rs`,
+  `reference_b.rs` (three content lines), `fixtures/corpus_types.rs`,
+  `fixtures/evaluation_policy.json`, `tests/retrieval_evaluation.rs`,
+  `tests/model_benchmark.rs`, and report
+  `docs/hybrid-rag/task-1.3g-corpus-gate-patch.md`.
+- Approach: patch only approved surfaces; derive gate scope from fixture state;
+  prove every requirement with executable assertions rather than prose; keep
+  reference/critical cases outside all tuning paths.
+**Not implemented:**
+- No model selection, constants promotion, chunk policy, answer-stage
+  evaluation, threshold change beyond the approved re-scope, or production edit.
+**Why not implemented:**
+- Explicit non-goals of the approved task; selection belongs to the final
+  Task `1.3` run and answer-stage measurement to Sprint 3/4.
+**Verification:**
+- `cargo test ... --test retrieval_evaluation -- --nocapture` - independently pass, 6 tests including the mutation suite.
+- `cargo test ... --test model_benchmark` - independently pass, 9 tests including rank1-admissibility and citation mutations.
+- Release canonical benchmark - worker pass twice plus one post-fix confirmation run; decision `blocked-quality-gates` (Critical R@1 3/5 remains model evidence); critical retrieval-stage contamination PASS `0/2`; citation precision `602/602`; feasibility now `79/2160` f32 / `78/2160` quint8.
+- Frontend typecheck - pass. Vitest - pass, 95 tests. Cargo check - pass.
+- `cargo fmt --check` and `git diff --check` - pass.
+- Privacy scan - pass; 9 matches, all classified as scanner/validator literals or regex false positives.
+**Rollback:**
+- Restore the six files from `e209b5d` and delete
+  `docs/hybrid-rag/task-1.3g-corpus-gate-patch.md`. Production and persisted
+  data unaffected; staged artifacts remain outside Git.
+**Decisions and follow-ups:**
+- The final Task `1.3` run is cleared to dispatch on this instrument; it must
+  apply the amendment-4 escalation if `pt-ref-sla-suporte` stays below rank 1.
+- Orchestrator acceptance review (2026-08-24) verified the corpus diff is three
+  content lines on the two approved surfaces and re-ran
+  `retrieval_evaluation` (6/6) independently. Accepted.
+- Four items recorded, none blocking (detail in this document's "What Task
+  1.3G established"): the report omits the tuned constants, so the final run
+  must disclose them; `0/2160` → `79/2160` is not comparable across the gate
+  re-definition; 74 of 107 retrieval-stage facts remain carrierless, so
+  percentage forms are diluted; and the in-scope-but-unspecified
+  `metadata_conforming` family filter is accepted as correct.
+- Follow-up owned by the final `1.3` run: amendment 5 (tuning partition and
+  objective) — `1.3G`'s `78-79/2160` feasibility result localizes the
+  remaining failure to constant selection.
+- Follow-up owned by Sprint 3 Task `3.6`: single-turn query expansion, the
+  architecturally correct remedy for `pt-ref-chaves-acesso`'s terminological
+  gap, which no stage in this program currently implements.
 
 ### Task Entry Template
 

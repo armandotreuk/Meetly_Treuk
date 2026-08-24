@@ -17,7 +17,10 @@ mod corpus;
 mod corpus_types;
 
 use concept_lexicon::CONCEPT_LEXICON;
-use corpus_types::{EvaluationCase, Evidence, Language, Meeting, MeetingState, Scope, ScopeKind};
+use corpus_types::{
+    classify_forbidden_fact, CarrierSourceState, EvaluationCase, Evidence, ForbiddenFactStage,
+    Language, Meeting, MeetingState, Scope, ScopeKind,
+};
 
 const CONTEXT_BUDGET_CHARS: usize = 1_200;
 
@@ -144,6 +147,10 @@ struct CaseMetrics {
     fact_total: usize,
     forbidden_hits: usize,
     forbidden_total: usize,
+    retrieval_forbidden_hits: usize,
+    retrieval_forbidden_total: usize,
+    answer_forbidden_hits: usize,
+    answer_forbidden_total: usize,
     source_hits: usize,
     source_total: usize,
 }
@@ -157,6 +164,8 @@ struct Metrics {
     evidence_recall_at_10: Fraction,
     fact_coverage: Fraction,
     forbidden_contamination: Fraction,
+    retrieval_forbidden_contamination: Fraction,
+    answer_forbidden_contamination: Fraction,
     source_precision: Fraction,
     cases: BTreeMap<String, CaseMetrics>,
 }
@@ -270,6 +279,9 @@ async fn setup_case(case: &EvaluationCase) -> SqlitePool {
                 .expect("insert synthetic meeting");
         }
         for evidence in &meeting.evidence {
+            if meeting.state == MeetingState::Deleted {
+                continue;
+            }
             sqlx::query("INSERT INTO meeting_fts (meeting_id, chunk_type, chunk_id, text, folder_id, folder_name) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")
                 .bind(&meeting.id)
                 .bind(&evidence.source_kind)
@@ -428,11 +440,25 @@ fn score_case(case: &EvaluationCase, output: &CaseOutput, evidence_k: usize) -> 
         .iter()
         .filter(|fact| retained_text.contains(&fact.to_lowercase()))
         .count();
-    let forbidden_hits = case
-        .forbidden_facts
-        .iter()
-        .filter(|fact| retained_text.contains(&fact.to_lowercase()))
-        .count();
+    let mut forbidden_hits = 0;
+    let mut retrieval_forbidden_hits = 0;
+    let mut retrieval_forbidden_total = 0;
+    let mut answer_forbidden_hits = 0;
+    let mut answer_forbidden_total = 0;
+    for fact in &case.forbidden_facts {
+        let hit = retained_text.contains(&fact.to_lowercase());
+        forbidden_hits += usize::from(hit);
+        match classify_forbidden_fact(case, fact).expect("forbidden fact carrier classification") {
+            classification if classification.stage == ForbiddenFactStage::Retrieval => {
+                retrieval_forbidden_total += 1;
+                retrieval_forbidden_hits += usize::from(hit);
+            }
+            _ => {
+                answer_forbidden_total += 1;
+                answer_forbidden_hits += usize::from(hit);
+            }
+        }
+    }
     let context_ids = production_retained_ids(retrieved)
         .into_iter()
         .collect::<HashSet<_>>();
@@ -444,6 +470,10 @@ fn score_case(case: &EvaluationCase, output: &CaseOutput, evidence_k: usize) -> 
         fact_total: case.required_facts.len(),
         forbidden_hits,
         forbidden_total: case.forbidden_facts.len(),
+        retrieval_forbidden_hits,
+        retrieval_forbidden_total,
+        answer_forbidden_hits,
+        answer_forbidden_total,
         source_hits: output
             .emitted_source_ids
             .iter()
@@ -522,6 +552,12 @@ fn aggregate(
         metrics.fact_coverage.denominator += case_metrics.fact_total;
         metrics.forbidden_contamination.numerator += case_metrics.forbidden_hits;
         metrics.forbidden_contamination.denominator += case_metrics.forbidden_total;
+        metrics.retrieval_forbidden_contamination.numerator +=
+            case_metrics.retrieval_forbidden_hits;
+        metrics.retrieval_forbidden_contamination.denominator +=
+            case_metrics.retrieval_forbidden_total;
+        metrics.answer_forbidden_contamination.numerator += case_metrics.answer_forbidden_hits;
+        metrics.answer_forbidden_contamination.denominator += case_metrics.answer_forbidden_total;
         metrics.source_precision.numerator += case_metrics.source_hits;
         metrics.source_precision.denominator += case_metrics.source_total;
         metrics.cases.insert(case.id.clone(), case_metrics);
@@ -822,10 +858,14 @@ fn validate_quality_gates(
         if scored.fact_hits as f64 / (scored.fact_total as f64) < gates.critical_fact_coverage {
             return Err(format!("{} critical fact coverage gate failed", case.id));
         }
-        if scored.forbidden_hits as f64 / scored.forbidden_total as f64
-            > gates.critical_forbidden_contamination
+        if scored.retrieval_forbidden_total > 0
+            && scored.retrieval_forbidden_hits as f64 / scored.retrieval_forbidden_total as f64
+                > gates.critical_forbidden_contamination
         {
-            return Err(format!("{} critical contamination gate failed", case.id));
+            return Err(format!(
+                "{} critical retrieval-stage contamination gate failed",
+                case.id
+            ));
         }
     }
     Ok(())
@@ -1374,11 +1414,22 @@ fn baseline_report(
         |case| case.critical,
         |scored| (scored.fact_hits, scored.fact_total),
     );
-    let critical_contamination = subset_case_fraction(
+    let critical_retrieval_contamination = subset_case_fraction(
         cases,
         metrics,
         |case| case.critical,
-        |scored| (scored.forbidden_hits, scored.forbidden_total),
+        |scored| {
+            (
+                scored.retrieval_forbidden_hits,
+                scored.retrieval_forbidden_total,
+            )
+        },
+    );
+    let critical_answer_contamination = subset_case_fraction(
+        cases,
+        metrics,
+        |case| case.critical,
+        |scored| (scored.answer_forbidden_hits, scored.answer_forbidden_total),
     );
     let mut shapes = HashSet::new();
     for case in cases {
@@ -1414,6 +1465,14 @@ fn baseline_report(
         format_fraction(
             "Forbidden-fact contamination",
             metrics.forbidden_contamination,
+        ),
+        format_fraction(
+            "Retrieval-stage forbidden-fact contamination",
+            metrics.retrieval_forbidden_contamination,
+        ),
+        format_fraction(
+            "Answer-stage forbidden facts in retained baseline context (informational; not evaluated/gated in Sprint 1)",
+            metrics.answer_forbidden_contamination,
         ),
         format_fraction("Citation/source precision", metrics.source_precision),
         format!("Production generic context budget: {CONTEXT_BUDGET_CHARS} Unicode characters"),
@@ -1454,10 +1513,14 @@ fn baseline_report(
             false,
         ),
         gate_line(
-            "Critical forbidden-fact contamination gate",
-            critical_contamination,
+            "Critical retrieval-stage forbidden-fact contamination gate",
+            critical_retrieval_contamination,
             policy.gates.critical_forbidden_contamination,
             true,
+        ),
+        format_fraction(
+            "Critical answer-stage forbidden facts in retained baseline context (informational; not evaluated/gated in Sprint 1)",
+            critical_answer_contamination,
         ),
         gate_line("Exact/name/number no-regression", exact_recall, 1.0, false),
         format!(
@@ -1648,45 +1711,89 @@ fn corpus_structural_solvency_invariants_hold_without_the_answer_key() {
 /// Every margin, coverage decision, and shape hash is computed from fixture
 /// text; labels never score, never bypass retrieval, and never widen what the
 /// answer-key-free structural check accepts.
-/// SUPERVISED critical-gate admissibility (Task 1.3F Deliverable 2,
-/// assert-and-report mode: failures are PRINTED, this check never gates or
-/// edits the corpus). For each critical case it answers two questions the
-/// failing gates need closed before the final selection run:
-///
-/// 1. Evidence admissibility: does at least one ordering of the case's
-///    documents place every required evidence inside the retained top-10
-///    (given HYDRATED_MEETINGS=5 / EVIDENCE_K=10 as pinned by the benchmark)
-///    while no retained text contains a forbidden fact? Computed
-///    constructively (required docs first, forbidden-bearing docs last),
-///    respecting the hydrated-meeting constraint. Forbidden presence uses
-///    authoritative text, because production hydration retains current
-///    content after its content-hash verification.
-/// 2. Co-residence: for each forbidden fact, whether it lives in a document
-///    that is itself required evidence — if so the contamination gate is
-///    unachievable at the retrieval stage by construction.
 const ADMISSIBILITY_EVIDENCE_K: usize = 10;
 const ADMISSIBILITY_HYDRATED_MEETINGS: usize = 5;
 
-fn supervised_critical_gate_admissibility(cases: &[EvaluationCase]) {
+fn report_forbidden_fact_classifications(
+    cases: &[EvaluationCase],
+) -> Result<(usize, usize), String> {
+    let (mut retrieval, mut answer) = (0, 0);
+    for case in cases {
+        for fact in &case.forbidden_facts {
+            let classification = classify_forbidden_fact(case, fact)?;
+            match classification.stage {
+                ForbiddenFactStage::Retrieval => retrieval += 1,
+                ForbiddenFactStage::Answer => answer += 1,
+            }
+            println!(
+                "[SUPERVISED:forbidden-classification] case={} fact={fact:?} stage={} carriers=[{}]",
+                case.id,
+                classification.stage.label(),
+                classification
+                    .carriers
+                    .iter()
+                    .map(|carrier| format!(
+                        "{}/{}:{}",
+                        carrier.meeting_id,
+                        carrier.evidence_id,
+                        carrier.state.label()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
+    }
+    println!(
+        "[SUPERVISED:forbidden-classification-counts] retrieval-stage={retrieval}/{} answer-stage-deferred={answer}/{} total={}/{}",
+        retrieval + answer,
+        retrieval + answer,
+        retrieval + answer,
+        retrieval + answer
+    );
+    Ok((retrieval, answer))
+}
+
+fn supervised_critical_gate_admissibility(cases: &[EvaluationCase]) -> Result<(), String> {
     struct AdmDoc<'a> {
         meeting_id: &'a str,
         evidence_id: &'a str,
         is_required: bool,
         forbidden_hits: Vec<usize>,
     }
+    let mut failures = Vec::new();
     for case in cases.iter().filter(|case| case.critical) {
+        let classifications = case
+            .forbidden_facts
+            .iter()
+            .map(|fact| classify_forbidden_fact(case, fact))
+            .collect::<Result<Vec<_>, _>>()?;
+        for (fact, classification) in case.forbidden_facts.iter().zip(&classifications) {
+            if classification.stage == ForbiddenFactStage::Retrieval
+                && classification.carriers.is_empty()
+            {
+                failures.push(format!(
+                    "{} retrieval-stage fact {fact:?} has no fixture-text carrier",
+                    case.id
+                ));
+            }
+        }
         let mut docs: Vec<AdmDoc> = Vec::new();
-        for meeting in &case.meetings {
+        for meeting in case
+            .meetings
+            .iter()
+            .filter(|meeting| meeting.state != MeetingState::Deleted)
+        {
             for evidence in &meeting.evidence {
                 let forbidden_hits = case
                     .forbidden_facts
                     .iter()
                     .enumerate()
-                    .filter(|(_, fact)| {
-                        evidence
-                            .authoritative_text
-                            .to_lowercase()
-                            .contains(&fact.to_lowercase())
+                    .filter(|(index, fact)| {
+                        classifications[*index].stage == ForbiddenFactStage::Retrieval
+                            && evidence
+                                .authoritative_text
+                                .to_lowercase()
+                                .contains(&fact.to_lowercase())
                     })
                     .map(|(index, _)| index)
                     .collect();
@@ -1698,28 +1805,34 @@ fn supervised_critical_gate_admissibility(cases: &[EvaluationCase]) {
                 });
             }
         }
-        // Co-residence analysis per forbidden fact.
         let mut unachievable_by_coresidence = false;
         for (fact_index, fact) in case.forbidden_facts.iter().enumerate() {
+            if classifications[fact_index].stage == ForbiddenFactStage::Answer {
+                println!(
+                    "[SUPERVISED:co-residence] case={} fact={fact:?} ANSWER_STAGE_EXEMPT carriers=[{}]",
+                    case.id,
+                    classifications[fact_index]
+                        .carriers
+                        .iter()
+                        .map(|carrier| carrier.evidence_id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                continue;
+            }
             let carriers: Vec<&AdmDoc> = docs
                 .iter()
                 .filter(|d| d.forbidden_hits.contains(&fact_index))
                 .collect();
-            if carriers.is_empty() {
-                println!(
-                    "[SUPERVISED:co-residence] case={} fact=\"{fact}\" UNHITTABLE_BY_CONSTRUCTION: no document carries this fact in indexed or authoritative text",
-                    case.id
-                );
-                continue;
-            }
             let required_co_residence = carriers.iter().any(|d| d.is_required);
             unachievable_by_coresidence |= required_co_residence;
             println!(
-                "[SUPERVISED:co-residence] case={} fact=\"{fact}\" carriers=[{}] required_co_residence={}",
+                "[SUPERVISED:co-residence] case={} fact={fact:?} carriers=[{}] required_co_residence={}",
                 case.id,
-                carriers
+                classifications[fact_index]
+                    .carriers
                     .iter()
-                    .map(|d| d.evidence_id)
+                    .map(|carrier| carrier.evidence_id.as_str())
                     .collect::<Vec<_>>()
                     .join(","),
                 required_co_residence
@@ -1831,6 +1944,14 @@ fn supervised_critical_gate_admissibility(cases: &[EvaluationCase]) {
              constructive_retained_forbidden={retained_forbidden_bearing}",
             case.id
         );
+        if verdict != "FEASIBLE_BY_ORDERING" {
+            failures.push(format!("{} retrieval-stage gate is {verdict}", case.id));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("\n"))
     }
 }
 
@@ -1869,10 +1990,21 @@ fn corpus_supervised_labels_margin_coverage_and_distinctness_hold() {
     }
     println!("winning channel distribution: {channel_wins:?}");
 
-    // Task 1.3F: assert-and-report admissibility of the failing critical
-    // gates. Output is labeled `[SUPERVISED:…]`, never gates the corpus, and
-    // feeds a user decision rather than an automatic corpus edit.
-    supervised_critical_gate_admissibility(&cases);
+    let (retrieval_facts, answer_facts) =
+        report_forbidden_fact_classifications(&cases).expect("fixture-derived carrier states");
+    assert_eq!((retrieval_facts, answer_facts), (107, 14));
+    supervised_critical_gate_admissibility(&cases)
+        .expect("retrieval-stage forbidden-fact gate admissibility");
+
+    let chaves = cases
+        .iter()
+        .find(|case| case.id == "pt-ref-chaves-acesso")
+        .expect("chaves critical case");
+    let chaves_margins = case_margins(chaves, &policy.lexical_policy);
+    assert!(
+        chaves_margins[0].1 > 0.0 || chaves_margins[2].1 > 0.0,
+        "pt-ref-chaves-acesso must have a positive lexical/title production channel"
+    );
 
     // Supervised distinctness: normalized question + required target evidence
     // text only (IDs label the target evidence), with numeric tokens collapsed.
@@ -1980,5 +2112,122 @@ fn negative_rank_evidence_and_source_mutations_are_rejected() {
         validate_quality_gates(&cases, &mismatch_metrics, &policy.gates)
             .unwrap_err()
             .contains("retained-source precision")
+    );
+}
+
+#[test]
+fn carrier_state_and_ordering_admissibility_mutations_are_rejected() {
+    let reference = corpus::cases()
+        .into_iter()
+        .find(|case| case.id == "fixture-whatsapp-retention")
+        .expect("WhatsApp reference");
+    for fact in &reference.forbidden_facts {
+        let classification = classify_forbidden_fact(&reference, fact).unwrap();
+        assert_eq!(classification.stage, ForbiddenFactStage::Retrieval);
+        assert!(!classification.carriers.is_empty());
+        assert!(classification
+            .carriers
+            .iter()
+            .all(|carrier| carrier.state == CarrierSourceState::Superseded));
+    }
+    supervised_critical_gate_admissibility(std::slice::from_ref(&reference))
+        .expect("patched retrieval-stage facts are feasible");
+
+    let mut trapped = reference.clone();
+    trapped.required_evidence_ids.push(
+        classify_forbidden_fact(&trapped, "apenas 3 dias")
+            .unwrap()
+            .carriers[0]
+            .evidence_id
+            .clone(),
+    );
+    assert!(supervised_critical_gate_admissibility(&[trapped]).is_err());
+
+    let mut uncarried = reference.clone();
+    for evidence in uncarried
+        .meetings
+        .iter_mut()
+        .flat_map(|meeting| meeting.evidence.iter_mut())
+    {
+        evidence.indexed_text = evidence
+            .indexed_text
+            .replace("apenas 3 dias", "três jornadas");
+        evidence.authoritative_text = evidence
+            .authoritative_text
+            .replace("apenas 3 dias", "três jornadas");
+    }
+    assert!(supervised_critical_gate_admissibility(&[uncarried]).is_err());
+
+    for state in [MeetingState::Dirty, MeetingState::StaleDerived] {
+        let mut answer_stage = reference.clone();
+        let expected = answer_stage.expected_meeting_ids[0].clone();
+        let target = answer_stage
+            .meetings
+            .iter_mut()
+            .find(|meeting| meeting.id == expected)
+            .unwrap();
+        target.state = state;
+        target.evidence[0]
+            .authoritative_text
+            .push_str(" Registro atual menciona apenas 3 dias.");
+        target.evidence[0].indexed_text = target.evidence[0].authoritative_text.clone();
+        let classification = classify_forbidden_fact(&answer_stage, "apenas 3 dias").unwrap();
+        assert_eq!(classification.stage, ForbiddenFactStage::Answer);
+        assert!(classification
+            .carriers
+            .iter()
+            .any(|carrier| carrier.state == CarrierSourceState::CurrentAuthoritative));
+    }
+
+    for state in [MeetingState::Dirty, MeetingState::StaleDerived] {
+        let mut differing = reference.clone();
+        assert!(differing
+            .expected_meeting_ids
+            .iter()
+            .all(|id| id != "mtg-webinar-convites"));
+        let target = differing
+            .meetings
+            .iter_mut()
+            .find(|meeting| meeting.id == "mtg-webinar-convites")
+            .unwrap();
+        target.state = state;
+        target.evidence[0]
+            .indexed_text
+            .push_str(" O índice retém apenas 3 dias de antecedência neste fluxo.");
+        target.evidence[0]
+            .authoritative_text
+            .push_str(" A régua vigente mantém apenas 3 dias de antecedência neste fluxo.");
+        assert!(classify_forbidden_fact(&differing, "apenas 3 dias").is_err());
+    }
+
+    let mut indexed_only = reference;
+    for evidence in indexed_only
+        .meetings
+        .iter_mut()
+        .flat_map(|meeting| meeting.evidence.iter_mut())
+    {
+        evidence.indexed_text = evidence
+            .indexed_text
+            .replace("apenas 3 dias", "três jornadas");
+        evidence.authoritative_text = evidence
+            .authoritative_text
+            .replace("apenas 3 dias", "três jornadas");
+    }
+    let expected = indexed_only.expected_meeting_ids[0].clone();
+    let target = indexed_only
+        .meetings
+        .iter_mut()
+        .find(|meeting| meeting.id == expected)
+        .unwrap();
+    target.state = MeetingState::StaleDerived;
+    target.evidence[0]
+        .indexed_text
+        .push_str(" Índice antigo menciona apenas 3 dias.");
+    let classification = classify_forbidden_fact(&indexed_only, "apenas 3 dias").unwrap();
+    assert_eq!(classification.stage, ForbiddenFactStage::Retrieval);
+    assert_eq!(classification.carriers.len(), 1);
+    assert_eq!(
+        classification.carriers[0].state,
+        CarrierSourceState::StaleDerived
     );
 }

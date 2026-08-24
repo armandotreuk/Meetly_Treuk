@@ -172,11 +172,10 @@ would require.
 
 ## Program Status
 
-**Status:** Sprint 1 remediation in progress. Batch 5 Task `1.3F` completed on
-2026-08-24 and the user resolved category (c) the same day with the hybrid
-remedy (corpus patches + carrier-source-state gate re-scope, approved
-`architecture.md` amendments). **Task `1.3G` is the next dispatch (Batch 6)**;
-the final Task `1.3` run follows it. Sprint 6.1 is closed.
+**Status:** Sprint 1 remediation in progress. Batch 6 Task `1.3G` completed
+independent verification on 2026-08-24, closing the category (c) resolution.
+**The final Task `1.3` selection run (Batch 7) is next** on the closed
+post-`1.3G` instrument. Sprint 6.1 is closed.
 
 Current execution state:
 
@@ -206,17 +205,31 @@ Current execution state:
    `0/2160` jointly passing configurations. `pt-ref-chaves-acesso` also has no
    production-implementable rank-1 channel. Standing decisions: the e5-base
    RAM band is approved and `bge-reranker-base` is retired.
-6. **Batch 6 (next):** Task `1.3G` implements the 2026-08-24 category (c)
-   resolution — patch `pt-ref-chaves-acesso` (production-channel
-   discriminability, terminological gap preserved) and the two vacuous
-   WhatsApp forbidden carriers (superseded/neighbour sources only); re-scope
-   critical contamination by carrier source state (retrieval-stage gate over
-   superseded/stale/deleted carriers; the four current-note facts become
-   defined-but-deferred answer-stage facts for Sprint 3/4); promote the
-   admissibility invariant to enforcing; re-record the baseline and align the
-   baseline harness. The final `1.3` selection run follows on the post-`1.3G`
-   instrument.
-7. **User decision on Deep-as-default** is deferred to Sprint 4 close and is
+6. **Batch 6:** Task `1.3G` is complete. The corpus patch touches exactly the
+   two approved surfaces; carrier-source-state classification (`107` retrieval-
+   stage / `14` answer-stage) is fixture-derived and test-pinned; admissibility
+   is enforced with rejecting mutations; the baseline re-record moved only
+   forbidden contamination `25/121` → `26/121`. Every critical case now has a
+   positive production-implementable rank-1 channel and the re-scoped critical
+   contamination gate passes `0/2`. The final `1.3` selection run follows on
+   this closed instrument.
+7. **Batch 7 (next):** the final Task `1.3` selection run, carrying
+   **amendment 5**. `1.3G` measured `79/2160` (mmarco-f32) and `78/2160`
+   (mmarco-quint8) configurations of the existing e5-base-int8 pair that
+   jointly pass every gate, while the held-out objective selects a `3/5`
+   configuration — so the remaining failure is constant selection, not model
+   capability or corpus content. The run admits the 10 non-critical
+   reference-category cases into the tuning partition (the 5 critical/pinned
+   cases stay isolated), adds a reference-category Recall@1 objective term,
+   and must disclose all tuned constants. Selecting constants by inspecting
+   critical-case results is forbidden. If the retune still yields `3/5`, the
+   run stops and reports; the resulting choice belongs to the user.
+8. **Deferred to Sprint 3 Task `3.6`:** single-turn query expansion, the
+   architecturally correct remedy for `pt-ref-chaves-acesso`'s terminological
+   gap. It is registered with its approach left as an open architecture
+   question (hand-authored lexicon vs. local LLM expansion vs.
+   pseudo-relevance feedback) and is blocked on a user decision.
+9. **User decision on Deep-as-default** is deferred to Sprint 4 close and is
    not a Sprint 1 blocker. The open question remains recorded in
    `architecture.md`.
 

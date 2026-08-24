@@ -88,14 +88,18 @@ model, chunker, index backend, and status contracts from Sprints 1-2.
 | 3.3 | Context | Add authoritative multi-meeting hydration, bounded allocation, coverage, and retained-source output. | L | Pending `worker-l` | 3.2 | Reference context contains complete schedule/MPV facts and all sources match retained evidence. | Keep old generic context builder and lexical path. |
 | 3.4 | Broad Chat rollout | Integrate Fast hybrid retrieval into all/folder streaming and non-streaming Chat through shared preparation, and ship the mandatory `force_lexical_retrieval` kill switch. | M | Pending `worker-m` | 3.1-3.3 | Product-path tests prove all/folder Fast behavior, lexical fallback, kill-switch behavior, cancellation, and source events. | Enable `force_lexical_retrieval` at runtime; no rebuild or reinstall required. |
 | 3.5 | Quality regression | Run/fix multilingual evaluation, context budgets, performance, and Windows native broad-Chat smoke. | M | Pending `worker-m` | 3.4 | Required quality deltas and reference answer facts pass; no context/latency gate regresses. | Test/threshold changes revert independently; production rollback is Task 3.4 flag/path. |
+| 3.6 | Query expansion | Add single-turn query expansion as an additional query variant, after the user resolves its open architecture question. | M | Pending `worker-l` | 3.1-3.3, **user architecture decision** | Terminological-gap cases (`pt-ref-chaves-acesso` and its siblings) improve measurably against the Sprint 1 corpus with no exact-term regression and no Fast-budget breach. | Drop the expansion variant; original/rewritten/core variants continue unchanged. |
 
 ## Dependency Order
 
 `3.1 -> 3.2 -> 3.3 -> 3.4 -> 3.5`
 
+`3.1-3.3 -> 3.6` (additionally gated on the user's architecture decision)
+
 Every task shares retrieval contracts or `api/chat.rs` behavior with the next;
 no implementation tasks are safely parallel by default. Tasks 3.1-3.3 are L
-and run alone.
+and run alone. Task `3.6` may run after `3.5` closes or alongside it once the
+expansion approach is approved; it must not delay the `3.4` rollout.
 
 ## Task Specifications
 
@@ -439,6 +443,77 @@ git diff --check
 
 Record the benchmark and native-smoke procedure/results in the execution entry.
 
+### 3.6 - Single-turn query expansion [M]
+
+**Outcome:** A query whose vocabulary differs from the content that answers it
+can still retrieve that content, through an additional query variant rather
+than through corpus authoring or a hand-maintained lexicon.
+
+**Origin.** Sprint 1 Task `1.3G` left `pt-ref-chaves-acesso` unresolved: the
+question says *trocar as chaves de acesso* while the decision says *rotação
+periódica de credenciais*, and no production stage bridges that gap. The
+implemented rewrite path at `frontend/src-tauri/src/api/chat.rs:465-494` is
+**follow-up-only** — it triggers on conversational history, and the case is
+single-turn, so it structurally cannot apply. Sprint 1 patched the fixture's
+title so a production channel could discriminate, which closed the
+admissibility defect but narrowed what the case tests. This task is the real
+remedy, and Sprint 1's record defers that case to it.
+
+**Blocking architecture question — user decision required before dispatch.**
+The approach is not pre-decided, and the three candidates differ materially:
+
+| Approach | Consequence |
+|---|---|
+| (a) Hand-authored PT/EN synonym lexicon | Promotes the evaluation harness's `CONCEPT_LEXICON` pattern into production. Sprint 1 explicitly classified that as a non-production proxy; it also cannot generalize to a user's own vocabulary and needs indefinite maintenance. |
+| (b) Local LLM expansion via the existing provider path | Reuses infrastructure the app already has, but puts a provider round-trip **inside the retrieval path** against the 2 s Fast budget, and makes retrieval quality depend on provider choice and availability — a material change for a local-first product. `architecture.md` already counts the follow-up rewrite in its worst-case round-trip budget. |
+| (c) Pseudo-relevance feedback (Rocchio-style) | Purely local, deterministic, no new dependency — but expands toward the first pass's top results, which for this failure mode are the neighbours that own the surface vocabulary. Query drift is the expected outcome and it may worsen the case it targets. |
+
+Do not begin implementation until the user selects an approach and it is
+recorded in this sprint's decision log.
+
+**Required implementation (approach-independent):**
+
+- Expose expansion as an **additional query variant** alongside original,
+  rewritten, and core-term variants. Do not replace or mutate the user's
+  query, and preserve variant provenance through fusion and diagnostics as
+  Task `3.1` already requires.
+- Keep the expansion deterministic for evaluation, or record its
+  nondeterminism explicitly and pin it in tests.
+- Fail open: if expansion is unavailable, errors, or exceeds its budget,
+  retrieval proceeds with the existing variants and logs a privacy-safe
+  counter — never a raw query.
+- Charge the expansion's cost to the query-preparation budget and report it as
+  its own stage figure against the Fast budget.
+- Respect the kill switch: `force_lexical_retrieval` disables expansion with
+  the rest of the semantic path.
+
+**Acceptance criteria:**
+
+- `pt-ref-chaves-acesso` and its terminological-gap siblings measurably
+  improve against the Sprint 1 corpus, reported with denominators.
+- No exact-term/number/name regression, and no semantic-category regression.
+- The Fast p95 budget holds with the expansion stage included and reported
+  separately.
+- Retrieval still functions with expansion disabled or failing.
+- No raw query text reaches logs.
+- If approach (b) is selected, the added round-trip is reflected in the
+  documented worst-case provider count.
+
+**Required verification:**
+
+```powershell
+$env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA "meetily-cargo-target"
+cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --test retrieval_evaluation
+cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib
+cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check
+git diff --check
+```
+
+**Worker report additions:** the selected approach and why it satisfies the
+recorded architecture decision; before/after metrics for the terminological-gap
+cases with denominators; the measured expansion-stage latency against its
+budget; and the failure/fallback behavior actually exercised.
+
 ## Sprint Acceptance Criteria
 
 - Fast folder/all Chat retrieves, reranks, and hydrates meetings through one
@@ -475,6 +550,8 @@ Record the benchmark and native-smoke procedure/results in the execution entry.
 | 2026-08-21 | The `force_lexical_retrieval` kill switch is mandatory, not conditional. | This sprint replaces the primary Chat retrieval path. Index pause/rebuild affect derived state only, so without it the sole rollback from a bad result on a user's real corpus is a reinstall. | Keep the original "add a feature-disable only if needed" wording. | Main agent, pending sprint approval |
 | 2026-08-21 | Reranking depth comes from Sprint 1's measured sub-budget, not the provisional 30-50 range. | The provisional range predates measurement and plausibly consumes the entire Fast budget on CPU. | Use the architecture's provisional range and adjust reactively. | Main agent, pending sprint approval |
 | 2026-08-21 | Adaptive reranking depth must be deterministic, never wall-clock driven. | Timing-driven depth makes evaluation results irreproducible and quality gates meaningless. | Allow a time-boxed reranking budget. | Main agent, pending sprint approval |
+| 2026-08-24 | Register Task `3.6` (single-turn query expansion) here rather than in Sprint 1, with its approach left as an open architecture question. | Sprint 1's `pt-ref-chaves-acesso` failure is a genuine vocabulary gap that no current stage bridges — the implemented rewrite is follow-up-only and the case is single-turn. Sprint 3 already carries the query-variant plumbing, so this is the natural home. It was kept out of Sprint 1 because Sprint 1 excludes production retrieval behavior, because building expansion to fix a gate case and then grading models on that case repeats the overfitting problem one stage upstream, and because model selection blocks Tasks `1.4`/`1.5` and all of Sprint 2 — putting a new feature in front of it inverts the dependency. | Build it inside Sprint 1 alongside the final model run; defer it informally without a registered task. | User |
+| 2026-08-24 | Leave the expansion approach undecided and block Task `3.6` dispatch on an explicit user choice. | The three candidates differ materially in architecture: a hand-authored lexicon promotes the non-production `CONCEPT_LEXICON` pattern into the product, LLM expansion places a provider round-trip inside the retrieval path of a local-first product against a 2 s budget, and pseudo-relevance feedback would likely drift toward the very distractors that own the surface vocabulary. Choosing among them is a product decision, not an implementation detail. | Pre-select an approach in the task specification. | User |
 
 ## Task Execution Log
 
