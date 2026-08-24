@@ -4,12 +4,12 @@
 
 | Field | Value |
 |---|---|
-| Status | Proposed, awaiting approval |
-| Date | 2026-08-21 |
+| Status | Approved by the user on 2026-08-22 |
+| Date | 2026-08-21 (revised 2026-08-21 after pre-implementation critique) |
 | Owner | Main orchestration agent |
 | Product | Meetily desktop application |
-| Platforms | Windows x64, macOS ARM64, Linux x64 |
-| Related records | `docs/sprint-6-1-contextual-chat.md`, sprint files in this directory |
+| Platforms | **Release target: Windows x64 only.** macOS ARM64 and Linux x64 are deferred (see "Platform Scope"). |
+| Related records | `docs/sprint-6-1-contextual-chat.md`, `../../../ROADMAP.md`, sprint files in this directory |
 
 This document is normative. `MUST`, `MUST NOT`, `SHOULD`, and `MAY` describe
 implementation requirements. A subagent may not weaken a `MUST` or `MUST NOT`
@@ -46,12 +46,107 @@ their authoritative content. Vector similarity alone is not the product.
 | Retrieval depth | Hybrid retrieval, local reranker, and iterative LLM retrieval | The design includes Fast and Deep paths. |
 | Expected scale | Up to 250,000 semantic documents per user | A measured exact-search or ANN path must satisfy the release gate. |
 | Scope rollout | Folder/all first, then all saved scopes | Live recording remains separate. |
-| Platform rollout | All current desktop targets | Packaged inference smoke tests are mandatory on all three targets. |
+| Platform rollout | **Windows x64 for this release; macOS/Linux deferred** | Packaged inference smoke tests are mandatory on Windows x64. Other targets require CI that does not exist in this fork. |
 | Initial indexing | Automatic background backfill after launch | Startup and primary writes cannot wait for embeddings. |
 | Chat quality mode | User-selectable Fast/Deep, Deep default | Deep adds bounded model calls before final answer streaming. |
-| Runtime envelope | Quality-first 1 GiB target with explicit escalation band | Model, active/shadow snapshots, deltas, and sessions are measured together; no silent release above target. |
+| Runtime envelope | Quality-first 1 GiB RAM target with explicit escalation band | Model, active/shadow snapshots, deltas, and sessions are measured together; no silent release above target. The envelope is an arithmetic constraint on model dimension and vector encoding, not a preference. See "Resource Budget Arithmetic". |
+| Derived disk envelope | 2 GiB steady-state target, 3 GiB peak during shadow rebuild | Derived chunk text plus vectors plus two retained generations are measured together; no silent release above target. |
 | Product surfaces | Chat, sidebar search, Tauri context/search APIs, and MCP | External BM25 contracts require additive hybrid APIs rather than silent score changes. |
 | Deleted meeting Chat | Keep answer text, scrub deleted-meeting source data | Preserve conversation value without retaining navigable/snippet source copies. |
+
+## Platform Scope
+
+This release targets **Windows x64 only**.
+
+The original draft required packaged tokenizer, embedding, and reranker
+inference on Windows x64, macOS ARM64, and Linux x64 before Sprint 2, and again
+on installed packages in Sprint 5. That requirement was unsatisfiable:
+
+- This fork's only active CI workflow is `.github/workflows/build-windows.yml`
+  at the repository root.
+- `upstream/.github/workflows/build-macos.yml` and `build-linux.yml` exist on
+  disk but are nested inside `upstream/`, which GitHub Actions never reads.
+  They have never executed for this fork and cannot execute without new
+  root-level workflows.
+- No macOS or Linux development hardware is recorded anywhere in this project.
+
+Rather than declare a `MUST` that no gate could satisfy, the program ships
+Windows x64 and defers the other targets explicitly.
+
+Consequences:
+
+- Every packaging, inference, and smoke gate in Sprints 1 and 5 applies to
+  Windows x64 only.
+- Model selection MUST NOT depend on a platform-specific ONNX export, operator
+  set, or execution provider. Portability is preserved in the design even
+  though it is not gate-verified.
+- Model artifacts, tokenizer contracts, and license attribution remain
+  platform-neutral so a later macOS/Linux enablement is additive.
+- Release notes and any capability documentation MUST state that hybrid
+  retrieval is verified on Windows x64 only. Do not claim macOS or Linux
+  support without executing installed-package inference on that target.
+
+Re-enabling a deferred platform requires: a root-level build workflow for that
+target, the Sprint 1 reference-inference gate executed on it, and the Sprint 5
+installed-package smoke executed on it. That is a scope change requiring
+explicit user approval, not a task-level decision.
+
+## Resource Budget Arithmetic
+
+The 1 GiB retrieval RAM envelope is not a preference that model selection may
+trade against quality. It is an arithmetic constraint that eliminates most
+candidates before benchmarking begins. Sprint 1 MUST apply it as a pre-filter
+so Task 1.3 only benchmarks models that Task 1.4 can accept.
+
+Peak retrieval RAM is bounded below by:
+
+```text
+peak_bytes >=
+      dimensions
+    * bytes_per_value          (4 for f32, 2 for fp16, 1 for int8)
+    * document_count           (release gate: 250,000)
+    * snapshot_overlap_factor  (2 during shadow activation)
+  + embedding_session_bytes
+  + reranker_session_bytes
+  + delta_and_tombstone_bytes
+  + reader_held_old_snapshot_bytes
+```
+
+Worked values at the 250,000-document gate, vectors only, including the
+mandatory 2x shadow-activation overlap:
+
+| Dimensions | Encoding | Vector bytes at 250k | With 2x overlap | Headroom under 1 GiB for both model sessions |
+|---|---|---|---|---|
+| 384 | int8 | 96 MB | 192 MB | ~830 MB — comfortable |
+| 384 | f32 | 384 MB | 768 MB | ~250 MB — tight, likely fails with a cross-encoder |
+| 768 | int8 | 192 MB | 384 MB | ~640 MB — workable |
+| 768 | f32 | 768 MB | 1536 MB | none — **exceeds the 1.25 GiB hard fail before any model loads** |
+| 1024 | f32 | 1024 MB | 2048 MB | none — **fails** |
+
+Derived admissibility rule, which Sprint 1 Task 1.3 MUST apply before
+benchmarking a candidate:
+
+```text
+dimensions * bytes_per_value * 250000 * 2
+  + embedding_session_bytes
+  + reranker_session_bytes
+  <= 1 GiB   (automatic pass)
+  <= 1.25 GiB (requires explicit user risk approval)
+  >  1.25 GiB (inadmissible; do not benchmark)
+```
+
+Consequences that Sprint 1 MUST treat as given rather than rediscover:
+
+- A 768-dimension f32 bi-encoder is inadmissible at the 250,000-document gate.
+  It may only be considered together with an approved quantized encoding.
+- Quantization is therefore a first-class part of model selection, not a
+  contingency. `retrieval_models.vector_encoding` exists for this reason and
+  the document table MUST NOT hardcode an f32 byte width.
+- If no admissible pair meets the quality gates, Sprint 1 stops for an
+  architecture decision. The permitted levers are lower dimensionality,
+  quantization, memory-mapping the base snapshot, or an approved reduction of
+  the 250,000-document scale gate. Adding an ANN index is not a lever; see
+  "Vector Search Backend".
 
 ## Current State And Evidence
 
@@ -85,6 +180,26 @@ their authoritative content. Vector similarity alone is not the product.
   manager, so retrieval state will be additive.
 - `frontend/src-tauri/src/mcp/server.rs:133-233` exposes lexical search,
   context, and shared Chat preparation to localhost MCP clients.
+- The repository root `.github/workflows/` contains only `build-windows.yml`.
+  The macOS and Linux workflows under `upstream/.github/workflows/` are inert
+  for this fork. This is the basis for the Windows-only platform scope.
+- `frontend/src-tauri/tests/` and `frontend/src-tauri/benches/` do not exist.
+  Sprint 1 creates the first integration-test target and MUST pin its name.
+- `upstream/.cargo/config.toml` sets only `WHISPER_DONT_GENERATE_BINDINGS`. It
+  does **not** set `CARGO_TARGET_DIR`, contrary to `MIGRATION.md`. Every
+  verification command in this program sets it explicitly.
+
+## Relationship To Other Program Records
+
+This program is registered in the project `ROADMAP.md` under Phase 6. It is not
+a parallel or competing plan.
+
+| Record | Relationship |
+|---|---|
+| `ROADMAP.md` Sprint 6A task 6.1 | Contextual Chat entry points. This program depends on that surface work and does not duplicate it. |
+| `ROADMAP.md` backlog "Semantic/hybrid search" | That item was deferred pending "a repeatable retrieval benchmark showing FTS5 misses important results at a material rate." **Sprint 1 Task 1.2 is that benchmark.** Sprint 1 closing with a recorded FTS baseline failure satisfies the deferral condition; Sprint 1 failing to demonstrate it cancels the program. |
+| `docs/sprint-6-1-contextual-chat.md` | Sprint 6.1 closed on 2026-08-22 after the manual Windows/Tauri smoke passed. Task `6.1.R10` defines the saved-meeting invariants that this program's Sprint 4.3 must preserve. |
+| `docs/fts5-search-mcp-plan.md` | Historical. Superseded for retrieval design by this directory. |
 
 ## Scope
 
@@ -165,7 +280,18 @@ their authoritative content. Vector similarity alone is not the product.
 - Indexing MUST be single-owner, bounded, cancellable, and throttled or paused
   during recording/transcription pressure.
 - The release implementation MUST satisfy the Sprint 1 benchmark gates at
-  250,000 documents and stay within the approved retrieval RAM envelope.
+  250,000 documents and stay within the approved retrieval RAM and derived-disk
+  envelopes.
+- Cross-encoder reranking is the most expensive interactive stage and MUST have
+  its own measured sub-budget. It MUST NOT be permitted to consume the whole
+  Fast preparation budget.
+
+### Recoverability
+
+- A user MUST be able to force lexical-only retrieval at runtime without
+  reinstalling, rebuilding, or editing files. This is a persisted setting, not
+  a compile-time flag. It is the operational rollback for the retrieval path,
+  distinct from index pause/rebuild which only affect derived state.
 
 ## Architecture Overview
 
@@ -436,11 +562,14 @@ CREATE TABLE retrieval_models (
     created_at TEXT NOT NULL
 );
 
+-- 'active' is deliberately NOT a generation state. The singleton pointer in
+-- retrieval_active_model is the only authority on which generation is active.
+-- Two representations of the same fact cannot be kept consistent.
 CREATE TABLE retrieval_generations (
     generation_id TEXT PRIMARY KEY,
     model_id TEXT NOT NULL
         REFERENCES retrieval_models(model_id),
-    state TEXT NOT NULL CHECK (state IN ('building', 'ready', 'active', 'failed', 'retired')),
+    state TEXT NOT NULL CHECK (state IN ('building', 'ready', 'failed', 'retired')),
     document_count INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     activated_at TEXT,
@@ -466,7 +595,18 @@ CREATE TABLE search_source_state (
     fts_last_error TEXT
 );
 
+-- Due-work selection is the worker's hottest query. Without this the worker
+-- full-scans every meeting on every poll.
+CREATE INDEX search_source_state_fts_due
+    ON search_source_state(fts_next_attempt_at)
+    WHERE fts_indexed_revision < fts_projection_revision;
+
+-- Deliberately a rowid table. Rows carry a multi-KB vector BLOB plus chunk
+-- text, which is far above the small-row profile WITHOUT ROWID is designed
+-- for; large WITHOUT ROWID rows spill to overflow chains and degrade the
+-- full-table scan that snapshot loading depends on.
 CREATE TABLE retrieval_documents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     generation_id TEXT NOT NULL
         REFERENCES retrieval_generations(generation_id) ON DELETE CASCADE,
     document_id TEXT NOT NULL,
@@ -479,18 +619,25 @@ CREATE TABLE retrieval_documents (
     ordinal INTEGER NOT NULL,
     content TEXT NOT NULL,
     content_hash BLOB NOT NULL,
-    dimensions INTEGER NOT NULL,
+    dimensions INTEGER NOT NULL CHECK (dimensions > 0),
+    vector_encoding TEXT NOT NULL,
     vector BLOB NOT NULL,
     source_revision INTEGER NOT NULL,
     updated_at TEXT NOT NULL,
-    PRIMARY KEY (generation_id, document_id),
-    CHECK (length(vector) = dimensions * 4)
-) WITHOUT ROWID;
+    UNIQUE (generation_id, document_id)
+);
+
+-- No byte-width CHECK here. A hardcoded `length(vector) = dimensions * 4`
+-- forbids every non-f32 encoding and would block the quantization path that
+-- "Resource Budget Arithmetic" depends on. Encoding-aware validation of
+-- (vector_encoding, dimensions, byte length, finiteness, norm) is performed at
+-- the repository boundary, which this document already requires.
 
 CREATE INDEX retrieval_documents_by_meeting
     ON retrieval_documents(generation_id, meeting_id);
 
 CREATE TABLE retrieval_document_staging (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id TEXT NOT NULL,
     generation_id TEXT NOT NULL
         REFERENCES retrieval_generations(generation_id) ON DELETE CASCADE,
@@ -499,8 +646,11 @@ CREATE TABLE retrieval_document_staging (
     source_revision INTEGER NOT NULL,
     document_id TEXT NOT NULL,
     payload BLOB NOT NULL,
-    PRIMARY KEY (job_id, document_id)
-) WITHOUT ROWID;
+    UNIQUE (job_id, document_id)
+);
+
+CREATE INDEX retrieval_document_staging_by_generation
+    ON retrieval_document_staging(generation_id, meeting_id);
 
 CREATE TABLE retrieval_meeting_state (
     generation_id TEXT NOT NULL
@@ -515,6 +665,11 @@ CREATE TABLE retrieval_meeting_state (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (generation_id, meeting_id)
 ) WITHOUT ROWID;
+
+-- Due-work selection for semantic indexing. Same rationale as the FTS index
+-- above: step 1 of the worker algorithm must not scan every meeting row.
+CREATE INDEX retrieval_meeting_state_due
+    ON retrieval_meeting_state(generation_id, state, next_attempt_at);
 
 CREATE TABLE retrieval_index_state (
     generation_id TEXT PRIMARY KEY
@@ -536,12 +691,34 @@ CREATE TABLE retrieval_index_changes (
     source_revision INTEGER,
     created_at TEXT NOT NULL
 );
+
+-- Journal replay filters by generation inside a change_id range. change_id is
+-- a rowid alias so the range is cheap, but the generation filter is not.
+CREATE INDEX retrieval_index_changes_replay
+    ON retrieval_index_changes(generation_id, change_id);
 ```
 
-Vectors are normalized finite little-endian `f32`. Repository reads validate
-dimension, byte length, finiteness, and norm before admitting a vector to an
-in-memory index. Malformed derived rows are quarantined/rebuilt, not allowed to
-crash application startup.
+Vectors are normalized, finite, little-endian, and stored in the encoding named
+by `vector_encoding` for their generation's model. `f32` is the reference
+encoding; `int8` and `fp16` are permitted when Sprint 1 approves them under
+"Resource Budget Arithmetic". Repository reads validate encoding, dimension,
+byte length, finiteness, and norm before admitting a vector to an in-memory
+index. A quantized encoding MUST record its dequantization parameters in
+`retrieval_models` so a vector is never interpreted under the wrong scale.
+Malformed derived rows are quarantined/rebuilt, not allowed to crash
+application startup.
+
+### Derived Storage Cost
+
+Storing derived chunk text is intentional, but it is not free and the program
+gates it. At the 250,000-document release scale, one generation holds a second
+copy of the indexed transcript, summary, and note text plus its vectors, and a
+shadow rebuild transiently doubles that. The derived disk envelope is a 2 GiB
+steady-state target and a 3 GiB peak during rebuild, measured as the total of
+`retrieval_documents`, `retrieval_document_staging`, any sidecar, and all
+retained generations. Sprint 1 records the measured per-document cost; Sprint 5
+qualifies against the envelope. Exceeding it blocks release in the same way an
+over-budget RAM result does.
 
 Storing derived chunk text is intentional. It gives reranking a stable,
 content-hash-bound input and avoids recomputing every candidate window during a
@@ -668,13 +845,34 @@ Exact search is preferred because it has full recall and the smallest failure
 surface. It ships if Sprint 1 proves that 250,000-document vector-stage p95 and
 peak retrieval RAM satisfy the approved gates on reference hardware.
 
+### Backend Decision Rule
+
+The latency gate and the RAM gate have different remedies and MUST NOT be
+treated as one "scale gate". An ANN index stores a proximity graph *in addition
+to* the vectors it indexes; it reduces query latency and **increases** memory.
+Selecting ANN in response to a RAM failure makes the failure worse.
+
+| Measured result at 250k | Permitted remedy |
+|---|---|
+| Both gates pass | Ship exact search. Do not evaluate ANN. |
+| Latency p95 misses, RAM passes | Evaluate a pure-Rust HNSW-style index. This is the ANN path. |
+| RAM misses, latency passes | Reduce the footprint: quantized `vector_encoding`, a lower-dimension model, or memory-mapping the base snapshot. **ANN is not a remedy and MUST NOT be evaluated for this failure.** |
+| Both miss | Stop. Architecture decision required. Do not silently reduce scale, quality, or the evaluation corpus. |
+
+Because "Resource Budget Arithmetic" is applied as a pre-filter during model
+selection, a RAM miss at Task 1.4 should be rare. If one occurs it means the
+pre-filter arithmetic was wrong, which is itself a finding to record.
+
 ### ANN Option
 
-If exact search fails the scale gate, add a pure-Rust HNSW-style index. Do not
-add a native extension or external service.
+Add a pure-Rust HNSW-style index **only under the latency-miss row above**. Do
+not add a native extension or external service.
 
 Requirements:
 
+- The ANN graph's own memory MUST be counted in the retrieval RAM envelope
+  alongside vectors and model sessions. An ANN candidate that pushes peak RAM
+  above the approved band is rejected regardless of its latency benefit.
 - SQLite vectors remain canonical.
 - Sidecar files are versioned by model and index generation.
 - Build to a temporary path, hash/validate, then atomically rename.
@@ -818,6 +1016,13 @@ contribution is capped and diversity is measured separately.
 The cross-encoder receives question/evidence pairs for a bounded top candidate
 set. It reranks evidence and contributes to meeting ranking.
 
+Reranking is the most expensive stage in an otherwise cheap pipeline. A
+512-token cross-encoder pass on CPU costs roughly 30-80 ms per pair depending on
+model size and the ORT intra-op cap, so the provisional 30-50 input range
+implies **1.0-4.0 seconds for reranking alone** — potentially the entire Fast
+preparation budget before embedding, FTS, vector scan, fusion, and hydration are
+counted. The stage therefore has its own gate and an approved adaptive policy.
+
 Requirements:
 
 - Input truncation follows the reranker's tokenizer and manifest.
@@ -826,6 +1031,19 @@ Requirements:
 - Search surfaces use local reranking without an LLM call.
 - Reranker output is never presented as calibrated confidence unless Sprint 1
   proves calibration.
+- The reranking stage MUST satisfy its own p95 sub-budget of **900 ms** on
+  reference hardware, inside the overall Fast preparation budget.
+- Sprint 1 MUST measure per-pair latency for the selected reranker and derive
+  the maximum admissible candidate count from the sub-budget, rather than
+  assuming the provisional 30-50 range is affordable.
+- Adaptive reranking depth is pre-approved so Sprint 3 does not have to
+  renegotiate a gate. The implementation MAY rerank a reduced head when the
+  fused top-k margin is unambiguous, provided the policy is deterministic,
+  recorded with Sprint 1 evidence, and evaluated by the corpus. It MUST NOT
+  vary depth by wall-clock timing, which would make results irreproducible.
+- The `Search` retrieval purpose MAY use a shallower approved depth than
+  `Chat`. Sidebar search reranks on every debounced keystroke and does not
+  need Chat-grade depth.
 
 ## Authoritative Hydration
 
@@ -921,8 +1139,14 @@ Constraints:
 - Maximum ten expanded evidence IDs per round.
 - Maximum planner input of 24,000 Unicode characters and strict output of one
   JSON object no larger than 8 KiB/512 output tokens.
-- Maximum 20 seconds per planner call and 45 seconds total Deep preparation.
-- Maximum two planner provider calls before final answer generation.
+- Maximum 15 seconds per planner call and **30 seconds total Deep preparation**,
+  reduced from 45 seconds because Deep is the default path and the budget is
+  time a user spends watching nothing happen.
+- Maximum two planner provider calls before final answer generation. Note that
+  a Deep turn may additionally incur the existing follow-up query-rewrite call
+  (`api/chat.rs:465-494`), so the worst case is four provider round-trips
+  including final generation. Sprint 4 MUST report this total, not just the
+  planner count.
 - Every action is schema-validated and allow-listed.
 - Meeting text is untrusted data and cannot alter system instructions.
 - Scope cannot widen.
@@ -938,6 +1162,50 @@ conversations default to Deep. Do not add conversation persistence for the
 mode unless a later approved task requires it. MCP Chat is not an interactive
 conversation and remains Fast-only in this release. Deep through unauthenticated
 localhost MCP is deferred until it has an approved cancellation/cost contract.
+
+### Deep Preparation Progress
+
+Deep inserts up to 30 seconds of preparation in front of a UI that currently
+begins streaming almost immediately. Static explanatory copy is not sufficient
+for a default experience; silence reads as a hang.
+
+- Deep preparation MUST emit stage-level progress events through the existing
+  Chat event channel before final answer streaming begins.
+- Events carry **stage identity and counts only** — for example searching,
+  ranking, reviewing N meetings, expanding evidence, or writing the answer.
+- Events MUST NOT carry planner output, reasoning text, queries, meeting
+  content, or any evidence text. The prohibition on displaying hidden planner
+  reasoning is unchanged; this is a progress contract, not a reasoning display.
+- Cancellation remains available and typed throughout the progress phase.
+- Fast mode emits no preparation progress events; it has no user-perceptible
+  preparation phase to report.
+
+### Open Decision: Deep As Default
+
+Deep-as-default is a recorded user decision and remains in force. It is flagged
+here because the critique that produced this revision recommended re-examining
+it, and the authority order requires the user, not an implementation agent, to
+settle it.
+
+The tension: Sprint 3 requires Fast alone to solve the reference case before
+Deep exists, so Deep is a quality margin rather than the mechanism that fixes
+the reported failure — and it costs up to 30 seconds and up to three extra
+provider calls on every new conversation. Fast-by-default with Deep one click
+away would deliver the same fix at a fraction of the latency and provider cost.
+
+No implementation task may change the default. Sprint 4 MUST report measured
+Deep preparation latency and provider-call counts, and the user MAY revisit the
+default at Sprint 4 close with that evidence in hand.
+
+### Mode Applicability By Scope
+
+The selector MUST NOT present a choice that the backend ignores.
+
+| Scope | Fast/Deep behavior | Required UI |
+|---|---|---|
+| All, folder, meeting, snapshot, today | Both modes are honored | Selector enabled |
+| Live recording | Retrieval is the direct in-memory transcript path; mode has no effect | Selector disabled, with a short explanation that live Chat reads the current transcript directly |
+| MCP Chat | Fast-only by decision | Not applicable; no MCP selector exists |
 
 ## Scope Semantics
 
@@ -1050,6 +1318,8 @@ raw embeddings.
 | User/stream cancellation | Propagate typed cancellation; stop preparation and emit no stale/final answer or source event. |
 | Scope validation failure | Fail closed before retrieval. |
 | Database/index write contention | Retry derived work; never fail the primary meeting mutation. |
+| User forced lexical-only | Use FTS for every surface; report as an explicit user-selected state, not a failure. |
+| Derived disk envelope exceeded | Report in diagnostics, block generation activation, and offer rebuild/cleanup; never delete primary data automatically. |
 
 ## Security And Privacy
 
@@ -1108,14 +1378,36 @@ Add retrieval status under Settings after the backend status contract exists:
 - Pause/resume indexing.
 - Rebuild semantic index.
 - Last error with retry.
-- Estimated local index size.
+- Estimated local index size, shown against the approved disk envelope.
+- **Force lexical-only retrieval** (see below).
 
 The model is bundled, so there is no download/delete workflow. Rebuild deletes
 only derived semantic state, never transcripts, summaries, notes, or FTS.
 
+### Retrieval Kill Switch
+
+Hybrid retrieval replaces the primary Chat retrieval path. Index pause and
+rebuild only affect derived state; neither returns a user to the previously
+shipped retrieval behavior. Without a runtime control, recovery from a bad
+result on a user's real corpus requires a reinstall.
+
+- A persisted `force_lexical_retrieval` setting MUST exist and MUST be
+  surfaced in Settings.
+- When enabled, every retrieval surface — Chat in all scopes, sidebar search,
+  Tauri hybrid commands, and MCP hybrid tools — takes the same lexical path
+  used when semantic state is unavailable. No new code path is introduced; the
+  switch reuses the existing fallback.
+- It takes effect on the next request without restart, and does not delete,
+  invalidate, or pause the semantic index. Turning it off restores hybrid
+  behavior immediately.
+- Diagnostics MUST report it as an explicit distinct reason, so a
+  user-forced lexical state is never mistaken for a model failure.
+
 Chat exposes Fast and Deep. New conversations default to Deep. The UI explains
 that Deep may take longer and use additional requests to the configured Chat
-provider. No hidden reasoning/planner output is displayed.
+provider, and shows stage-level progress during Deep preparation. The selector
+is disabled in live-recording scope, where mode has no effect. No hidden
+reasoning/planner output is displayed.
 
 ## Evaluation Contract
 
@@ -1149,6 +1441,90 @@ Metrics:
 Deterministic expected meetings/evidence/facts are primary acceptance evidence.
 An LLM judge MAY supplement but MUST NOT replace deterministic checks.
 
+### Baseline Failure Reproduction
+
+A synthetic fixture that today's retrieval already answers correctly proves
+nothing, and the same agent that must beat the reference case also authors the
+fixture standing in for it. The corpus therefore carries an explicit
+falsifiability requirement:
+
+- The synthetic reference case MUST **fail** under the current FTS-only
+  baseline in the same mode as the observed production failure: isolated
+  numeric fragments, incomplete schedule, missing MPV distinction.
+- The harness MUST assert that baseline failure explicitly, as a passing test.
+  If a change ever makes the baseline succeed, that assertion fails and the
+  fixture is revealed as unrepresentative.
+- The same requirement applies to every case in the semantic/paraphrase
+  category: each MUST be shown to be under-served by the FTS baseline, or it
+  cannot be used to claim a semantic improvement.
+- Categories that exist to protect against regression — exact terms, numbers,
+  names — are exempt. Those SHOULD pass on the baseline, and their gate is
+  no-regression rather than improvement.
+
+### Corpus Solvability
+
+"Baseline Failure Reproduction" constrains the corpus in one direction only: the
+fixture must be hard enough that the FTS baseline fails it. Satisfying that
+requirement alone is trivial and useless — a corpus can be made impossible for
+*every* retriever, which passes the letter of the falsifiability rule while
+destroying its purpose. Task `1.2` did exactly this, and Task `1.3` spent an
+L-sized benchmark discovering it. Both constraints are therefore normative, and
+neither may be satisfied at the other's expense.
+
+- Every case MUST be solvable from its own text. The expected evidence MUST be
+  closer to the query than each of that case's distractors on at least one
+  retrieval channel — lexical overlap, or semantic relatedness a multilingual
+  bi-encoder can be expected to represent.
+- A distractor MUST NOT contain the query verbatim, or contain a superset of the
+  query's content terms, unless the expected evidence also contains them. A
+  target that shares less surface with the query than its distractors do is not
+  a hard case; it is an unanswerable one.
+- The harness MUST assert structural solvability as a passing test, computed
+  from fixture text without consulting the answer key: query-copy/superset
+  distractors, nonce discriminators, duplicated templates, and non-varying
+  ranking attributes are rejected directly.
+- A separate supervised margin assertion MAY use expected IDs only to label
+  which raw-text evidence is the target. Every channel score and target-versus-
+  strongest-distractor margin MUST be computed from fixture text; IDs MUST NOT
+  contribute to the score or bypass retrieval. An oracle that returns
+  `required_evidence_ids` directly does not satisfy this: it proves the scoring
+  code can score a perfect result, not that a retriever could produce one.
+- Cases MUST be materially distinct from one another. A corpus generated by
+  interpolating an ordinal into a shared template has an effective sample size
+  equal to its template count, not its case count, and cannot satisfy "Corpus
+  Size Floors" no matter how many rows it emits.
+- Nonce tokens (`Sintetico42`, `Cedar42`) MUST NOT carry the discriminating
+  signal of a semantic case. They tokenize to subword noise in a multilingual
+  encoder and defeat the paraphrase relation the case exists to test.
+- Fixture attributes that a ranking input depends on MUST vary across meetings
+  within a case. Identical titles, identical dates, or a folder allow-list that
+  excludes nothing render title overlap, recency semantics, and scope isolation
+  untestable while appearing to be covered.
+
+**Diagnostic signal.** If two unrelated model families — different
+architectures, dimensions, or training corpora — produce identical aggregate
+metrics on this corpus, the corpus is the deciding variable rather than the
+model. Treat that as evidence of a corpus defect and stop; do not tune
+constants, change models, or adjust gates against it.
+
+### Corpus Size Floors
+
+Percentage gates are uninterpretable without sample size. At twenty cases a
+single case moves Recall@3 by five points and a "+10 percentage point"
+improvement is one or two cases of noise. Minimum counts:
+
+| Scope | Minimum cases |
+|---|---|
+| Total corpus | 120 |
+| Each required category in the list above | 15 |
+| Portuguese subset | 40 |
+| English subset | 40 |
+| Reference/critical designated cases | 5 |
+
+Below these counts a gate is reported as **indicative only** and cannot be used
+to close a sprint. Sprint 1 MAY propose different floors with a documented
+power/precision argument, but MUST NOT close with unstated sample sizes.
+
 Sprint 1 does not close until it publishes a numeric gate table approved by the
 user. Minimum defaults, which may only be tightened or changed by explicit
 approval after baseline evidence, are:
@@ -1164,7 +1540,11 @@ approval after baseline evidence, are:
 | Semantic/paraphrase category | At least +10 percentage points Recall@3 over FTS, or at least 95% when baseline is already above 85% |
 | Reranker designated cases | Improves pairwise/NDCG metric and causes no critical-case regression |
 | Forbidden-fact contamination in critical cases | 0 |
-| Retrieval RAM at 250k | `<=1 GiB` automatic pass; `>1 GiB` through `1.25 GiB` requires explicit user risk/quality approval; `>1.25 GiB` fails without a product scope change. Includes active sessions and old/new snapshot overlap. |
+| Retrieval RAM at 250k | `<=1 GiB` automatic pass; `>1 GiB` through `1.25 GiB` requires explicit user risk/quality approval; `>1.25 GiB` fails without a product scope change. Includes active sessions, ANN graph if selected, and old/new snapshot overlap. |
+| Derived disk at 250k | `<=2 GiB` steady state and `<=3 GiB` during shadow rebuild automatic pass; above either figure requires explicit user approval. Includes documents, staging, sidecars, and all retained generations. |
+| Baseline falsifiability | Reference and semantic-category cases demonstrably fail the FTS-only baseline; asserted by the harness |
+| Corpus solvability | Every case satisfies "Corpus Solvability"; asserted by the harness from fixture text without consulting the answer key. A corpus may not pass falsifiability by being unanswerable |
+| Corpus size | Meets the floors in "Corpus Size Floors"; every reported percentage carries its denominator |
 
 The approved Sprint 1 gate table records corpus counts so percentages cannot be
 interpreted without sample size.
@@ -1189,13 +1569,23 @@ Sprint 1 defines reference hardware and records results. Provisional release
 ceilings:
 
 - Up to 250,000 semantic documents.
-- Target at most 1 GiB peak retrieval RAM, including vector snapshot, active
-  retrieval model sessions, delta/tombstones, reader-held old snapshots, and
-  shadow activation overlap. A measured 1-1.25 GiB result blocks release until
-  explicitly approved; above 1.25 GiB fails the architecture gate.
+- Target at most 1 GiB peak retrieval RAM, including vector snapshot, ANN graph
+  when selected, active retrieval model sessions, delta/tombstones, reader-held
+  old snapshots, and shadow activation overlap. A measured 1-1.25 GiB result
+  blocks release until explicitly approved; above 1.25 GiB fails the
+  architecture gate.
+- Target at most 2 GiB derived disk in steady state and 3 GiB during shadow
+  rebuild. Above either figure blocks release until explicitly approved.
 - Vector-search stage p95 below 500 ms on reference hardware.
+- Cross-encoder reranking stage p95 below 900 ms on reference hardware. This is
+  a sub-budget of Fast preparation, not additional to it.
 - Fast local retrieval preparation p95 below 2 seconds excluding final LLM
-  answer generation.
+  answer generation. If Sprint 1 measurement shows the selected reranker cannot
+  fit its sub-budget at any useful candidate depth, the correct response is an
+  approved change to this gate with recorded evidence, not silent depth
+  reduction below evaluated quality.
+- Deep preparation p95 below 30 seconds including all planner calls, with
+  stage-level progress events emitted throughout.
 - App startup is not blocked by backfill.
 - Interactive audio capture shows no new drop/overflow warning and no more than
   10% p95 transcription-throughput degradation under the scheduler test.
@@ -1206,20 +1596,25 @@ support.
 
 ## Packaging And Platform Gates
 
-Before Sprint 2, development/CI runners for Windows x64, macOS ARM64, and Linux
-x64 must execute reference tokenizer, embedding, and reranker inference for the
-selected pair. Sprint 5 additionally proves installed-package inference.
+These gates apply to **Windows x64 only**, per "Platform Scope". macOS ARM64 and
+Linux x64 gates are deferred with the platforms themselves.
 
-For Sprint 1 on each target:
+Before Sprint 2, the Windows x64 CI runner must execute reference tokenizer,
+embedding, and reranker inference for the selected pair. Sprint 5 additionally
+proves installed-package inference.
+
+For Sprint 1 on Windows x64:
 
 - CI fetches/verifies model artifacts and runs reference tokenizer, embedding,
   and reranker inference from the staged resource layout.
 - A known sentence tokenizes/embeds to the expected dimension and tolerance.
 - A known question/evidence pair produces the expected finite reranker order.
+- The reference outputs are recorded in a platform-neutral form so a future
+  macOS/Linux enablement can be checked against the same expectations.
 
-For Sprint 5 on each installed package:
+For Sprint 5 on the installed Windows package:
 
-- Tauri packages include all model/tokenizer artifacts and licenses.
+- The Tauri package includes all model/tokenizer artifacts and licenses.
 - Installed application locates the signed resource path and loads both ONNX
   sessions.
 - A minimal hybrid query returns the expected fixture.
@@ -1235,7 +1630,17 @@ only on CI's unpinned `stable` behavior.
 Semantic schema changes are additive. Migration creates tables/triggers and
 queues backfill; it performs no inference.
 
-Rollback principles:
+Rollback principles, ordered from cheapest to most disruptive:
+
+1. **Force lexical-only setting.** Runtime, reversible, no data change, no
+   restart. This is the first response to a retrieval-quality problem in the
+   field and the only one a user can perform themselves.
+2. **Pause indexing.** Stops derived work; active generation stays queryable.
+3. **Rebuild semantic index.** Deletes derived state only; primary data and FTS
+   are untouched.
+4. **Ship a build with semantic paths disabled.** Requires a release.
+5. **Binary rollback across the semantic migration.** Requires a verified
+   pre-upgrade database backup; see below.
 
 - Disabling semantic retrieval leaves FTS and primary meeting data usable.
 - Derived tables and sidecars can be deleted/rebuilt without data loss.
@@ -1296,9 +1701,11 @@ Rollback principles:
 
 ### Packaged Smoke Tests
 
-- Installed application model loading and inference on each supported target.
+- Installed application model loading and inference on Windows x64, the only
+  supported target this release.
 - Windows CUDA/Vulkan Whisper variants do not change ORT correctness.
 - Missing resource and corrupt sidecar fallback.
+- Forced lexical-only setting produces lexical behavior on every surface.
 
 ## Subagent Guardrails
 
@@ -1328,6 +1735,12 @@ Subagents MUST NOT:
 - Build sources before final context budgeting.
 - Add a native SQLite extension without a user-approved architecture change.
 - Claim packaged support without executing installed-package inference tests.
+- Claim macOS or Linux support. This release is Windows x64 only.
+- Reintroduce a fixed byte-width `CHECK` on the vector column.
+- Add `'active'` back to the generation state enum.
+- Select an ANN backend in response to a memory-budget failure.
+- Present a Fast/Deep control in a scope whose retrieval ignores it.
+- Emit planner text, queries, or evidence content through progress events.
 
 ## Review Gates
 
@@ -1351,10 +1764,17 @@ No sprint closes with unresolved blocker or should-fix findings.
 These are not open product questions. Sprint 1 must resolve them with recorded
 evidence:
 
-- Exact embedding and reranker models/revisions.
+- Exact embedding and reranker models/revisions, **from the admissible set
+  defined by "Resource Budget Arithmetic"**.
+- Vector encoding (`f32`, `fp16`, or `int8`) and, when quantized, its
+  dequantization parameters and measured recall cost.
 - Token-window profile.
 - Whether all summary templates improve retrieval enough to index.
-- Exact vector scan versus exact plus HNSW.
+- Exact vector scan versus exact plus HNSW, **decided by the Backend Decision
+  Rule table, not by an undifferentiated scale gate**.
+- Reranker candidate depth derived from the 900 ms sub-budget, and the adaptive
+  depth policy if one is adopted.
+- Measured per-document derived disk cost and the projected 250k footprint.
 - Lexical normalization/core-term and high-frequency-word policy.
 - Candidate limits, RRF constant/weights, and meeting-aggregation constants.
 - Reranker batch size and candidate count.
@@ -1380,6 +1800,13 @@ Any failure to resolve one of these gates blocks Sprint 2 approval.
 | Partial-generation activation | Biases results toward meetings indexed first. |
 | Silently change MCP/BM25 rank semantics | Breaks concrete external consumers and observability. |
 | Embed live transcript continuously | Adds resource/privacy/lifecycle complexity; live Chat already has an authoritative in-memory path. |
+| Require macOS/Linux inference gates without macOS/Linux CI | The gate could never be satisfied in this fork, so it would have silently blocked Sprint 1 forever or been quietly ignored. Deferring the platform is honest; an unsatisfiable `MUST` is not. |
+| ANN as the remedy for a memory-budget miss | An HNSW graph is stored in addition to the vectors; it cannot reduce a footprint it adds to. |
+| `WITHOUT ROWID` for `retrieval_documents` | Rows carry multi-KB vectors and chunk text, far above the small-row profile the storage form is designed for. |
+| Fixed `length(vector) = dimensions * 4` constraint | Hardcodes f32 and forbids the quantization path the RAM envelope depends on. |
+| `'active'` as a generation state alongside the singleton pointer | Two representations of one fact with nothing keeping them consistent. |
+| Code revert as the only retrieval rollback | Requires a rebuild and reinstall to recover from a bad result on a user's real corpus. |
+| Static copy alone as the Deep latency mitigation | Up to 30 seconds of silence in a streaming UI reads as a hang regardless of what a tooltip said earlier. |
 
 ## Decision Log
 
@@ -1389,13 +1816,32 @@ Any failure to resolve one of these gates blocks Sprint 2 approval.
 | 2026-08-21 | Use local bundled embeddings. | Preserve local processing and offline retrieval. | User |
 | 2026-08-21 | Optimize for quality without a strict total model-asset limit. | Retrieval quality is the primary product target. | User |
 | 2026-08-21 | Include local reranking and iterative LLM retrieval. | Reach beyond one-shot vector retrieval. | User |
-| 2026-08-21 | Support up to 250,000 documents with a quality-first 1 GiB target and approval band through 1.25 GiB. | Make the approximate user-selected envelope testable without silently rejecting a material quality win or releasing above target. | Main agent interpretation, pending architecture approval |
+| 2026-08-21 | Support up to 250,000 documents with a quality-first 1 GiB target and approval band through 1.25 GiB. | Make the approximate user-selected envelope testable without silently rejecting a material quality win or releasing above target. | User |
 | 2026-08-21 | Roll out broad Chat first, then all saved scopes. | Fix the demonstrated gap while preserving staged validation. | User |
 | 2026-08-21 | Target all current desktop platforms. | Preserve the supported product footprint. | User |
 | 2026-08-21 | Backfill automatically after launch. | Avoid manual setup while keeping startup non-blocking. | User |
 | 2026-08-21 | Expose Fast/Deep and default new Chat conversations to Deep. | Make highest quality the normal experience while retaining a faster option. | User |
 | 2026-08-21 | Extend all retrieval surfaces. | Keep Chat, sidebar, context APIs, and MCP capabilities aligned. | User |
 | 2026-08-21 | Keep answer text but scrub deleted-meeting source snippets/navigation metadata. | Preserve conversation history while reducing retained source copies after deletion. | User |
-| 2026-08-21 | Keep MCP Chat Fast-only in the first release. | Avoid iterative provider calls through unauthenticated localhost MCP without cancellation/cost controls. | Main agent, pending architecture approval |
-| 2026-08-21 | Use per-generation indexed source revisions plus a canonical/publication journal. | Prevent model upgrades/rebuilds, crashes, and deletions from leaving stale active vectors. | Main agent, pending architecture approval |
-| 2026-08-21 | Durably repair FTS before semantic indexing. | FTS cannot be the availability fallback if best-effort refresh failures remain permanent. | Main agent, pending architecture approval |
+| 2026-08-21 | Keep MCP Chat Fast-only in the first release. | Avoid iterative provider calls through unauthenticated localhost MCP without cancellation/cost controls. | User |
+| 2026-08-21 | Use per-generation indexed source revisions plus a canonical/publication journal. | Prevent model upgrades/rebuilds, crashes, and deletions from leaving stale active vectors. | User |
+| 2026-08-21 | Durably repair FTS before semantic indexing. | FTS cannot be the availability fallback if best-effort refresh failures remain permanent. | User |
+| 2026-08-21 | **Ship Windows x64 only; defer macOS ARM64 and Linux x64.** | This fork's only active workflow is the root `build-windows.yml`; the macOS/Linux workflows are nested under `upstream/` where GitHub Actions never reads them, and no macOS/Linux hardware is recorded. The original all-three-target `MUST` was unsatisfiable and would have blocked Sprint 1 permanently. | User |
+| 2026-08-21 | Express the RAM envelope as budget arithmetic and apply it as a model-selection pre-filter. | A 768-dim f32 model is inadmissible at 250k documents before any model loads. Deriving that up front avoids two L-sized benchmark tasks discovering arithmetic empirically. | User |
+| 2026-08-21 | Split the vector-backend decision rule by gate; ANN answers latency only. | An HNSW graph adds memory to the vectors it indexes and cannot remedy a RAM miss. The original single "scale gate" rule sent workers down a path that could not succeed. | User |
+| 2026-08-21 | Remove the fixed byte-width vector `CHECK`; validate encoding at the repository boundary. | The constraint hardcoded f32 and forbade the quantization escape hatch that the same document offers as the RAM remedy. | User |
+| 2026-08-21 | Add a derived-disk envelope with the same target/approval/fail structure as RAM. | Derived chunk text plus vectors plus two retained generations plausibly reach ~2 GiB at the release scale, with no ceiling previously stated anywhere. | User |
+| 2026-08-21 | Give cross-encoder reranking a 900 ms p95 sub-budget and pre-approve deterministic adaptive depth. | Reranking 30-50 pairs on CPU plausibly consumes the entire 2 s Fast budget alone; it was the only expensive stage without its own gate. | User |
+| 2026-08-21 | Require stage-level progress events during Deep preparation and cut the budget from 45 s to 30 s. | Deep is the default and inserts silence into a streaming UI. Static copy does not prevent a hang from reading as a hang. | User |
+| 2026-08-21 | Flag Deep-as-default for user re-examination at Sprint 4 close with measured evidence. | Deep-as-default is a recorded user decision; Fast must independently solve the reference case, which makes Deep a margin rather than the fix. Only the user may change it. | Main agent, **open question for user** |
+| 2026-08-21 | Disable the Fast/Deep selector in live-recording scope. | Live retrieval ignores the mode; showing an active control that does nothing misleads the user in the scope most likely to want depth. | User |
+| 2026-08-21 | Require a persisted force-lexical-retrieval kill switch. | Index pause/rebuild affect derived state only and cannot return a user to prior retrieval behavior; the sole documented rollback was a code revert. | User |
+| 2026-08-21 | Remove `'active'` from the generation state enum. | The singleton pointer is already declared the sole authority; keeping a second representation invites divergence. | User |
+| 2026-08-21 | Make `retrieval_documents` a rowid table and add due-work/replay indexes. | Multi-KB rows defeat `WITHOUT ROWID`, and the worker's due-item selection had no supporting index on either state table. | User |
+| 2026-08-21 | Require the reference fixture to reproduce the baseline FTS failure, and set corpus size floors. | A synthetic fixture the current retrieval already passes makes the program's headline gate unfalsifiable; percentage gates at small N are noise. | User |
+| 2026-08-21 | Register the program in `ROADMAP.md` and gate dispatch on closing Sprint 6.1. | Two live plans with no stated relationship; Sprint 6.1 is still blocked and defines the saved-meeting invariants Sprint 4.3 must preserve. | User |
+| 2026-08-22 | Record Sprint 6.1 as closed after all six manual Windows/Tauri checks passed. | Clears the final prerequisite without waiving native scope, provider-disclosure, recording-promotion, or source checks. | User |
+| 2026-08-22 | Add "Corpus Solvability" as a normative counterweight to "Baseline Failure Reproduction". | The falsifiability rule constrained the corpus in one direction only. Task `1.2` satisfied it by making the corpus impossible for every retriever — the reference target shares almost no surface with its query while 30 distractors contain the query verbatim — and Task `1.3` consumed an L-sized benchmark before the defect surfaced. | User |
+| 2026-08-22 | Implement corpus solvability as an answer-key-free structural check plus a supervised raw-text margin check. | An unsupervised check cannot know which evidence is expected, while an oracle proves nothing. Expected IDs may label the target only; all scores and margins come from text. | User |
+| 2026-08-22 | Treat identical aggregate metrics across unrelated model families as a corpus-defect signal, not a model finding. | e5-small (384-d), e5-base (768-d), and paraphrase-MiniLM produced byte-identical corpus metrics in Task `1.3`. Architectures that differ in dimension and training data cannot agree to the digit unless the model is not the deciding variable. | User |
+| 2026-08-22 | Void the Task `1.3` fusion, aggregation, and reranker-weight constants; they do not carry into Sprint 2. | The 144-configuration grid ran against an objective whose first two terms were constant across every configuration (exact violations 0 everywhere, semantic misses 30 everywhere), so the search degenerated to its "prefer smaller constants" tie-break. The locked values are search artifacts, not measurements. | User |

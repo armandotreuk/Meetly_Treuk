@@ -226,9 +226,10 @@ impl FtsRepository {
         expand_transcript_segments(pool, &mut results, 200).await?;
 
         info!(
-            "FTS search: query_len={} folder={:?} results={}",
-            parsed.fts_query.len(),
-            parsed.folder_id,
+            "FTS search: query_len={} mode={:?} folder_scoped={} results={}",
+            parsed.fts_query.chars().count(),
+            match_mode,
+            parsed.folder_id.is_some(),
             results.len()
         );
         Ok(results)

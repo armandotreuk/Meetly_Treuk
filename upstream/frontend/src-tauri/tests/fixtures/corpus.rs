@@ -6,7 +6,7 @@
 // ponytail: solvability rests on two authored invariants instead of a solver —
 // failing cases keep >=3 neighbours repeating one query content term while the
 // target repeats none (deterministic bm25 misrank), and the margin lexicon in
-// `retrieval_evaluation.rs` covers exactly these paraphrase pairs.
+// `fixtures/concept_lexicon.rs` covers exactly these paraphrase pairs.
 
 #[path = "corpus/follow_up.rs"]
 mod follow_up;

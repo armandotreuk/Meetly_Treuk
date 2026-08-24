@@ -347,6 +347,15 @@ async fn make_api_request<R: Runtime, T: for<'de> Deserialize<'de>>(
 
 // API Commands for Tauri
 
+fn lexical_search_log_fields(query: &str, mode: &str, result_count: usize) -> String {
+    format!(
+        "query_len={}, mode={}, results={}",
+        query.chars().count(),
+        mode,
+        result_count
+    )
+}
+
 #[tauri::command]
 pub async fn api_get_meetings<R: Runtime>(
     _app: AppHandle<R>,
@@ -382,24 +391,23 @@ pub async fn api_search_transcripts<R: Runtime>(
     query: String,
     auth_token: Option<String>,
 ) -> Result<Vec<TranscriptSearchResult>, String> {
-    log_info!(
-        "api_search_transcripts called with query: '{}', auth_token: {}",
-        query,
-        auth_token.is_some()
-    );
-
     let pool = state.db_manager.pool();
 
     match TranscriptsRepository::search_transcripts(pool, &query).await {
         Ok(results) => {
             log_info!(
-                "Search completed successfully with {} results.",
-                results.len()
+                "api_search_transcripts completed: {}, auth_token={}",
+                lexical_search_log_fields(&query, "legacy_transcript", results.len()),
+                auth_token.is_some()
             );
             Ok(results)
         }
         Err(e) => {
-            log_error!("Error searching transcripts for query '{}': {}", query, e);
+            log_error!(
+                "api_search_transcripts failed: query_len={}, mode=legacy_transcript, error={}",
+                query.chars().count(),
+                e
+            );
             Err(format!("Failed to search transcripts: {}", e))
         }
     }
@@ -601,16 +609,18 @@ pub async fn api_search_fts<R: Runtime>(
     limit: Option<u32>,
     auth_token: Option<String>,
 ) -> Result<Vec<FtsSearchResult>, String> {
+    let pool = state.db_manager.pool();
+    let limit = limit.unwrap_or(20);
+    let results = FtsRepository::search(pool, &query, limit, None)
+        .await
+        .map_err(|e| format!("Failed to search FTS index: {}", e))?;
     log_info!(
-        "api_search_fts called with query: '{}', limit: {:?}, auth_token: {}",
-        query,
+        "api_search_fts completed: {}, limit={}, auth_token={}",
+        lexical_search_log_fields(&query, "fts_or", results.len()),
         limit,
         auth_token.is_some()
     );
-    let pool = state.db_manager.pool();
-    FtsRepository::search(pool, &query, limit.unwrap_or(20), None)
-        .await
-        .map_err(|e| format!("Failed to search FTS index: {}", e))
+    Ok(results)
 }
 
 #[tauri::command]
@@ -1035,6 +1045,27 @@ mod tests {
         });
 
         assert_eq!(meeting.folder_id.as_deref(), Some("folder-1"));
+    }
+
+    #[test]
+    fn lexical_search_info_fields_never_contain_raw_query_text() {
+        for query in [
+            "quais reuniões falaram sobre retenção",
+            "which meetings discussed retention",
+        ] {
+            for mode in ["fts_or", "legacy_transcript"] {
+                let fields = lexical_search_log_fields(query, mode, 3);
+                assert_eq!(
+                    fields,
+                    format!(
+                        "query_len={}, mode={}, results=3",
+                        query.chars().count(),
+                        mode
+                    )
+                );
+                assert!(!fields.contains(query));
+            }
+        }
     }
 }
 

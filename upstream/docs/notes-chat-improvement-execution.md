@@ -94,12 +94,12 @@ Custom subagents are defined in `~/.config/opencode/agent/` (pinned models); the
 |-------|-------|---------|
 | `worker-s` | `opencode-go/deepseek-v4-flash` | `[S]` implementation tasks |
 | `worker-m` | `opencode-go/kimi-k2.6` | `[M]` implementation tasks (incl. Rust-heavy `[M]`) |
-| `worker-l` | `opencode-go/kimi-k2.7-code` | `[L]` implementation tasks |
+| `worker-l` | `opencode-go/ox-alpha-free` | `[L]` implementation tasks; no model substitution |
 | `reviewer` | `opencode-go/kimi-k3` | Sprint-end full reviews (R1, R2, R4, R5, R6, R7) |
 | `arch-reviewer` | `opencode-go/gpt-5.6-luna` | R3 (streaming architecture) + any structural review |
 | `reviewer-light` | `opencode-go/glm-5.2` | Low-risk batches (dead-code deletion, copy changes) |
 
-Fallbacks if an agent/model is unavailable: `[S]` → `opencode/deepseek-v4-flash-free` · `[M]` → `opencode-go/glm-5.2` or `opencode-go/deepseek-v4-pro` · `[L]` → `opencode-go/qwen3.7-max`.
+Fallbacks if an agent/model is unavailable: `[S]` → `opencode/deepseek-v4-flash-free` · `[M]` → `opencode-go/glm-5.2` or `opencode-go/deepseek-v4-pro`. `[L]` has no fallback; pause if `opencode-go/ox-alpha-free` is unavailable.
 
 Per-task specifics (deviations from the table):
 
@@ -107,9 +107,9 @@ Per-task specifics (deviations from the table):
 |------|-------------------|-----|
 | 1.1 | `opencode-go/kimi-k2.6` | Cross-layer (TS hook + save flow), correctness-critical |
 | 1.3 | `opencode-go/deepseek-v4-pro` | Small Rust change but touches search correctness |
-| 3.1 | `opencode-go/kimi-k2.7-code` | Streaming architecture across 7 LLM providers |
+| 3.1 | `opencode-go/ox-alpha-free` | Streaming architecture across 7 LLM providers |
 | 3.2 | same session as 3.1 | Stop button is part of the streaming design |
-| 4.3 | `opencode-go/kimi-k2.7-code` | Retrieval algorithm changes + tests |
+| 4.3 | `opencode-go/ox-alpha-free` | Retrieval algorithm changes + tests |
 | 5.1 | `opencode-go/glm-5.2` | Reuses existing BlockNote patterns, mostly wiring |
 | 5.4 | `opencode-go/kimi-k2.6` | Wide but mechanical refactor |
 

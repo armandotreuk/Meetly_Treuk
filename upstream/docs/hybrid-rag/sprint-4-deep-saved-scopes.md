@@ -2,7 +2,11 @@
 
 ## Status
 
-Planned, blocked by Sprint 3 approval and completion
+Planned, blocked by Sprint 3 approval and completion.
+
+Revised 2026-08-21 after pre-implementation critique: Deep preparation progress
+contract added, budget reduced from 45 s to 30 s, and the mode selector
+disabled in live scope. Estimate: 6-9 working days.
 
 ## Goal
 
@@ -23,7 +27,9 @@ Fast retrieval contracts delivered by Sprint 3.
 
 - Request-level `fast` and `deep` Chat retrieval modes.
 - Deep default for new interactive Chat UI sessions.
-- A visible Fast/Deep selector with accurate latency/provider-use copy.
+- A visible Fast/Deep selector with accurate latency/provider-use copy,
+  disabled in live-recording scope where the mode has no effect.
+- Stage-level progress events during Deep preparation.
 - Provider-independent, schema-validated iterative retrieval planning.
 - At most two additional retrieval rounds under explicit budgets.
 - Vector/lexical transcript anchors for ordinary saved-meeting Chat.
@@ -133,8 +139,17 @@ default to Deep without altering conversation identity or persistence.
 - Backend must validate unknown mode values and apply an explicit default.
 - MCP Chat remains Fast-only in this release; do not expose Deep mode through
   unauthenticated localhost MCP.
-- Live Chat accepts the UI mode but its retrieval remains direct; Deep planner
-  integration for live is out of scope and should resolve to existing behavior.
+- **Disable the selector in live-recording scope** with a short explanation
+  that live Chat reads the current transcript directly. Live retrieval ignores
+  the mode entirely, and presenting an active "Deep" control that does nothing
+  misleads the user in the scope most likely to want extra depth. Follow the
+  Mode Applicability By Scope table in `architecture.md`.
+- **Emit stage-level Deep preparation progress** through the existing Chat
+  event channel, per `architecture.md` "Deep Preparation Progress". Events
+  carry stage identity and counts only — never planner output, queries, or
+  evidence text. Fast emits no preparation progress.
+- Render progress accessibly, replacing the current silent gap between send and
+  first token.
 
 **Acceptance criteria:**
 
@@ -146,6 +161,13 @@ default to Deep without altering conversation identity or persistence.
   generating and cannot return a stale final result.
 - Unknown backend values fail or use the explicitly documented safe default.
 - Selector has accessible name, keyboard behavior, and explanatory text.
+- **In live-recording scope the selector is disabled and explains why; no
+  request carries a Deep mode that live retrieval would ignore.**
+- **Deep preparation emits stage-level progress events that reach the UI before
+  the first answer token**, and a test asserts no planner text, query text, or
+  evidence content appears in any progress payload.
+- Progress is announced accessibly without excessive screen-reader chatter.
+- Cancellation remains available throughout the progress phase.
 - Existing scope switch and stream-isolation tests remain green.
 - No migration or persisted conversation format change occurs.
 
@@ -193,8 +215,15 @@ additional scope-safe retrieval before the final answer.
 - Enforce the architecture limits: at most two rounds/two planner calls, three
   queries per round, 256 Unicode characters per query, five opened meetings per
   round/eight total, ten expanded evidence IDs per round, 24,000 planner-input
-  characters, 8 KiB/512 output tokens, 20 seconds per planner call, and 45
-  seconds total Deep preparation.
+  characters, 8 KiB/512 output tokens, **15 seconds per planner call, and 30
+  seconds total Deep preparation** (reduced from 20/45 because Deep is the
+  default path and the budget is time the user spends watching nothing happen).
+- Emit a stage-level progress event at each phase boundary: initial retrieval,
+  each planner round, each additional search, and handoff to answer generation.
+- Count and report **total provider round-trips per Deep turn**, including the
+  pre-existing follow-up query-rewrite call at `api/chat.rs:465-494`. The worst
+  case is four: rewrite, two planner calls, and final generation. Reporting
+  only the planner count understates the cost the user pays.
 - Deduplicate queries/actions and prevent loops.
 - Merge additional evidence through the same fusion/rerank/hydration contracts,
   not by appending arbitrary planner text.
@@ -223,8 +252,11 @@ additional scope-safe retrieval before the final answer.
 - Every numeric planner limit above is tested at boundary and over-boundary.
 - Malformed JSON, timeout, and provider error fall back to Fast evidence;
   user/stream cancellation aborts without stale stream events.
-- Fast mode makes no planner call.
+- Fast mode makes no planner call and emits no preparation progress events.
 - Planner requests are observable through privacy-safe stage metrics only.
+- **Deep preparation p95 is at or below 30 seconds**, measured and reported.
+- **Total provider round-trips per Deep turn are counted and reported**,
+  including the query-rewrite call, with the worst case shown to be four.
 - Final sources derive from final retained evidence, including new rounds.
 
 **Required verification:**
@@ -389,8 +421,15 @@ cancellation, sources, failure fallback, and native product integration.
   deleted meeting and recheck source existence before final source/done events.
 - Verify history rewriting plus Deep does not lose the original user question.
 - Run full evaluation with Fast/Deep answer fact/source metrics.
-- Measure Deep request count/latency and enforce approved ceilings.
-- Perform a Windows native smoke for mode switching and representative scopes.
+- Measure Deep request count/latency and enforce approved ceilings, reporting
+  total provider round-trips rather than planner calls alone.
+- **Produce the evidence the user needs to revisit Deep-as-default at sprint
+  close**: measured Deep preparation p50/p95, provider round-trips and their
+  cost implication, and the measured quality delta of Deep over Fast on the
+  evaluation corpus. `architecture.md` records this as an open user decision;
+  this task supplies the numbers, and MUST NOT change the default itself.
+- Perform a Windows native smoke for mode switching and representative scopes,
+  including the disabled selector in live scope and visible Deep progress.
 
 **Acceptance criteria:**
 
@@ -424,9 +463,13 @@ Record Deep request/latency metrics and native-smoke steps/results.
 
 ## Sprint Acceptance Criteria
 
-- New interactive Chat defaults to Deep and exposes Fast.
+- New interactive Chat defaults to Deep and exposes Fast, with the selector
+  disabled in live-recording scope.
+- Deep preparation shows stage-level progress and stays inside 30 seconds p95.
 - Deep is bounded, schema-validated, scope-safe, cancellable, and hidden from
   answer history/UI.
+- Measured Deep latency, provider round-trips, and quality delta are recorded
+  so the user can settle the Deep-as-default question at sprint close.
 - Saved-meeting hybrid anchors preserve every authoritative-context invariant.
 - Snapshot and today scopes become query-aware without membership drift.
 - All persisted scopes pass Fast/Deep quality and source evaluation.
@@ -435,8 +478,13 @@ Record Deep request/latency metrics and native-smoke steps/results.
 
 ## Risks And Mitigations
 
-- **Additional provider cost/latency:** explicit UI copy, max rounds, budgets,
-  Fast mode, and metrics.
+- **Additional provider cost/latency:** explicit UI copy, max rounds, a reduced
+  30 s budget, Fast mode, reported round-trip counts, and a recorded open
+  decision on whether Deep should remain the default.
+- **Silent preparation reads as a hang:** stage-level progress events, since a
+  tooltip read before sending does not help during a 30-second wait.
+- **Selector that does nothing:** disabled in live scope rather than accepted
+  and ignored.
 - **Prompt injection:** strict action schema, content delimiters, allow-lists,
   and evidence-is-data system rules.
 - **Scope widening:** resolve original allow-list once and validate every action.
@@ -453,6 +501,10 @@ Record Deep request/latency metrics and native-smoke steps/results.
 | 2026-08-21 | Deep is request-level and not persisted in conversation schema. | Meet the requested mode choice without an unnecessary migration. | Persist mode per thread. | Main agent, pending sprint approval |
 | 2026-08-21 | Deep uses provider-independent structured JSON rather than native tool calling. | All configured Chat providers must behave consistently. | Provider-specific tools/function calling. | Main agent, pending sprint approval |
 | 2026-08-21 | MCP Chat remains Fast-only even though new interactive conversations default to Deep. | MCP is an unauthenticated local API invocation without the approved Deep cancellation/cost contract. | Optional or default Deep for MCP. | Main agent, pending sprint approval |
+| 2026-08-21 | Require stage-level Deep progress events and cut the budget from 45 s to 30 s. | Deep is the default and inserts silence into a UI that currently streams almost immediately; static copy does not stop a hang from reading as a hang. | Keep 45 s with explanatory copy only. | Main agent, pending sprint approval |
+| 2026-08-21 | Disable the Fast/Deep selector in live-recording scope. | Live retrieval ignores the mode; an active control that does nothing misleads the user in the scope most likely to want depth. | Accept and silently ignore the mode. | Main agent, pending sprint approval |
+| 2026-08-21 | Report total provider round-trips per Deep turn, not planner calls alone. | The pre-existing query-rewrite call makes the true worst case four round-trips; reporting two understates user-visible cost. | Report planner calls only. | Main agent, pending sprint approval |
+| 2026-08-21 | Task 4.5 supplies evidence for the Deep-as-default question but must not change the default. | Deep-as-default is a recorded user decision; only the user may revise it, and they need measured latency, cost, and quality-delta data to do so. | Change the default based on implementation judgement. | Main agent, **open question for user at sprint close** |
 
 ## Task Execution Log
 
@@ -509,4 +561,8 @@ to all saved Chat retrieval paths.
 - Task 4.2 is L and requires a single-task batch approval.
 - Planner actions/rounds, remote data behavior, or conversation persistence
   changes require explicit scope-change approval.
+- **At sprint close, present the measured Deep latency, provider round-trip,
+  and quality-delta evidence and ask the user to confirm or change
+  Deep-as-default.** Record the outcome in the `architecture.md` decision log
+  either way.
 - Sprint-close approval is required before Sprint 5 begins.

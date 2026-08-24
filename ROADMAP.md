@@ -280,7 +280,42 @@ These are real missing functions but are not approved implementation scope. They
 - **Hosted platform:** public cloud REST API, signed webhooks, Zapier, CRM automation, and externally hosted sharing links. Meetily's local MCP remains the preferred near-term integration surface.
 - **Enterprise administration:** SSO/SAML, SCIM, domain management, org-wide retention/sharing controls, usage analytics, and managed deployment.
 - **Standalone notes library:** reconsider only if demand shows users want non-meeting knowledge capture; ad-hoc meeting notes remain supported.
-- **Semantic/hybrid search:** reconsider only after a repeatable retrieval benchmark shows FTS5 misses important results at a material rate.
+- **Semantic/hybrid search:** ~~reconsider only after a repeatable retrieval benchmark shows FTS5 misses important results at a material rate.~~ **Reconsidered 2026-08-21 — see Phase 6 below.** The deferral condition is now the explicit entry gate of that program: Sprint 1 builds the retrieval benchmark, and the program is cancelled if that benchmark cannot show the FTS5 baseline failing.
+
+---
+
+## Phase 6 — Local hybrid retrieval (F14)
+
+_Goal: make folder and all-meetings Chat answer detailed questions as completely as saved-meeting Chat, while staying local, scope-safe, grounded, and usable when semantic indexing is unavailable._
+
+> **Full program documents live in [`upstream/docs/hybrid-rag/`](upstream/docs/hybrid-rag/README.md).** That directory is the source of truth for retrieval design; this section is the roadmap-level registration and status. `architecture.md` there is normative for anything inside the program's scope.
+
+**Why this exists.** Broad Chat ranked transcript chunks globally and surfaced only short FTS snippets, so a question about a WhatsApp retention schedule returned isolated `3 days` / `4 days` fragments while the correct complete answer sat in storage unread. The fix is architectural — rank meetings first, then hydrate their authoritative content — not a prompt change.
+
+**Relationship to the rest of this roadmap:**
+
+- Depends on **Sprint 6A task 6.1** (contextual Chat entry points). This program does not duplicate that surface work.
+- **Sprint 6.1** in `upstream/docs/sprint-6-1-contextual-chat.md` closed on 2026-08-22 after its manual Windows/Tauri smoke passed. Its saved-meeting invariants (`6.1.R10`) remain requirements for the program's Sprint 4.
+- Satisfies the "Semantic/hybrid search" deferral condition above, or cancels itself.
+
+| Sprint | Scope | Estimate | Status |
+|---|---|---|---|
+| 1 — Quality gates | Correctness prerequisites, evaluation corpus, model/reranker selection, vector backend, model supply chain | 6–9 days | in progress — Tasks 1.1 and 1.2R complete; 1.3 blocked by quality gates |
+| 2A — Index foundation | Persistence schema, ONNX model runtime, deterministic chunking | 8–12 days | blocked by Sprint 1 |
+| 2B — Index runtime | Background worker, query index, generation activation | 8–12 days | blocked by 2A |
+| 3 — Broad hybrid Chat | Fusion, meeting aggregation, reranking, authoritative hydration, folder/all rollout, retrieval kill switch | 8–12 days | blocked by Sprint 2 |
+| 4 — Deep and saved scopes | Fast/Deep modes, bounded iterative retrieval, remaining persisted scopes | 6–9 days | blocked by Sprint 3 |
+| 5 — Search surfaces and release | Sidebar, Tauri/MCP contracts, index diagnostics, packaging, scale validation | 8–12 days | blocked by Sprint 4 |
+
+Roughly **45–65 working days** total. These are planning figures, not commitments; revise after Sprint 1 produces velocity data.
+
+**Decisions resolved before Sprint 1 dispatch:**
+
+- [x] **Windows-only platform scope.** The program originally required packaged model inference on Windows, macOS, and Linux. This fork's only active workflow is the root `build-windows.yml`; the macOS/Linux workflows sit under `upstream/.github/workflows/` where GitHub Actions never reads them. The gate was unsatisfiable, so the program now targets Windows x64 and defers the rest. **This is a product scope change.**
+- [x] **Close Sprint 6.1** before dispatching Sprint 1.
+- [x] **Defer Deep-as-default confirmation** to Sprint 4 close, when measured latency, provider-cost, and quality-delta evidence exists.
+
+**Phase 6 exit criteria:** broad Chat answers complete multi-fact questions with sources that exactly match the evidence in the final prompt; every semantic failure degrades to working lexical search; the user can force lexical-only retrieval at runtime; and the 250k-document scale, memory, disk, crash, and deletion gates pass on an installed Windows build.
 
 ---
 
@@ -294,7 +329,7 @@ These are real missing functions but are not approved implementation scope. They
 
 ---
 
-## Status snapshot (2026-08-17)
+## Status snapshot (2026-08-21)
 
 | Phase | Features | Status |
 |---|---|---|
@@ -305,6 +340,7 @@ These are real missing functions but are not approved implementation scope. They
 | Phase 3 | F5, F6, F9 | partial — Chat shipped and was hardened in Phase 4; diarization/calendar remain |
 | Phase 4 | F12 Notes & Chat | Sprints 1–5 ✅ approved/shippable; revised Sprint 6 pending |
 | Phase 5 | F13 Meeting context & relationship memory | scoped; pending Sprint 6 completion |
+| Phase 6 | F14 Local hybrid retrieval | Sprint 1 in progress; Tasks 1.1 and 1.2R complete; Task 1.3 blocked by quality gates |
 
 ### Build verification results (Phase 0.1)
 

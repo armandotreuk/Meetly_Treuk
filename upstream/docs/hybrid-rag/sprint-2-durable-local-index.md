@@ -2,7 +2,34 @@
 
 ## Status
 
-Planned, blocked by Sprint 1 approval and completion
+Planned, blocked by Sprint 1 approval and completion.
+
+Revised 2026-08-21 after pre-implementation critique: split into two
+independently reviewed halves, and schema semantics corrected.
+
+## Sprint Split
+
+The original single sprint contained three `L` tasks plus a high-risk migration
+covering durable triggers, generation lifecycle, staging, a publication journal,
+two ONNX model runtimes, deterministic chunking, a scheduler, a background
+worker, immutable snapshots, atomic activation, and garbage collection. That is
+too much work behind one review gate: a flawed persistence foundation would not
+be discovered until after the query index was built on top of it.
+
+| Half | Tasks | Estimate | Gate |
+|---|---|---|---|
+| **Sprint 2A — Foundation** | 2.1 persistence, 2.2 model runtime, 2.3 chunking | 8-12 working days | Code + architecture review, then user sprint-half close |
+| **Sprint 2B — Runtime** | 2.4 index worker, 2.5 query index and activation | 8-12 working days | Code + architecture review, then user sprint close |
+
+Sprint 2B MUST NOT begin until 2A is reviewed, approved, and closed. Estimates
+assume one worker at a time with the review overhead this program requires, and
+exclude Sprint 1 model-selection time.
+
+For calibration against the rest of the program: Sprint 1 is roughly 6-9 days,
+Sprint 3 roughly 8-12, Sprint 4 roughly 6-9, and Sprint 5 roughly 8-12 —
+placing the full program near 45-65 working days. These are planning figures,
+not commitments, and should be revised once Sprint 1 produces real velocity
+data.
 
 ## Goal
 
@@ -87,19 +114,28 @@ backend, limit, and toolchain addenda approved at Sprint 1 close.
 
 ## Task List
 
+### Sprint 2A — Foundation
+
 | ID | Feature | Task | Size | Owner | Dependencies | Acceptance check | Rollback |
 |---|---|---|---|---|---|---|---|
-| 2.1 | Persistence | Add source revisions, per-generation state, semantic/staging documents, active-generation pointer, publication journal/tombstones, retry state, triggers, and repository APIs. | M, high risk | Pending `worker-m` | Sprint 1 | Migration/repository tests prove coalescing, generation independence, staged deletion, deletion journal, retry state, revision fencing, and no inference in migration. | Prior runtime ignores unused feature paths, but old-binary rollback requires the verified pre-upgrade DB backup. |
-| 2.2 | Local models | Load and validate the bundled tokenizer, embedding model, and reranker model through bounded CPU ONNX sessions. | L | Pending `worker-l` | 1.3, 1.5 | Production engine matches reference outputs locally and preserves the Sprint 1 cross-target reference gate. | Disable/remove retrieval state registration; FTS unaffected. |
+| 2.1 | Persistence | Add source revisions, per-generation state, semantic/staging documents, active-generation pointer, publication journal/tombstones, retry state, due-work indexes, triggers, and repository APIs. | M, high risk | Pending `worker-m` | Sprint 1 | Migration/repository tests prove coalescing, generation independence, staged deletion, deletion journal, retry state, revision fencing, encoding-aware vector validation, and no inference in migration. | Prior runtime ignores unused feature paths, but old-binary rollback requires the verified pre-upgrade DB backup. |
+| 2.2 | Local models | Load and validate the bundled tokenizer, embedding model, and reranker model through bounded CPU ONNX sessions. | L | Pending `worker-l` | 1.3, 1.5 | Production engine matches reference outputs locally and preserves the Sprint 1 Windows x64 reference gate. | Disable/remove retrieval state registration; FTS unaffected. |
 | 2.3 | Semantic documents | Implement authoritative source extraction and deterministic model-token chunking. | M | Pending `worker-m` | 2.1, 2.2 | Golden tests prove stable IDs, transcript ranges, Markdown sections, limits, and Unicode behavior. | Derived chunking module can be removed; no primary data change. |
-| 2.4 | Index worker | Implement shared lifecycle/scheduler, model-independent FTS repair, and resumable per-generation indexing into canonical SQLite/publication journal. | L | Pending `worker-l` | 2.1-2.3 | Crash/change/retry/poison/scheduler tests prove stale vectors cannot commit, FTS heals, and work is not lost/starved. | Stop worker and leave derived rows inactive; revision state remains recoverable. |
-| 2.5 | Query index and activation | Implement exact/ANN base+delta/tombstone snapshots, journal replay, atomic swaps, complete model activation, and status API. | L | Pending `worker-l` | 1.4, 2.4 | Nearest-neighbor, scope, journal crash, deletion, activation, lifecycle, corruption, and cancellation tests pass. | Disable query index and use durably repaired FTS; SQLite vectors remain rebuildable. |
+
+### Sprint 2B — Runtime
+
+| ID | Feature | Task | Size | Owner | Dependencies | Acceptance check | Rollback |
+|---|---|---|---|---|---|---|---|
+| 2.4 | Index worker | Implement shared lifecycle/scheduler, model-independent FTS repair, and resumable per-generation indexing into canonical SQLite/publication journal. | L | Pending `worker-l` | 2A close | Crash/change/retry/poison/scheduler tests prove stale vectors cannot commit, FTS heals, and work is not lost/starved. | Stop worker and leave derived rows inactive; revision state remains recoverable. |
+| 2.5 | Query index and activation | Implement exact/ANN base+delta/tombstone snapshots, journal replay, atomic swaps, complete model activation, disk-envelope reporting, and status API. | L | Pending `worker-l` | 1.4, 2.4 | Nearest-neighbor, scope, journal crash, deletion, activation, lifecycle, corruption, and cancellation tests pass. | Disable query index and use durably repaired FTS; SQLite vectors remain rebuildable. |
 
 ## Dependency Order
 
-`2.1 -> 2.4 -> 2.5`
+Within 2A: `2.1 + 2.2 -> 2.3`
 
-`2.1 + 2.2 -> 2.3 -> 2.4`
+Gate: **2A close approval**
+
+Within 2B: `2.4 -> 2.5`
 
 Task `2.1` is a migration and runs alone. Tasks `2.2`, `2.4`, and `2.5` are L
 and run alone. Do not parallelize `2.1` and `2.2` without explicit approval if
@@ -145,7 +181,29 @@ for semantic reindexing, and derived documents can be replaced atomically.
   every built generation so an existing snapshot can remove vectors after commit or
   restart.
 - Add a singleton active-generation pointer; do not infer active state from
-  multiple generation rows.
+  multiple generation rows. **`'active'` MUST NOT appear in the generation
+  state enum** — the permitted values are `building`, `ready`, `failed`, and
+  `retired`. Two representations of one fact cannot be kept consistent.
+- **Store `vector_encoding` on each document row and validate vectors
+  encoding-aware at the repository boundary. Do NOT add a fixed byte-width
+  `CHECK` such as `length(vector) = dimensions * 4`** — it forbids the
+  quantized encodings that `architecture.md` "Resource Budget Arithmetic"
+  depends on. Validate encoding, dimension, byte length, finiteness, and norm
+  in `repositories/retrieval.rs`.
+- **Make `retrieval_documents` and `retrieval_document_staging` rowid tables**
+  with `UNIQUE (generation_id, document_id)` and `UNIQUE (job_id, document_id)`
+  respectively. They carry multi-KB vector BLOBs plus chunk text, far above the
+  small-row profile `WITHOUT ROWID` is designed for; large rows there spill to
+  overflow chains and degrade the full-table scan snapshot loading depends on.
+  `retrieval_meeting_state` stays `WITHOUT ROWID` — its rows are small.
+- **Add the due-work and replay indexes** from `architecture.md`:
+  `search_source_state_fts_due`, `retrieval_meeting_state_due`,
+  `retrieval_document_staging_by_generation`, and
+  `retrieval_index_changes_replay`. Step 1 of the worker algorithm selects one
+  due item per poll and would otherwise full-scan every meeting row.
+- When a quantized encoding is selected, persist its dequantization parameters
+  in `retrieval_models` so a vector can never be interpreted under the wrong
+  scale.
 - Separate immutable model identity from rebuildable generation identity and
   add revision/job-bound staging storage so one large meeting can be embedded
   in bounded batches before atomic publication.
@@ -187,8 +245,14 @@ for semantic reindexing, and derived documents can be replaced atomically.
   and commit.
 - Failed replacement leaves the prior complete meeting documents intact.
 - Retry scheduling can skip a poison item and process another due meeting.
-- Exactly one active generation is representable.
+- Exactly one active generation is representable, and `'active'` is not a
+  valid generation state value.
 - Malformed vectors are rejected without panicking startup.
+- A vector in a non-f32 approved encoding round-trips correctly, and a vector
+  whose byte length disagrees with its declared encoding and dimension is
+  rejected at the repository boundary.
+- Due-work selection uses an index rather than a full table scan; prove it with
+  `EXPLAIN QUERY PLAN` in a test for both the FTS repair and semantic paths.
 - Primary tables and existing migrations remain backward compatible.
 
 **Required verification:**
@@ -482,8 +546,11 @@ only after complete revision and snapshot validation.
 - Rebuild deletes only derived state.
 - Query cancellation returns without replacing newer Chat ownership.
 - Selected 250k benchmark gates remain satisfied in production code.
-- Status reports active generation, backend, document/meeting coverage, and
-  safe failure reason, canonical/published IDs, and activation blockers.
+- Status reports active generation, backend, document/meeting coverage, safe
+  failure reason, canonical/published IDs, activation blockers, and **measured
+  derived disk usage against the approved envelope**.
+- Derived disk usage crossing the approved envelope is reported and blocks
+  generation activation; it never triggers automatic deletion of primary data.
 
 **Required verification:**
 
@@ -503,17 +570,29 @@ cache/sidecar format, corruption behavior, and memory/latency results.
 
 ## Sprint Acceptance Criteria
 
+### Sprint 2A close
+
 - Every relevant authoritative mutation durably dirties its meeting.
-- Initial and upgraded semantic generations activate only when complete.
-- The bundled model pair produces reference-correct local outputs.
+- The schema matches the corrected `architecture.md` semantics: no `'active'`
+  generation state, no fixed byte-width vector `CHECK`, rowid document tables,
+  and the due-work/replay indexes present and proven used.
+- The bundled model pair produces reference-correct local outputs on Windows
+  x64.
 - Semantic documents are deterministic and source-rehydratable.
+- Code and architecture reviews approve the migration, model runtime, and
+  chunking boundaries.
+
+### Sprint 2B close
+
+- Initial and upgraded semantic generations activate only when complete.
 - Worker failures cannot fail primary writes or app startup.
-- The selected vector backend meets the 250k release gate.
-- Semantic index status/rebuild/pause backend contracts exist.
+- The selected vector backend meets the 250k RAM, latency, and derived-disk
+  release gates.
+- Semantic index status/rebuild/pause backend contracts exist, including disk
+  reporting.
 - FTS behavior remains available and unchanged.
 - Full Rust tests, typecheck, Vitest, Cargo check, rustfmt, and diff checks pass.
-- Code and architecture reviews approve the migration, worker, model runtime,
-  and query-index boundaries.
+- Code and architecture reviews approve the worker and query-index boundaries.
 
 ## Risks And Mitigations
 
@@ -537,6 +616,12 @@ cache/sidecar format, corruption behavior, and memory/latency results.
 | 2026-08-21 | Use durable SQL source-revision triggers rather than another best-effort hook chain. | Future write paths, model upgrades, and crashes must not permanently stale FTS or semantic state. | Add embedding calls beside every FTS refresh. | Main agent, pending sprint approval |
 | 2026-08-21 | Keep semantic documents/vectors in SQLite and memory/ANN state disposable. | Preserve import/deletion integrity and one authoritative derived store. | Sidecar-only vectors or vector service. | Main agent, pending sprint approval |
 | 2026-08-21 | Do not activate partial initial backfill. | Prevent rankings from favoring meetings indexed first. | Query partial coverage with a warning. | Main agent, pending sprint approval |
+| 2026-08-21 | Split the sprint into 2A foundation and 2B runtime with separate review gates. | Three L tasks plus a high-risk migration behind one gate would surface a flawed persistence foundation only after the query index was built on it. | Keep one sprint; add a mid-sprint checkpoint. | Main agent, pending sprint approval |
+| 2026-08-21 | Remove `'active'` from the generation state enum. | The singleton pointer is already the declared authority; a second representation invites divergence with nothing enforcing consistency. | Add a trigger keeping the two in sync. | Main agent, pending sprint approval |
+| 2026-08-21 | No fixed byte-width `CHECK` on the vector column; validate encoding-aware at the repository. | `length(vector) = dimensions * 4` hardcodes f32 and forbids the quantization path the RAM envelope depends on. | Keep the CHECK and add a second column for quantized vectors. | Main agent, pending sprint approval |
+| 2026-08-21 | Make the document and staging tables rowid tables. | Multi-KB rows defeat `WITHOUT ROWID`, which targets small rows; overflow chains degrade the snapshot-load scan. | Keep `WITHOUT ROWID` and raise SQLite page size. | Main agent, pending sprint approval |
+| 2026-08-21 | Add due-work and journal-replay indexes in the initial migration. | The worker selects one due item per poll; without an index every poll scans all meetings. Adding them later costs another migration. | Add indexes reactively if profiling shows a problem. | Main agent, pending sprint approval |
+| 2026-08-21 | Report derived disk usage and block activation when the envelope is exceeded. | Derived text plus vectors plus two retained generations plausibly reach ~2 GiB with no prior ceiling. | Track disk as a metric only. | Main agent, pending sprint approval |
 
 ## Task Execution Log
 
@@ -588,10 +673,12 @@ sidecar lifecycle.
 
 ## Approval Gates
 
-- Sprint 1 close and exact model/backend decisions must be approved first.
+- Sprint 1 close and exact model, vector encoding, and backend decisions must be
+  approved first.
 - User approval of this PRD is required before Sprint 2 TODO creation.
 - Task 2.1 migration and every L task require separate dependency-ready batch
   approval and normally run alone.
+- **Sprint 2A close approval is required before any 2B task is dispatched.**
 - Any new model, ANN dependency, schema semantic change, or runtime download
   requires scope-change approval.
 - Sprint-close approval is required before Sprint 3 begins.

@@ -2,10 +2,11 @@
 
 ## Status
 
-Blocked
+Complete
 
 Tasks `6.1.R10` and `6.1.R11` are implemented and code-review approved. The
-original interactive Windows/Tauri smoke remains the only Sprint 6.1 blocker.
+user confirmed all six interactive Windows/Tauri smoke checks passed and
+approved sprint close on 2026-08-22.
 
 ## Goal
 
@@ -164,7 +165,7 @@ change is required.
 | 6.1.2 | Contextual Chat | Resolve saved-meeting, recursive-folder, and frozen-search scopes server-side through the existing Chat preparation path. | M | `worker-m` (`ses_fef606b73ffezOC38aV94Lv3Uc`) | 6.1.1 | Passed: 14 focused Rust Chat tests cover scopes, descendants, snapshot validation, and legacy retrieval. | Remove additive scoped resolver/command; legacy Chat and MCP paths remain intact. |
 | 6.1.3 | Contextual Chat | Generalize `ChatPanel`, add one app-wide host, and wire Home, meeting, folder, and search-result launchers. | M | `worker-m` (`ses_fef5409d9ffe74HHBIQPVrjsgo`) | 6.1.1, 6.1.2 | Passed: scoped host/panel tests plus 81 total Vitest tests and 14 focused Rust Chat tests. | Revert additive host/launcher/stream wiring; persisted scope data remains unaffected. |
 | 6.1.4 | Contextual Chat | Add live transcript retrieval, live-source/disclosure UI, and atomic promotion after recording save. | L | `worker-l` (`ses_fef4a7506ffeto0zVac8xMFt5v`) | 6.1.1, 6.1.3 | Passed: 86 Vitest tests, 15 Chat API tests, six repository tests, Cargo check, and rustfmt. | Disable/remove live host integration and promotion command; stored live threads remain local. |
-| 6.1.5 | Contextual Chat | Add cross-context regression coverage and perform the Windows native smoke path. | S | `worker-s` (`ses_fef3d0e7bffevKC0KgsftE7Hcq`) | 6.1.2, 6.1.3, 6.1.4 | Automated pass: 87 Vitest tests, 15 API tests, six repository tests, Cargo checks. Native smoke pending. | Test-only changes revert independently; no production rollback required. |
+| 6.1.5 | Contextual Chat | Add cross-context regression coverage and perform the Windows native smoke path. | S | `worker-s` (`ses_fef3d0e7bffevKC0KgsftE7Hcq`); user smoke | 6.1.2, 6.1.3, 6.1.4 | Passed: automated scope coverage plus all six interactive Windows/Tauri smoke checks. | Test-only changes revert independently; no production rollback required. |
 | 6.1.R1 | Review remediation | Own cancellation before preparation and fence delayed listener/setup work. | L | `worker-l` (`ses_fef23a694ffe2ciW3GajyRqxAJ`) | 6.1.4 | Passed: delayed preparation/listener tests, 88 Vitest tests, and 16 Chat API tests. | Retain the single-stream model if the ownership path must be disabled. |
 | 6.1.R2 | Review remediation | Bind live scope identity and remote-provider consent at the Rust boundary. | L | `worker-l` (`ses_fef1808e4ffe3iyjUCInN24zlj`) | 6.1.R1 | Passed: 21 Rust Chat tests and 88 Vitest tests cover scope validation and consent. | Disable live Chat rather than fall back to renderer-only consent. |
 | 6.1.R3 | Review remediation | Make live promotion stream-safe, idempotent, and crash-recoverable. | L | `worker-l` (`ses_feef915e0ffej6a25iCC4vGCOA`) | 6.1.R1, 6.1.R2 | Passed: 90 Vitest tests, 7 repository tests, and 362 Rust library tests. | Retain live threads until an explicit repair succeeds; never discard messages. |
@@ -248,6 +249,7 @@ journey coverage requires every context.
 | 2026-08-20 | Approve batch 1 containing only `6.1.R10 [M]` for `worker-m`. | The task is dependency-ready after `6.1.R9` and must run alone because it shares retrieval and prompt-assembly files. | Revise the batch or owner. | User |
 | 2026-08-20 | Reopen `6.1.R10` after code review and repair it in the same worker session. | Stale-hit fallback, bounded meeting metadata, and production-path verification are required by the approved no-hit, mandatory-content, budget, and source-parity criteria. They are corrections, not a new feature or scope expansion. | Create reviewer-proposed `6.1.R11`; defer the findings. | Main agent |
 | 2026-08-20 | Accept the final `6.1.R10` code re-review with no findings. | All review findings and the non-vacuous production source-parity regression are closed. | Defer the verification gap. | Reviewer and main agent |
+| 2026-08-22 | Accept all six interactive Windows/Tauri smoke checks and close Sprint 6.1. | The final native prerequisite passed across persisted scopes, live local/cloud disclosure, recording promotion, sources, and stale-stream fencing. | Keep the sprint blocked or waive the smoke. | User |
 
 ## Task Execution Log
 
@@ -459,6 +461,10 @@ journey coverage requires every context.
   this document remains the canonical Sprint 6.1 record.
 - Sprint close remains blocked until the manual smoke below succeeds and the
   required reviews are complete.
+
+**2026-08-22 manual-smoke completion addendum:** The user confirmed all six
+checks below passed in the installed Windows application. Task `6.1.5` and
+Sprint 6.1 are complete; sprint close was explicitly approved.
 
 ### Manual Windows Smoke Checklist
 
@@ -779,6 +785,11 @@ the generated `meetily_0.4.0_x64-setup.exe` was installed successfully. The
 installed `meetily` 0.4.0 package is at `C:\Users\arman\AppData\Local\meetily`.
 The manual Windows/Tauri smoke remains pending.
 
+**2026-08-22 deployment verification addendum:** The user completed and passed
+the six-step manual Windows/Tauri checklist against the installed package. The
+earlier pending statement is retained as execution history and is superseded by
+this addendum.
+
 ### 6.1.R11 - Broader-scope fallback accumulation
 
 **Status:** Complete
@@ -931,3 +942,12 @@ live-data privacy, and recording lifecycle behavior.
 - None.
 **Required follow-ups:**
 - None.
+
+### Sprint Close
+
+**Approved:** 2026-08-22 by the user.
+**Delivered:** Scoped persisted and live Chat, safe promotion/recovery,
+authoritative saved-meeting context, broader lexical fallback accumulation,
+source parity, and native Windows coverage.
+**Residual work:** Semantic/hybrid retrieval remains in the separately approved
+`docs/hybrid-rag/` program.

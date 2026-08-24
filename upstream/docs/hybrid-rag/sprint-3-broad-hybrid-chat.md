@@ -2,7 +2,10 @@
 
 ## Status
 
-Planned, blocked by Sprint 2 approval and completion
+Planned, blocked by Sprint 2 approval and completion.
+
+Revised 2026-08-21 after pre-implementation critique: reranking sub-budget and a
+mandatory runtime kill switch added. Estimate: 8-12 working days.
 
 ## Goal
 
@@ -83,7 +86,7 @@ model, chunker, index backend, and status contracts from Sprints 1-2.
 | 3.1 | Hybrid candidates | Add concrete persisted-scope retrieval requests and scope-safe FTS/vector candidate generation. | L | Pending `worker-l` | Sprint 2 | Tests prove all/folder allow-lists, query variants, cancellation, semantic fallback, and no out-of-scope candidates. | Route broad Chat back to existing `resolve_scope_results`; index remains unused. |
 | 3.2 | Ranking | Add RRF, stable dedupe, meeting aggregation/diversity, and local cross-encoder reranking. | L | Pending `worker-l` | 3.1 | Evaluation proves correct meeting ranking and reranker improvement without exact-term regression. | Disable reranking/fusion service and use ordered lexical candidates. |
 | 3.3 | Context | Add authoritative multi-meeting hydration, bounded allocation, coverage, and retained-source output. | L | Pending `worker-l` | 3.2 | Reference context contains complete schedule/MPV facts and all sources match retained evidence. | Keep old generic context builder and lexical path. |
-| 3.4 | Broad Chat rollout | Integrate Fast hybrid retrieval into all/folder streaming and non-streaming Chat through shared preparation. | M | Pending `worker-m` | 3.1-3.3 | Product-path tests prove all/folder Fast behavior, lexical fallback, cancellation, and source events. | Feature-disable hybrid broad path and call existing lexical resolver. |
+| 3.4 | Broad Chat rollout | Integrate Fast hybrid retrieval into all/folder streaming and non-streaming Chat through shared preparation, and ship the mandatory `force_lexical_retrieval` kill switch. | M | Pending `worker-m` | 3.1-3.3 | Product-path tests prove all/folder Fast behavior, lexical fallback, kill-switch behavior, cancellation, and source events. | Enable `force_lexical_retrieval` at runtime; no rebuild or reinstall required. |
 | 3.5 | Quality regression | Run/fix multilingual evaluation, context budgets, performance, and Windows native broad-Chat smoke. | M | Pending `worker-m` | 3.4 | Required quality deltas and reference answer facts pass; no context/latency gate regresses. | Test/threshold changes revert independently; production rollback is Task 3.4 flag/path. |
 
 ## Dependency Order
@@ -189,7 +192,15 @@ complete relevant evidence rather than frequent isolated chunks.
 - Include approved meeting-profile, title-overlap, concept-coverage, and
   diversity terms.
 - Do not use recency unless requested by the question/temporal intent.
-- Select a bounded evidence set for local cross-encoder reranking.
+- Select a bounded evidence set for local cross-encoder reranking, using the
+  **candidate depth Sprint 1 derived from the 900 ms p95 sub-budget** — not the
+  provisional 30-50 range from `architecture.md`, which predates measurement.
+- Implement the Sprint 1 adaptive depth policy if one was approved: rerank a
+  reduced head when the fused top-k margin is unambiguous. The policy MUST be
+  deterministic and MUST NOT vary by wall-clock timing, which would make
+  results irreproducible.
+- Apply the shallower `Search` purpose depth where Sprint 1 approved one, so
+  sidebar search does not pay Chat-grade reranking cost per keystroke.
 - Batch reranker inference under approved limits and cancellation checks.
 - Recompute final evidence/meeting order using the approved policy.
 - On reranker failure, retain deterministic fused ordering.
@@ -206,6 +217,11 @@ complete relevant evidence rather than frequent isolated chunks.
   weak.
 - RRF results are deterministic for ties.
 - Reranking passes the Sprint 1 designated-case and aggregate numeric gates.
+- **The reranking stage p95 is at or below 900 ms on reference hardware**,
+  measured separately from the rest of Fast preparation and reported as its own
+  figure.
+- If an adaptive depth policy is used, identical inputs produce identical depth
+  and identical ordering across runs.
 - Reranker component failure produces deterministic fused fallback; user/stream
   cancellation propagates and produces no answer/source event.
 - No constants are tuned solely to one evaluation case.
@@ -314,8 +330,20 @@ cancellation behavior.
   approved fallback condition occurs.
 - Preserve current all/folder conversation scope and folder descendant
   semantics.
-- Add a safe feature-disable route/configuration only if needed for rollback;
-  do not add a user-facing experimental toggle unless approved.
+- **Implement the persisted `force_lexical_retrieval` kill switch required by
+  `architecture.md` "Retrieval Kill Switch".** This is mandatory, not
+  conditional. Index pause and rebuild only affect derived state; neither
+  returns a user to the previously shipped retrieval behavior, so without this
+  the only rollback for a bad result on a real corpus is a reinstall.
+  - Persisted setting, readable by the backend on every request.
+  - When enabled, every retrieval surface takes the existing lexical fallback
+    path. No new code path is introduced.
+  - Takes effect on the next request without restart, and does not delete,
+    invalidate, or pause the semantic index.
+  - Reported in diagnostics as a distinct user-selected reason, never as a
+    model or index failure.
+  - The Settings control is delivered in Sprint 5.3; this task delivers the
+    setting, the backend behavior, and a temporary command to toggle it.
 
 **Acceptance criteria:**
 
@@ -328,6 +356,11 @@ cancellation behavior.
   to lexical answer generation.
 - Source events and saved `sources_json` contain only retained evidence.
 - Meeting-list and live branches bypass broad hybrid retrieval.
+- **With `force_lexical_retrieval` enabled, every scope answers through the
+  lexical path, the setting survives restart, disabling it restores hybrid
+  behavior on the next request without restart, and the semantic index is
+  neither paused nor invalidated by either transition.**
+- Diagnostics distinguish user-forced lexical state from semantic failure.
 - Existing scope/persistence/live tests remain green.
 
 **Required verification:**
@@ -364,8 +397,13 @@ budget, latency, and native product checks.
   diagnostic, hybrid, and hybrid+reranker.
 - Verify reference required facts from retained context and final answer.
 - Verify Portuguese/English and distractor breakdowns.
-- Measure Fast stage p50/p95 and RAM at current and 250k synthetic scale.
+- Measure Fast stage p50/p95 and RAM at current and 250k synthetic scale,
+  **reporting the reranking stage as its own figure against its 900 ms
+  sub-budget**.
+- Measure derived disk against its envelope at the same scales.
 - Verify local lexical fallback with model/index deliberately unavailable.
+- Verify the `force_lexical_retrieval` kill switch end to end on the native
+  build, including persistence across restart.
 - Perform a Windows installed/native folder and all Chat smoke using a safe
   fixture or approved local database.
 - Fix only defects required by already-approved Sprint 3 acceptance. Record
@@ -379,8 +417,10 @@ budget, latency, and native product checks.
 - Hybrid+reranker does not underperform FTS on exact-number/name cases.
 - Reference folder/all answer includes complete required facts.
 - Context and source parity is exact.
-- Fast retrieval remains within approved latency/RAM gates.
+- Fast retrieval remains within approved latency, RAM, and disk gates, with the
+  reranking stage inside its own sub-budget.
 - Lexical fallback works with semantic resources unavailable.
+- The kill switch works at runtime and persists across restart.
 - Windows native smoke proves visible answer/sources and scope isolation.
 - Full automated suites pass.
 
@@ -432,6 +472,9 @@ Record the benchmark and native-smoke procedure/results in the execution entry.
 | 2026-08-21 | Broad Chat ranks meetings before hydration. | Solves the demonstrated global snippet failure. | Return top vector chunks directly. | Main agent, pending sprint approval |
 | 2026-08-21 | Fast mode must solve the reference case before Deep exists. | Deep cannot mask a weak retrieval foundation. | Depend on iterative LLM search immediately. | Main agent, pending sprint approval |
 | 2026-08-21 | Summary/notes sources join transcript sources. | Answers may be grounded by authoritative non-transcript content. | Continue showing transcript-only sources. | Main agent, pending sprint approval |
+| 2026-08-21 | The `force_lexical_retrieval` kill switch is mandatory, not conditional. | This sprint replaces the primary Chat retrieval path. Index pause/rebuild affect derived state only, so without it the sole rollback from a bad result on a user's real corpus is a reinstall. | Keep the original "add a feature-disable only if needed" wording. | Main agent, pending sprint approval |
+| 2026-08-21 | Reranking depth comes from Sprint 1's measured sub-budget, not the provisional 30-50 range. | The provisional range predates measurement and plausibly consumes the entire Fast budget on CPU. | Use the architecture's provisional range and adjust reactively. | Main agent, pending sprint approval |
+| 2026-08-21 | Adaptive reranking depth must be deterministic, never wall-clock driven. | Timing-driven depth makes evaluation results irreproducible and quality gates meaningless. | Allow a time-boxed reranking budget. | Main agent, pending sprint approval |
 
 ## Task Execution Log
 

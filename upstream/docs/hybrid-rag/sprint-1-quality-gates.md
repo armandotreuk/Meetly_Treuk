@@ -2,7 +2,54 @@
 
 ## Status
 
-Awaiting approval
+Task `1.2R` completed independent verification on 2026-08-23 and replaces the
+invalid Task `1.2` corpus. Its baseline is approved. The Batch 4 Task `1.3`
+rerun completed with a blocked verdict and no production model pair selected.
+Task `1.1` is unaffected; Tasks `1.4` and `1.5` remain blocked on `1.3`.
+
+Task `1.3`'s *resource* findings survive the corpus defect and are retained —
+admissibility arithmetic, measured pair RAM, derived disk, per-pair reranker
+latency, quantization fidelity, and license screening. Its *quality* findings
+and its tuned fusion/aggregation/reranker constants are void.
+
+**The external prerequisite is satisfied:** Sprint 6.1 closed after the user
+confirmed all six Windows/Tauri smoke checks passed on 2026-08-22.
+
+### Why Task 1.3 blocked
+
+The corpus is generated procedurally from four templates in
+`frontend/src-tauri/tests/fixtures/corpus.rs`. Two of them are unwinnable by
+construction:
+
+- **Reference case.** The query is `quais os dias de comunicacao por whatsapp
+  para o fluxo de retencao?`. The expected evidence shares almost no surface
+  with it, while each of 30 distractors contains the query *verbatim* followed
+  by a wrong answer. The target is lexically and semantically further from the
+  query than every competitor. No retriever wins this; `bge` reaching rank 2 is
+  approximately the ceiling.
+- **Semantic cases.** Identical shape — expected evidence with near-zero query
+  overlap against 20 verbatim-query distractors. This is why semantic Recall@3
+  is `0% (0/30)` for the FTS baseline **and** for every hybrid configuration in
+  both candidate pairs. The `+10 percentage point` semantic gate is not unmet;
+  it is unreachable against this corpus.
+
+Three confirming observations:
+
+1. Three unrelated bi-encoder families — e5-small (384-d), e5-base (768-d),
+   paraphrase-MiniLM — produced **byte-identical** aggregate metrics. Per
+   `architecture.md` "Corpus Solvability", that is a corpus-defect signal.
+2. Pair A's hybrid result equals the FTS baseline exactly (`Recall@3 90/135` in
+   both). The vector channel changed nothing, because the tuner's objective was
+   constant across all 144 configurations and fell through to its tie-break.
+3. Size floors are met in letter only: ~10 distinct sentence shapes across 120
+   cases; `similar_topic_distractor` is attached to every case unconditionally;
+   all meetings share one title and one date; `ScopeKind::All` and
+   `ScopeKind::Folder` resolve to the same allow-list; the 15 `Meeting`-scope
+   cases permit exactly one meeting, making their Recall@1 free.
+
+The harness's `oracle_results` did not catch this because it returns
+`required_evidence_ids` directly — it verifies the scoring code, never whether a
+retriever could produce the result.
 
 ## Goal
 
@@ -17,6 +64,11 @@ any of these contracts.
 All work follows [`architecture.md`](architecture.md). A task stops and reports
 a blocker when it cannot satisfy that document without changing an approved
 product decision.
+
+Every implementation task in this program receives a fresh `worker-l` session,
+even when its complexity remains M, and must use `opencode-go/ox-alpha-free`.
+Do not use `worker-s`, `worker-m`, or another implementation model. Sprint
+reviews use the standard configured `reviewer` and `arch-reviewer`.
 
 ## Scope
 
@@ -72,33 +124,54 @@ product decision.
   or personal identifiers.
 - The reference WhatsApp case MUST retain its factual structure while using
   synthetic meeting IDs/names/content suitable for source control.
-- Model selection MUST record exact revisions, licenses, dimensions,
-  tokenizer, pooling, normalization, prefixes, ONNX export source, artifact
-  hashes, package size, RAM, latency, and quality metrics.
+- The reference case and every semantic/paraphrase case MUST demonstrably
+  **fail** under the current FTS-only baseline, asserted by the harness. See
+  `architecture.md` "Baseline Failure Reproduction".
+- The corpus MUST simultaneously satisfy `architecture.md` "Corpus Solvability"
+  and "Baseline Failure Reproduction". Neither may be met at the other's
+  expense: an unanswerable corpus fails the baseline trivially and measures
+  nothing.
+- The corpus MUST meet the floors in `architecture.md` "Corpus Size Floors",
+  and every reported percentage MUST carry its denominator. Cases MUST be
+  materially distinct; template-generated variants count once toward a floor,
+  not once per emitted row.
+- Model selection MUST first apply the admissibility filter in
+  `architecture.md` "Resource Budget Arithmetic". Inadmissible candidates are
+  not benchmarked.
+- Model selection MUST record exact revisions, licenses, dimensions, vector
+  encoding, tokenizer, pooling, normalization, prefixes, ONNX export source,
+  artifact hashes, package size, RAM, latency, and quality metrics.
 - Model selection MUST test Portuguese and English.
-- Reranker selection MUST be evaluated separately from embedding recall.
-- The vector-backend decision MUST use 12k, 50k, and 250k synthetic scales.
+- Reranker selection MUST be evaluated separately from embedding recall, and
+  MUST derive its candidate depth from the 900 ms p95 sub-budget rather than
+  assuming the provisional 30-50 range is affordable.
+- The vector-backend decision MUST use 12k, 50k, and 250k synthetic scales and
+  MUST follow the Backend Decision Rule table in `architecture.md`. ANN is
+  evaluated only for a latency miss.
+- Derived disk cost per document MUST be measured and projected to 250k.
 - Benchmark commands and corpus generation MUST be reproducible.
 - The sprint MUST publish a user-approved numeric quality/resource gate table;
   qualitative phrases such as "improves" are not sufficient acceptance.
 - The lexical core-term/high-frequency-word policy, RRF limits, meeting-
-  aggregation constants, scheduler limits, and ORT thread cap MUST be recorded
-  as measured decisions before Sprint 2.
+  aggregation constants, reranker depth policy, scheduler limits, and ORT
+  thread cap MUST be recorded as measured decisions before Sprint 2.
+- Platform gates apply to Windows x64 only.
 - No task may add a remote service or native SQLite extension.
 
 ## Task List
 
 | ID | Feature | Task | Size | Owner | Dependencies | Acceptance check | Rollback |
 |---|---|---|---|---|---|---|---|
-| 1.1 | Retrieval correctness | Fix today/list intersection, generic retained-source parity, and existing raw lexical query logging before semantic expansion. | M | Pending `worker-m` | None | Focused Rust tests prove date intersection/source parity and logs contain lengths/counts rather than query text. | Revert localized resolver/context/log changes; no data change. |
-| 1.2 | Evaluation | Add a private-safe multilingual corpus, deterministic metrics, baseline runner, and the reference regression. | M | Pending `worker-m` | None | One command reports baseline Recall/MRR/evidence/fact metrics and fails a deliberately degraded ranking. | Test/fixture tooling only; remove without production effect. |
-| 1.3 | Model selection | Benchmark and select the bundled multilingual embedding and reranker pair plus chunk policy. | L | Pending `worker-l` | 1.2 | Reproducible report identifies one approved pair satisfying quality, license, platform, RAM, and ONNX gates. | No production default changes before approval; remove benchmark artifacts. |
+| 1.1 | Retrieval correctness | Fix today/list intersection, generic retained-source parity, and existing raw lexical query logging before semantic expansion. | M | `worker-l` (`ses_fd6904208ffef0bDNhO4huicTS`) | None | Passed: 41 Chat tests, 11 context tests, privacy-log regression, Cargo check, rustfmt, and diff check. | Revert localized resolver/context/log changes; no data change. |
+| 1.2 | Evaluation | Add a private-safe multilingual corpus, deterministic metrics, baseline runner, and the reference regression. | M | `worker-l` (`ses_fd69041d9ffe3Prh5s1KjcPHNL`) | None | **Superseded by `1.2R`:** harness and metrics retained; generated corpus and recorded baseline void. | Test/fixture tooling only; remove without production effect. |
+| 1.2R | Evaluation | Re-author the corpus as materially distinct hand-written cases; add the solvability invariant and its harness assertion. | M | `worker-l` (`ses_fd317c5a5ffe20snhqLcOtBV3h`) | 1.2 | Passed: 120-case solvable corpus, answer-key-free structural checks, supervised raw-text margins, deterministic baseline, privacy scan, compatibility tests, rustfmt, Cargo check, and diff check. Baseline awaits user approval before `1.3`. | Restore the prior corpus/harness; test tooling only, no production effect. |
+| 1.3 | Model selection | Benchmark and select the bundled multilingual embedding and reranker pair plus chunk policy. | L | `worker-l` (`ses_fd06da77cffeQmAh22R2sPO3Fz`); first run `ses_fd65db999ffe5gwCX1YNm12F5w` | 1.2R | **Blocked after rerun.** All three budget-viable pairs fail Critical Recall@1 and critical forbidden contamination; source precision is unevaluated. No production pair selected. | No production default changes before approval; remove benchmark artifacts. |
 | 1.4 | Vector backend | Benchmark exact search and, only if needed, a pure-Rust HNSW candidate at 250k scale. | L | Pending `worker-l` | 1.3 | Report selects exact or exact+ANN and demonstrates the architecture performance/RAM gates. | Benchmark-only dependency/code can be removed; no persisted format ships. |
-| 1.5 | Model supply chain | Implement the small bundle manifest and reproducible hash/license verification pipeline; reconcile Rust MSRV. | M | Pending `worker-m` | 1.3 | Valid artifacts pass; tampered/missing artifacts fail before packaging; toolchain contract is explicit and checked. | Remove additive manifest/fetch verification; no runtime behavior yet. |
+| 1.5 | Model supply chain | Implement the small bundle manifest and reproducible hash/license verification pipeline; reconcile Rust MSRV. | M | Pending `worker-l` | 1.3 | Valid artifacts pass; tampered/missing artifacts fail before packaging; toolchain contract is explicit and checked. | Remove additive manifest/fetch verification; no runtime behavior yet. |
 
 ## Dependency Order
 
-`1.2 -> 1.3 -> 1.4`
+`1.2 -> 1.2R -> 1.3 -> 1.4`
 
 `1.3 -> 1.5`
 
@@ -106,6 +179,10 @@ product decision.
 `api/chat.rs` inline tests. Tasks `1.3` and `1.4` are L and run alone. Task
 `1.5` may start after `1.3`, but should not run concurrently with `1.4` if both
 need to change `Cargo.toml`, benchmark targets, or model artifact scripts.
+
+`1.2R` is a hard blocker for `1.3`. No model, encoding, chunk, fusion, or
+reranker-depth decision may be made against the superseded corpus, and the
+`1.3` rerun may not begin until `1.2R`'s new baseline is recorded and approved.
 
 ## Task Specifications
 
@@ -225,18 +302,161 @@ answer mode category
 
 - Fixtures contain no copied private transcript text or real user identifiers.
 - Baseline FTS results are recorded and reproducible.
+- **The reference case fails under the FTS-only baseline in the same mode as
+  the observed production failure — isolated numeric fragments, incomplete
+  schedule, missing MPV distinction — and the harness asserts that failure as a
+  passing test.** A fixture the current retrieval already answers is
+  unrepresentative and must be strengthened until the baseline fails.
+- **Every case in the semantic/paraphrase category is likewise shown to be
+  under-served by the baseline.** Exact-term, number, and name categories are
+  exempt and instead assert baseline success, since their gate is
+  no-regression.
 - The reference case expects the complete day schedule and MPV distinction.
 - The harness fails when the correct meeting is moved below the required rank.
 - The harness fails when required evidence is removed despite correct meeting
   ranking.
 - Corpus loading, metric computation, and output ordering are deterministic.
+- **The corpus meets the size floors in `architecture.md`: at least 120 cases
+  total, at least 15 per required category, at least 40 Portuguese and 40
+  English, and at least 5 designated reference/critical cases.** A metric
+  computed below its floor is reported as indicative only and cannot close a
+  sprint.
 - The task publishes numeric pass/fail gates with corpus counts for every
-  metric required by `architecture.md`; default floors may change only with
-  explicit user approval based on baseline evidence.
+  metric required by `architecture.md`; every percentage is reported with its
+  denominator. Default floors may change only with explicit user approval based
+  on baseline evidence.
 - The task publishes the evaluated lexical normalization/core-term policy and
   high-frequency-word list/algorithm; it must cover Portuguese and English and
   preserve exact names/numbers.
 - One documented command runs the evaluation locally.
+
+**Required verification:**
+
+Run from the repository's `upstream/` directory.
+
+```powershell
+$env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA "meetily-cargo-target"
+cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --test retrieval_evaluation
+cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check
+git diff --check
+```
+
+`frontend/src-tauri/tests/` does not exist yet; this task creates it. The
+integration target **MUST be named `retrieval_evaluation`** so the command
+above is stable — Sprints 2 through 5 hardcode it. If a different name is
+unavoidable, the worker must update every sprint document that references it in
+the same change, and record the rename in this sprint's decision log.
+
+**Worker report additions:** List every case ID/category with its baseline
+pass/fail status, and explain how the reference private case was syntheticized
+while preserving the failure mode.
+
+### 1.2R - Corpus re-authoring and solvability invariant [M]
+
+**Outcome:** The evaluation corpus measures retrieval quality instead of
+measuring its own impossibility. Gates become reachable by a competent retriever
+and unreachable by an incompetent one.
+
+**Supersedes:** the corpus produced by Task `1.2`. The `1.2` harness, metrics,
+scoring, mutation tests, and privacy audit are sound and are **retained**; only
+the fixture content and the missing solvability assertion are in scope. Do not
+rewrite `retrieval_evaluation.rs` wholesale.
+
+**Likely touchpoints:**
+
+- `frontend/src-tauri/tests/fixtures/corpus.rs` — replaced
+- `frontend/src-tauri/tests/fixtures/evaluation_policy.json` — new baseline
+- `frontend/src-tauri/tests/retrieval_evaluation.rs` — solvability assertion,
+  distinctness assertion, updated `expectedBaseline`
+- This sprint decision log and task execution entry
+
+**Required implementation:**
+
+- Replace procedural generation with hand-authored cases. `format!` interpolation
+  of an ordinal into a shared sentence is the defect being removed; it MUST NOT
+  reappear in any category that carries a discriminating signal.
+- Author each case so its expected evidence beats that case's distractors on at
+  least one channel, per `architecture.md` "Corpus Solvability".
+- Remove every distractor that contains the query verbatim or a superset of its
+  content terms. Distractors MUST be plausible topical neighbours — meetings a
+  user could reasonably confuse with the target — not query copies.
+- Add an answer-key-free structural assertion over fixture text that rejects
+  query-copy/superset distractors, nonce semantic discriminators, duplicated
+  templates, and non-varying ranking attributes.
+- Add a separate margin assertion that may use expected IDs only to label the
+  target. Compute target and strongest-distractor channel scores entirely from
+  raw fixture text; IDs may not contribute to scores or bypass retrieval. State
+  the discriminating channel and margin per case in the report.
+- Add a distinctness assertion: no two cases may share a normalized question or
+  expected-evidence template. Report the count of distinct sentence shapes
+  alongside the case count.
+- Give meetings distinct titles and dates so title overlap and recency inputs
+  are exercised. Make folder allow-lists actually exclude meetings so
+  `ScopeKind::Folder` differs from `ScopeKind::All`.
+- Give `ScopeKind::Meeting` cases more than one permitted meeting, so their
+  Recall@1 is earned.
+- Replace nonce discriminators (`Sintetico42`, `Cedar42`, `Atlas42`) in semantic
+  cases with real Portuguese and English paraphrase relations. Nonce tokens are
+  acceptable **only** in exact-term/number/name cases, where verbatim matching
+  is the property under test.
+- Re-record `expectedBaseline` in `evaluation_policy.json` from the new corpus.
+  The prior figures (`R@1 75/135`, `R@3 90/135`, `MRR 0.625`) are void.
+- Preserve the `retrieval_evaluation` target name and the existing three
+  mutation tests unchanged.
+
+**Reference case reconstruction — read this before authoring it:**
+
+The production failure recorded in `architecture.md` "Reference Acceptance Case"
+was an **evidence-completeness failure, not a meeting-ranking failure**: the
+baseline surfaced isolated numeric fragments and an incomplete schedule, and
+reduced the answer to "3 and 4 days". Task `1.2` re-encoded it as a ranking
+failure and manufactured 30 verbatim-query distractor *meetings* to force it,
+which is both unrepresentative and unwinnable.
+
+The reconstruction MUST instead:
+
+- Let the correct meeting be findable — it discusses the topic and carries the
+  topic's terms, as the real one did.
+- Place the complete schedule (`1, 3, 7, 10 and 15`) and the MPV/non-MPV day-one
+  distinction in **separate sections of that meeting**, far enough apart that a
+  bounded fragment-level retrieval can return one without the other.
+- Source the misleading "3 days"/"4 days" figures from partial or superseded
+  content in the topical neighbourhood — an earlier draft section, a related
+  meeting — not from a wall of query clones.
+- Fail the baseline on **Evidence Recall and required-fact coverage**, with
+  meeting rank passing or near-passing. Assert that specific failure shape, not
+  merely "the baseline fails".
+
+The remaining four critical cases follow the same discipline: each names the
+failure mode it reproduces and asserts that mode specifically.
+
+**Acceptance criteria:**
+
+- Every case satisfies "Corpus Solvability": answer-key-free structural checks
+  pass, and a separate raw-text margin check proves the expected evidence beats
+  its strongest distractor on at least one declared channel.
+- The reference and semantic-category cases still fail the FTS baseline,
+  asserted by the harness — falsifiability and solvability hold **together**.
+- The reference case fails the baseline on evidence completeness, with its
+  failure shape asserted specifically.
+- Distinct sentence shapes are at least 80% of the case count; the corpus meets
+  all "Corpus Size Floors" on materially distinct cases.
+- Semantic cases carry a real paraphrase relation; no nonce token is the
+  discriminating signal in any semantic case.
+- Meeting titles and dates vary within every case; folder scope excludes at
+  least one in-corpus meeting; no `ScopeKind::Meeting` case has a single-meeting
+  allow-list.
+- The new baseline is recorded, reproducible, and reported with denominators.
+- Exact-term/number/name cases still pass the baseline (no-regression contract
+  unchanged).
+- The three existing mutation tests still fail the corpus when rank, evidence,
+  or retained sources are degraded.
+- Fixtures contain no private transcript text, identifiers, keys, or paths.
+
+**Explicit non-goals:** no model inference, no changes to metrics definitions or
+gate thresholds, no production code changes. If the new baseline suggests a gate
+threshold is wrong, **report it — do not change it.** Gate changes require user
+approval on baseline evidence.
 
 **Required verification:**
 
@@ -247,16 +467,74 @@ cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check
 git diff --check
 ```
 
-The exact test target name may differ; the worker must document the final
-single command.
-
-**Worker report additions:** List every case ID/category and explain how the
-reference private case was syntheticized.
+**Worker report additions:** For every case, state the discriminating channel
+and its margin over the strongest distractor. State the distinct-shape count
+against the case count. State the new baseline with denominators beside the
+superseded `1.2` figures. Name any gate the new baseline calls into question,
+without changing it.
 
 ### 1.3 - Embedding, reranker, and chunk selection [L]
 
 **Outcome:** One exact, redistributable model pair and chunking contract are
 approved for production implementation.
+
+**Rerun scope (2026-08-22).** This task has run once. It is a **rerun against
+the `1.2R` corpus**, not a re-implementation. The harness
+(`tests/model_benchmark.rs`), candidate manifest, artifact staging, and
+reproduction commands are sound and are retained.
+
+*Retained from the first run — do not re-derive:*
+
+- Admissibility pre-filter arithmetic and the full candidate estimate table.
+- Measured pair RAM: 966.8 MiB (e5-small-int8 + mmarco-quint8), 1116.7 MiB
+  (e5-small-int8 + bge-int8), and the e5-base pairings.
+- Derived disk: 555 B/doc → 0.13 GiB steady, 0.26 GiB rebuild at 250k.
+- Per-pair reranker latency and the depth-50 ceiling under the 900 ms
+  sub-budget; the fp16/f32 budget exclusions.
+- Quantization fidelity: int8 = fp16 = f32 at zero measured recall cost; int8
+  vs f32 session cosine agreement 0.9919.
+- License, ONNX-availability, and portability screening, including the
+  documented-unavailable and rejected-before-benchmark candidate lists.
+
+*Void — must be re-measured against the `1.2R` corpus:*
+
+- All quality metrics for both pairs, all category and PT/EN breakdowns, and
+  both gate verdict tables.
+- The locked fusion constants (`k=5, w_vec=0.5, w_lex=0.5, α=0, β=0`), all
+  tuned γ values, and the meeting-aggregation constants. Per `architecture.md`
+  Decision Log 2026-08-22, these are artifacts of a degenerate search and carry
+  no evidentiary weight.
+- The chunk-profile conclusion that 256/48, 384/64, and 512/96 are equivalent.
+  That result followed from template-identical fixture text, not from a
+  measured property of the profiles.
+- The reranker selection rule's output. Re-rank the budget-viable candidates on
+  the new corpus before naming a leader.
+
+*Mandatory title/concept diagnostics for the rerun:*
+
+- Expand the held-out title-weight grid from `β ∈ {0, 1}` to
+  **`β ∈ {0, 0.25, 0.5, 1, 2}`**. Tune it with the other fusion constants; do
+  not assume either title-off or unit title weight is optimal.
+- For every candidate pair, report semantic and reference metrics twice: once
+  at the tuned `β` and once with only `β` ablated to `0`. This mandatory pair
+  holds every other tuned constant fixed. If the embedding contribution is
+  visible only when title scoring is enabled, make that the headline finding,
+  not a footnote or an unqualified model-quality pass.
+- For every case, compare the selected bi-encoder's raw vector rank for the
+  expected meeting/evidence with the supervised `CONCEPT_LEXICON` prediction.
+  Report case ID, concept margin, vector rank, and agreement/disagreement. The
+  lexicon is a corpus-solvability proxy, not model evidence; disagreement must
+  remain visible rather than being hidden by title or fusion scores.
+
+*Unchanged and still blocking regardless of corpus:* `BAAI/bge-reranker-base`
+declares zh/en on its model card and is metadata-nonconforming for a PT+EN
+product. A better corpus does not resolve this. If bge leads on quality again,
+report the conformity blocker separately and do not treat the quality result as
+resolving it.
+
+Re-staging note: artifacts were staged to `%TEMP%\opencode\meetly-task13\models`
+and have likely been cleared. Re-stage from the pinned revisions and hashes in
+the manifest before rerunning.
 
 **Likely touchpoints:**
 
@@ -265,29 +543,74 @@ approved for production implementation.
 - This sprint decision log and task execution entry
 - Small candidate metadata/manifests; no committed large model binaries
 
+**Mandatory pre-filter — apply before benchmarking anything:**
+
+Compute admissibility from `architecture.md` "Resource Budget Arithmetic" for
+every candidate pair:
+
+```text
+dimensions * bytes_per_value * 250000 * 2   (shadow-activation overlap)
+  + embedding_session_bytes
+  + reranker_session_bytes
+  <= 1 GiB     -> admissible
+  <= 1.25 GiB  -> admissible only with explicit user risk approval
+  >  1.25 GiB  -> inadmissible; DO NOT BENCHMARK
+```
+
+Record the computed figure for every candidate considered, including the ones
+this filter eliminates. Two consequences are given, not findings to rediscover:
+
+- A 768-dimension **f32** bi-encoder is inadmissible at the 250,000-document
+  gate. It may be reconsidered only paired with an approved quantized encoding.
+- Vector encoding is part of model selection, not a later optimization. Report
+  `f32`, `fp16`, and `int8` variants of a candidate as distinct entries with
+  their own quality and recall measurements.
+
+If the filter eliminates every candidate that could meet the quality gates,
+stop and raise an architecture decision. Permitted levers are lower
+dimensionality, quantization, memory-mapping the base snapshot, or an approved
+reduction of the 250,000-document scale gate. Adding an ANN index is not a
+lever.
+
 **Required candidates:**
 
 - At least two multilingual bi-encoder families suitable for Portuguese and
-  English.
+  English, **from the admissible set**.
 - At least two multilingual cross-encoder/reranker candidates when licensing
   and ONNX availability permit.
 - At least the transcript window profiles defined in `architecture.md`.
 - Latest-summary-only versus labeled all-summary-template evidence.
+- For any candidate whose f32 form is inadmissible, its quantized form if the
+  export exists.
 
 **Required measurements:**
 
 - Evaluation metrics from Task 1.2 for embedding retrieval.
 - Reranker pairwise accuracy or NDCG on the reranker subset.
 - Query and document inference latency.
+- **Per-pair cross-encoder latency, and the maximum candidate depth that fits
+  the 900 ms p95 reranking sub-budget.** If the affordable depth is below the
+  depth that meets the quality gates, report the conflict rather than silently
+  choosing one; it requires an approved gate change.
 - Batch throughput.
 - Peak model-session RAM.
 - Artifact and installed resource size.
-- Embedding dimensions and expected 250k vector memory.
+- Embedding dimensions, vector encoding, and expected 250k vector memory,
+  including the 2x shadow-activation overlap.
+- Measured derived disk cost per document and the projected 250k footprint
+  against the 2 GiB steady-state envelope.
+- Quantization recall cost when a quantized encoding is proposed.
 - Portuguese/English regression breakdown.
 - Held-out hybrid simulations selecting RRF `k`/channel weights, concept/title/
   support meeting-aggregation constants, reranker candidate count, and reranker
   batch size without tuning only the reference case.
-- CPU behavior on representatives of all supported architectures.
+- Title ablation on semantic and reference subsets at tuned `β` versus `β=0`,
+  with all other selected constants fixed, using the expanded title-weight grid
+  above.
+- Per-case selected-bi-encoder rank versus `CONCEPT_LEXICON` margin, including
+  explicit agreement/disagreement classification.
+- CPU behavior on Windows x64 reference hardware. Other platforms are deferred;
+  do not block on unavailable runners.
 - License and redistribution evidence.
 - Tokenizer, prefix, pooling, normalization, and quantization fidelity against
   a trusted reference implementation.
@@ -304,22 +627,34 @@ approved for production implementation.
 
 **Acceptance criteria:**
 
-- One embedding and one reranker model/revision are selected.
+- One embedding and one reranker model/revision are selected, **with an
+  explicit vector encoding**.
+- The admissibility pre-filter was applied and its computed figure is recorded
+  for every candidate considered, including eliminated ones.
+- The selected pair's projected peak RAM at 250k, including 2x snapshot
+  overlap and both model sessions, is at or below 1 GiB, or has explicit user
+  risk approval within the 1-1.25 GiB band.
 - The pair meets the Task 1.2 approved numeric semantic-category delta/floor
   without violating exact-term/number no-regression gates after planned fusion.
+- Semantic and reference gate evidence includes the mandatory tuned-`β` and
+  `β=0` pair. A title-dependent pass is reported as title-dependent and is not
+  attributed solely to the embedding model.
 - The reference case retrieves the correct meeting and complete evidence under
   at least one approved chunk profile.
 - All required manifest fields are known and immutable.
 - Licenses permit bundling in the distributed application.
-- Model pair plus 250k vector estimate can meet the approved RAM envelope or a
-  documented vector encoding/backend path exists for Task 1.4.
-- RRF/channel, meeting-aggregation, reranker candidate/batch, and ORT intra-op
-  thread values are selected with numeric evidence and recorded in an approved
-  architecture addendum.
+- RRF/channel, meeting-aggregation, ORT intra-op thread values, and **reranker
+  candidate depth derived from the 900 ms sub-budget** are selected with
+  numeric evidence and recorded in an approved architecture addendum. If an
+  adaptive depth policy is adopted it is deterministic, evaluated by the
+  corpus, and never varied by wall-clock timing.
+- Projected derived disk at 250k is recorded against the 2 GiB envelope.
 - A reference sentence/query produces stable expected outputs for future
-  packaged smoke tests.
-- Windows x64, macOS ARM64, and Linux x64 development/CI runners execute actual
-  tokenizer, embedding, and reranker reference inference before Sprint 2.
+  packaged smoke tests, recorded platform-neutrally.
+- The **Windows x64** development/CI runner executes actual tokenizer,
+  embedding, and reranker reference inference before Sprint 2. macOS and Linux
+  runners are deferred with the platforms; see `architecture.md` "Platform
+  Scope".
 - Embedding and reranker preprocessing are recorded independently, including
   tokenizer revision, pair formatting, input/output names/dtypes, truncation,
   output-label interpretation, and score transform.
@@ -340,7 +675,8 @@ git diff --check
 
 **Worker report additions:** Include a candidate comparison table, exact model
 IDs/revisions, license URLs/files, artifact hashes if available, rejected
-alternatives, and the recommended chunk policy.
+alternatives, the recommended chunk policy, the tuned-title/title-off metric
+pair, and the per-case bi-encoder/`CONCEPT_LEXICON` disagreement table.
 
 ### 1.4 - Vector backend benchmark [L]
 
@@ -372,10 +708,29 @@ not an assumed dependency choice.
 
 **Decision rule:**
 
-- Select exact-only when it satisfies the approved p95/RAM gates at 250k.
-- Evaluate and select exact+HNSW only when exact misses a gate.
-- Reject any ANN candidate that cannot be persisted/rebuilt safely on all
-  platforms or whose measured recall harms the evaluation corpus.
+The latency gate and the RAM gate have different remedies. An ANN index stores
+a proximity graph *in addition to* the vectors it indexes: it reduces query
+latency and **increases** memory. Selecting ANN in response to a RAM failure
+makes the failure worse. Follow the Backend Decision Rule table in
+`architecture.md`:
+
+| Measured result at 250k | Permitted remedy |
+|---|---|
+| Both gates pass | Ship exact search. Do not evaluate ANN. |
+| Latency p95 misses, RAM passes | Evaluate a pure-Rust HNSW-style index. This is the only ANN trigger. |
+| RAM misses, latency passes | Quantized `vector_encoding`, lower-dimension model, or memory-mapped base. **Do not evaluate ANN for this failure.** |
+| Both miss | Stop. Architecture decision required. Do not silently reduce scale, quality, or corpus. |
+
+Additional constraints:
+
+- An ANN candidate's graph memory counts toward the retrieval RAM envelope. A
+  candidate that pushes peak RAM above the approved band is rejected regardless
+  of its latency benefit.
+- Reject any ANN candidate that cannot be persisted/rebuilt safely on Windows
+  x64, or whose measured recall harms the evaluation corpus.
+- Because Task 1.3 applies the memory pre-filter, a RAM miss here means the
+  pre-filter arithmetic was wrong. Record that as a finding, do not work around
+  it silently.
 
 **Acceptance criteria:**
 
@@ -385,10 +740,13 @@ not an assumed dependency choice.
 - Narrow scope filtering cannot return out-of-scope documents.
 - The selected backend has a documented update and crash-recovery strategy.
 - Meeting updates do not synchronously copy/rebuild all 250k base vectors.
-- Peak old/new snapshot, delta/tombstone, and active model-session RAM is at or
-  below 1 GiB, or a measured 1-1.25 GiB result is explicitly approved before
-  selection; above 1.25 GiB fails without a product scope change.
-- Any added ANN library has acceptable license, maintenance, and all-target
+- Peak old/new snapshot, delta/tombstone, ANN graph when selected, and active
+  model-session RAM is at or below 1 GiB, or a measured 1-1.25 GiB result is
+  explicitly approved before selection; above 1.25 GiB fails without a product
+  scope change.
+- Measured derived disk at 250k is at or below the 2 GiB steady-state and 3 GiB
+  rebuild-peak envelope, or has explicit approval.
+- Any added ANN library has acceptable license, maintenance, and Windows x64
   build evidence.
 - Vector candidate limits, scan permits, interactive queue limit, index
   compaction threshold, and scheduler policy are recorded in the architecture
@@ -417,7 +775,11 @@ before packaging when altered, missing, unlicensed, or incompatible.
 
 - Small checked-in manifest under `frontend/src-tauri/` resources/config
 - Build or CI script for pinned artifact acquisition and hash verification
-- `.github/workflows/build-{windows,macos,linux}.yml`
+- The repository-root `.github/workflows/build-windows.yml` — **this is the
+  only active workflow in this fork.** The macOS and Linux workflows under
+  `upstream/.github/workflows/` are nested where GitHub Actions never reads
+  them; do not edit them expecting CI to run, and do not treat their existence
+  as platform coverage.
 - Root/frontend Rust toolchain or manifest metadata
 - License-resource configuration
 
@@ -440,7 +802,8 @@ before packaging when altered, missing, unlicensed, or incompatible.
 
 **Acceptance criteria:**
 
-- Valid pinned artifacts pass on each target workflow path.
+- Valid pinned artifacts pass on the Windows x64 workflow path. No macOS or
+  Linux workflow path is required or claimed this release.
 - One-byte corruption fails verification.
 - Missing tokenizer/model/license fails verification.
 - Unknown manifest version fails closed.
@@ -466,10 +829,17 @@ license packaging, CI impact, and the exact Rust toolchain decision.
 
 ## Sprint Acceptance Criteria
 
-- All five task acceptance sets pass.
-- `architecture.md` contains approved addenda for selected models, chunking,
-  vector backend, limits, and toolchain.
+- All six task acceptance sets pass (`1.1`, `1.2R`, `1.3`, `1.4`, `1.5`; `1.2`
+  is superseded by `1.2R`).
+- The corpus satisfies solvability and falsifiability simultaneously, both
+  asserted by the harness, on materially distinct cases.
+- `architecture.md` contains approved addenda for selected models, vector
+  encoding, chunking, vector backend, reranker depth, limits, and toolchain.
+- The evaluation corpus meets its size floors and the reference/semantic cases
+  demonstrably fail the FTS baseline.
 - Evaluation baseline and selected-model results are reproducible.
+- The selected pair's projected 250k RAM and disk figures are recorded against
+  their envelopes.
 - No private corpus content is committed.
 - No production semantic schema or runtime retrieval is introduced early.
 - Full Rust library tests, typecheck, Vitest, Cargo check, rustfmt, and diff
@@ -477,17 +847,45 @@ license packaging, CI impact, and the exact Rust toolchain decision.
 - Code review and architecture review return Approved with no unresolved
   blocker or should-fix finding.
 
+**Cancellation condition:** if Task 1.2 cannot demonstrate that the current
+FTS-only baseline fails the reference and semantic categories, the `ROADMAP.md`
+deferral condition for semantic search is unmet. The correct outcome is to
+cancel this program and keep the Sprint 1.1 correctness fixes, not to proceed
+with a retrieval rewrite that has no measured problem to solve.
+
 ## Risks And Mitigations
 
 - **Benchmark overfitting:** require multilingual categories and held-out cases,
   not only the reported WhatsApp question.
+- **Unrepresentative synthetic fixture:** the same agent authors the fixture and
+  must beat it. Mitigated by requiring the fixture to fail the FTS baseline in
+  the observed failure mode, asserted as a passing test.
+- **Unanswerable synthetic fixture (materialized in `1.2`; mitigated by
+  `1.2R`):** the falsifiability requirement alone is satisfiable by making the
+  corpus impossible, which passes the letter of the rule and measures nothing.
+  Mitigated by `architecture.md` "Corpus Solvability", asserted from fixture
+  text without the answer key, and by treating identical metrics across
+  unrelated model families as a corpus-defect signal.
+- **Template-inflated sample size:** procedural generation satisfies the size
+  floors nominally while leaving the effective N at the template count.
+  Mitigated by the distinctness assertion and the 80% distinct-shape floor.
+- **Constants tuned on a degenerate objective:** when a search objective's
+  leading terms are constant across all configurations, the grid resolves on its
+  tie-break and produces values that look measured. Mitigated by voiding the
+  `1.3` constants explicitly rather than carrying them into Sprint 2.
+- **Statistically meaningless gates:** percentage thresholds at small N are
+  noise. Mitigated by corpus size floors and mandatory denominators.
 - **Model license ambiguity:** treat unclear redistribution as a blocker.
 - **Reference mismatch:** compare Rust tokenization/outputs with trusted model
   reference vectors.
 - **Installer growth:** report exact package size even though no strict total
   asset limit was selected.
-- **ANN complexity without need:** exact must fail a measured gate before ANN is
-  selected.
+- **Memory arithmetic discovered late:** mitigated by applying the
+  admissibility pre-filter in 1.3 before benchmarking, not after.
+- **ANN complexity without need:** exact must fail the *latency* gate before ANN
+  is selected; a RAM miss is never an ANN trigger.
+- **Reranker exceeding the Fast budget:** measured per-pair latency and a
+  derived depth ceiling, rather than assuming 30-50 pairs are affordable.
 - **Private fixture leakage:** use synthetic text and review fixture diffs.
 - **CI artifact drift:** immutable revisions plus SHA-256, never floating URLs.
 
@@ -495,13 +893,306 @@ license packaging, CI impact, and the exact Rust toolchain decision.
 
 | Date | Decision or change | Rationale | Alternatives considered | Approved by |
 |---|---|---|---|---|
-| 2026-08-21 | Sprint 1 is a quality gate and does not ship semantic retrieval. | Prevent foundational model/index guesses from leaking into production architecture. | Implement a chosen model immediately. | Main agent, pending sprint approval |
-| 2026-08-21 | Use synthetic source-controlled evaluation fixtures. | Preserve privacy while retaining factual retrieval structure. | Commit a copy of the live user database. | Main agent, pending sprint approval |
-| 2026-08-21 | Exact search must be benchmarked before ANN. | Current scale is small and deletion is cheaper than a speculative subsystem. | Adopt sqlite-vec/HNSW immediately. | Main agent, pending sprint approval |
+| 2026-08-21 | Sprint 1 is a quality gate and does not ship semantic retrieval. | Prevent foundational model/index guesses from leaking into production architecture. | Implement a chosen model immediately. | User |
+| 2026-08-21 | Use synthetic source-controlled evaluation fixtures. | Preserve privacy while retaining factual retrieval structure. | Commit a copy of the live user database. | User |
+| 2026-08-21 | Exact search must be benchmarked before ANN. | Current scale is small and deletion is cheaper than a speculative subsystem. | Adopt sqlite-vec/HNSW immediately. | User |
+| 2026-08-21 | Apply the memory admissibility filter before benchmarking any model. | A 768-dim f32 candidate is inadmissible at 250k by arithmetic alone; discovering that through two L-sized benchmark tasks wastes the sprint. | Benchmark on quality first and check memory afterward. | User |
+| 2026-08-21 | ANN is triggered by a latency miss only, never a RAM miss. | An HNSW graph is stored in addition to the vectors and cannot reduce a footprint it adds to. | Keep the original undifferentiated "scale gate" rule. | User |
+| 2026-08-21 | Vector encoding is part of model selection; quantized variants are distinct candidates. | The RAM envelope makes encoding a first-order quality decision, not a later optimization. | Select f32 and treat quantization as contingency. | User |
+| 2026-08-21 | Require the reference fixture to fail the FTS baseline, asserted by the harness. | Otherwise the program's headline gate cannot fail and therefore cannot inform anything. | Record the baseline without asserting failure. | User |
+| 2026-08-21 | Set corpus size floors and require denominators on every percentage. | At N=20 a single case moves Recall@3 by 5 points and "+10 points" is noise. | Record counts without setting floors. | User |
+| 2026-08-21 | Derive reranker candidate depth from a 900 ms sub-budget. | 30-50 cross-encoder pairs on CPU plausibly consume the entire 2 s Fast budget alone. | Assume the provisional 30-50 range is affordable. | User |
+| 2026-08-21 | Windows x64 only for all platform gates in this sprint. | The macOS/Linux workflows in this fork are nested under `upstream/` and never execute; the original gate was unsatisfiable. | Add root-level macOS/Linux workflows as a Sprint 0 prerequisite. | User |
+| 2026-08-21 | Pin the evaluation target name to `retrieval_evaluation`. | Four later sprints hardcode the command; "the name may differ" would break them all. | Let the worker choose and update references later. | User |
+| 2026-08-21 | Add an explicit program cancellation condition. | If the FTS baseline does not fail, the `ROADMAP.md` deferral condition is unmet and the rewrite has no measured problem to solve. | Proceed regardless of baseline evidence. | User |
+| 2026-08-22 | Pin every implementation and review subagent to `openai/gpt-5.6-sol`; use distinct `worker-l` sessions for all tasks. | The user explicitly required the main agent's model for the entire implementation and forbade model changes at that point. | Use size-tier worker models. | User |
+| 2026-08-22 | Approve Batch 1 containing Tasks `1.1` and `1.2`, each in a distinct `worker-l` session. | Both tasks have no dependencies and are parallel-safe when the evaluation harness stays outside `api/chat.rs` inline tests. | Dispatch either task alone or revise boundaries. | User |
+| 2026-08-22 | Supersede the Sol-only model pin: use only fresh `worker-l` sessions for implementation, with the standard model configured for that subagent. | The user explicitly revised the dispatch policy after the first two workers returned no report. Task scope and Batch 1 approval are unchanged. | Keep the prior Sol-only pin or use size-tier workers. | User |
+| 2026-08-22 | Pause implementation before Task `1.3`; do not approve proposed Batch 2. | The user selected Pause implementation at the Batch 2 dispatch gate. Batch 1 remains complete and Tasks `1.3`-`1.5` remain pending. | Approve Task `1.3` or review its boundaries first. | User |
+| 2026-08-22 | Require `opencode-go/ox-alpha-free` for every `worker-l` implementation session with no model substitution. | The user explicitly pinned the implementation agent model. This supersedes the earlier standard-configured-model policy without resuming paused implementation. | Keep the configurable standard model or permit fallbacks. | User |
+| 2026-08-22 | Resume implementation and approve single-task Batch 2 containing Task `1.3`. | Task `1.2` is complete, verified, and logged; Task `1.3` is dependency-ready and must run alone because it is L-sized and establishes shared model/chunk contracts. | Keep implementation paused or review Task `1.3` boundaries again. | User |
+| 2026-08-22 | Record Task `1.3` as blocked with no production model pair selected. | Independent audit and reruns confirm the PT+EN-conforming e5-small+mmarco pair passes RAM/latency but degrades NDCG and misses quality gates; the NDCG-leading BGE pair is metadata-nonconforming and falls in the RAM approval band. | Silently weaken a gate, treat a benchmark leader as selected, or start dependent Tasks `1.4`/`1.5`. | Main agent |
+| 2026-08-22 | Task `1.3` blocker addendum: exhaust held-out fusion and meeting-aggregation constants before requesting an architecture decision. | A 144-configuration fusion grid plus six reranker weights per viable pair, tuned on 105 non-critical/non-reference cases, still leaves the conforming pair at 66.67% Recall@3 with degraded NDCG and the nonconforming BGE pair at 77.78% Recall@3 with reference rank 2. The blocked verdict stands. | Treat fixed channel weights or only gamma 0/1 as exhaustive, or tune constants against the reference cases. | Main agent |
+| 2026-08-22 | Reattribute the Task `1.3` block: the Task `1.2` corpus is invalid, and `1.3`'s quality findings are uninterpretable rather than adverse. | The reference and semantic templates place the query verbatim inside every distractor while the expected evidence shares almost no surface with it. No retriever can win those cases. Three unrelated bi-encoder families returning byte-identical metrics confirms the corpus, not the model, is the deciding variable. | Accept the blocked verdict as a model finding and choose between Pair A and Pair B. | User |
+| 2026-08-22 | Add Task `1.2R` to re-author the corpus; make it a hard blocker for `1.3`. | The instrument must be repaired before any irreversible model, encoding, chunk, or fusion contract is set from its output. | Lower the gates to fit the observed numbers, or approve Pair B on RAM/metadata waivers. | User |
+| 2026-08-22 | Reject the gate-lowering and approve-Pair-B options recorded in the `1.3` report §5. | Both ratify a measuring instrument now known to be invalid, and would lock a production contract for four downstream sprints on uninterpretable evidence. | Adjust the affected quality gates with the existing evidence; waive bge's zh/en metadata and RAM band. | User |
+| 2026-08-22 | Retain `1.3`'s resource findings; void its quality findings and tuned constants. | RAM, disk, latency, quantization fidelity, and licensing are properties of the models and hardware, independent of fixture content. Quality metrics and constants tuned on a degenerate objective are not. | Void the entire task and rerun it from scratch. | User |
+| 2026-08-22 | Do not invoke the cancellation condition yet. | The `ROADMAP.md` deferral condition is currently *unproven in both directions*: `1.2` showed FTS failing a corpus that everything fails, which is not evidence about FTS. `1.2R` resolves it honestly either way — real FTS gaps mean proceed, no gaps mean cancel with justification. | Cancel now on the existing blocked verdict, keeping only the `1.1` fixes. | User |
+| 2026-08-22 | Record `BAAI/bge-reranker-base` zh/en metadata nonconformity as an independent blocker that `1.2R` does not resolve. | It is a property of the model card, not of the corpus. A corpus fix must not be allowed to look as though it cleared this. | Treat a post-rerun quality win as resolving the conformity question. | User |
+| 2026-08-22 | Approve single-task Batch 3 containing Task `1.2R`, with a two-part solvability assertion. | The task is dependency-ready and must repair the shared corpus before `1.3` can rerun. Structural defects are checked without the answer key; expected IDs only label targets for raw-text margin scoring. | Keep the task paused or require an impossible unsupervised expected-target assertion. | User |
+| 2026-08-23 | Record title concentration in `1.2R` and require title ablation plus concept-proxy disagreement evidence in the `1.3` rerun. | Title is the strongest supervised solvability channel for 52/120 cases overall and 23/45 reference/semantic cases. A passing fused gate could therefore conceal weak embedding behavior unless tuned-`β` and `β=0` results are paired and raw bi-encoder ranks are compared with the `CONCEPT_LEXICON` proxy per case. | Treat titles as ordinary fusion input and report only the tuned aggregate; retain the two-point `β ∈ {0,1}` grid; assume the handcrafted concept proxy predicts the selected model. | User |
+| 2026-08-23 | Approve the Task `1.2R` baseline as the authority for the Task `1.3` rerun. | Independent verification passed on the solvable 120-case corpus and the tests-only checkpoint `1e41b6b` makes subsequent benchmark changes diffable. Approved figures: R@1 72/135, R@3 96/135, R@5 124/135, MRR 0.695833, Evidence R@10 181/209, fact coverage 130/149, forbidden contamination 25/121, source precision 471/471. | Keep model work blocked and revise `1.2R`; approve a gate or model pair together with the baseline. | User |
+| 2026-08-23 | Approve single-task Batch 4 containing only the Task `1.3` rerun in a fresh `worker-l` session using `opencode-go/ox-alpha-free` with no fallback. | `1.2R` is complete and approved; the retained harness and staged artifacts are available. The rerun must retune void quality constants on the fixed corpus, use the expanded title grid, publish title ablation and concept-proxy disagreement evidence, and select no pair unless every gate passes. | Keep Task `1.3` blocked or merge dependent Tasks `1.4`/`1.5` into the model rerun. | User |
+| 2026-08-23 | Route the same Ox Alpha model through `openrouter/stealth/ox-alpha` for the Batch 4 remediation, superseding only the `opencode-go` provider route. | `opencode-go/ox-alpha-free` returned repeated provider `network_error` responses and left remediation incomplete. OpenRouter exposes the exact Ox Alpha model; changing transport preserves the model pin rather than authorizing a fallback. | Keep retrying the unavailable `opencode-go` endpoint; substitute a different model. | User |
+| 2026-08-23 | Restore the Batch 4 worker route to `opencode-go/ox-alpha-free`. | OpenRouter recognized `stealth/ox-alpha` but every worker and direct probe completed with empty output, so that route could not perform or report work. The model pin remains Ox Alpha and no fallback is authorized. | Keep the nonfunctional OpenRouter route; substitute another model. | User |
+| 2026-08-23 | Record the Batch 4 Task `1.3` rerun as blocked with no production pair selected. | Every budget-viable pair fails Critical Recall@1 and critical forbidden contamination `4/6`; bge also fails the pinned Reference Recall@1 and remains zh/en metadata-nonconforming. Citation/source precision is unevaluated, all conforming e5-base pairings require RAM-band approval, and latency viability varies with machine state. | Select the best aggregate pair despite failed/unevaluated gates; weaken critical gates; treat title-assisted aggregate recall as sufficient. | Main agent |
 
 ## Task Execution Log
 
 <!-- Append one immutable entry per completed, blocked, or cancelled task. -->
+
+### 1.1 - Retrieval correctness prerequisites
+
+**Status:** Complete
+**Owner:** `worker-l` (`ses_fd6904208ffef0bDNhO4huicTS`)
+**Completed:** 2026-08-22
+**Implemented:**
+- Intersected today/list title resolution with all, recursive-folder, and
+  frozen-snapshot allow-lists.
+- Made generic context return stable retained evidence identities and construct
+  broad sources only after final prompt overhead is budgeted.
+- Replaced raw lexical query logging with Unicode length, mode, scope, limit,
+  authorization-presence, and result-count fields.
+**Implementation:**
+- Files: `frontend/src-tauri/src/api/api.rs`,
+  `frontend/src-tauri/src/api/chat.rs`,
+  `frontend/src-tauri/src/database/repositories/fts.rs`, and
+  `frontend/src-tauri/src/export/context.rs`.
+- Approach: `prepare_chat_inputs_for_scope` computes the final evidence budget,
+  calls `build_context_markdown_with_limit`, and filters `ChatSource` values by
+  its `(meeting_id, chunk_type, chunk_id)` identities before `assemble_prompt`.
+**Not implemented:**
+- Semantic types, model dependencies, schema, IPC, persisted-source changes,
+  or changes to saved-meeting/live source behavior.
+**Why not implemented:**
+- Explicitly outside Task 1.1.
+**Verification:**
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib api::chat::tests` - pass, 41 tests.
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib export::context::tests` - pass, 11 tests.
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib api::api::tests::lexical_search_info_fields_never_contain_raw_query_text` - pass, 1 test.
+- `cargo check --manifest-path "frontend/src-tauri/Cargo.toml"` - pass.
+- `cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check` - pass.
+- `git diff --check` - pass; unrelated `ROADMAP.md` line-ending warning only.
+**Rollback:**
+- Revert the four Rust files; no migration or data repair is required.
+**Decisions and follow-ups:**
+- All persisted streaming/non-streaming and MCP Chat callers inherit the shared
+  preparation fix. String-returning lexical context APIs keep their contracts.
+
+### 1.2 - Evaluation corpus and harness
+
+**Status:** Complete
+**Owner:** `worker-l` (`ses_fd69041d9ffe3Prh5s1KjcPHNL`)
+**Completed:** 2026-08-22
+**Implemented:**
+- Added 120 deterministic synthetic cases: 60 Portuguese, 60 English, five
+  critical references, and at least 15 cases in every required overlapping
+  category.
+- Reproduced the WhatsApp schedule failure with days 1, 3, 7, 10, and 15 plus
+  the MPV/non-MPV day-one distinction, without private source text.
+- Added deterministic FTS metrics, numeric gates, lexical policy, latency hooks,
+  baseline-failure/no-regression assertions, and rank/evidence/source mismatch
+  mutation checks.
+**Implementation:**
+- Files: `frontend/src-tauri/tests/retrieval_evaluation.rs` and
+  `frontend/src-tauri/tests/fixtures/{corpus.rs,evaluation_policy.json,README.md}`.
+- Approach: exercise the production `FtsRepository` against isolated in-memory
+  SQLite FTS5 databases and the production generic context builder at a 1,200
+  Unicode-character budget. The deterministic baseline is Recall@1 `75/135`,
+  Recall@3 `90/135`, Recall@5 `90/135`, MRR `0.625`, Evidence Recall@10
+  `90/150`, required-fact coverage `90/150`, forbidden contamination `105/135`,
+  and retained-source precision `300/300`.
+**Not implemented:**
+- Embedding/reranker inference, chunk selection, hybrid deltas, production
+  semantic runtime, or RAM/disk/backend benchmarks.
+**Why not implemented:**
+- These belong to Tasks 1.3 and 1.4.
+**Verification:**
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --test retrieval_evaluation` - pass, 3 tests including degraded rank, missing evidence, and unretained-source mutations.
+- `cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check` - pass.
+- `git diff --check` - pass; unrelated `ROADMAP.md` line-ending warning only.
+- Fixture secret/path scan and built-in private-marker validation - pass; matches are scanner literals only.
+**Rollback:**
+- Remove the integration target and its three fixture files; production behavior
+  and persisted data are unaffected.
+**Decisions and follow-ups:**
+- All 15 reference variants and all 30 semantic/paraphrase cases fail the FTS
+  baseline as required; all 75 exact-term cases pass the no-regression contract.
+- A worker-added entry in the unrelated Notes/Chat execution record was removed;
+  this sprint document remains authoritative.
+
+### 1.3 - Embedding, reranker, and chunk selection
+
+**Status:** Blocked
+**Owner:** `worker-l` (`ses_fd65db999ffe5gwCX1YNm12F5w`)
+**Completed:** 2026-08-22
+**Implemented:**
+- Added a reproducible Windows x64 benchmark harness, candidate manifest, and
+  evidence report without committing model weights.
+- Applied admissibility filtering, ran real tokenizer/ONNX inference, evaluated
+  three bi-encoder families and two reranker families/precisions, measured
+  deterministic batch-1 latency and pair RAM, and compared all required chunk
+  and summary policies against the Task 1.2 corpus.
+- Recorded platform-neutral reference outputs, artifact hashes, license and
+  preprocessing contracts, vector encoding, 250k RAM/disk projections, and
+  benchmark-leader constants explicitly not approved for production.
+**Implementation:**
+- Files: `frontend/src-tauri/tests/model_benchmark.rs`,
+  `frontend/src-tauri/tests/fixtures/model_bundle_manifest.json`,
+  `frontend/src-tauri/tests/fixtures/corpus_types.rs`,
+  `frontend/src-tauri/tests/retrieval_evaluation.rs`,
+  `frontend/src-tauri/Cargo.toml`, `Cargo.lock`, and
+  `docs/hybrid-rag/task-1.3-model-selection.md`.
+- Approach: stage immutable model artifacts outside git, execute them through
+  the existing ORT major contract plus a benchmark-only Hugging Face tokenizer,
+  run production FTS and deterministic hybrid simulations, and keep blocked
+  evidence under `benchmarkLeader` rather than a production `selected` contract.
+**Not implemented:**
+- No production model pair, semantic runtime, vector backend, bundle supply
+  chain, schema, API, or model weights.
+**Why not implemented:**
+- The PT+EN-conforming e5-small-int8 + mmarco-quint8 pair passes the automatic
+  RAM envelope at 966.8 MiB and the latency/license/portability gates, but
+  degrades NDCG and fails semantic/reference quality gates. The NDCG-leading
+  BGE pair is metadata-nonconforming for Portuguese and measures 1116.7 MiB,
+  requiring separate risk approval even if its model-contract blocker changed.
+**Verification:**
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --test retrieval_evaluation` - pass, 3 tests.
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --test model_benchmark` - pass, 7 offline-safe/coherence tests with no target warnings.
+- Staged-artifact reference inference and full release hybrid/resource benchmark - pass as reproducible commands; decision is `blocked-quality-gates`.
+- `MEETLY_RAG_PAIR=e5-small-int8/...:mmarco-reranker/... pair_ram_probe` - independently measured 966.8 MiB projected peak at 250k.
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib` - pass, 394 tests; 2 ignored.
+- `cargo check --manifest-path "frontend/src-tauri/Cargo.toml"` - pass.
+- `cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check` - pass.
+- `git diff --check` - pass; unrelated `ROADMAP.md` line-ending warning only.
+**Rollback:**
+- Remove the benchmark target, candidate manifest/report, and shared corpus type
+  file; restore the Task 1.2 local type definitions and Cargo dependency/lock
+  changes. Production runtime and persisted data are unaffected.
+**Decisions and follow-ups:**
+- No production pair is selected. Tasks `1.4` and `1.5` remain blocked on this
+  task. Continue only after the user approves an architecture resolution.
+
+### 1.2 / 1.3 - Amendment: corpus invalidated
+
+**Status:** Amendment (the `1.2` and `1.3` entries above remain immutable and
+are not edited; this entry records what later evidence changed about them.)
+**Owner:** Main agent
+**Recorded:** 2026-08-22
+**Finding:**
+- The `1.2` corpus is invalid. Its reference and semantic templates place the
+  query verbatim inside every distractor while the expected evidence shares
+  almost no surface with the query, making those categories unwinnable by any
+  retriever. See this document's "Why Task 1.3 blocked".
+- Consequently the `1.2` entry's claim that "all 15 reference variants and all
+  30 semantic/paraphrase cases fail the FTS baseline as required" is true as
+  written but does not carry the meaning it was recorded to carry: they fail
+  for every retriever, not because FTS is lexical.
+- The `1.3` entry's blocked verdict stands, but its stated cause — no model pair
+  satisfies the quality gates — is superseded. The gates were unreachable.
+**Effect on the record:**
+- `1.2` status changes from Complete to **Superseded by `1.2R`**.
+- `1.3` status remains Blocked; its cause is reattributed and its rerun scope is
+  defined in the task specification above.
+- `1.2`'s recorded baseline (`R@1 75/135`, `R@3 90/135`, `MRR 0.625`,
+  `Evidence R@10 90/150`) is void and is re-recorded by `1.2R`.
+- `1.3`'s resource findings are retained; its quality findings and tuned
+  constants are void.
+**Not changed:**
+- Task `1.1` is unaffected and remains Complete.
+- The `1.2` harness, metrics, scoring, mutation tests, and privacy audit remain
+  in use; only fixture content and the missing solvability assertion are
+  replaced.
+**Follow-ups:**
+- Dispatch `1.2R`, then rerun `1.3`. Tasks `1.4` and `1.5` remain blocked.
+
+### 1.2R - Corpus re-authoring and solvability invariant
+
+**Status:** Complete; baseline approved
+**Owner:** `worker-l` (`ses_fd317c5a5ffe20snhqLcOtBV3h`)
+**Completed:** 2026-08-23
+**Implemented:**
+- Replaced the invalid generated corpus with 120 materially distinct cases: 60
+  Portuguese, 60 English, five critical, and at least 15 in every required
+  overlapping category.
+- Added separate answer-key-free structural checks and supervised raw-text
+  margin, coverage, and distinctness checks. Expected IDs only label targets
+  and never contribute to scores or bypass retrieval.
+- Reproduced the reference failure as evidence incompleteness while keeping all
+  semantic cases individually solvable and under-served by the FTS baseline.
+**Implementation:**
+- Files: `frontend/src-tauri/tests/retrieval_evaluation.rs`,
+  `frontend/src-tauri/tests/fixtures/corpus.rs`,
+  `frontend/src-tauri/tests/fixtures/corpus/*.rs`,
+  `frontend/src-tauri/tests/fixtures/evaluation_policy.json`,
+  `frontend/src-tauri/tests/fixtures/README.md`, and
+  `docs/hybrid-rag/task-1.2r-corpus.md`.
+- Approach: hand-authored literal case families use shared schema builders;
+  production FTS and context code remain unchanged. The new deterministic
+  baseline is Recall@1 `72/135`, Recall@3 `96/135`, Recall@5 `124/135`, MRR
+  `0.695833`, Evidence Recall@10 `181/209`, fact coverage `130/149`, forbidden
+  contamination `25/121`, and source precision `471/471`.
+- Tests-only checkpoint: `1e41b6b` (`frontend/src-tauri/tests/`).
+**Not implemented:**
+- No production retrieval, model, chunk, fusion, schema, API, persisted-data,
+  or model-weight change. No Task `1.3` quality result or constant was retained.
+**Why not implemented:**
+- These are outside the approved single-task remediation batch. Task `1.3`
+  must rerun against this baseline only after explicit user approval.
+**Verification:**
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --test retrieval_evaluation -- --nocapture` - pass, 5 tests.
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --test model_benchmark` - pass, 7 tests against the shared repaired corpus.
+- `cargo check --manifest-path "frontend/src-tauri/Cargo.toml"` - pass.
+- `cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check` - pass.
+- `git diff --check` - pass; unrelated `ROADMAP.md` line-ending warning only.
+- Focused privacy scan - pass; matches are scanner/documentation literals and
+  the existing `blocked-risk-approval` decision string only.
+**Rollback:**
+- Restore the pre-`1.2R` fixture/harness files and remove the new family modules
+  and report. Production behavior and persisted data are unaffected.
+**Decisions and follow-ups:**
+- The Task `1.2` baseline is void and replaced by the figures above.
+- The user approved this baseline and single-task Batch 4 on 2026-08-23. Rerun
+  Task `1.3` in a fresh session; do not inherit the void quality constants.
+
+### 1.3 - Embedding, reranker, and chunk selection rerun
+
+**Status:** Blocked
+**Owner:** `worker-l` (`ses_fd06da77cffeQmAh22R2sPO3Fz`)
+**Completed:** 2026-08-23
+**Implemented:**
+- Reran actual tokenizer, embedding, and reranker inference against the approved
+  `1.2R` corpus for three budget-viable pairs, with the expanded title-weight
+  grid, per-pair title ablation, and per-case concept-proxy disagreement report.
+- Corrected the benchmark's Meeting-scope lexical parity and dynamic contracted
+  pair labels, then repaired the reference-inference contract so record/replay
+  share byte-identical ordered pairs and reject manifest text corruption.
+- Recorded e5-base-int8 and mmarco-quint8 as non-production benchmark leaders;
+  no model pair or tuned constant was promoted to a production contract.
+**Implementation:**
+- Files: `frontend/src-tauri/tests/model_benchmark.rs`,
+  `frontend/src-tauri/tests/retrieval_evaluation.rs` (mechanical shared-lexicon
+  import only), `frontend/src-tauri/tests/fixtures/concept_lexicon.rs`,
+  `frontend/src-tauri/tests/fixtures/corpus.rs` (comment only),
+  `frontend/src-tauri/tests/fixtures/model_bundle_manifest.json`, and
+  `docs/hybrid-rag/task-1.3-model-selection.md`.
+- Approach: retain approved resource evidence, remeasure all corpus-dependent
+  quality evidence in release mode, tune only on the held-out partition, and
+  keep all blocked leaders under non-production manifest fields.
+**Not implemented:**
+- No production model selection, runtime, schema, API, vector backend, bundle,
+  model weights, or approved fusion/chunk constants.
+**Why not implemented:**
+- Every evaluated pair fails Critical Recall@1 and critical forbidden
+  contamination `4/6`. BGE additionally fails pinned Reference Recall@1 and is
+  zh/en metadata-nonconforming. Citation/source precision is unevaluated, all
+  conforming e5-base pairings need RAM-band approval, and latency viability is
+  machine-state-sensitive.
+**Verification:**
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --test retrieval_evaluation` - pass, 5 tests; approved baseline unchanged.
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --test model_benchmark -- --nocapture` - pass, 7 tests; independently rerun by the main agent.
+- Release `hybrid_corpus_and_resource_benchmark` - pass with verdict `blocked-quality-gates`; a second run produced digit-identical quality tables.
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib` - pass, 394 tests; 2 ignored.
+- `cargo check` and `cargo fmt --check` - pass.
+- `git diff --check` - pass; unrelated `ROADMAP.md` line-ending warning only.
+**Rollback:**
+- Restore checkpoint `1e41b6b` for the three checkpointed test files, remove
+  `fixtures/concept_lexicon.rs`, and restore the prior report. Production and
+  persisted data are unaffected; staged model artifacts remain outside git.
+**Decisions and follow-ups:**
+- Tasks `1.4` and `1.5` remain blocked. Any continuation requires a new user
+  architecture decision; do not choose the best aggregate pair by weakening or
+  ignoring critical, source, metadata, RAM, or latency gates.
 
 ### Task Entry Template
 
@@ -549,8 +1240,15 @@ sprint.
 
 ## Approval Gates
 
-- User approval of this PRD is required before creating the Sprint 1 TODO list.
+- **The Windows-only platform scope and this PRD were approved by the user on
+  2026-08-22.**
+- **Sprint 6.1 closed on 2026-08-22** after all six manual Windows/Tauri smoke
+  checks passed. Its task `6.1.R10` defines saved-meeting invariants that Sprint
+  4.3 must preserve.
+- Sprint 1 TODOs were authorized by the user's PRD approval on 2026-08-22.
 - User approval of each dependency-ready batch is required before dispatch.
-- User approval is required for the exact production model pair and any ANN
-  dependency before Sprint 2.
+- User approval is required for the exact production model pair, its vector
+  encoding, and any ANN dependency before Sprint 2.
+- Explicit user risk approval is required if the selected pair lands in the
+  1-1.25 GiB RAM band or exceeds the derived-disk envelope.
 - Sprint-close approval is required before Sprint 2 begins.

@@ -2,14 +2,19 @@
 
 ## Status
 
-Planned, blocked by Sprint 4 approval and completion
+Planned, blocked by Sprint 4 approval and completion.
+
+Revised 2026-08-21 after pre-implementation critique: packaging descoped to
+Windows x64, derived-disk gate added, kill-switch UI added, and a sidebar
+reranking guard added. Estimate: 8-12 working days.
 
 ## Goal
 
 Extend reviewed hybrid retrieval to every approved search/context surface, give
-users safe local index controls and diagnostics, package both models on every
-supported desktop target, and close the program only after 250,000-document,
-crash, upgrade, deletion, privacy, and installed-application validation passes.
+users safe local index controls and diagnostics, package both models in the
+supported Windows x64 desktop build, and close the program only after
+250,000-document, crash, upgrade, deletion, privacy, and installed-application
+validation passes.
 
 ## Architecture Authority
 
@@ -24,9 +29,11 @@ retrieval, context, and Deep-mode contracts from Sprints 1-4.
 - Stable search-snapshot creation from displayed meeting IDs.
 - Additive Tauri hybrid search and context commands.
 - Additive/versioned MCP hybrid search and context tools.
-- Retrieval index status, progress, pause/resume, rebuild, and error UI.
-- Bundled model resources and license attribution in all supported packages.
-- Installed-package tokenizer, embedding, reranker, and hybrid-query smoke tests.
+- Retrieval index status, progress, pause/resume, rebuild, force-lexical, and
+  error UI.
+- Bundled model resources and license attribution in the Windows x64 package.
+- Installed-package tokenizer, embedding, reranker, and hybrid-query smoke tests
+  on Windows x64.
 - 12k/50k/250k scale and concurrency validation.
 - Crash/restart, dirty update, model upgrade, deletion, cache/sidecar corruption,
   and fallback validation.
@@ -41,6 +48,9 @@ retrieval, context, and Deep-mode contracts from Sprints 1-4.
 - MCP authentication.
 - Vector indexing live unsaved transcripts.
 - A general search UI redesign unrelated to hybrid ranking.
+- **macOS ARM64 and Linux x64 packaging.** Deferred with the platforms; see
+  `architecture.md` "Platform Scope". Do not add root-level workflows for those
+  targets in this sprint, and do not claim support for them.
 
 ## Current State And Evidence
 
@@ -58,8 +68,11 @@ retrieval, context, and Deep-mode contracts from Sprints 1-4.
   navigation/content.
 - `frontend/src/components/shared/DownloadProgressToast.tsx` provides a global
   progress-event UI pattern, although retrieval indexing is not a download.
-- `.github/workflows/build-{windows,macos,linux}.yml` build current target
-  packages but do not install them and execute ORT inference.
+- The repository root `.github/workflows/build-windows.yml` builds the Windows
+  package but does not install it and execute ORT inference. It is the only
+  active workflow in this fork; `upstream/.github/workflows/build-macos.yml`
+  and `build-linux.yml` are nested where GitHub Actions never reads them and
+  have never run.
 - Sprints 2-4 provide backend status/control, hybrid search internals, context
   retention, and all persisted Chat behavior.
 
@@ -83,8 +96,8 @@ retrieval, context, and Deep-mode contracts from Sprints 1-4.
 |---|---|---:|---|---|---|---|---|
 | 5.1 | Sidebar search | Consume the approved Tauri hybrid contract for meeting-level sidebar search, relevance snippets/provenance, lexical fallback, cancellation, and stable snapshot IDs. | M | Pending `worker-m` | 5.2 | Frontend/Rust tests prove ranking, fallback, folder filters, request cancellation, dedupe, keyboard/a11y, and snapshot membership. | Switch sidebar invocation back to existing FTS command. |
 | 5.2 | API and MCP | Add explicit cancellable Tauri and versioned bounded Fast-only MCP hybrid search/context contracts while preserving all lexical tools. | M | Pending `worker-m` | Sprint 4 | Contract/execution tests prove surface classification, scope composition, provenance, source retention, cancellation/bounds, compatibility, and no score ambiguity. | Remove additive commands/tools; existing lexical APIs remain. |
-| 5.3 | Index UX | Add Settings status, progress, pause/resume, rebuild, error/retry, model/license, and local-size UI. | M | Pending `worker-m` | 2.5 | UI/backend tests prove controls, lexical-only state, accessibility, and rebuild cannot delete primary data. | Remove additive UI/commands; background index continues or can be disabled. |
-| 5.4 | Packaging | Bundle, sign, attribute, install, and smoke-test embedding/reranker resources on Windows, macOS, and Linux. | L | Pending `worker-l` | 1.5, Sprint 2 | Installed packages load/tokenize/embed/rerank/query and fail over when resources are unavailable. | Remove resources and ship lexical-only build; never claim hybrid availability. |
+| 5.3 | Index UX | Add Settings status, progress, pause/resume, rebuild, force-lexical toggle, error/retry, model/license, and local-size UI. | M | Pending `worker-m` | 2.5, 3.4 | UI/backend tests prove controls, lexical-only state, kill switch, disk reporting, accessibility, and rebuild cannot delete primary data. | Remove additive UI/commands; background index continues or can be disabled. |
+| 5.4 | Packaging | Bundle, sign, attribute, install, and smoke-test embedding/reranker resources on **Windows x64**. | M | Pending `worker-m` | 1.5, Sprint 2 | The installed Windows package loads/tokenizes/embeds/reranks/queries and fails over when resources are unavailable. | Remove resources and ship lexical-only build; never claim hybrid availability. |
 | 5.5 | Release qualification | Run/fix scale, concurrency, crash, upgrade, deletion, corruption, privacy, evaluation, native, and rollback gates. | L | Pending `worker-l` | 5.1-5.4 | All architecture release gates pass and final code/architecture reviews approve. | Disable semantic feature paths and retain FTS; restore pre-upgrade backup when release procedure requires. |
 
 ## Dependency Order
@@ -98,7 +111,8 @@ retrieval, context, and Deep-mode contracts from Sprints 1-4.
 Tasks `5.1` and `5.3` may run in one approved batch only if their TypeScript
 types, command registrations, and settings/search components are disjoint.
 Task `5.2` owns all serialized Tauri/MCP hybrid contracts and runs before its
-sidebar consumer. Tasks `5.4` and `5.5` are L and run alone.
+sidebar consumer. Task `5.5` is L and runs alone. Task `5.4` dropped from L to
+M when packaging was descoped to Windows x64 only.
 
 ## Task Specifications
 
@@ -136,6 +150,16 @@ membership.
 - Avoid displaying internal model/index errors as raw Rust messages.
 - Generate a stable request ID per search generation and cancel the prior
   backend request before/when a newer sidebar query supersedes it.
+- **Bound the cost of reranking on every debounced keystroke.** Sidebar search
+  runs the cross-encoder far more often than Chat does, and an empty-query
+  guard alone is not sufficient. Required guards:
+  - Use the `RetrievalPurpose::Search` shallower reranking depth approved in
+    Sprint 1, not the Chat depth.
+  - Do not run model inference below an approved minimum query length.
+  - Cancel the previous request's in-flight reranking, not just its result
+    publication, so superseded keystrokes stop consuming the ONNX permit.
+  - Respect the shared scheduler's interactive priority so sidebar typing
+    cannot starve an active Chat request.
 
 **Acceptance criteria:**
 
@@ -149,6 +173,13 @@ membership.
 - Snapshot captures exactly the displayed ordered IDs up to the existing cap.
 - Lexical fallback is automatic and visibly usable while index builds/fails.
 - Empty query does not run model inference.
+- **A query below the approved minimum length does not run model inference.**
+- **A superseded search cancels its in-flight reranking and releases the model
+  permit, proven by a test rather than only by discarded results.**
+- **Sidebar reranking uses the `Search` purpose depth**, and a test asserts it
+  does not use the deeper Chat depth.
+- Typing rapidly while a Chat request is streaming does not delay that stream
+  beyond the approved scheduler policy.
 - Debounce/cancellation prevents stale older results replacing newer results.
 - Search controls/results remain keyboard and screen-reader accessible.
 
@@ -260,8 +291,17 @@ without touching files or risking meeting data.
 - Show bundled model name/revision and license attribution/link.
 - Show active/building/paused/failed/lexical-only status.
 - Show indexed versus total meetings and background progress.
-- Show estimated derived index disk/RAM information when available.
+- Show estimated derived index disk/RAM information when available, **presented
+  against the approved disk envelope** so a user can see when it is being
+  approached rather than only an unanchored number.
 - Provide pause, resume, rebuild, and retry controls.
+- **Provide the `force_lexical_retrieval` toggle** delivered in Sprint 3.4.
+  Explain it in user terms — searching and Chat keep working using exact word
+  matching instead of meaning-based matching — and make clear that it does not
+  delete the index and can be turned off at any time. This is the user's own
+  rollback for a bad retrieval result and must be discoverable, not buried.
+- Show forced-lexical state distinctly from a semantic failure state, so a user
+  never mistakes their own setting for a broken index.
 - Confirm rebuild clearly states that transcripts, summaries, notes, recordings,
   conversations, and FTS are not deleted.
 - Disable conflicting actions while active and expose accessible live status.
@@ -277,6 +317,13 @@ without touching files or risking meeting data.
 - Simulated rebuild failure preserves primary data and offers retry.
 - Lexical-only state explains that search/Chat still work with lower semantic
   quality.
+- **The force-lexical toggle round-trips: enabling it changes retrieval on the
+  next request, it survives restart, disabling it restores hybrid behavior, and
+  neither transition pauses or invalidates the index.**
+- **User-forced lexical state is visually and textually distinct from a
+  semantic failure state.**
+- Disk usage is shown against its envelope, with a clear indication when the
+  approved figure is exceeded.
 - Model/license attribution is present.
 - Layout works on desktop and narrow Settings views.
 
@@ -295,28 +342,33 @@ git diff --check
 **Worker report additions:** Record Settings placement rationale, state/event
 contract, rebuild safety wording, and accessibility checks.
 
-### 5.4 - Cross-platform model packaging and installed smoke [L]
+### 5.4 - Windows model packaging and installed smoke [M]
 
-**Outcome:** Every supported installed application includes trusted retrieval
-assets and can execute real tokenizer/embedding/reranker inference.
+**Outcome:** The supported Windows x64 installed application includes trusted
+retrieval assets and can execute real tokenizer/embedding/reranker inference.
+
+**Platform note:** this task covers Windows x64 only. macOS ARM64 and Linux x64
+are deferred per `architecture.md` "Platform Scope" because this fork has no
+active CI for them. Do not create root-level workflows for those targets here,
+and do not edit the inert workflows under `upstream/.github/workflows/`
+expecting them to run.
 
 **Likely touchpoints:**
 
 - `frontend/src-tauri/tauri.conf.json`
-- `.github/workflows/build-windows.yml`
-- `.github/workflows/build-macos.yml`
-- `.github/workflows/build-linux.yml`
+- The repository-root `.github/workflows/build-windows.yml`
 - Artifact fetch/verification scripts from Sprint 1
-- Platform smoke-test helper/command
+- Windows smoke-test helper/command
 - License/attribution resources
 
 **Required implementation:**
 
-- Fetch pinned model artifacts in every build workflow through the approved
-  verifier.
-- Place resources at stable Tauri resource paths.
-- Include model/tokenizer/license files in every installer/package.
-- Preserve app signing/notarization behavior.
+- Fetch pinned model artifacts in the Windows build workflow through the
+  approved verifier.
+- Place resources at stable Tauri resource paths, chosen so a later
+  macOS/Linux enablement is additive rather than a rework.
+- Include model/tokenizer/license files in the installer/package.
+- Preserve app signing behavior.
 - Install package artifacts in CI or a platform runner where supported, then
   invoke a headless/safe diagnostic that loads both sessions and executes known
   reference inference.
@@ -332,14 +384,14 @@ assets and can execute real tokenizer/embedding/reranker inference.
 
 - Windows x64 NSIS/MSI package passes installed tokenizer, embedding, reranker,
   and hybrid fixture inference.
-- macOS ARM64 signed/notarized app or test package passes the same inference.
-- Linux x64 supported package format passes the same inference.
 - Artifact corruption/missing license fails before package creation.
 - Runtime missing/corrupt model produces semantic-unavailable/FTS fallback,
   not application startup failure.
 - Package contains exact manifest hashes and license attribution.
 - Model resources are not duplicated unnecessarily in app data.
 - Package-size report is recorded and approved.
+- Release documentation states that hybrid retrieval is verified on Windows
+  x64 only and makes no macOS or Linux claim.
 
 **Required verification:**
 
@@ -390,19 +442,35 @@ cross-platform, and within approved scale/resource limits.
 - Corrupt vector row/cache/sidecar/model resource.
 - Initial and partial backfill lexical-only behavior.
 - Every Chat scope in Fast/Deep, live direct path, sidebar, Tauri, and MCP.
+- **Forced lexical-only retrieval across every surface, its persistence across
+  restart, and clean restoration of hybrid behavior when disabled.**
+- **Derived disk at 12k/50k/250k in steady state and during a shadow rebuild,
+  measured against the 2 GiB / 3 GiB envelope.**
+- **Reranking stage p95 measured separately against its 900 ms sub-budget, for
+  both the Chat and Search purposes.**
+- **Deep preparation p95, total provider round-trips per turn, and progress
+  event delivery.**
+- Sustained sidebar typing while a Chat stream is active, proving reranking
+  cancellation and scheduler priority.
 - Source parity and persisted old-source compatibility.
 - Privacy-safe logs and no runtime embedding network traffic.
-- Cross-platform installed package smoke evidence from Task 5.4.
+- Windows x64 installed package smoke evidence from Task 5.4.
 
 **Acceptance criteria:**
 
 - All `architecture.md` correctness, privacy, availability, scope, performance,
   packaging, evaluation, and reference-case gates pass.
-- Peak retrieval RAM at 250k is at most 1 GiB on reference hardware, or has the
-  explicit required approval for a measured 1-1.25 GiB result; above 1.25 GiB
-  fails without a product scope change.
-- Vector-stage and Fast preparation p95 meet approved final thresholds.
+- Peak retrieval RAM at 250k is at most 1 GiB on reference hardware, including
+  the ANN graph when selected, or has the explicit required approval for a
+  measured 1-1.25 GiB result; above 1.25 GiB fails without a product scope
+  change.
+- Derived disk at 250k is at most 2 GiB steady state and 3 GiB during shadow
+  rebuild, or has explicit approval.
+- Vector-stage, reranking-stage, Fast preparation, and Deep preparation p95 all
+  meet their approved thresholds, each reported as its own figure.
 - ANN recall, when selected, meets the Sprint 1 quality gate.
+- The retrieval kill switch works on the installed package and is documented as
+  the first-line rollback.
 - Crashes never corrupt primary meeting content or activate partial semantic
   state.
 - Deleted/out-of-scope meetings never appear from stale vectors.
@@ -440,13 +508,15 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 - Sidebar, explicit Tauri hybrid commands, hybrid MCP tools, and Chat use the
   shared reviewed retrieval service.
 - Existing lexical APIs/tools remain compatible.
-- Users can inspect, pause, retry, and safely rebuild semantic state.
-- Every supported package executes installed local inference.
+- Users can inspect, pause, retry, safely rebuild, and force lexical-only
+  retrieval from Settings.
+- The Windows x64 package executes installed local inference.
 - 250k scale, crash, update, deletion, upgrade, corruption, scope, privacy,
-  fallback, and source gates pass.
-- Final evaluation passes every approved numeric quality/category gate.
-- Program documentation contains exact model/backend limits and operational
-  recovery behavior.
+  fallback, disk, and source gates pass.
+- Final evaluation passes every approved numeric quality/category gate, with
+  corpus sizes reported alongside every percentage.
+- Program documentation contains exact model/backend limits, the Windows-only
+  platform scope, and operational recovery behavior including the kill switch.
 - Code/architecture reviews and user sprint-close approval are complete.
 
 ## Risks And Mitigations
@@ -457,9 +527,16 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 - **Unsafe rebuild UI:** derived-only backend contract plus confirmation/tests.
 - **Installer failure/size:** pinned CI artifacts, package reports, installed
   smoke.
-- **Cross-platform ORT drift:** per-platform reference inference.
-- **Scale memory spike:** measure active model sessions plus old/new snapshots,
-  not vectors alone.
+- **Unverified platform claims:** Windows-only scope stated in release
+  documentation; no macOS or Linux support asserted without installed-package
+  inference on that target.
+- **Scale memory spike:** measure active model sessions plus old/new snapshots
+  plus the ANN graph, not vectors alone.
+- **Derived disk growth:** measured against an explicit envelope at every
+  scale, including the shadow-rebuild peak.
+- **Sidebar reranking cost:** minimum query length, `Search` purpose depth,
+  in-flight cancellation, and scheduler priority verified under sustained
+  typing.
 - **Recovery claim without proof:** crash injection and restart tests.
 - **Privacy regression:** local network/log audit and no remote telemetry.
 
@@ -470,6 +547,10 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 | 2026-08-21 | Preserve existing lexical Tauri/MCP tools and add hybrid contracts. | Concrete external consumers may depend on BM25 score semantics. | Silently change existing tools to hybrid. | Main agent, pending sprint approval |
 | 2026-08-21 | Put index controls in existing Settings structure unless content proves a new tab necessary. | Minimize navigation/UI expansion. | Add a Search tab immediately. | Main agent, pending sprint approval |
 | 2026-08-21 | Require installed-package inference, not package file inspection. | ORT resource/dylib failures appear only after installation. | Treat successful `tauri build` as proof. | Main agent, pending sprint approval |
+| 2026-08-21 | Descope packaging to Windows x64 and drop Task 5.4 from L to M. | The macOS/Linux workflows in this fork are nested under `upstream/` and never execute; the original gate could not be satisfied. | Add root-level macOS/Linux workflows and keep the three-platform gate. | Main agent, **requires user approval — product scope change** |
+| 2026-08-21 | Surface the force-lexical kill switch in Settings as a first-class control. | It is the user's own rollback from a bad retrieval result and is useless if undiscoverable. | Keep it as a hidden or developer-only setting. | Main agent, pending sprint approval |
+| 2026-08-21 | Add derived-disk qualification at every scale, including the rebuild peak. | Derived text plus vectors plus two retained generations plausibly reach ~2 GiB with no prior ceiling anywhere in the program. | Report disk as an unanchored metric. | Main agent, pending sprint approval |
+| 2026-08-21 | Guard sidebar reranking with a minimum query length, `Search` depth, and in-flight cancellation. | Sidebar runs the cross-encoder per debounced keystroke; an empty-query check alone does not bound that cost. | Rely on debounce and the empty-query guard. | Main agent, pending sprint approval |
 
 ## Task Execution Log
 
@@ -525,9 +606,13 @@ failure recovery, privacy, and final release claims.
 - User approval of this PRD is required before Sprint 5 TODO creation.
 - Task 5.2 external contracts require a dedicated approved batch unless proven
   safe with another task.
-- Tasks 5.4 and 5.5 are L and run alone.
+- Task 5.5 is L and runs alone.
 - Package-size, supported-platform, resource-limit, remote behavior, or lexical
   compatibility changes require explicit scope/risk approval.
+- Adding macOS or Linux back to the release scope requires a root-level build
+  workflow for that target, the Sprint 1 reference-inference gate executed on
+  it, and the Task 5.4 installed smoke executed on it. It is a scope change,
+  not a task-level decision.
 - Binary rollback after the semantic migration requires a verified pre-upgrade
   database backup; do not test/claim old-binary startup against a newer migrated
   database unless migrator policy was separately approved.

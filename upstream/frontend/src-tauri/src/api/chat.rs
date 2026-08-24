@@ -19,7 +19,7 @@ use crate::{
         fts::{FtsRepository, MatchMode},
         setting::SettingsRepository,
     },
-    export::context::build_meeting_context_markdown,
+    export::context::{build_meeting_context_markdown, lexical_evidence_id},
     export::{build_context_markdown, build_context_markdown_with_limit},
     state::AppState,
     summary::llm_client::{generate_summary, generate_summary_stream, LLMProvider},
@@ -507,7 +507,8 @@ async fn prepare_chat_inputs_for_scope(
     };
     let meeting_list_context = if requests_meeting_list(query) {
         Some(format_meeting_list_context(
-            &meeting_titles_for_scope(pool, &retrieval_scope, query).await?,
+            &meeting_titles_for_scope(pool, &retrieval_scope, query, today_meeting_ids.as_deref())
+                .await?,
         ))
     } else {
         None
@@ -519,6 +520,8 @@ async fn prepare_chat_inputs_for_scope(
             meeting_ids.len()
         ));
     }
+    let persisted_context_budget =
+        context_budget_for_prompt(query, &search_query, &temporal_context, max_context_chars);
     let (context, sources) = match retrieval_scope {
         ChatRetrievalScope::LiveRecording(scope_key) => {
             ensure_live_scope_matches_active_recording(&scope_key)?;
@@ -538,17 +541,6 @@ async fn prepare_chat_inputs_for_scope(
                     resolve_meeting_context(pool, &meeting_id, &search_query, query, chunk_limit)
                         .await?;
                 ensure_not_cancelled(cancellation_token)?;
-                let context_budget = max_context_chars.saturating_sub(
-                    format!("\n{}\nMeeting context:\n", temporal_context)
-                        .chars()
-                        .count()
-                        + format!(
-                            "\nUser question: {}\nSearch query: {}\n",
-                            query, search_query
-                        )
-                        .chars()
-                        .count(),
-                );
                 let built = build_meeting_context_markdown(
                     &meeting.meeting_id,
                     &truncate_meeting_title(&meeting.meeting_title),
@@ -556,7 +548,7 @@ async fn prepare_chat_inputs_for_scope(
                     meeting.notes.as_deref(),
                     &meeting.transcripts,
                     meeting.total_transcript_segments,
-                    context_budget,
+                    persisted_context_budget,
                 );
                 let retained = built
                     .retained_transcript_ids
@@ -580,9 +572,17 @@ async fn prepare_chat_inputs_for_scope(
                 )
                 .await?;
                 ensure_not_cancelled(cancellation_token)?;
-                let context = build_context_markdown_with_limit(&results, max_context_chars);
-                let sources = results.iter().map(chat_source_from_result).collect();
-                (context, sources)
+                let built = build_context_markdown_with_limit(&results, persisted_context_budget);
+                let retained = built
+                    .retained_evidence_ids
+                    .into_iter()
+                    .collect::<HashSet<_>>();
+                let sources = results
+                    .iter()
+                    .filter(|result| retained.contains(&lexical_evidence_id(result)))
+                    .map(chat_source_from_result)
+                    .collect();
+                (built.markdown, sources)
             }
         }
     };
@@ -766,6 +766,7 @@ async fn meeting_titles_for_scope(
     pool: &SqlitePool,
     scope: &ChatRetrievalScope,
     query_text: &str,
+    meeting_ids_override: Option<&[String]>,
 ) -> Result<Vec<String>, String> {
     if matches!(scope, ChatRetrievalScope::LiveRecording(_)) {
         return Ok(Vec::new());
@@ -790,10 +791,12 @@ async fn meeting_titles_for_scope(
     };
 
     let mut query = QueryBuilder::<Sqlite>::new("SELECT title FROM meetings");
+    let mut has_filter = false;
     match scope {
         ChatRetrievalScope::All if named_folder_ids.is_empty() => {}
         ChatRetrievalScope::All => {
             query.push(" WHERE folder_id IN (");
+            has_filter = true;
             let mut values = query.separated(", ");
             for folder_id in named_folder_ids {
                 values.push_bind(folder_id);
@@ -804,6 +807,7 @@ async fn meeting_titles_for_scope(
         ChatRetrievalScope::Meeting(meeting_id) => {
             query.push(" WHERE id = ");
             query.push_bind(meeting_id);
+            has_filter = true;
         }
         ChatRetrievalScope::Folder(folder_id) => {
             let folder_ids = FolderRepository::get_subtree_ids(pool, folder_id)
@@ -813,6 +817,7 @@ async fn meeting_titles_for_scope(
                 return Ok(Vec::new());
             }
             query.push(" WHERE folder_id IN (");
+            has_filter = true;
             let mut values = query.separated(", ");
             for folder_id in folder_ids {
                 values.push_bind(folder_id);
@@ -825,6 +830,7 @@ async fn meeting_titles_for_scope(
                 return Ok(Vec::new());
             }
             query.push(" WHERE id IN (");
+            has_filter = true;
             let mut values = query.separated(", ");
             for meeting_id in meeting_ids {
                 values.push_bind(meeting_id);
@@ -833,6 +839,22 @@ async fn meeting_titles_for_scope(
             query.push(")");
         }
         ChatRetrievalScope::LiveRecording(_) => unreachable!(),
+    }
+    if let Some(meeting_ids) = meeting_ids_override {
+        if meeting_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        query.push(if has_filter {
+            " AND id IN ("
+        } else {
+            " WHERE id IN ("
+        });
+        let mut values = query.separated(", ");
+        for meeting_id in meeting_ids {
+            values.push_bind(meeting_id);
+        }
+        drop(values);
+        query.push(")");
     }
     query.push(" ORDER BY datetime(created_at), id");
     query
@@ -1328,6 +1350,25 @@ fn tail_at_char_boundary(value: &str, max_chars: usize) -> &str {
         .nth(start)
         .map(|(index, _)| &value[index..])
         .unwrap_or("")
+}
+
+fn context_budget_for_prompt(
+    query: &str,
+    search_query: &str,
+    temporal_context: &str,
+    max_context_chars: usize,
+) -> usize {
+    max_context_chars.saturating_sub(
+        format!("\n{}\nMeeting context:\n", temporal_context)
+            .chars()
+            .count()
+            + format!(
+                "\nUser question: {}\nSearch query: {}\n",
+                query, search_query
+            )
+            .chars()
+            .count(),
+    )
 }
 
 fn assemble_prompt(
@@ -2360,6 +2401,7 @@ mod tests {
             &pool,
             &ChatRetrievalScope::Folder("root".to_string()),
             "listar reuniões existentes nesta pasta",
+            None,
         )
         .await
         .unwrap();
@@ -2387,6 +2429,7 @@ mod tests {
             &pool,
             &ChatRetrievalScope::All,
             "listar reuniões na pasta Child",
+            None,
         )
         .await
         .unwrap();
@@ -2514,6 +2557,7 @@ mod tests {
         }
 
         assert!(requests_todays_meetings("Summarize today's meetings"));
+        assert!(requests_meeting_list("list today's meetings"));
         assert!(!requests_todays_meetings(
             "Which action items are due today?"
         ));
@@ -2540,6 +2584,35 @@ mod tests {
         assert_eq!(all_ids, vec!["m1", "m2"]);
         assert_eq!(folder_ids, vec!["m1", "m2"]);
         assert_eq!(snapshot_ids, vec!["m2"]);
+
+        let all_titles = meeting_titles_for_scope(
+            &pool,
+            &ChatRetrievalScope::All,
+            "list today's meetings",
+            Some(&all_ids),
+        )
+        .await
+        .unwrap();
+        let folder_titles = meeting_titles_for_scope(
+            &pool,
+            &ChatRetrievalScope::Folder("root".to_string()),
+            "list today's meetings",
+            Some(&folder_ids),
+        )
+        .await
+        .unwrap();
+        let snapshot_titles = meeting_titles_for_scope(
+            &pool,
+            &ChatRetrievalScope::SearchSnapshot(vec!["m2".to_string(), "m3".to_string()]),
+            "list today's meetings",
+            Some(&snapshot_ids),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(all_titles, vec!["Root", "Child"]);
+        assert_eq!(folder_titles, vec!["Root", "Child"]);
+        assert_eq!(snapshot_titles, vec!["Child"]);
 
         let results = resolve_scope_results(
             &pool,
@@ -2601,7 +2674,7 @@ mod tests {
     }
 
     #[test]
-    fn build_context_produces_sources_from_search_results() {
+    fn broad_context_produces_sources_only_from_retained_results() {
         let results = vec![
             make_search_result(
                 "m1",
@@ -2613,22 +2686,66 @@ mod tests {
             make_search_result("m2", "Retro", "transcript", "Team velocity is improving."),
         ];
 
+        let built = build_context_markdown_with_limit(&results, 250);
+        let retained = built
+            .retained_evidence_ids
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
         let sources: Vec<ChatSource> = results
             .iter()
-            .map(|r| ChatSource {
-                meeting_id: r.meeting_id.clone(),
-                meeting_title: r.meeting_title.clone(),
-                chunk_type: r.chunk_type.clone(),
-                snippet: r.snippet.clone(),
-                folder_name: r.folder_name.clone(),
-                source_kind: None,
-            })
+            .filter(|result| retained.contains(&lexical_evidence_id(result)))
+            .map(chat_source_from_result)
             .collect();
 
-        assert_eq!(sources.len(), 3);
+        assert!(!sources.is_empty());
+        assert!(sources.len() < results.len());
         assert_eq!(sources[0].meeting_title, "Sprint Planning");
-        assert_eq!(sources[1].chunk_type, "summary");
-        assert_eq!(sources[2].meeting_id, "m2");
+        assert!(sources
+            .iter()
+            .all(|source| built.markdown.contains(&source.snippet)));
+    }
+
+    #[tokio::test]
+    async fn broad_preparation_emits_only_sources_delivered_to_model() {
+        let pool = scope_pool().await;
+        sqlx::query("CREATE TABLE settings (id TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL, whisperModel TEXT NOT NULL, groqApiKey TEXT, openaiApiKey TEXT, anthropicApiKey TEXT, ollamaApiKey TEXT, openRouterApiKey TEXT, ollamaEndpoint TEXT, customOpenAIConfig TEXT, customVocabulary TEXT, chatProvider TEXT, chatModel TEXT, chatOllamaEndpoint TEXT)")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO settings (id, provider, model, whisperModel, chatProvider, chatModel) VALUES ('1', 'ollama', 'local', 'whisper', 'ollama', 'local')")
+            .execute(&pool).await.unwrap();
+        sqlx::query("UPDATE meetings SET saved_at = '2026-08-22T00:00:00Z'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE meetings SET title = ? WHERE id = 'm1'")
+            .bind("🦀".repeat(64_000))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let inputs = prepare_chat_inputs_for_scope(
+            &pool,
+            None,
+            &reqwest::Client::new(),
+            "alpha",
+            None,
+            ChatRetrievalScope::All,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(!inputs.sources.is_empty());
+        assert!(inputs
+            .sources
+            .iter()
+            .all(|source| source.meeting_id != "m1"));
+        assert!(inputs
+            .sources
+            .iter()
+            .all(|source| inputs.user_prompt.contains(&source.snippet)));
+        assert!(inputs.user_prompt.chars().count() <= 64_000);
     }
 
     #[test]

@@ -15,6 +15,23 @@ so implementation agents do not reinterpret product decisions while coding.
 | [`sprint-4-deep-saved-scopes.md`](sprint-4-deep-saved-scopes.md) | Fast/Deep modes, bounded iterative retrieval, and remaining persisted Chat scopes. | Living PRD and execution record for Sprint 4. |
 | [`sprint-5-search-release.md`](sprint-5-search-release.md) | Sidebar, Tauri and MCP surfaces, diagnostics, packaging, scale validation, and release gates. | Living PRD and execution record for Sprint 5. |
 
+## Relationship To The Project Roadmap
+
+This program is registered in the project `ROADMAP.md` under Phase 6. It is not
+a competing plan, and `ROADMAP.md` is not "historical" — it is a live tracker
+that sits above this directory for anything outside hybrid retrieval.
+
+- `ROADMAP.md` Sprint 6A task 6.1 delivers contextual Chat entry points. This
+  program depends on that surface work and does not duplicate it.
+- `ROADMAP.md` defers "Semantic/hybrid search" until "a repeatable retrieval
+  benchmark shows FTS5 misses important results at a material rate."
+  **Sprint 1 Task 1.2 is that benchmark.** If Sprint 1 cannot demonstrate a
+  baseline FTS failure on the reference and semantic categories, the deferral
+  condition is unmet and this program is cancelled rather than continued.
+- `docs/sprint-6-1-contextual-chat.md` closed on 2026-08-22 after its manual
+  Windows/Tauri smoke passed. Its task `6.1.R10` defines the saved-meeting
+  invariants Sprint 4.3 must preserve.
+
 ## Authority Order
 
 When documents disagree, use this order:
@@ -23,7 +40,8 @@ When documents disagree, use this order:
 2. `architecture.md` invariants and accepted decisions.
 3. The currently approved sprint PRD.
 4. A task execution entry.
-5. Historical plans elsewhere in `docs/`.
+5. `ROADMAP.md` for anything outside this program's retrieval scope.
+6. Historical plans elsewhere in `docs/`.
 
 Do not silently resolve a material conflict. Record it in the active sprint's
 decision log and request user approval before changing scope, persistence,
@@ -35,9 +53,13 @@ privacy, model distribution, or an external contract.
 2. Mirror the approved task list in the opencode TODO list.
 3. Propose a dependency-ready batch and obtain explicit batch approval.
 4. Assign each implementation task to a new subagent session sized according
-   to the task's `S`, `M`, or `L` rating.
+   to the task's `S`, `M`, or `L` rating. **Do not merge multiple tasks into
+   one long-running session to save on context.** See "Caching Strategy"
+   below — the saving is available without merging, and merging costs the
+   isolation this protocol depends on.
 5. Give the worker the architecture document, exact task section, file
-   boundaries, acceptance checks, and required commands.
+   boundaries, acceptance checks, and required commands, assembled per
+   "Caching Strategy" below.
 6. Review the worker report and actual diff. Run the acceptance checks.
 7. Append the immutable task execution entry before starting a dependent task.
 8. Run code review at every sprint end. Run architecture review for every
@@ -48,6 +70,13 @@ privacy, model distribution, or an external contract.
 The main agent owns product context, approvals, dependency ordering,
 verification, and documentation. It does not implement a task delegated to a
 worker. Workers must not absorb neighboring tasks or edit another sprint's PRD.
+
+For this implementation, use a new `worker-l` session for every implementation
+task regardless of its S/M/L complexity label. Every worker must use
+`opencode-go/ox-alpha-free`; do not dispatch `worker-s` or `worker-m`, and do
+not substitute another model.
+Sprint reviews use the standard configured `reviewer` and `arch-reviewer`.
+Complexity labels remain scope classifications, not agent-tier selections.
 
 ## Required Worker Report
 
@@ -64,24 +93,113 @@ Every worker must return:
 An implementation is not complete because code exists. It is complete only
 after its acceptance checks pass and its sprint execution entry is written.
 
-## Verification Environment
+## Caching Strategy
 
-Sprint command blocks use PowerShell because the current workspace is Windows.
-They set `CARGO_TARGET_DIR` under `%LOCALAPPDATA%` to avoid OneDrive build-path
-failures without hardcoding a user name. Linux/macOS workers must use an
-equivalent local path outside synchronized storage, for example:
+Every worker dispatch resends `architecture.md` (~1,800 lines) plus the sprint
+PRD in full, per the Execution Protocol's step 5 — this is intentional and
+MUST NOT be trimmed per task, since the point of full-document dispatch is to
+stop workers reinterpreting product decisions. Full resend is expensive if
+done carelessly. It is nearly free if the prefix is structured for prompt
+caching, which is keyed to **content**, not to session — a cache write from
+one subagent's dispatch is readable by the next subagent's dispatch, as long
+as the prefix bytes match and the read happens within the cache TTL. This is
+why sessions are not merged for caching purposes: merging trades an
+already-available saving for a real loss of isolation.
 
-```bash
-export CARGO_TARGET_DIR="${TMPDIR:-/tmp}/meetily-cargo-target"
+**Assemble every dispatch in this order:**
+
+```text
+[stable, byte-identical across every dispatch in a sprint]
+  architecture.md (full)
+  sprint PRD (full)
+  cache_control breakpoint, ttl: "1h"
+[volatile, per-task]
+  exact task section
+  file boundaries
+  acceptance checks
+  required commands
 ```
 
-Workers run the equivalent command for their platform and record the exact
-command. Platform-specific packaged checks in Sprint 5 cannot be replaced by a
-Windows-only result.
+**Rules:**
+
+- The stable block MUST be byte-identical across dispatches. Any variation
+  before the breakpoint — a timestamp, a reordered field, a per-task
+  annotation inserted into the architecture doc — invalidates the cache for
+  the entire prefix, not just the changed part.
+- Use an extended cache TTL (1 hour) rather than the 5-minute default. Batches
+  are already dispatched close together under step 3's batch-approval flow, so
+  a 1-hour TTL lets task 2 through N in an approved batch read the cache
+  written by task 1.
+- Prompt caching is per-model. All implementation tasks use
+  `opencode-go/ox-alpha-free` through `worker-l`, so byte-identical stable
+  prefixes can share that model's cache across distinct task sessions.
+- Do not shrink or excerpt `architecture.md` per task to "save context." That
+  reintroduces the reinterpretation risk this directory exists to prevent, for
+  a saving the cache already provides without it.
+- Do not merge multiple tasks into one continuous agent session to avoid
+  resending the architecture document. A continuous session resends its own
+  growing transcript — prior tasks' file reads, diffs, and dead ends — on
+  every turn, which is typically larger than the architecture document by the
+  time a sprint's later tasks run. It also blurs the per-task review and
+  rollback boundary this protocol depends on: a bad turn in one task should be
+  discardable without contaminating the next task's context.
+
+## Verification Environment
+
+**Working directory:** every verification block in these documents runs from
+the repository's `upstream/` directory. The relative path
+`frontend/src-tauri/Cargo.toml` resolves only from there. Workers MUST `cd` to
+`upstream/` first and record the directory they used.
+
+**Build target directory:** sprint command blocks use PowerShell because the
+current workspace is Windows. They set `CARGO_TARGET_DIR` under
+`%LOCALAPPDATA%` to avoid OneDrive build-path failures without hardcoding a
+user name:
+
+```powershell
+$env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA "meetily-cargo-target"
+```
+
+Note that `upstream/.cargo/config.toml` does **not** set `CARGO_TARGET_DIR` —
+it sets only `WHISPER_DONT_GENERATE_BINDINGS`. `MIGRATION.md` claims otherwise
+and is stale. Setting the variable explicitly in every command block is
+therefore required, not redundant. Other project documents name different target
+paths; within this program the `%LOCALAPPDATA%` path above is authoritative.
+
+**Platform:** this program targets Windows x64 only. See `architecture.md`
+"Platform Scope" for why macOS and Linux are deferred and what re-enabling them
+would require.
 
 ## Program Status
 
-**Status:** Awaiting architecture and Sprint 1 approval.
+**Status:** Sprint 1 remediation in progress. Batch 3 Task `1.2R` completed
+independent verification and its baseline was approved on 2026-08-23. Batch 4
+Task `1.3` reran against that baseline and remains blocked with no production
+model pair selected. Sprint 6.1 is closed.
 
-No implementation task may start from these documents until the user approves
-the relevant sprint and the first task batch.
+Current execution state:
+
+1. **Batch 1:** Task 1.1 is complete and unaffected. Task 1.2 is **superseded
+   by Task `1.2R`** — its harness and metrics are retained, its corpus is not.
+2. **Batch 2:** Task 1.3's first run is blocked. Its resource findings (RAM,
+   disk, latency, quantization fidelity, licensing) are retained; its quality
+   findings and tuned fusion/aggregation constants are void. Tasks 1.4 and 1.5
+   remain blocked behind Task `1.3`.
+3. **Batch 3:** Task `1.2R` is complete. Its baseline is Recall@1 `72/135`,
+   Recall@3 `96/135`, Recall@5 `124/135`, MRR `0.695833`, Evidence Recall@10
+   `181/209`, fact coverage `130/149`, forbidden contamination `25/121`, and
+   source precision `471/471`; the user approved these figures on 2026-08-23.
+4. **Batch 4:** Task `1.3` rerun is complete with verdict
+   `blocked-quality-gates`. Every evaluated pair fails Critical Recall@1 and
+   critical forbidden contamination; citation/source precision is unevaluated.
+   No production model pair or constants are approved.
+5. **User decision on Deep-as-default** is deferred to Sprint 4 close and is
+   not a Sprint 1 blocker. The open question remains recorded in
+   `architecture.md`.
+
+`architecture.md` now carries a **"Corpus Solvability"** section as the
+normative counterweight to "Baseline Failure Reproduction". A corpus may not
+satisfy falsifiability by being unanswerable.
+
+No task outside the approved batch may start without its own dependency-ready
+batch approval.

@@ -32,7 +32,13 @@ See `ROADMAP.md` → "Blocker: Smart App Control" for options.
 
 ### Target directory
 
-`CARGO_TARGET_DIR` is set to `C:/Users/arman/meetily-build-target` via `upstream/.cargo/config.toml` to keep build artifacts out of OneDrive.
+`CARGO_TARGET_DIR` must be set **explicitly per shell** to keep build artifacts out of OneDrive. It is **not** set by `upstream/.cargo/config.toml` — that file only sets `WHISPER_DONT_GENERATE_BINDINGS`. An earlier revision of this document claimed otherwise; that claim was wrong.
+
+```powershell
+$env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA "meetily-cargo-target"
+```
+
+This `%LOCALAPPDATA%` path is the convention used by `upstream/docs/hybrid-rag/` and should be preferred for new work. Older documents in this repo name `C:\Users\arman\cargo-target` and `C:/Users/arman/meetily-build-target`; any of them work, but pick one per shell session and record which one a verification run used.
 
 ---
 

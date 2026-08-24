@@ -7,6 +7,11 @@ pub struct MeetingContextBuild {
     pub retained_transcript_ids: Vec<String>,
 }
 
+pub struct ContextBuild {
+    pub markdown: String,
+    pub retained_evidence_ids: Vec<String>,
+}
+
 pub fn build_meeting_context_markdown(
     _meeting_id: &str,
     meeting_title: &str,
@@ -143,15 +148,21 @@ fn truncate_with_marker(value: &str, max_chars: usize) -> String {
 /// timestamp metadata, so the LLM can cite specific sections.
 /// Meetings appear in BM25 rank order (first result = most relevant).
 pub fn build_context_markdown(results: &[FtsSearchResult]) -> String {
-    build_context_markdown_with_limit(results, 100_000)
+    build_context_markdown_with_limit(results, 100_000).markdown
 }
 
 pub fn build_context_markdown_with_limit(
     results: &[FtsSearchResult],
     max_context_chars: usize,
-) -> String {
+) -> ContextBuild {
     if results.is_empty() {
-        return String::from("No relevant meeting content found.\n");
+        return ContextBuild {
+            markdown: "No relevant meeting content found.\n"
+                .chars()
+                .take(max_context_chars)
+                .collect(),
+            retained_evidence_ids: Vec::new(),
+        };
     }
 
     // Group by meeting_id, preserving BM25 rank order of first appearance
@@ -164,47 +175,86 @@ pub fn build_context_markdown_with_limit(
         meetings.entry(r.meeting_id.clone()).or_default().push(r);
     }
 
-    let mut out = String::with_capacity(results.len() * 256);
-    out.push_str("# Meeting Context\n\n");
-    out.push_str(&format!(
-        "_{} matching sections from {} meeting(s)_\n\n",
+    let reserved_prefix = format!(
+        "# Meeting Context\n\n_{} matching sections from {} meeting(s)_\n\n",
         results.len(),
         meeting_order.len()
-    ));
+    );
+    if reserved_prefix.chars().count() >= max_context_chars {
+        return ContextBuild {
+            markdown: reserved_prefix.chars().take(max_context_chars).collect(),
+            retained_evidence_ids: Vec::new(),
+        };
+    }
 
-    for (i, meeting_id) in meeting_order.iter().enumerate() {
+    let body_budget = max_context_chars - reserved_prefix.chars().count();
+    let mut body = String::with_capacity(results.len() * 256);
+    let mut retained_evidence_ids = Vec::new();
+    let mut retained_meeting_count = 0;
+    for meeting_id in &meeting_order {
         let chunks = &meetings[meeting_id];
         let title = &chunks[0].meeting_title;
         let folder = &chunks[0].folder_name;
-        out.push_str(&format!(
+        let mut meeting_header = format!(
             "## Meeting {} — {}\n\n**ID:** `{}`\n",
-            i + 1,
+            retained_meeting_count + 1,
             title,
             meeting_id
-        ));
+        );
         if !folder.is_empty() {
-            out.push_str(&format!("**Folder:** {}\n", folder));
+            meeting_header.push_str(&format!("**Folder:** {}\n", folder));
         }
-        out.push('\n');
+        meeting_header.push('\n');
 
+        let mut meeting_retained = false;
         for chunk in chunks {
-            let mut meta = Vec::new();
-            meta.push(format!("**{}**", chunk.chunk_type));
-            if let Some(ref s) = chunk.speaker {
-                meta.push(format!("Speaker: {}", s));
+            let section = format_context_chunk(chunk);
+            let required = section.chars().count()
+                + if meeting_retained {
+                    0
+                } else {
+                    meeting_header.chars().count()
+                };
+            if body.chars().count() + required > body_budget {
+                continue;
             }
-            if let Some(ref t) = chunk.timestamp_label {
-                meta.push(format!("Time: {}", t));
+            if !meeting_retained {
+                body.push_str(&meeting_header);
+                meeting_retained = true;
+                retained_meeting_count += 1;
             }
-            out.push_str(&format!("> {}\n", meta.join(" · ")));
-            out.push_str(&format!("> {}\n\n", chunk.snippet));
+            body.push_str(&section);
+            retained_evidence_ids.push(lexical_evidence_id(chunk));
         }
     }
 
-    if out.chars().count() > max_context_chars {
-        out = out.chars().take(max_context_chars).collect();
+    let mut markdown = format!(
+        "_{} matching sections from {} meeting(s)_\n\n",
+        retained_evidence_ids.len(),
+        retained_meeting_count
+    );
+    markdown.insert_str(0, "# Meeting Context\n\n");
+    markdown.push_str(&body);
+    ContextBuild {
+        markdown,
+        retained_evidence_ids,
     }
-    out
+}
+
+pub(crate) fn lexical_evidence_id(result: &FtsSearchResult) -> String {
+    serde_json::to_string(&(&result.meeting_id, &result.chunk_type, &result.chunk_id))
+        .expect("lexical evidence identity is serializable")
+}
+
+fn format_context_chunk(chunk: &FtsSearchResult) -> String {
+    let mut meta = vec![format!("**{}**", chunk.chunk_type)];
+    if let Some(ref speaker) = chunk.speaker {
+        meta.push(format!("Speaker: {}", speaker));
+    }
+    if let Some(ref timestamp) = chunk.timestamp_label {
+        meta.push(format!("Time: {}", timestamp));
+    }
+    format!("> {}\n> {}\n\n", meta.join(" · "), chunk.snippet)
 }
 
 #[cfg(test)]
@@ -322,8 +372,43 @@ mod tests {
     #[test]
     fn context_limit_is_unicode_safe() {
         let r = make_result("m1", "Meeting", "transcript", &"🦀".repeat(100), "");
-        let md = build_context_markdown_with_limit(&[r], 80);
-        assert_eq!(md.chars().count(), 80);
+        let built = build_context_markdown_with_limit(&[r], 80);
+        assert!(built.markdown.chars().count() <= 80);
+        assert!(std::str::from_utf8(built.markdown.as_bytes()).is_ok());
+        assert!(built.retained_evidence_ids.is_empty());
+    }
+
+    #[test]
+    fn generic_context_reports_only_complete_retained_evidence() {
+        let mut too_large = make_result(
+            "m1",
+            "Meeting",
+            "transcript",
+            &format!("excluded-{}", "x".repeat(500)),
+            "",
+        );
+        too_large.chunk_id = "large".to_string();
+        let mut retained = make_result("m1", "Meeting", "transcript", "retained evidence", "");
+        retained.chunk_id = "small".to_string();
+
+        let built = build_context_markdown_with_limit(&[too_large.clone(), retained.clone()], 180);
+
+        assert!(!built.markdown.contains(&too_large.snippet));
+        assert!(built.markdown.contains(&retained.snippet));
+        assert_eq!(
+            built.retained_evidence_ids,
+            vec![lexical_evidence_id(&retained)]
+        );
+    }
+
+    #[test]
+    fn lexical_evidence_identity_includes_meeting_and_source_kind() {
+        let mut first = make_result("m1", "One", "note", "first", "");
+        let mut second = make_result("m2", "Two", "summary", "second", "");
+        first.chunk_id = "shared".to_string();
+        second.chunk_id = "shared".to_string();
+
+        assert_ne!(lexical_evidence_id(&first), lexical_evidence_id(&second));
     }
 
     #[test]
