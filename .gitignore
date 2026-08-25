@@ -1,6 +1,11 @@
 # Build artifacts
 build/
 meetily-build-target/
+# FFmpeg build script is source code caught by the broad rule above:
+# re-include its directory, ignore contents, then allow exactly this file
+!upstream/frontend/src-tauri/build/
+upstream/frontend/src-tauri/build/*
+!upstream/frontend/src-tauri/build/ffmpeg.rs
 
 # Upstream git metadata (we keep the code, not the .git)
 upstream/.git/
