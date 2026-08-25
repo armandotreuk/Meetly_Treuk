@@ -181,6 +181,14 @@ stages that decide ordinal position. Selected: **`e5-base-int8` +
 `mmarco-quint8`**, int8 vector storage, `k=5 w_vector=1 w_lexical=0.5
 alpha=0.5 beta=1 gamma=0`, chunk profile 384/64, 1118.3 MiB inside the
 approved band. Tasks `1.4` and `1.5` are unblocked. Sprint 6.1 is closed.
+**Task `1.4` is now complete: exact search is selected and ANN was not
+evaluated.** Its 250k p95 is `61.1 ms`, recall@150 is `1.0000`, and the
+highest valid same-process rebuild peak `1319.9 MiB` remains inside the
+explicitly approved 1.30 GiB transient ceiling. **Task `1.5` is complete:** the
+selected bundle is hash/license pinned and staged before packaging, and its lazy
+verifier is ready for Sprint 2 integration. `1.R1a` corrected the active CI
+staging path and `1.R3a` corrected bounded journal publication; final reviews
+approve, and a successful hosted Windows build remains before Sprint close.
 
 Current execution state:
 
@@ -234,16 +242,40 @@ Current execution state:
    release gate. The bi-encoder already ranks four of five critical targets
    first, so the residual failure is ordinal position produced by fusion and
    aggregation — Sprint 3's stages. Debt is attributed by measured cause:
-   `pt-ref-sla-suporte` and `pt-ref-nps-detrator` to Task `3.2`,
-   `pt-ref-chaves-acesso` to Task `3.6`. **Task `1.3` is complete; the pair,
-   encoding, and constants are approved and need an `architecture.md` addendum
-   before Sprint 2. Tasks `1.4` and `1.5` are unblocked.**
-9. **Deferred to Sprint 3 Task `3.6`:** single-turn query expansion, the
+    `pt-ref-sla-suporte` and `pt-ref-nps-detrator` to Task `3.2`,
+    `pt-ref-chaves-acesso` to Task `3.6`. **Task `1.3` is complete; the pair,
+    encoding, constants, chunk profile, and title-dependence qualification are
+     recorded in the approved `architecture.md` addendum. Tasks `1.4` and `1.5`
+     are unblocked.**
+9. **Batch 8 Task `1.4`:** exact vector search is selected under the approved
+   768-d int8 bundle. At 250k it passes global p95 `48.2 ms` (500 ms gate),
+   exact recall@150 `1.0000`, scope isolation, update/journal recovery,
+   bounded concurrency, and a 2 ms interactive-pause response. Steady RAM is
+   initial arithmetic figures were superseded by Task `1.R3`'s same-process
+   result: `61.1 ms` p95, `1134.8 MiB` steady state, and `1317.9 MiB` active+
+   shadow+delta+session peak. ANN was not evaluated because exact latency and
+   RAM pass.
+10. **Batch 9 Task `1.5`:** the manifest locks the approved e5-base int8 and
+    mmarco quint8 bundle, with separate tokenizer contracts, exact hashes,
+    artifact provenance, and MIT/Apache-2.0 resources. Fresh-cache staging
+    verifies and atomically publishes all ten artifacts (411 MiB) before the
+    Tauri build; the runtime validator/verifier passes 19 focused tests and is
+    not yet called by startup. Rust 1.88.0 is declared locally. **Review blocks
+    Sprint 1 close:** `1.R1` moved the gate to active root CI and added staged
+    reference inference; `1.R2` closed package/provenance and recovery hardening;
+    `1.R3` closed sparse-ID and production-shaped vector rebuild measurement.
+     `1.R1a` corrected the active CI staging path and `1.R3a` corrected bounded
+     journal publication with self-contained upsert payloads. Independent
+     release evidence passes at p95 `61.1 ms`, recall@150 `1.0000`, steady
+     `1133.8 MiB`, and peak `1316.9 MiB`; the conservative governing peak is
+     `1319.9 MiB`. Final reviews approve; a hosted Windows build remains
+     required.
+11. **Deferred to Sprint 3 Task `3.6`:** single-turn query expansion, the
    architecturally correct remedy for `pt-ref-chaves-acesso`'s terminological
    gap. It is registered with its approach left as an open architecture
    question (hand-authored lexicon vs. local LLM expansion vs.
    pseudo-relevance feedback) and is blocked on a user decision.
-10. **User decision on Deep-as-default** is deferred to Sprint 4 close and is
+12. **User decision on Deep-as-default** is deferred to Sprint 4 close and is
     not a Sprint 1 blocker. The open question remains recorded in
     `architecture.md`.
 

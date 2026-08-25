@@ -98,19 +98,23 @@ trade against quality. It is an arithmetic constraint that eliminates most
 candidates before benchmarking begins. Sprint 1 MUST apply it as a pre-filter
 so Task 1.3 only benchmarks models that Task 1.4 can accept.
 
-Peak retrieval RAM is bounded below by:
+Steady-state retrieval RAM is bounded below by:
 
 ```text
-peak_bytes >=
+steady_bytes >=
       dimensions
     * bytes_per_value          (4 for f32, 2 for fp16, 1 for int8)
     * document_count           (release gate: 250,000)
-    * snapshot_overlap_factor  (2 during shadow activation)
-  + embedding_session_bytes
-  + reranker_session_bytes
-  + delta_and_tombstone_bytes
-  + reader_held_old_snapshot_bytes
+    + embedding_session_bytes
+    + reranker_session_bytes
+    + delta_and_tombstone_bytes
 ```
+
+During a shadow rebuild, the vector term uses a `snapshot_overlap_factor` of
+2: one active snapshot and one building shadow snapshot. A reader retains an
+`Arc` to the active snapshot and does not allocate a third vector copy. An
+implementation that materializes a genuinely separate third snapshot MUST
+measure and count it; it is not covered by this contract.
 
 Worked values at the 250,000-document gate, vectors only, including the
 mandatory 2x shadow-activation overlap:
@@ -123,17 +127,29 @@ mandatory 2x shadow-activation overlap:
 | 768 | f32 | 768 MB | 1536 MB | none — **exceeds the 1.25 GiB hard fail before any model loads** |
 | 1024 | f32 | 1024 MB | 2048 MB | none — **fails** |
 
-Derived admissibility rule, which Sprint 1 Task 1.3 MUST apply before
-benchmarking a candidate:
+Derived steady-state admissibility rule, which Sprint 1 Task 1.3 MUST apply
+before benchmarking a candidate:
 
 ```text
 dimensions * bytes_per_value * 250000 * 2
   + embedding_session_bytes
   + reranker_session_bytes
+  + delta_and_tombstone_bytes
+  <= 1.30 GiB (transient rebuild only; explicit user approval required)
+
+dimensions * bytes_per_value * 250000
+  + embedding_session_bytes
+  + reranker_session_bytes
+  + delta_and_tombstone_bytes
   <= 1 GiB   (automatic pass)
   <= 1.25 GiB (requires explicit user risk approval)
   >  1.25 GiB (inadmissible; do not benchmark)
 ```
+
+The transient rebuild ceiling is **1.30 GiB** only for the approved
+two-snapshot e5-base int8 bundle and only while a shadow snapshot builds or
+activates. It is not a new steady-state band, does not authorize a third
+snapshot, and does not weaken the 1.25 GiB model-selection cap.
 
 Consequences that Sprint 1 MUST treat as given rather than rediscover:
 
@@ -480,6 +496,24 @@ hash mismatch, unknown license, or incompatible manifest. Runtime lazily
 rechecks length/hash before the first load in each process so post-install
 resource corruption cannot reach ONNX Runtime.
 
+### Package Authority And Provenance (1.R2, 2026-08-25)
+
+The staged `resources/retrieval/bundle` is the only packaged retrieval
+authority: it contains one manifest, its manifest-managed model/tokenizer/
+license artifacts, and one hash-pinned README placeholder. Build-input copies
+outside that directory are not packaged. Publication and recovery reject a
+missing, corrupt, divergent, or unmanifested file before a bundle can be
+activated or restored.
+
+The manifest parser admits only the approved Sprint 1 contract, including
+model/export identities, preprocessing, tensor I/O, artifact-source revisions,
+and license authority. The e5-base ONNX conversion is attributed to its pinned
+Xenova export and the MIT upstream model; the packaged notice preserves the
+applicable Microsoft copyright and MIT permission text from the pinned E5
+development repository. The mmarco package retains its pinned Apache-2.0
+declaration and canonical license text. A model or provenance change requires
+an architecture amendment and a new artifact/notice verification run.
+
 Models load directly from Tauri's signed read-only resource directory. Copying
 to app data is permitted only if the selected ONNX export requires writable or
 co-located external-data files that cannot be loaded from resources. Such a
@@ -487,6 +521,40 @@ copy MUST be atomic, versioned, hash-verified, and recoverable.
 
 ORT inference is CPU-only in the initial release. Whisper CUDA, Vulkan, Metal,
 and OpenBLAS features do not imply ORT acceleration.
+
+### Approved Sprint 1 Bundle And Runtime Contract (2026-08-24)
+
+Sprint 1 Task `1.3` selected the following production bundle. Task `1.5` MUST
+encode this contract in the reproducible artifact manifest; Sprint 2 MUST NOT
+substitute a model, revision, encoding, or preprocessing detail without a
+user-approved architecture amendment.
+
+| Component | Approved contract |
+|---|---|
+| Bi-encoder | `intfloat/multilingual-e5-base` at `d128750597153bb5987e10b1c3493a34e5a4502a`; dynamic-int8 ONNX export at `1ec9243030a27d1a115d5c340572074c125b58b2`; 768 dimensions; MIT |
+| Reranker | `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` at `1427fd652930e4ba29e8149678df786c240d8825`; `quint8_avx2` ONNX export; Apache-2.0 |
+| Vector storage | int8, with the encoding recorded per generation and validated at the repository boundary |
+| Chunk profile | 384 tokens with 64-token overlap |
+| Fusion and aggregation | RRF `k=5`; `w_vector=1`; `w_lexical=0.5`; support `alpha=0.5`; title `beta=1`; reranker `gamma=0`; support cap 3 |
+| Reranker runtime | Chat depth 50; Search depth 25; batch 1; ORT intra-op 4 |
+
+The measured projected 250k peak is 1118.3 MiB, inside the user-approved
+1-1.25 GiB e5-base band. The measured depth-50 rerank cost is 720 ms, inside
+the 900 ms reranking sub-budget. Derived disk is 558 B per document, projected
+at 0.13 GiB steady state and 0.26 GiB during shadow rebuild.
+
+This selection is **title-assisted**, not an embedding-only claim. Holding all
+other earned constants fixed, reference-category Recall@1 is 12/15 at
+`beta=1` and 7/15 at `beta=0`; semantic Recall@3 remains 30/30. Any future
+quality report MUST preserve that qualification rather than attributing the
+reference-family outcome solely to the bi-encoder.
+
+The constants are the final held-out objective's output; its five
+critical/pinned cases were never inspected by a tuning path. The diagnostic
+probe's 78 quint8 configurations passed only Critical Recall@1, critical
+retrieval-stage contamination, and exact-term no-regression. It did not test
+every gate for those configurations and MUST NOT be cited as proof that an
+alternative fully-passing configuration exists.
 
 ## Semantic Document Model
 
@@ -862,6 +930,34 @@ Selecting ANN in response to a RAM failure makes the failure worse.
 Because "Resource Budget Arithmetic" is applied as a pre-filter during model
 selection, a RAM miss at Task 1.4 should be rare. If one occurs it means the
 pre-filter arithmetic was wrong, which is itself a finding to record.
+
+### Approved Exact Backend Contract (2026-08-24)
+
+Task `1.4` selects exact search for the approved 768-d int8 bundle. ANN was
+not evaluated: the 250k exact benchmark passes the vector-stage p95 gate at
+61.1 ms (500 ms gate), has exact recall@150 `1.0000`, and records a measured
+steady state of 1134.8 MiB inside the approved 1-1.25 GiB band. Task `1.R3`
+replaced the preliminary arithmetic rebuild estimate with a same-process
+measurement holding active snapshot, streamed shadow, delta/tombstones, and
+  both warmed selected ONNX sessions. R3 measured 1316.3 MiB and the first
+  independent rerun measured 1317.9 MiB. After R3a corrected bounded journal
+  publication, valid release reruns measured 1319.9 MiB and 1316.9 MiB. The
+  governing observed peak is therefore 1319.9 MiB, inside the explicitly
+  approved 1.30 GiB transient ceiling by 11.3 MiB. These figures cover exactly
+  two snapshots; a third remains unapproved.
+
+Sprint 2 MUST implement one immutable contiguous base snapshot, an exact
+upsert delta, and tombstones. It MUST preserve canonical SQLite plus the
+publication journal, serve the active snapshot while a shadow builds, replay a
+canonical-ahead-of-published crash window before semantic use, and compact in
+the background rather than copying the base during a meeting update.
+
+Initial measured operating limits are: 150 candidates; two concurrent vector
+scans; interactive queue capacity 8; interactive index-worker pause within
+250 ms; update batch 128 documents; and compaction at or before a 2% delta.
+The production implementation MUST re-measure these limits under its actual
+allocation and scheduling behavior. Any third resident snapshot or rebuild
+peak above 1.30 GiB blocks activation until a user-approved remedy exists.
 
 ### ANN Option
 
@@ -1633,9 +1729,17 @@ For Sprint 5 on the installed Windows package:
 - Missing/corrupt-resource simulation produces lexical fallback, not startup
   failure.
 
-The current ORT crate requires a newer Rust version than the manifest's stated
-MSRV. Sprint 1 must reconcile and test the declared toolchain rather than rely
-only on CI's unpinned `stable` behavior.
+### Toolchain Contract (Task 1.5, 2026-08-25)
+
+The locked dependency graph requires Rust 1.88: `ort` 2.0.0-rc.10 itself
+requires Rust 1.81, while locked transitive crates require 1.88. Task `1.5`
+updates the workspace and Tauri crate declarations to `rust-version = "1.88"`
+and pins `upstream/rust-toolchain.toml` to `1.88.0`. Review follow-up `1.R1`
+configures the active repository-root Windows workflow to read, install, and
+assert that same exact version in both jobs. CI MUST NOT substitute unpinned
+`stable` for this contract. Future dependency updates that raise the floor must
+update all declarations and exercise the new exact toolchain in the active
+workflow.
 
 ## Migration And Rollback
 
@@ -1861,3 +1965,4 @@ Any failure to resolve one of these gates blocks Sprint 2 approval.
 | 2026-08-24 | Split the critical-case gate: hydration-window membership (rank within top 5) is the Sprint 1 model-selection gate; Recall@1 at 100% is retained in full and reassigned to Sprint 3 as a release gate. | The final Task `1.3` run measured the raw bi-encoder ranking the expected meeting **first for four of the five critical cases** — only `pt-ref-chaves-acesso` (rank 4) misses. The demotions are produced by fusion and meeting aggregation, which Sprint 3 Task 3.2 builds and tunes; Sprint 1 selects an embedding/reranker pair and cannot fix a stage that does not exist. All five critical meetings land inside the hydration window (ranks 1,1,2,3,2) with critical required-fact coverage 100% (9/9) and zero retrieval-stage contamination, so the product outcome is correct for all five and the residual failure is ordinal position. The threshold is not lowered; ownership moves to the sprint whose mechanism decides it. | Keep Recall@1 as a Sprint 1 gate and leave model selection blocked indefinitely; grant a dated exception contingent on query expansion, which the evidence shows would address only one of the three misses; lower the threshold below 100%. | User |
 | 2026-08-24 | Record that a lexicographic-minimizing tuning objective is stricter than a threshold gate, and require threshold semantics for Sprint 3 fusion tuning. | The final run's feasibility probe showed every gate-passing configuration paying `+2` semantic and `+2` overall Recall@3 misses against the tuned configuration — yet 28/30 semantic still clears its gate overwhelmingly against a 0/30 baseline, and ~133/135 still clears the 95% floor. An objective that minimizes misses lexicographically can therefore never trade two semantic misses for three critical rank-1 hits, even when every gate would accept that trade. Sprint 3 Task 3.2 must gate on thresholds and optimize only within the feasible set, or it inherits the same blind spot on real data. | Leave the objective shape unexamined and let Sprint 3 rediscover it. | User |
 | 2026-08-24 | Require a supervised admissibility proof for every zero-tolerance gate, on production-implementable channels only, before any model is benchmarked against it. | The same defect shape consumed two L-sized benchmark tasks in one sprint: `1.2` shipped an unwinnable corpus past a falsifiability-only rule, and the `1.2R` corpus certified three critical cases "solvable" via a hand-authored concept lexicon no production channel implements. An existence proof from fixture text (expected IDs as labels only) makes the trap structurally impossible to re-author. | User |
+| 2026-08-24 | Clarify two-snapshot rebuild accounting and approve a 1.30 GiB transient rebuild ceiling for the selected e5-base int8 bundle; select exact vector search and do not evaluate ANN. | A reader's `Arc` to the active snapshot does not allocate a third vector copy, so rebuild accounting is active plus shadow snapshots. The measured two-snapshot peak is 1296.5 MiB, inside the explicit 1.30 GiB transient ceiling; steady state remains 1113.4 MiB inside the existing approved 1-1.25 GiB band. Exact search passes p95 48.2 ms at 250k with recall@150 1.0000, while ANN would add memory and its only trigger (latency miss with passing RAM) did not occur. Any true third allocation or peak above 1.30 GiB remains blocking. | User |

@@ -77,3 +77,8 @@ experiments/
 target/
 
 frontend/src-tauri/binaries/
+# Retrieval model bundle fetched artifacts (Task 1.5; staged by scripts/stage-retrieval-models.ps1)
+frontend/src-tauri/resources/retrieval/bundle/*
+!frontend/src-tauri/resources/retrieval/bundle/README.md
+frontend/src-tauri/resources/retrieval/.staging-*/
+frontend/src-tauri/resources/retrieval/.bundle-backup-*

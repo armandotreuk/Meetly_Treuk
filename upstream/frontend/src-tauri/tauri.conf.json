@@ -95,7 +95,8 @@
         ],
         "resources": [
             "templates/*.json",
-            "templates/fonts/*"
+            "templates/fonts/*",
+            "resources/retrieval/bundle"
         ],
         "externalBin": [
             "binaries/llama-helper",

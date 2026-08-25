@@ -1,0 +1,151 @@
+{
+  "manifestVersion": 1,
+  "bundleId": "meetily-retrieval-bundle-1",
+  "embeddingModel": {
+    "modelId": "intfloat/multilingual-e5-base",
+    "revision": "d128750597153bb5987e10b1c3493a34e5a4502a",
+    "dimensions": 768,
+    "maxSequenceLength": 512,
+    "onnxExport": {
+      "repo": "Xenova/multilingual-e5-base",
+      "revision": "1ec9243030a27d1a115d5c340572074c125b58b2",
+      "quantization": "dynamic-int8"
+    },
+    "tokenizer": {
+      "type": "XLM-RoBERTa unigram (tokenizer.json)",
+      "revision": "1ec9243030a27d1a115d5c340572074c125b58b2",
+      "truncationSide": "right",
+      "artifacts": [
+        {
+          "path": "tokenizers/embedding/tokenizer.json",
+          "byteLength": 17082660,
+          "sha256": "62c24cdc13d4c9952d63718d6c9fa4c287974249e16b7ade6d5a85e7bbb75626",
+          "source": {
+            "url": "https://huggingface.co/Xenova/multilingual-e5-base/resolve/1ec9243030a27d1a115d5c340572074c125b58b2/tokenizer.json"
+          }
+        },
+        {
+          "path": "tokenizers/embedding/tokenizer_config.json",
+          "byteLength": 418,
+          "sha256": "efb5c0d09722e5fe59a462cd2a9976ee216d55b037597d997cd3fe833216da15",
+          "source": {
+            "url": "https://huggingface.co/Xenova/multilingual-e5-base/resolve/1ec9243030a27d1a115d5c340572074c125b58b2/tokenizer_config.json"
+          }
+        },
+        {
+          "path": "tokenizers/embedding/special_tokens_map.json",
+          "byteLength": 280,
+          "sha256": "06e405a36dfe4b9604f484f6a1e619af1a7f7d09e34a8555eb0b77b66318067f",
+          "source": {
+            "url": "https://huggingface.co/Xenova/multilingual-e5-base/resolve/1ec9243030a27d1a115d5c340572074c125b58b2/special_tokens_map.json"
+          }
+        }
+      ]
+    },
+    "queryPrefix": "query: ",
+    "documentPrefix": "passage: ",
+    "pooling": "masked-mean over attention_mask positions of last_hidden_state",
+    "normalization": "l2",
+    "inputs": [
+      { "name": "input_ids", "dtype": "int64" },
+      { "name": "attention_mask", "dtype": "int64" }
+    ],
+    "outputs": [{ "name": "last_hidden_state", "dtype": "float32" }],
+    "artifacts": [
+      {
+        "path": "models/embedding/model_int8.onnx",
+        "byteLength": 278184162,
+        "sha256": "9ddfd8b45086dabc59a7e1bb00463225dace8954962418b240840f2153bc87da",
+        "source": {
+          "url": "https://huggingface.co/Xenova/multilingual-e5-base/resolve/1ec9243030a27d1a115d5c340572074c125b58b2/onnx/model_int8.onnx"
+        }
+      }
+    ]
+  },
+  "rerankerModel": {
+    "modelId": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+    "revision": "1427fd652930e4ba29e8149678df786c240d8825",
+    "maxSequenceLength": 512,
+    "onnxExport": {
+      "repo": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+      "revision": "1427fd652930e4ba29e8149678df786c240d8825",
+      "quantization": "quint8_avx2"
+    },
+    "tokenizer": {
+      "type": "XLM-RoBERTa unigram (tokenizer.json)",
+      "revision": "1427fd652930e4ba29e8149678df786c240d8825",
+      "truncationSide": "right",
+      "artifacts": [
+        {
+          "path": "tokenizers/reranker/tokenizer.json",
+          "byteLength": 17082660,
+          "sha256": "62c24cdc13d4c9952d63718d6c9fa4c287974249e16b7ade6d5a85e7bbb75626",
+          "source": {
+            "url": "https://huggingface.co/cross-encoder/mmarco-mMiniLMv2-L12-H384-v1/resolve/1427fd652930e4ba29e8149678df786c240d8825/tokenizer.json"
+          }
+        },
+        {
+          "path": "tokenizers/reranker/tokenizer_config.json",
+          "byteLength": 435,
+          "sha256": "e7fbfbfa6347b4e414c1cee50d142e2c2f9a895dad68b068ae83a8b564c3837e",
+          "source": {
+            "url": "https://huggingface.co/cross-encoder/mmarco-mMiniLMv2-L12-H384-v1/resolve/1427fd652930e4ba29e8149678df786c240d8825/tokenizer_config.json"
+          }
+        },
+        {
+          "path": "tokenizers/reranker/special_tokens_map.json",
+          "byteLength": 239,
+          "sha256": "378eb3bf733eb16e65792d7e3fda5b8a4631387ca04d2015199c4d4f22ae554d",
+          "source": {
+            "url": "https://huggingface.co/cross-encoder/mmarco-mMiniLMv2-L12-H384-v1/resolve/1427fd652930e4ba29e8149678df786c240d8825/special_tokens_map.json"
+          }
+        }
+      ]
+    },
+    "pairFormat": "question,evidence",
+    "inputs": [
+      { "name": "input_ids", "dtype": "int64" },
+      { "name": "attention_mask", "dtype": "int64" }
+    ],
+    "outputs": [{ "name": "logits", "dtype": "float32" }],
+    "outputLabelIndex": 0,
+    "scoreTransform": "identity",
+    "artifacts": [
+      {
+        "path": "models/reranker/model_quint8_avx2.onnx",
+        "byteLength": 118620016,
+        "sha256": "6c2513767fb63d008a4377bef7a7a3555433d9436342bb53e35a3a72ffc52d4b",
+        "source": {
+          "url": "https://huggingface.co/cross-encoder/mmarco-mMiniLMv2-L12-H384-v1/resolve/1427fd652930e4ba29e8149678df786c240d8825/onnx/model_quint8_avx2.onnx"
+        }
+      }
+    ]
+  },
+  "chunkerVersion": 1,
+  "licenses": [
+    {
+      "spdx": "MIT",
+      "appliesTo": "embeddingModel",
+      "attribution": "intfloat/multilingual-e5-base (MIT per pinned model-card metadata at d128750597153bb5987e10b1c3493a34e5a4502a), packaged via the unlicensed mechanical ONNX conversion Xenova/multilingual-e5-base @ 1ec9243030a27d1a115d5c340572074c125b58b2, which declares no separate license and names this model as its sole base. Applicable copyright notice Copyright (c) Microsoft Corporation taken from microsoft/unilm LICENSE @ 0e31c7c09737df491e7ff74ded19614b884c52b4, the E5 development repository linked by the model card; neither upstream repo ships a LICENSE file. See packaged licenses/e5-base-MIT-NOTICE.txt for the full pinned evidence chain and permission text.",
+      "resource": "https://huggingface.co/intfloat/multilingual-e5-base/tree/d128750597153bb5987e10b1c3493a34e5a4502a",
+      "path": "licenses/e5-base-MIT-NOTICE.txt",
+      "byteLength": 3289,
+      "sha256": "b1470baa9d083bc6a3d3af31148fa4566873c2a3ecbea30f07c394e7993088ae",
+      "source": {
+        "url": "https://raw.githubusercontent.com/microsoft/unilm/0e31c7c09737df491e7ff74ded19614b884c52b4/LICENSE"
+      }
+    },
+    {
+      "spdx": "Apache-2.0",
+      "appliesTo": "rerankerModel",
+      "attribution": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1 (Apache-2.0 declared both as the repository license tag and in the pinned model-card front matter at 1427fd652930e4ba29e8149678df786c240d8825; upstream ships neither a LICENSE nor a NOTICE file, so no additional notice is required beyond this license copy). The packaged onnx/model_quint8_avx2.onnx lives in that same pinned revision. Base model nreimers/mMiniLMv2-L12-H384-distilled-from-XLMR-Large carries no upstream license declaration and is not packaged.",
+      "resource": "https://huggingface.co/cross-encoder/mmarco-mMiniLMv2-L12-H384-v1/tree/1427fd652930e4ba29e8149678df786c240d8825",
+      "path": "licenses/mmarco-mMiniLMv2-Apache-2.0.txt",
+      "byteLength": 11358,
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "source": {
+        "url": "https://www.apache.org/licenses/LICENSE-2.0.txt"
+      }
+    }
+  ]
+}

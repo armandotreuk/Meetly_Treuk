@@ -4,6 +4,9 @@
 //! `%TEMP%\opencode\meetly-task13\models`; override with `MEETLY_RAG_MODELS_DIR`.
 //! Artifact-gated tests skip cleanly when the directory is absent so plain
 //! `cargo test` stays green on machines without staged weights.
+//! CI release gate: set `MEETLY_RAG_BUNDLE_DIR` to a staged production bundle
+//! (`resources/retrieval/bundle`) and reference inference runs against that
+//! layout, failing closed instead of skipping.
 //!
 //! Commands (run from `upstream/`):
 //! ```powershell
@@ -518,7 +521,19 @@ impl TextModel {
         max_len: usize,
         intra_threads: usize,
     ) -> Result<Self, String> {
-        let mut tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
+        Self::load_from(dir, dir, model_file, max_len, intra_threads)
+    }
+
+    /// The production bundle layout keeps tokenizers under `tokenizers/<role>`
+    /// instead of beside the ONNX file; benchmark staging co-locates them.
+    fn load_from(
+        model_dir: &Path,
+        tokenizer_dir: &Path,
+        model_file: &str,
+        max_len: usize,
+        intra_threads: usize,
+    ) -> Result<Self, String> {
+        let mut tokenizer = Tokenizer::from_file(tokenizer_dir.join("tokenizer.json"))
             .map_err(|e| format!("tokenizer: {e}"))?;
         // LongestFirst pair truncation via the tokenizer itself preserves the
         // question sequence and the <s>…</s></s>…</s> separators instead of
@@ -536,8 +551,8 @@ impl TextModel {
             .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
             .and_then(|b| b.with_execution_providers(vec![CPUExecutionProvider::default().build()]))
             .and_then(|b| b.with_intra_threads(intra_threads))
-            .and_then(|b| b.commit_from_file(dir.join(model_file)))
-            .map_err(|e| format!("session {}: {e}", dir.join(model_file).display()))?;
+            .and_then(|b| b.commit_from_file(model_dir.join(model_file)))
+            .map_err(|e| format!("session {}: {e}", model_dir.join(model_file).display()))?;
 
         let input_names: Vec<String> = session.inputs.iter().map(|i| i.name.clone()).collect();
         let output_names: Vec<String> = session.outputs.iter().map(|o| o.name.clone()).collect();
@@ -634,6 +649,22 @@ impl Embedder {
         Ok(Self(TextModel::load(dir, file, max_len, threads)?))
     }
 
+    fn load_from(
+        model_dir: &Path,
+        tokenizer_dir: &Path,
+        file: &str,
+        max_len: usize,
+        threads: usize,
+    ) -> Result<Self, String> {
+        Ok(Self(TextModel::load_from(
+            model_dir,
+            tokenizer_dir,
+            file,
+            max_len,
+            threads,
+        )?))
+    }
+
     /// Mean pooling over unmasked positions then L2 normalization — or, when
     /// the export is an end-to-end SentenceTransformer graph, its final
     /// `sentence_embedding` output (pooling/dense/normalize already included).
@@ -711,6 +742,22 @@ impl RerankModel {
         Ok(Self(TextModel::load(dir, file, max_len, threads)?))
     }
 
+    fn load_from(
+        model_dir: &Path,
+        tokenizer_dir: &Path,
+        file: &str,
+        max_len: usize,
+        threads: usize,
+    ) -> Result<Self, String> {
+        Ok(Self(TextModel::load_from(
+            model_dir,
+            tokenizer_dir,
+            file,
+            max_len,
+            threads,
+        )?))
+    }
+
     /// Score (query, evidence) pairs; logits[.,0] passed through sigmoid.
     fn score(&mut self, pairs: &[(String, String)]) -> Result<Vec<f32>, String> {
         if pairs.is_empty() {
@@ -772,7 +819,21 @@ fn embedding_expectation(
 
 #[test]
 fn reference_inference_is_stable_finite_and_dimensional() {
-    let Some(root) = models_dir() else {
+    // Release-gate mode (CI sets MEETLY_RAG_BUNDLE_DIR) consumes the staged
+    // production bundle layout and fails closed on anything missing; legacy
+    // benchmark staging keeps its skip-on-absent behavior for plain `cargo test`.
+    let bundle_root = std::env::var("MEETLY_RAG_BUNDLE_DIR")
+        .ok()
+        .map(PathBuf::from);
+    if let Some(dir) = &bundle_root {
+        assert!(
+            dir.is_dir(),
+            "MEETLY_RAG_BUNDLE_DIR is set but missing: {}",
+            dir.display()
+        );
+    }
+    let bundle_mode = bundle_root.is_some();
+    let Some(root) = bundle_root.or_else(models_dir) else {
         println!("SKIP reference inference: set MEETLY_RAG_MODELS_DIR to staged artifacts");
         return;
     };
@@ -780,9 +841,18 @@ fn reference_inference_is_stable_finite_and_dimensional() {
     let record_mode = std::env::var("MEETLY_RAG_RECORD_EXPECTATIONS").is_ok();
 
     let leader = &manifest.benchmark_leader.embedding;
-    let emb_dir = root.join(&leader.benchmark_artifact_dir);
-    let mut embedder = Embedder::load(
-        &emb_dir,
+    let (emb_model_dir, emb_tokenizer_dir) = if bundle_mode {
+        (
+            root.join("models").join("embedding"),
+            root.join("tokenizers").join("embedding"),
+        )
+    } else {
+        let dir = root.join(&leader.benchmark_artifact_dir);
+        (dir.clone(), dir)
+    };
+    let mut embedder = Embedder::load_from(
+        &emb_model_dir,
+        &emb_tokenizer_dir,
         &leader.benchmark_artifact_file,
         leader.max_sequence_length,
         4,
@@ -865,21 +935,38 @@ fn reference_inference_is_stable_finite_and_dimensional() {
     // bge-reranker-base is permanently retired (user decision 2026-08-23:
     // zh/en card metadata nonconformity); its recorded expectation groups are
     // reused from the manifest and no longer executed here.
-    let reranker_dirs = [
-        ("mmarco-reranker", "model_quint8_avx2.onnx"),
-        ("mmarco-reranker", "model_f32.onnx"),
-    ];
-    for (dir, file) in reranker_dirs {
-        let mut model = RerankModel::load(&root.join(dir), file, 512, 4)
-            .unwrap_or_else(|e| panic!("load reranker {dir}/{file}: {e}"));
+    // ponytail: the production bundle ships only the approved quint8_avx2
+    // reranker export; the f32 sibling is a benchmark-only quantization-cost
+    // baseline outside the package contract. If a second packaged export ever
+    // appears, derive this list from the production manifest instead.
+    let reranker_runs: Vec<(&str, &str)> = if bundle_mode {
+        vec![("mmarco-reranker", "model_quint8_avx2.onnx")]
+    } else {
+        vec![
+            ("mmarco-reranker", "model_quint8_avx2.onnx"),
+            ("mmarco-reranker", "model_f32.onnx"),
+        ]
+    };
+    for (bench_dir, file) in reranker_runs {
+        let (model_dir, tokenizer_dir) = if bundle_mode {
+            (
+                root.join("models").join("reranker"),
+                root.join("tokenizers").join("reranker"),
+            )
+        } else {
+            let dir = root.join(bench_dir);
+            (dir.clone(), dir)
+        };
+        let mut model = RerankModel::load_from(&model_dir, &tokenizer_dir, file, 512, 4)
+            .unwrap_or_else(|e| panic!("load reranker {bench_dir}/{file}: {e}"));
         let pairs = reference_rerank_pairs();
         let scores = model.score(&pairs).expect("score reference pairs");
         assert_eq!(scores.len(), pairs.len());
         assert!(
             scores.iter().all(|s| s.is_finite()),
-            "{dir} scores must be finite"
+            "{bench_dir} scores must be finite"
         );
-        let is_selected = dir == manifest.benchmark_leader.reranker.benchmark_model_dir;
+        let is_selected = bench_dir == manifest.benchmark_leader.reranker.benchmark_model_dir;
         if is_selected {
             // The selected reranker must reproduce the reference-case ordering
             // contract it can honestly satisfy: complete schedule above
@@ -889,15 +976,15 @@ fn reference_inference_is_stable_finite_and_dimensional() {
             // corpus finding handled by fusion/aggregation, not hidden here.
             assert!(
                 scores[0] > scores[2],
-                "selected reranker {dir} must rank complete schedule above unrelated text: {scores:?}"
+                "selected reranker {bench_dir} must rank complete schedule above unrelated text: {scores:?}"
             );
             assert!(
                 scores[3] > scores[4],
-                "selected reranker {dir} must rank relevant English evidence above distractor: {scores:?}"
+                "selected reranker {bench_dir} must rank relevant English evidence above distractor: {scores:?}"
             );
         }
         rerank_groups.push(RerankPairGroup {
-            model_dir: format!("{dir}/{file}"),
+            model_dir: format!("{bench_dir}/{file}"),
             pairs: pairs
                 .into_iter()
                 .zip(scores)
@@ -977,7 +1064,22 @@ fn reference_inference_is_stable_finite_and_dimensional() {
             .model_dir
             .rsplit_once('/')
             .unwrap_or((group.model_dir.as_str(), "model_int8.onnx"));
-        let mut model = RerankModel::load(&root.join(dir_name), file, 512, 4)
+        if bundle_mode && file != "model_quint8_avx2.onnx" {
+            println!(
+                "[bundle] {} replay not applicable: benchmark-only export outside the staged production bundle",
+                group.model_dir
+            );
+            continue;
+        }
+        let (model_dir, tokenizer_dir) = if bundle_mode {
+            (
+                root.join("models").join("reranker"),
+                root.join("tokenizers").join("reranker"),
+            )
+        } else {
+            (root.join(dir_name), root.join(dir_name))
+        };
+        let mut model = RerankModel::load_from(&model_dir, &tokenizer_dir, file, 512, 4)
             .unwrap_or_else(|e| panic!("load reranker {dir_name}/{file}: {e}"));
         // Replay must score exactly what recording scored: pairs come from the
         // shared in-code contract, and the manifest's stored texts are checked

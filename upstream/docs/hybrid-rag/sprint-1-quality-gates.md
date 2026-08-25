@@ -40,6 +40,30 @@ earned constants above, int8 vector encoding, measured 1118.3 MiB inside the
 pre-approved band. Tasks `1.4` and `1.5` are unblocked. Task `1.1` is
 unaffected. No further Sprint 1 instrument iteration is permitted.
 
+**Batch 8 Task `1.4` completed independent verification on 2026-08-24.** Exact
+search is selected at 250k (p95 `48.2 ms`, recall@150 `1.0000`); ANN was not
+evaluated because its latency trigger did not occur. The user approved the
+measured two-snapshot rebuild peak (`1296.5 MiB`) under a 1.30 GiB transient
+ceiling while retaining the 1.25 GiB steady-state cap. Task `1.5` is next and
+runs alone.
+
+**Batch 9 Task `1.5` implementation completed on 2026-08-25, but Sprint review
+returned changes requested.** Its local manifest, staging, and Rust 1.88 work
+is retained. **Batch 10 `1.R1` is complete:** the active root workflow now
+stages, verifies, and reference-tests the production bundle on Rust 1.88.0.
+**Batch 11 `1.R2` is complete:** the production package/provenance boundary is
+fail-closed, with full backup integrity recovery. `1.R3` remains before Sprint
+close to remeasure the exact backend's transient envelope.
+
+**Batch 12 `1.R3` is complete:** sparse document IDs survive crash replay and
+compaction, and the measured same-process active/shadow/delta/ONNX-session peak
+is 1317.9 MiB on independent rerun, within the approved 1.30 GiB transient
+ceiling. **Batch 13 `1.R1a` and `1.R3a` are complete:** the active CI staging
+path resolves from the checkout root, and bounded journal publication replays
+self-contained upsert payloads correctly across same-document concurrent
+updates. Final code and architecture reviews approve; one hosted root Windows
+workflow execution remains required before Sprint close.
+
 Task `1.3`'s *resource* findings survive and are retained — admissibility
 arithmetic, measured pair RAM, derived disk, per-pair reranker latency,
 quantization fidelity, and license screening. From the rerun, its *aggregate
@@ -337,8 +361,13 @@ reviews use the standard configured `reviewer` and `arch-reviewer`.
 | 1.3F | Gate closure | Audit harness fidelity against the architecture pipeline, prove or refute gate admissibility for the failing critical gates, add citation-precision simulation, and deliver a per-blocker verdict table. | L | `worker-l` (`ses_fce6f62e3ffekuqxK1x52fEwoT`) | 1.2R, 1.3 rerun evidence | **Passed:** all five deliverables, constructive admissibility report, production-typed citation precision `602/602` for pairs B/C, falsifiability mutation, `0/2160` feasibility result, privacy and boundary checks. | Tests/evidence only; restore committed `tests/` state; no production effect. |
 | 1.3G | Corpus patch + gate re-scope | Implement the 2026-08-24 category (c) decision: patch `pt-ref-chaves-acesso` and the two vacuous WhatsApp forbidden carriers; re-scope critical contamination by carrier source state; promote the admissibility invariant to enforcing for retrieval-stage facts; re-record the baseline and align the baseline harness. | M | `worker-l` (primary `ses_fcbf894c0ffe0XwFSDMSavxqDj`; residual fix `ses_fcb41049cffefT5nm7rG3j6sNE`) | 1.3F | **Passed:** rank-1 admissibility positive for `chaves-acesso` on the title channel with baseline still failing; both WhatsApp facts carried in superseded sources and `FEASIBLE_BY_ORDERING`; classification `107/14` pinned by test; enforcing admissibility plus five rejecting mutations; new baseline recorded (`26/121`); structural/margin/distinctness/mutation/privacy checks pass. | Restore fixtures/harness from `e209b5d`; test tooling only, no production effect. |
 | 1.3 | Model selection | Benchmark and select the bundled multilingual embedding and reranker pair plus chunk policy. | L | `worker-l` (`ses_fcaf0a683ffeJQbDb2utDAyIQW`); earlier runs `ses_fd06da77cffeQmAh22R2sPO3Fz`, `ses_fd65db999ffe5gwCX1YNm12F5w` | 1.2R, 1.3F, 1.3G | **Complete — pair selected (2026-08-24).** Amendment-5 retune with the five critical/pinned cases isolated earned fully disclosed constants; every Sprint 1 gate passes, including critical hydration `5/5`, critical facts `9/9`, critical retrieval-stage contamination `0/2`, citation precision `602/602`. Critical Recall@1 `2/5` is retained at 100% as a Sprint 3 release gate per the approved gate split. Selected: `e5-base-int8` + `mmarco-quint8`, int8 encoding, 1118.3 MiB in the approved band. | Revert the approved addendum and re-block `1.4`/`1.5`; no production default ships until Sprint 2. |
-| 1.4 | Vector backend | Benchmark exact search and, only if needed, a pure-Rust HNSW candidate at 250k scale. | L | Pending `worker-l` | 1.3 | Report selects exact or exact+ANN and demonstrates the architecture performance/RAM gates. | Benchmark-only dependency/code can be removed; no persisted format ships. |
-| 1.5 | Model supply chain | Implement the small bundle manifest and reproducible hash/license verification pipeline; reconcile Rust MSRV. | M | Pending `worker-l` | 1.3 | Valid artifacts pass; tampered/missing artifacts fail before packaging; toolchain contract is explicit and checked. | Remove additive manifest/fetch verification; no runtime behavior yet. |
+| 1.4 | Vector backend | Benchmark exact search and, only if needed, a pure-Rust HNSW candidate at 250k scale. | L | Complete after `1.R3` review remediation | 1.3 | **Complete:** exact selected; no ANN trigger. Post-`1.R3a` 250k matrix: p95 `61.1 ms`, recall@150 `1.0000`, steady `1133.8 MiB`, and conservative governing active+shadow+delta+sessions peak `1319.9 MiB` within 1.30 GiB. | Delete benchmark/report harness; no production backend ships yet. |
+| 1.5 | Model supply chain | Implement the small bundle manifest and reproducible hash/license verification pipeline; reconcile Rust MSRV. | M | Complete after `1.R1`/`1.R2` review remediation | 1.3, 1.4 | Root CI exercises Rust 1.88.0, staged-bundle verification, and reference inference; strict package/provenance/recovery checks pass. | Remove additive manifest/fetch verification; no runtime behavior yet. |
+| 1.R1 | Active CI gate | Move the toolchain, staging, semantic manifest validation, and reference inference to the active root Windows workflow. | L | `worker-l` (`ses_fc6bd168effeAUd4Tj4WGqpoyj`) | 1.5 | **Complete:** root CI reads/asserts Rust 1.88.0, stages/verifies ten artifacts, and executes staged tokenizer/embedding/reranker inference before Tauri build. | Revert root workflow and harness gate adapter; no runtime behavior changes. |
+| 1.R2 | Package/provenance boundary | Fail closed for the exact selected bundle, resolve exporter attribution, reject unexpected package content, and recover a lone interrupted publish. | M | `worker-l` (`ses_fc634146bffevaVpdPBU0R2NE6`) | 1.5, 1.R1 | **Complete:** 21 strict parser/verifier tests and eight script self-test families pass; immutable export/notice evidence is recorded. | Revert Task 1.R2 package/verifier changes; no runtime retrieval behavior. |
+| 1.R3 | Exact benchmark envelope | Repair sparse-ID replay semantics and measure active+shadow+delta+selected sessions in one 250k process. | L | `worker-l` (`ses_fc60bbe8bffehPVuVVU0jP9OyO`) | 1.4, 1.5, 1.R2 | **Complete:** 10 deterministic tests, including a mutation-proven sparse-ID regression; independent 250k p95 `61.1 ms`, recall@150 `1.0000`, and combined peak `1317.9 MiB` pass. | Revert benchmark/report changes; no production backend ships. |
+| 1.R1a | CI staging path | Correct the checkout-root path for the active Windows staging step. | S | `worker-l` (`ses_fc5b84814ffe609Kxu6ZtJI0wi`) | 1.R1 | **Complete:** root YAML lint and the exact checkout-root `-SelfTest` invocation pass; staging, verification, inference, and packaging retain their required order. | Restore the prior single workflow path; no runtime effect. |
+| 1.R3a | Bounded journal publication | Make the benchmark-local journal self-contained and publish only through a captured canonical bound. | M | `worker-l` (`ses_fc5b8478fffepoG91Zm7Cjreoj`) | 1.R3 | **Complete:** 13 deterministic tests cover same-document concurrent commits, repeated upserts, upsert/delete tombstones, and crash replay; independent 250k matrix passes. | Restore the prior benchmark fixture/report; no production backend ships. |
 
 ## Dependency Order
 
@@ -1477,6 +1506,14 @@ with a retrieval rewrite that has no measured problem to solve.
 | 2026-08-24 | Approve `intfloat/multilingual-e5-base` (dynamic int8, 768-d, MIT) + `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` (quint8_avx2, Apache-2.0) with int8 vector storage as the production pair, at the earned constants `k=5, w_vector=1, w_lexical=0.5, alpha=0.5, beta=1, gamma=0`, support cap 3, chat depth 50, search depth 25, batch 1, ORT intra-op 4; chunk profile 384/64. | Every Sprint 1 gate passes under the split: critical hydration 5/5, critical facts 9/9, critical retrieval-stage contamination 0/2, pinned reference rank 1, exact-term 90/90, overall R@3 135/135, R@5 135/135, EV@10 209/209, semantic 30/30 vs 0/30 baseline, NDCG non-degraded, citation precision 602/602, RAM 1118.3 MiB inside the pre-approved band, reranker depth-50 cost 720 ms inside the 900 ms sub-budget. Constants are the held-out objective's output with the five critical/pinned cases never inspected. | Select the f32 reranker variant (reference-only, no quality gain); defer selection pending Sprint 3 fusion work. | User |
 | 2026-08-24 | Record the title dependence of the selected configuration in the architecture addendum. | The mandatory ablation shows reference-category Recall@1 falling 12/15 → 7/15 and overall MRR 0.9681 → 0.9451 when title scoring is removed, while semantic Recall@3 holds at 30/30. The embedding channel is independently strong, but reference-family gate performance is materially title-assisted and must not be attributed solely to the embedding model. | Report the tuned aggregate only and omit the dependence. | User |
 | 2026-08-24 | Accept final Task `1.3` as a documented-stop outcome; select no production pair and request the gate-split versus dated-exception decision. | Independent release rerun reproduces the amendment-5 tuning result: the five critical/pinned cases remain isolated, objective `[0,0,0,0,0,2166666]` earns `k=5`, `w_vector=1`, `w_lexical=0.5`, `alpha=0.5`, `beta=1`, `gamma=0`, yet Critical Recall@1 is `2/5`. The quint8 feasibility probe proves `78/2160` joint-passing configurations exist but the earned configuration lies outside them at strictly better held-out objective value; selecting a passing configuration by inspection remains forbidden. `pt-ref-sla-suporte` is explicit amendment-4 open item at rank 3. | Iterate the corpus/gates/partition/objective again; select from the passing set by inspecting critical outcomes; approve a pair despite the failed critical gate. | Main agent |
+| 2026-08-24 | Approve the Task `1.4` two-snapshot rebuild accounting and its 1.30 GiB transient ceiling; select exact search and do not evaluate ANN. | The 2x overlap is exactly active plus shadow snapshots; a reader's `Arc` adds no third vector allocation. At 250k, exact search has p95 `48.2 ms` and recall@150 `1.0000`; steady-state RAM is `1113.4 MiB` in the approved 1-1.25 GiB band and the measured two-snapshot rebuild peak is `1296.5 MiB`, within the explicitly approved 1.30 GiB transient ceiling. ANN is not its permitted latency remedy because exact latency passes, and would add memory. Any true third snapshot or peak above 1.30 GiB remains blocking. | Treat the reader handle as an unmeasured third snapshot; leave the transient peak ungoverned; evaluate ANN despite an exact latency pass. | User |
+| 2026-08-25 | Accept Task `1.5` and replace the stale Rust 1.77 declaration with the exact Rust 1.88.0 toolchain contract. | The manifest encodes the approved selected pair, separate tokenizer contracts, ten length/hash-pinned artifacts, and license attribution. Fresh-cache staging fetches only immutable revision URLs, verifies each artifact, and atomically publishes the complete package. Independent focused tests (19/19), staging verification, typecheck, Cargo check, rustfmt, diff check, and workflow YAML lint pass. The locked graph's effective floor is Rust 1.88, above ORT's own 1.81 floor, so 1.77 and floating CI `stable` were false contracts. | Retain Rust 1.77; use floating CI stable; defer hash verification to Sprint 2; allow a partial bundle. | Main agent |
+| 2026-08-25 | Rescind Task `1.5` acceptance pending review remediation `1.R1`-`1.R3`. | Sprint review proved that the edited CI workflow is nested under `upstream/` and inert; the active root workflow remains on floating stable and does not stage, semantically validate, or run reference inference. Review also found incomplete production-contract/provenance enforcement and unproven vector rebuild RAM/recovery evidence. The local implementation evidence remains valid but cannot satisfy the release gate alone. | Close Sprint 1 on local checks; treat nested workflow edits as CI coverage; defer the findings to Sprint 2. | Main agent |
+| 2026-08-25 | Accept review remediation `1.R1`: activate the root Windows CI release gate. | Independent staged-bundle verification passes all ten artifacts and the existing reference harness passes tokenizer, embedding, and reranker inference against the staged production bundle. The actual root workflow now reads/asserts Rust 1.88.0 in both jobs and runs contract validation, staging, bundle verification, and inference before Tauri build. | Retain the inert nested workflow as CI authority; use hash staging without inference; defer the root workflow fix. | Main agent |
+| 2026-08-25 | Accept review remediation `1.R2`: harden the approved package/provenance boundary. | The parser rejects every selected-contract/provenance substitution in its 21 focused tests; source model/export attribution and exact MIT notice are pinned; the staged bundle is its only packaged authority; and the script self-test proves full-integrity backup recovery plus rejection/preservation of corrupt, missing, ambiguous, divergent, or unmanifested packages. | Keep generic schema-only manifest validation; retain duplicate packaged resources; restore backups without integrity validation; retain a generic MIT template. | Main agent |
+| 2026-08-25 | Accept review remediation `1.R3`: repair sparse-ID exact search and replace arithmetic RAM evidence with a true combined measurement. | The new canonical sparse-ID regression fails under the former ID-as-row mask and passes after the shared row-identity repair. The independent 250k release matrix holds active snapshot, streamed shadow, delta/tombstones, and both warmed selected ONNX sessions in one process: p95 `61.1 ms`, recall@150 `1.0000`, steady `1134.8 MiB`, and peak `1317.9 MiB`, 13.3 MiB below the approved 1.30 GiB transient ceiling. | Retain the ID-indexed mask; use retained session arithmetic; keep the superseded 1.25 GiB transient failure label; evaluate ANN. | Main agent |
+| 2026-08-25 | Reopen Sprint review for `1.R1a` and `1.R3a`. | Post-remediation review proves the root workflow invokes the staging script without its `upstream/` prefix, blocking its required CI gate. It also identifies a benchmark publication race that can mark concurrently committed journal entries published before application, plus an upsert/delete sequence that lacks a payload. Both invalidate release evidence until corrected and retested. | Close Sprint 1 on local checks; defer these correctness/CI defects to Sprint 2. | Main agent |
+| 2026-08-25 | Accept review corrections `1.R1a` and `1.R3a` pending final re-review. | The root workflow now invokes the staging script through its checkout-root-relative `upstream/...` path; YAML lint and the exact invocation's offline recovery self-test pass. The benchmark journal now carries immutable upsert payloads, so bounded replay remains correct when a later same-document commit changes or deletes the current row. Independent verification passes all 13 deterministic tests and the 250k release matrix: p95 `61.1 ms`, recall@150 `1.0000`, steady `1133.8 MiB`, and peak `1316.9 MiB`. The highest valid recorded post-fix peak remains `1319.9 MiB`, 11.3 MiB below the 1.30 GiB cap. | Retain a bound-only fix that derives upsert payload from current document state; accept the old workflow path; lower the cap or evaluate ANN. | Main agent |
 
 ## Task Execution Log
 
@@ -1933,9 +1970,10 @@ not edited; this entry records the user decision that resolved its stop.)
   `3.6`-contingent exception would have expired unredeemed.
 **Effect on the record:**
 - Task `1.3` status changes from *documented stop* to **Complete — pair
-  selected**. The selected pair, encoding, and constants are recorded in the
-  decision log above and require an `architecture.md` addendum before Sprint 2
-  implementation.
+  selected**. The selected pair, encoding, constants, chunk profile, runtime
+  limits, resource evidence, and title-dependence qualification are recorded
+  in `architecture.md` "Approved Sprint 1 Bundle And Runtime Contract" before
+  Sprint 2 implementation.
 - Tasks `1.4` and `1.5` are unblocked.
 - Critical Recall@1 `2/5` is not waived. It is re-measured at Sprint 3 close
   and must pass before release.
@@ -1956,8 +1994,362 @@ not edited; this entry records the user decision that resolved its stop.)
   passes *every* gate was never evaluated, so no claim that a fully-passing
   configuration exists is on the record.
 - The selected configuration's title dependence (reference-category Recall@1
-  12/15 at `beta=1` versus 7/15 at `beta=0`) must appear in the architecture
-  addendum.
+  12/15 at `beta=1` versus 7/15 at `beta=0`) is recorded in the architecture
+  addendum and cannot be attributed solely to the embedding model.
+
+### 1.4 - Vector backend benchmark
+
+**Status:** Complete - exact backend selected
+**Owner:** `worker-l` (`ses_fc993e5b7ffe423l47gsPHwsn9`, `openrouter/stealth/ox-alpha`)
+**Completed:** 2026-08-24
+**Implemented:**
+- Added a deterministic, bounded exact-vector benchmark at 12k, 50k, and 250k
+  selected 768-d int8 vectors, with cold/warm, global/narrow scope, candidate
+  depth, update/delta/tombstone, compaction, crash-window, concurrency, and
+  scheduler measurements.
+- Proved exact top-150 equality with brute force, scope isolation, immutable
+  base updates, journal replay after a simulated crash, scheduler capacity, and
+  the 250 ms interactive worker-pause budget.
+- Corrected the no-pause scheduling probe deadlock: it now requests and waits
+  for a pause only from the pause-honoring probe arm.
+- Selected exact search; ANN was not evaluated because exact p95 is `48.2 ms`
+  at 250k against the 500 ms gate, with recall@150 `1.0000`.
+**Implementation:**
+- Files: `frontend/src-tauri/tests/vector_backend_benchmark.rs`,
+  `docs/hybrid-rag/task-1.4-vector-backend.md`, and the worker's cross-program
+  execution note in `docs/notes-chat-improvement-execution.md`.
+- Approach: model the approved exact base+delta+tombstone and SQLite journal
+  contract in an isolated benchmark harness; make the backend decision before
+  considering any ANN dependency.
+**Not implemented:**
+- No ANN evaluation/dependency, production backend, schema/migration, model,
+  manifest, or runtime retrieval implementation.
+**Why not implemented:**
+- Backend Decision Rule row 1 applies. Exact passes its latency and RAM gates;
+  ANN has no trigger and would add memory.
+**Verification:**
+- Independent `cargo test --test vector_backend_benchmark` - pass, 9/9.
+- Independent release `full_matrix_benchmark` - pass: 250k global p95
+  `48.2 ms`, folder p95 `10.6 ms`, snapshot p95 `0.1 ms`, two-scanner p95
+  `44.9 ms`, pause observed in `2 ms`, and exact recall@150 `1.0000`.
+- RAM/disk: steady `1113.4 MiB` is in the approved band; measured active plus
+  shadow peak `1296.5 MiB` is in the approved 1.30 GiB transient ceiling;
+  disk `0.19/0.38 GiB` is inside the 2/3 GiB envelopes.
+- Worker also passed Rust library tests (394 pass, 2 ignored), Cargo check,
+  formatter, diff check, frontend typecheck/Vitest, and privacy/model-weight
+  scan.
+**Rollback:**
+- Delete `frontend/src-tauri/tests/vector_backend_benchmark.rs` and
+  `docs/hybrid-rag/task-1.4-vector-backend.md`; remove the matching
+  `HR-1.4` note in `docs/notes-chat-improvement-execution.md`. No production
+  state or dependency changed.
+**Decisions and follow-ups:**
+- Sprint 2 implements exact base+delta+tombstone search with the approved
+  limits: 150 candidates, two scan permits, queue 8, pause 250 ms, update
+  batch 128, and compaction at or before 2% delta; re-measure in production.
+- Any actual third vector snapshot or rebuild peak above 1.30 GiB blocks
+  activation pending a user-approved remedy.
+
+### 1.5 - Bundle manifest, artifact verification, and MSRV
+
+**Status:** Blocked
+**Owner:** `worker-l` (`ses_fc8fee5d7ffeeJczknaY5KJfR7`)
+**Completed:** Not applicable - 2026-08-25 dispatch failed before implementation.
+**Implemented:**
+- None.
+**Implementation:**
+- Files: None.
+- Approach: The user-approved isolated Worker-L dispatch was attempted twice
+  against the configured `opencode-go/ox-alpha-free` provider.
+**Not implemented:**
+- All Task `1.5` manifest, verification, CI, and MSRV work.
+**Why not implemented:**
+- Both attempts failed before the worker session could start: Console Go returned
+  `Upstream request failed: Endpoint is unavailable`.
+**Verification:**
+- Worker-L launch retry - failed before any repository command or edit.
+**Rollback:**
+- Not applicable; no repository changes were made by either failed dispatch.
+**Decisions and follow-ups:**
+- No fallback model was used. A new dispatch requires the configured provider
+  to recover or an explicit user-approved fallback.
+
+### 1.5 - Bundle manifest, artifact verification, and MSRV
+
+**Status:** Complete
+**Owner:** `worker-l` (`ses_fc75c4aa5ffertNOLMzRPRF904`, `opencode-go/ox-alpha-free`)
+**Completed:** 2026-08-25
+**Implemented:**
+- Added the selected-pair production manifest, separate complete embedding and
+  reranker tokenizer contracts, exact artifacts/licenses, provenance, and
+  attribution. The ten artifacts are length/SHA-256 pinned.
+- Added a Windows-only cache/stage/publish script. It fetches model/tokenizer
+  artifacts only from immutable revision URLs, verifies all artifacts as one
+  package outside Tauri resources, then atomically publishes the bundle.
+- Added a strict Rust manifest parser and lazy pre-load artifact verifier; 19
+  focused tests cover valid, corrupt, missing, unknown-version, contract, and
+  provenance cases. Application startup does not call it yet.
+- Set the true Rust 1.88 floor in both manifests, pinned `rust-toolchain.toml`
+  to 1.88.0, and made Windows CI install/assert that exact version instead of
+  floating `stable`.
+**Implementation:**
+- Files: `frontend/src-tauri/resources/retrieval/`,
+  `frontend/src-tauri/scripts/stage-retrieval-models.ps1`,
+  `frontend/src-tauri/src/model_bundle.rs`, `rust-toolchain.toml`, Cargo
+  manifests/lockfile, Tauri resources, Windows workflow, `.gitignore`, and
+  `docs/hybrid-rag/task-1.5-model-supply-chain.md`.
+- Approach: use a small checked-in contract and local hash verification, not a
+  runtime downloader; use a build cache and temporary sibling staging directory
+  so invalid/incomplete artifacts never enter the signed resource directory.
+**Not implemented:**
+- No runtime download, startup integration, ONNX session construction, vector
+  retrieval, schema/migration, ANN, or macOS/Linux workflow claim.
+**Why not implemented:**
+- These belong to later approved Sprint 2+ work. Task `1.5` prepares and
+  verifies the supply chain without activating retrieval behavior.
+**Verification:**
+- Fresh-cache `stage-retrieval-models.ps1` - pass: eight model/tokenizer
+  artifacts fetched from pinned URLs; two checked-in license texts verified;
+  all ten artifacts re-verified and atomically published (411 MiB).
+- Independent `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib model_bundle` - pass, 19/19.
+- Independent `pnpm --dir "frontend" run typecheck`, Cargo check with the
+  LOCALAPPDATA target directory, rustfmt check, `git diff --check`, and Windows
+  workflow YAML lint - pass.
+**Rollback:**
+- Revert the Task `1.5` files and resource entries; delete the local
+  `%LOCALAPPDATA%\meetily\model-cache` cache. Nothing calls the verifier or
+  consumes the staged bundle yet.
+**Decisions and follow-ups:**
+- Tokenizer JSON bytes are identical but tokenizer revisions/configs differ, so
+  contracts remain separate. `sentencepiece.bpe.model` is intentionally absent:
+  the approved runtime contract uses tokenizer.json; add it only if Sprint 2
+  requires a slow-tokenizer fallback.
+- The initial Worker-L dispatch remains recorded above as an infrastructure
+  outage; the fresh session completed after the provider recovered.
+
+### 1.R1 - Active root CI release gate
+
+**Status:** Complete
+**Owner:** `worker-l` (`ses_fc6bd168effeAUd4Tj4WGqpoyj`, `opencode-go/ox-alpha-free`)
+**Completed:** 2026-08-25
+**Implemented:**
+- Moved the exact Rust 1.88.0 install/assertion, manifest validation, bundle
+  cache/staging, ten-artifact verification, and reference-inference gate to
+  the active repository-root Windows workflow.
+- Adapted the existing benchmark reference harness to read the staged production
+  bundle layout under `MEETLY_RAG_BUNDLE_DIR`; bundle mode fails rather than
+  skipping when artifacts are absent and runs the approved tokenizer, embedding,
+  and quint8 reranker only.
+**Implementation:**
+- Files: root `.github/workflows/build-windows.yml`,
+  `frontend/src-tauri/tests/model_benchmark.rs`,
+  `frontend/src-tauri/src/model_bundle.rs`, and
+  `docs/hybrid-rag/task-1.r1-active-ci.md`.
+- Approach: reuse Task `1.3` reference expectations and inference implementation
+  with a production-layout adapter, rather than create a second ONNX test.
+**Not implemented:**
+- No installed-package inference, macOS/Linux workflow, model change, runtime
+  retrieval behavior, package/provenance remediation (`1.R2`), or vector
+  benchmark work (`1.R3`).
+**Why not implemented:**
+- Those are separately bounded review follow-ups or Sprint 5 gates.
+**Verification:**
+- Independent `MEETLY_RAG_VERIFY_STAGED_BUNDLE=1` test - pass, ten staged
+  artifacts verify by length and SHA-256.
+- Independent `MEETLY_RAG_BUNDLE_DIR=<staged bundle>` reference-inference
+  test - pass, tokenizer/embedding/reranker reference expectations reproduced.
+- Root workflow YAML lint and `git diff --check` - pass.
+**Rollback:**
+- Revert the root workflow gate and the two test-only adapter changes; delete
+  the local model cache. No application runtime path changed.
+**Decisions and follow-ups:**
+- The nested `upstream/.github` workflow remains inert and untouched.
+- `1.R2` and `1.R3` remain required before re-review/Sprint close.
+
+### 1.R2 - Package/provenance boundary
+
+**Status:** Blocked
+**Owner:** `worker-l` (`ses_fc6961588ffeU3IS7BWeayB3rI`)
+**Completed:** Not applicable - 2026-08-25 dispatch failed before implementation.
+**Implemented:**
+- None.
+**Implementation:**
+- Files: None.
+- Approach: The approved Worker-L dispatch was attempted twice against the
+  configured `opencode-go/ox-alpha-free` provider.
+**Not implemented:**
+- All `1.R2` selected-contract, provenance, package-authority, and recovery
+  remediation.
+**Why not implemented:**
+- Both attempts failed before a worker session started: Console Go returned
+  `Upstream request failed: Endpoint is unavailable`.
+**Verification:**
+- Worker-L launch retry - failed before any repository command or edit.
+**Rollback:**
+- Not applicable; neither failed dispatch changed the repository.
+**Decisions and follow-ups:**
+- No fallback model was used. Redispatch after the configured provider recovers
+  or obtain explicit user approval for a fallback.
+
+### 1.R2 - Package/provenance boundary
+
+**Status:** Complete
+**Owner:** `worker-l` (`ses_fc634146bffevaVpdPBU0R2NE6`, `opencode-go/ox-alpha-free`)
+**Completed:** 2026-08-25
+**Implemented:**
+- Bound manifest parsing to the exact approved models, exports, preprocessing,
+  tensor contracts, source revisions, artifact set, and license authority.
+- Replaced the generic e5 MIT template with a pinned evidence-backed notice for
+  the Xenova export's upstream E5 provenance; retained the pinned mmarco
+  Apache-2.0 attribution and text.
+- Made the staged bundle the sole packaged retrieval authority. It rejects
+  unexpected content, divergent manifests, and a missing/tampered required
+  README placeholder.
+- Added full-integrity single-backup recovery: every managed artifact, the
+  manifest copy, and placeholder pin must verify before restoration.
+**Implementation:**
+- Files: `frontend/src-tauri/resources/retrieval/`,
+  `frontend/src-tauri/src/model_bundle.rs`,
+  `frontend/src-tauri/scripts/stage-retrieval-models.ps1`,
+  `frontend/src-tauri/tauri.conf.json`, and
+  `docs/hybrid-rag/task-1.r2-package-provenance.md`.
+- Approach: use immutable primary-source evidence and one reusable package
+  integrity gate for staging, publication, and recovery.
+**Not implemented:**
+- No runtime retrieval/startup integration, installed-package inference,
+  macOS/Linux workflow, or Task `1.R3` vector benchmark changes.
+**Why not implemented:**
+- These are separate Sprint 2/Sprint 5 work or the remaining independent
+  review remediation.
+**Verification:**
+- Independent `stage-retrieval-models.ps1 -SelfTest` - pass: intact recovery,
+  missing/corrupt/ambiguous backup rejection, unmanifested/divergent/tampered
+  content rejection, and clean-package control.
+- Independent `cargo test --lib model_bundle` - pass, 21/21.
+- Independent staging, staged bundle/reference inference, typecheck, Cargo
+  check, rustfmt, active-workflow YAML lint, and diff checks - pass.
+**Rollback:**
+- Revert the R2 manifest/verifier/script/resource changes and delete the local
+  bundle/cache. No application runtime consumes them yet.
+**Decisions and follow-ups:**
+- The actual Microsoft E5 notice is now retained through a pinned provenance
+  chain; update its artifact/hash only with a corresponding approved model or
+  rights-holder change.
+- `1.R3` remains before the final review and Sprint-close request.
+
+### 1.R3 - Exact benchmark envelope
+
+**Status:** Complete
+**Owner:** `worker-l` (`ses_fc60bbe8bffehPVuVVU0jP9OyO`, `opencode-go/ox-alpha-free`)
+**Completed:** 2026-08-25
+**Implemented:**
+- Fixed the shared overlay mask to evaluate each base row by its stable document
+  ID, not an assumed ID-as-row position; fixed sibling scope-meeting lookup.
+- Added a canonical sparse-ID crash-replay/compaction regression that does not
+  share the production mask/index helper; restoring the old helper fails it.
+- Replaced vector/session arithmetic with a fail-closed staged-bundle run that
+  warms and holds both selected ONNX sessions while streaming the shadow over
+  the active snapshot and live delta/tombstone overlay.
+- Enforced the distinct 1.25 GiB steady and 1.30 GiB two-snapshot transient
+  ceilings in the benchmark output/assertions.
+**Implementation:**
+- Files: `frontend/src-tauri/tests/vector_backend_benchmark.rs` and
+  `docs/hybrid-rag/task-1.r3-vector-envelope.md`.
+- Approach: stream shadow rows into exact-capacity allocations and govern the
+  combined state with Windows process working-set/commit counters.
+**Not implemented:**
+- No ANN, model/package/workflow change, runtime backend, schema/migration, or
+  cap relaxation.
+**Why not implemented:**
+- Exact p95 and the measured combined envelope pass; ANN is neither triggered
+  nor a permitted RAM remedy.
+**Verification:**
+- Independent deterministic benchmark suite - pass, 10/10 including the
+  sparse-ID regression.
+- Independent 250k release matrix - pass: p95 `61.1 ms`, recall@150 `1.0000`,
+  steady `1134.8 MiB`, and combined active+shadow+delta+sessions `1317.9 MiB`
+  versus the 1.30 GiB cap; interactive pause observed in 2 ms.
+- Worker also proved missing/corrupt staged bundle failure, plus Cargo check,
+  rustfmt, diff check, typecheck, and Vitest.
+**Rollback:**
+- Restore the untracked benchmark harness/report to their pre-R3 state; no
+  production state or dependency changed.
+**Decisions and follow-ups:**
+- The independent rerun's `1317.9 MiB` is the governing observed result, above
+  the worker run's 1316.3 MiB but still 13.3 MiB inside the approved transient
+  cap. Sprint 2 must re-measure at its actual allocation/batching behavior.
+- All review remediation tasks are complete; final reviews remain required.
+
+### 1.R1a - Active CI staging path
+
+**Status:** Complete
+**Owner:** `worker-l` (`ses_fc5b84814ffe609Kxu6ZtJI0wi`, `opencode-go/ox-alpha-free`)
+**Completed:** 2026-08-25
+**Implemented:**
+- Corrected the active root workflow staging invocation to
+  `./upstream/frontend/src-tauri/scripts/stage-retrieval-models.ps1`.
+- Corrected the earlier R1 report to describe the same checkout-root path.
+**Implementation:**
+- Files: root `.github/workflows/build-windows.yml`,
+  `docs/hybrid-rag/task-1.r1-active-ci.md`, and this execution record.
+- Approach: use the repository-relative script path rather than adding a new
+  per-step working directory; the script already derives its own paths.
+**Not implemented:**
+- No model, script, manifest, package, runtime, or nested-workflow changes.
+**Why not implemented:**
+- The defect was a single active-workflow path error; changing another boundary
+  would not improve the CI gate.
+**Verification:**
+- Root workflow YAML lint - pass.
+- Exact checkout-root `stage-retrieval-models.ps1 -SelfTest` - pass, including
+  sole-backup recovery and invalid-package rejection families.
+- Static gate ordering/path assertions and `git diff --check` - pass.
+**Rollback:**
+- Restore the prior workflow invocation; no runtime state or packaged contract
+  changes.
+**Decisions and follow-ups:**
+- A GitHub-hosted `build-windows` run remains required evidence for the runner
+  cache, network staging, downstream inference, and packaging path.
+
+### 1.R3a - Bounded journal publication correctness
+
+**Status:** Complete
+**Owner:** `worker-l` (`ses_fc5b8478fffepoG91Zm7Cjreoj`, `opencode-go/ox-alpha-free`)
+**Completed:** 2026-08-25
+**Implemented:**
+- Added immutable vector, scale, and meeting payload columns to benchmark-local
+  upsert journal entries, with a SQLite `CHECK` that rejects payload-less
+  upserts.
+- Captures a canonical upper bound before publishing; replay reads only journal
+  entries in `(published, bound]` and advances only through the last applied ID.
+- Added regressions for same-document concurrent updates, repeated upserts,
+  upsert/delete tombstones, and retained crash-replay behavior.
+**Implementation:**
+- Files: `frontend/src-tauri/tests/vector_backend_benchmark.rs`,
+  `docs/hybrid-rag/task-1.r3a-journal-publication.md`, and this execution
+  record.
+- Approach: make every journal replay entry self-contained so later document
+  mutations cannot alter or invalidate bounded publication.
+**Not implemented:**
+- No production schema, migration, runtime backend, ANN, model, package, or
+  resource-cap change.
+**Why not implemented:**
+- This corrects only the benchmark fixture that supplies Sprint 2's journal
+  contract; production persistence belongs to Sprint 2.
+**Verification:**
+- Independent deterministic vector suite - pass, 13/13.
+- Independent 250k release matrix - pass: p95 `61.1 ms`, recall@150 `1.0000`,
+  steady `1133.8 MiB`, and combined peak `1316.9 MiB`.
+- Rust format/check and `git diff --check` - pass; the highest valid recorded
+  R3a peak remains `1319.9 MiB`, inside the 1.30 GiB cap by 11.3 MiB.
+**Rollback:**
+- Restore the prior benchmark fixture/report; no production state, dependency,
+  migration, or runtime behavior exists to roll back.
+**Decisions and follow-ups:**
+- Final code and architecture reviews approve. Sprint 2 must carry
+  journal-carried immutable upsert payloads or an equivalently correct,
+  revision-addressable replay contract; Sprint 1 still needs its hosted root
+  Windows workflow evidence before close.
 
 ### Task Entry Template
 
@@ -1988,10 +2380,118 @@ not edited; this entry records the user decision that resolved its stop.)
 
 ### Code Review
 
-**Reviewer:** Pending
-**Verdict:** Pending
-**Findings:** Pending
-**Required follow-ups:** Pending
+**Reviewer:** `reviewer` (`SPR1-HR-CR-20260825`)
+**Verdict:** Changes requested
+**Findings:**
+- **Blocker — the release/CI changes are in an inert nested workflow.** Git's
+  repository root is the parent of `upstream/`, so the edited
+  `upstream/.github/workflows/build-windows.yml:498-513,652-662` is not loaded
+  by GitHub Actions. The active workflow remains
+  `../.github/workflows/build-windows.yml:88-91,247-250` on floating `stable`
+  and has no model staging step. Consequently CI does not exercise Rust 1.88.0
+  and a clean release checkout can package only the ignored bundle placeholder,
+  not the verified model artifacts. This directly contradicts the repository-
+  root workflow authority recorded at `docs/hybrid-rag/architecture.md:65-70`
+  and `docs/hybrid-rag/sprint-1-quality-gates.md:1309-1313`.
+- **Blocker — the mandatory Windows reference-inference gate is absent.** Even
+  the edited inert workflow goes directly from hash staging at
+  `.github/workflows/build-windows.yml:660-662` to sidecar/Tauri builds; it
+  never runs tokenizer, embedding, or reranker inference from the staged
+  resource layout. The normative pre-Sprint-2 gate requires all three and
+  stable reference outputs (`docs/hybrid-rag/architecture.md:1686-1697`). Hash
+  verification proves provenance, not ONNX/tokenizer compatibility.
+- **Blocker — the claimed 1.30 GiB rebuild peak was not measured in the
+  required simultaneous state.** The harness explicitly omits both model
+  sessions (`frontend/src-tauri/tests/vector_backend_benchmark.rs:11-14`),
+  observes a 703.5 MiB process peak while loading two snapshots without them,
+  then reports 1296.5 MiB by adding the retained session figure to raw vector
+  payload sizes only (`:1383-1396,1501-1531`). `load_snapshot` also uses
+  `fetch_all` before constructing the contiguous snapshot (`:689-718`), so
+  transient SQLite rows/BLOBs and snapshot metadata/capacity are real parts of
+  the measured path but absent from the approval arithmetic. The narrow rebuild
+  ceiling and Task 1.4 matrix require old snapshot + shadow + delta + active
+  sessions together (`docs/hybrid-rag/architecture.md:94-152`;
+  `docs/hybrid-rag/sprint-1-quality-gates.md:1232-1237,1274-1277`). Exact
+  latency still passes and ANN remains the wrong RAM remedy, but activation at
+  the approved scale is not proven.
+- **Should-fix — manifest validation is not fail-closed against incompatible
+  bundle contracts.** `frontend/src-tauri/src/model_bundle.rs:161-213` accepts
+  arbitrary nonempty model IDs/revisions/prefixes/pooling, either normalization
+  and truncation side, and any listed quantization; `:300-317` does not bind an
+  ONNX repo/revision to approved artifacts or pinned source URLs. The exact-
+  production assertions at `:1080-1133` are tests only and are not run by the
+  release workflow. In addition, staging copies every unmanifested file from a
+  prior bundle into the signed package without hashing it
+  (`frontend/src-tauri/scripts/stage-retrieval-models.ps1:121-133`). A changed
+  but schema-valid manifest or stale extra resource can therefore pass the
+  build/package path instead of being rejected as an incompatible package.
+- **Should-fix — embedding-export redistribution provenance is incomplete.**
+  The packaged ONNX artifact comes from the separate
+  `Xenova/multilingual-e5-base` export
+  (`frontend/src-tauri/resources/retrieval/model-bundle.manifest.json:9-12,54-61`),
+  while the only embedding license entry attributes the upstream
+  `intfloat/multilingual-e5-base` model (`:125-136`). The packaged MIT text
+  still contains generic `<year> <copyright holders>` placeholders
+  (`frontend/src-tauri/resources/retrieval/licenses/e5-base-MIT.txt:1-12`). A
+  hash-pinned generic template does not establish the export repository's
+  redistribution authority or retain an applicable copyright notice.
+- **Should-fix — the exact-backend crash/compaction proof uses document IDs as
+  snapshot row indexes.** `base_scan_mask` writes `mask[doc_id]` at
+  `frontend/src-tauri/tests/vector_backend_benchmark.rs:212-225`, although
+  compaction and SQLite reload preserve sparse IDs while changing row
+  positions (`:327-370,689-718`). The crash test deletes IDs 50-52, reloads the
+  shortened snapshot, then compares two overlays using the same flawed mask
+  (`:970-1032`), so it can hide unrelated rows and still pass. That does not
+  prove the recorded deletion/replay strategy; add a sparse-ID regression and
+  compare replay results with canonical expected documents independently of
+  the implementation under test.
+- **Should-fix — the canonical benchmark still encodes the superseded 1.25 GiB
+  transient verdict.** `frontend/src-tauri/tests/vector_backend_benchmark.rs:1520-1529`
+  reports the measured 1296.5 MiB two-snapshot state as `FAIL`, while the
+  approved contract permits this specific state through 1.30 GiB
+  (`docs/hybrid-rag/architecture.md:149-152`). The review rerun reproduced that
+  failure label. Encode and assert the distinct steady-state and approved
+  transient ceilings so benchmark output cannot contradict the sprint record.
+**Required follow-ups:**
+- `1.R1` — move the toolchain assertion, model cache/staging, and required
+  reference-inference gate into the actual repository-root Windows workflow;
+  verify a clean checkout produces a bundle containing all ten artifacts.
+- `1.R2` — make build/runtime manifest validation reject non-approved or
+  incoherent model/preprocessing/provenance contracts and unexpected staged
+  files; record the ONNX export's license authority and package the applicable
+  notice/attribution; add release-path mutation tests.
+- `1.R3` — repair the exact benchmark's ID-to-row handling and transient RAM
+  gate, measure active + shadow + delta + both sessions in one production-shaped
+  process, add sparse-ID post-compaction/crash-replay tests, and rerun the
+  release matrix before relying on its RAM/recovery evidence.
+**Remaining risks:** Fresh-cache network acquisition and installed-package
+resource discovery were not rerun in this review. The ignored 411 MiB local
+bundle is correctly excluded by `.gitignore:80-84`, but only the corrected
+active CI clean-checkout test can prove release packaging. No runtime consumer
+calls `parse_manifest`/`verify_artifacts` yet (`frontend/src-tauri/src/lib.rs:49`);
+that deliberate Sprint 2 integration remains a fail-closed implementation risk.
+**Verification:** Rust 1.88.0; focused manifest tests 19/19; vector tests 9/9;
+release 12k/50k/250k matrix passed with 250k warm-global p95 53.2 ms and exact
+recall@150 1.0000 (but emitted the transient-RAM `FAIL` above); Cargo check and
+rustfmt passed; frontend typecheck passed; Vitest 20 files/95 tests passed; `git
+diff --check` passed with existing line-ending warnings.
+**Files reviewed:** `.github/workflows/build-windows.yml`, `.gitignore`,
+`Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`,
+`frontend/src-tauri/Cargo.toml`, `frontend/src-tauri/src/lib.rs`,
+`frontend/src-tauri/src/model_bundle.rs`,
+`frontend/src-tauri/scripts/stage-retrieval-models.ps1`,
+`frontend/src-tauri/tauri.conf.json`,
+`frontend/src-tauri/tests/vector_backend_benchmark.rs`,
+`frontend/src-tauri/resources/retrieval/model-bundle.manifest.json`,
+`frontend/src-tauri/resources/retrieval/licenses/e5-base-MIT.txt`,
+`frontend/src-tauri/resources/retrieval/licenses/mmarco-mMiniLMv2-Apache-2.0.txt`,
+`frontend/src-tauri/resources/retrieval/bundle/README.md`,
+`docs/hybrid-rag/architecture.md`, `docs/hybrid-rag/sprint-1-quality-gates.md`,
+`docs/hybrid-rag/task-1.4-vector-backend.md`, and
+`docs/hybrid-rag/task-1.5-model-supply-chain.md`; active-workflow context:
+`../.github/workflows/build-windows.yml`. Unrelated user/main documentation
+changes in `docs/hybrid-rag/README.md` and
+`docs/notes-chat-improvement-execution.md` were preserved and excluded.
 
 ### Architecture Review
 
@@ -1999,9 +2499,701 @@ not edited; this entry records the user decision that resolved its stop.)
 cross-platform native runtime, and a decision that constrains every later
 sprint.
 
-**Reviewer:** Pending
-**Verdict:** Pending
-**Findings:** Pending
+**Reviewer:** `arch-reviewer` (`Sprint-1-Hybrid-RAG-architecture-review`)
+**Verdict:** Changes requested
+**Findings:**
+- **BLOCKER — the mandatory pre-Sprint-2 Windows reference-inference gate is
+  not present in CI.** The architecture requires the Windows runner to execute
+  tokenizer, embedding, and reranker inference from the staged resource layout
+  and compare platform-neutral reference results before Sprint 2
+  (`docs/hybrid-rag/architecture.md:1681-1697`). The workflow only stages and
+  hashes the bundle, then proceeds to the application build
+  (`.github/workflows/build-windows.yml:652-664`); it never runs the existing
+  Task 1.3 reference-inference harness. Local Task 1.3 evidence does not satisfy
+  the explicit CI-runner gate. Cheapest correction: reuse that focused
+  reference-inference check against `resources/retrieval/bundle` immediately
+  after staging; do not add a second inference implementation.
+- **BLOCKER — the 1.30 GiB rebuild result is arithmetic, not a measurement of
+  the required simultaneously resident state.** The benchmark explicitly does
+  not load either model session (`frontend/src-tauri/tests/vector_backend_benchmark.rs:11-14`),
+  loads all SQLite rows with `fetch_all` while constructing the shadow
+  (`frontend/src-tauri/tests/vector_backend_benchmark.rs:689-717`), and then
+  computes `1296.5 MiB` from two raw vector payloads plus a retained session
+  number (`frontend/src-tauri/tests/vector_backend_benchmark.rs:1501-1531`). Its
+  observed shadow-load process peak is instead reported without sessions
+  (`docs/hybrid-rag/task-1.4-vector-backend.md:161-166,195-204`). This omits
+  snapshot metadata/capacity and transient SQL row/BLOB allocations at the
+  narrow 1.30 GiB margin, contrary to the combined-envelope contract
+  (`docs/hybrid-rag/architecture.md:94-152`) and Task 1.4 matrix
+  (`docs/hybrid-rag/sprint-1-quality-gates.md:1232-1237,1274-1277`). Exact
+  latency still clearly passes and ANN remains the wrong RAM remedy, but the
+  rebuild activation limit handed to Sprint 2 is unproven. Cheapest correction:
+  stream the shadow load into the production-shaped contiguous allocation and
+  measure active snapshot + shadow + delta + both resident sessions in one
+  process; record and govern any additional transient allocation rather than
+  calling raw-payload arithmetic a measured peak.
+- **HIGH — the package path does not enforce the approved bundle contract.**
+  The staging script validates version, paths, lengths, hashes, and duplicates
+  only (`frontend/src-tauri/scripts/stage-retrieval-models.ps1:46-63`), while
+  the exact model/revision/tensor/tokenizer assertions live only in a Rust unit
+  test (`frontend/src-tauri/src/model_bundle.rs:1080-1133`) that the Windows
+  packaging workflow does not run. A manifest changed to a different
+  hash-matching model can therefore be signed even though Sprint 2 is forbidden
+  to substitute the approved pair (`docs/hybrid-rag/architecture.md:507-539`).
+  Cheapest correction: run the existing focused production-manifest test in
+  the packaging job before staging; keep the script responsible for bytes and
+  the Rust validator responsible for the semantic contract.
+- **HIGH — redistribution evidence does not yet close the artifact trust
+  boundary.** The packaged embedding ONNX bytes come from the separate
+  `Xenova/multilingual-e5-base` export
+  (`frontend/src-tauri/resources/retrieval/model-bundle.manifest.json:9-12,54-61`),
+  but the sole embedding license entry attributes only the upstream
+  `intfloat/multilingual-e5-base` model
+  (`frontend/src-tauri/resources/retrieval/model-bundle.manifest.json:125-136`).
+  Its packaged MIT notice still contains literal `<year> <copyright holders>`
+  placeholders (`frontend/src-tauri/resources/retrieval/licenses/e5-base-MIT.txt:1-12`).
+  Hashing a generic template proves integrity, not that the required upstream
+  copyright notice and the exporter artifact's redistribution provenance were
+  retained. Record the ONNX export's license/provenance and package the actual
+  applicable notice/attribution before approving the bundle.
+- **MEDIUM — publication and package layout create avoidable recovery and
+  authority ambiguity.** Staging copies the manifest and licenses into the
+  bundle (`frontend/src-tauri/scripts/stage-retrieval-models.ps1:108-135`), but
+  Tauri also packages the source manifest and licenses as separate resources
+  (`frontend/src-tauri/tauri.conf.json:96-102`), leaving two signed copies for
+  Sprint 2 to choose between. In addition, a prior valid backup is deleted on
+  the next run before recovery (`frontend/src-tauri/scripts/stage-retrieval-models.ps1:65-69`),
+  despite the two-rename missing-directory window
+  (`frontend/src-tauri/scripts/stage-retrieval-models.ps1:137-150`). Use one
+  packaged bundle authority; if `bundle` is absent and one backup exists,
+  restore it before cleanup. This keeps the accepted single-publisher design
+  without adding a journal.
+- **Assumptions/risks:** the exact Rust 1.88.0 declarations are aligned across
+  both manifests, `rust-toolchain.toml`, and Windows CI
+  (`Cargo.toml:8-12`, `frontend/src-tauri/Cargo.toml:1-10`,
+  `rust-toolchain.toml:1-4`, `.github/workflows/build-windows.yml:498-513`). The
+  verifier is correctly not on startup, but Sprint 2 must invoke it exactly
+  once off Tokio worker threads immediately before first ORT session creation,
+  and convert failure to semantic-unavailable/FTS fallback
+  (`frontend/src-tauri/src/model_bundle.rs:265-285`;
+  `docs/hybrid-rag/architecture.md:1376-1394`). Reviewed staged binaries were
+  treated as generated build outputs: all ten present files matched manifest
+  byte lengths and SHA-256 locally, and the focused model-bundle suite passed
+  19/19; no CI run evidence was assumed.
+- **Reviewed files:** `.github/workflows/build-windows.yml`, `.gitignore`,
+  `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`,
+  `docs/hybrid-rag/{README.md,architecture.md,sprint-1-quality-gates.md,task-1.4-vector-backend.md,task-1.5-model-supply-chain.md}`,
+  `docs/notes-chat-improvement-execution.md`,
+  `frontend/src-tauri/{Cargo.toml,tauri.conf.json,scripts/stage-retrieval-models.ps1,src/lib.rs,src/model_bundle.rs,tests/vector_backend_benchmark.rs}`,
+  `frontend/src-tauri/resources/retrieval/model-bundle.manifest.json`, both
+  checked-in license files, `bundle/README.md`, and the ignored staged bundle's
+  ten manifest-managed artifacts (length/hash verification only for large
+  binary/tokenizer outputs).
+
+### Post-Remediation Architecture Review
+
+**Required because:** This re-review determines whether the Sprint 1 model
+supply-chain, exact-backend, recovery, resource-envelope, and Sprint 2 handoff
+remediations close the two prior review records.
+
+**Reviewer:** `arch-reviewer` (`SPR1-HR-AR-POST-20260825`)
+**Verdict:** Changes requested
+**Findings:**
+- **BLOCKER — the active root workflow contains the right gate but invokes the
+  staging script from the wrong repository-relative path.** GitHub Actions runs
+  a step at the checkout root unless `working-directory` is set. The active
+  workflow calls `./frontend/src-tauri/scripts/stage-retrieval-models.ps1`
+  without changing directory (`../.github/workflows/build-windows.yml:138-140`),
+  but the script is under `upstream/frontend/...`; the following Rust gates do
+  explicitly enter `upstream` (`../.github/workflows/build-windows.yml:142-156`).
+  A checkout-root path check confirms the invoked path is absent and the
+  `upstream/...` path exists. Therefore active CI stops before staging and never
+  reaches staged tokenizer/embedding/reranker inference, so the prior Windows
+  CI blocker is not yet resolved despite the correct exact-toolchain and
+  fail-closed inference machinery being present (`../.github/workflows/build-windows.yml:88-111,150-156`).
+- **RESOLVED — package authority, contract, provenance, and recovery now form
+  one fail-closed boundary.** Tauri packages only the bundle directory
+  (`frontend/src-tauri/tauri.conf.json:96-100`); manifest parsing binds the
+  exact selected models, exports, preprocessing, artifact paths/URLs, and
+  license authorities (`frontend/src-tauri/src/model_bundle.rs:289-516`); the
+  staged/published/recovered package shares one integrity gate and rejects
+  foreign, divergent, missing, corrupt, or placeholder-tampered content
+  (`frontend/src-tauri/scripts/stage-retrieval-models.ps1:82-130,321-330,396-415`).
+  The immutable E5 export/upstream chain and applicable Microsoft MIT notice
+  are retained in the managed bundle (`frontend/src-tauri/resources/retrieval/model-bundle.manifest.json:125-148`;
+  `frontend/src-tauri/resources/retrieval/licenses/e5-base-MIT-NOTICE.txt:4-61`).
+  The offline recovery self-test and all 21 focused Rust verifier tests passed
+  in this review.
+- **RESOLVED — exact sparse-ID and two-snapshot evidence now matches the
+  approved backend semantics.** Base masking keys every row by stable document
+  ID, and the independent crash/replay/compaction regression scores a canonical
+  expected map without sharing the mask helper
+  (`frontend/src-tauri/tests/vector_backend_benchmark.rs:161-184,238-254,1150-1297`).
+  The production-shaped envelope keeps active snapshot, streamed shadow,
+  delta/tombstones, and both warmed selected sessions alive in one process and
+  asserts separate 1.25 GiB steady/1.30 GiB transient limits
+  (`frontend/src-tauri/tests/vector_backend_benchmark.rs:1750-1754,1890-2010`).
+  The independent recorded peak is 1317.9 MiB, with exactly two snapshots and
+  13.3 MiB margin (`docs/hybrid-rag/task-1.r3-vector-envelope.md:94-169`). The
+  deterministic suite passed 10/10 in this review.
+- **RESOLVED WITH NARROW HANDOFF RISK — Sprint 2 has an authoritative exact
+  backend and rollback contract.** The architecture requires exact immutable
+  base + delta + tombstones, canonical journal replay, production
+  remeasurement, and activation blocking above 1.30 GiB
+  (`docs/hybrid-rag/architecture.md:934-958`); Sprint 2 requires pre-load bundle
+  verification/fallback and a production 250k rerun
+  (`docs/hybrid-rag/sprint-2-durable-local-index.md:274-333,482-569`). Rollback
+  remains lexical-first and derived-state-only, with old-binary rollback
+  correctly requiring a verified pre-upgrade database backup
+  (`docs/hybrid-rag/architecture.md:1742-1769`). Residual risk: the Sprint 2
+  file still uses generic “exact or exact+ANN” wording
+  (`docs/hybrid-rag/sprint-2-durable-local-index.md:494-505`); architecture
+  authority makes ANN unavailable, but the task should be read together with
+  the Sprint 1 addendum before dispatch.
+
+**Required follow-ups:**
+- Correct the active root staging step to run from `upstream/` (or invoke the
+  `upstream/frontend/...` path), then execute the actual root Windows workflow
+  through staged-bundle verification, reference inference, and Tauri packaging.
+- Do not change the model/runtime/package design for this blocker; the cheaper
+  correction is one workflow path/working-directory fix. Sprint 1 remains open
+  until the active run passes.
+
+**Assumptions/risks:** No successful GitHub-hosted run was available to assume;
+local staged inference and the previously recorded 250k release reruns remain
+evidence for their own mechanisms, not evidence that the active workflow can
+reach them. The 13.3 MiB transient margin is narrow, so Sprint 2's required
+production remeasurement remains activation-blocking. Runtime invocation of
+`parse_manifest`/`verify_artifacts` remains deliberately owned by Sprint 2 and
+must convert failure to semantic-unavailable/FTS fallback.
+
+**Reviewed files:** full `docs/hybrid-rag/architecture.md`; full
+`docs/hybrid-rag/sprint-1-quality-gates.md`; both prior review records in that
+sprint file; full reports `task-1.4-vector-backend.md`,
+`task-1.5-model-supply-chain.md`, `task-1.r1-active-ci.md`,
+`task-1.r2-package-provenance.md`, and `task-1.r3-vector-envelope.md`; Sprint 2
+handoff `sprint-2-durable-local-index.md`; all tracked and untracked Sprint 1
+implementation changes, including root and nested Windows workflows, Cargo
+manifests/lock/toolchain, `.gitignore`, Tauri resource configuration,
+`src/lib.rs`, `src/model_bundle.rs`, the staging script, production manifest,
+both license/notice files, bundle README, model/reference benchmark changes,
+exact-vector benchmark, Hybrid RAG README, and cross-program execution note.
+
+### Post-Remediation Code Review
+
+**Required because:** Re-verify that the `1.R1`/`1.R2`/`1.R3` remediation
+resolves every blocker and should-fix raised by both prior review records
+before Sprint 1 can close and Sprint 2 can begin.
+
+**Reviewer:** `reviewer` (`SPR1-HR-CR-POST-20260825b`, main-agent session
+`e762b0ec-7ac3-454d-a05c-49ad443b817d`)
+**Verdict:** Changes requested
+**Findings:**
+- **BLOCKER — the active root workflow still invokes the staging script from a
+  path that does not exist on the runner.** GitHub Actions runs each step from
+  the checkout root unless `working-directory` is set, and every other Rust/
+  bash step in this file explicitly enters `upstream/` before invoking a
+  crate-relative path
+  (`.github/workflows/build-windows.yml:135,147,155,166,217,264-266,345`). The
+  staging step at `.github/workflows/build-windows.yml:138-140` is
+  `shell: pwsh` with no `cd` and no `working-directory`, and calls
+  `./frontend/src-tauri/scripts/stage-retrieval-models.ps1`; the script exists
+  only under `upstream/frontend/src-tauri/scripts/stage-retrieval-models.ps1`,
+  as `Task 1.5`, `1.R1`, and `1.R2` all confirm. From the checkout root, a
+  local `ls` reproduces the failure (`No such file or directory`). PowerShell
+  will fail with "term is not recognized" before any HF fetch happens; the job
+  never reaches the ten-artifact assertion, the reference-inference gate, or
+  the Tauri build. This is the identical bug the prior architecture re-review
+  named as its sole blocker (`SPR1-HR-AR-POST-20260825`,
+  `docs/hybrid-rag/sprint-1-quality-gates.md:2523-2534`), and the
+  `task-1.r1-active-ci.md:53` command line records the same wrong path — the
+  `1.R1` worker never noticed it, and no later remediation touched it. Cheapest
+  correction: add `working-directory: upstream` to the staging step (or wrap
+  the script call in a multi-line pwsh block that runs `Set-Location upstream`
+  first), then execute one full active-workflow run through the ten-artifact
+  assertion, the reference-inference gate, and the Tauri build. Do not change
+  the script, manifest, or benchmark to accommodate the mispath.
+- **RESOLVED — prior CI-authority blocker (partial):** the actual root
+  `.github/workflows/build-windows.yml:88-111,132-136,142-156` now reads the
+  pinned channel from `upstream/rust-toolchain.toml`, installs it via
+  `dtolnay/rust-toolchain@master` with `toolchain: <parsed>`, and rejects any
+  active `rustc` version that drifts from the file; both jobs enforce the same
+  assertion. The check-in `rust-toolchain.toml:1-4` pins `1.88.0` and the
+  workspace/member manifests both declare `rust-version = "1.88"`. The nested
+  `upstream/.github/workflows/build-windows.yml` remains inert but is no
+  longer authoritative; only the staging-invocation blocker above prevents
+  the release gate from actually reaching its correct downstream steps.
+- **RESOLVED — prior "reference-inference gate absent" blocker
+  (implementation-side):** the active workflow contains a fail-closed
+  reference-inference step
+  (`.github/workflows/build-windows.yml:150-156`) that reuses the Task 1.3
+  harness against the staged bundle via `MEETLY_RAG_BUNDLE_DIR`. The
+  `upstream/frontend/src-tauri/tests/model_benchmark.rs:822-857` handler
+  correctly asserts the directory exists when the env var is set and drives
+  the same production-shape tokenizer/embedding/reranker path
+  (`model_benchmark.rs:521-570,649-670,742-763`) with the packaged
+  `models/embedding/model_int8.onnx` and `models/reranker/model_quint8_avx2.onnx`
+  layout. The gate's effect is real; it is only unreachable today because of
+  the upstream staging blocker above.
+- **RESOLVED — arithmetic-not-measurement RAM blocker.** The R3 harness loads
+  BOTH selected ONNX sessions from the staged bundle before any measurement
+  (`upstream/frontend/src-tauri/tests/vector_backend_benchmark.rs:1897-1938`),
+  warms each at batch-1×512, holds the reader-held active snapshot and live
+  delta, streams the shadow via `load_snapshot_streaming`
+  (`vector_backend_benchmark.rs:751-798`), and reads Windows peak working set
+  through `K32GetProcessMemoryInfo` at the "combined holding" sample
+  (`vector_backend_benchmark.rs:1960-1990`). The 1.30 GiB ceiling is asserted
+  in-process (`vector_backend_benchmark.rs:1983-1990`), the 1.25 GiB steady
+  cap is asserted after the shadow is dropped
+  (`vector_backend_benchmark.rs:2002-2006`), and both verdict labels are
+  encoded (`vector_backend_benchmark.rs:895-925`). The independent 250k rerun
+  documented at `docs/hybrid-rag/task-1.r3-vector-envelope.md:127-169`
+  produces `1317.9 MiB` peak / `1134.8 MiB` steady inside the approved
+  ceilings.
+- **RESOLVED — sparse-ID should-fix.** `base_scan_mask`
+  (`upstream/frontend/src-tauri/tests/vector_backend_benchmark.rs:244-254`)
+  iterates `(row, doc)` pairs and asks the overlay by stable document ID,
+  never by row index. `Snapshot::row_of_doc`/`meeting_of_doc_id`
+  (`vector_backend_benchmark.rs:178-184`) route every ID-to-row translation
+  through binary search, and `verify_no_leak`
+  (`vector_backend_benchmark.rs:1593-1615`) consumes `meeting_of_doc_id`
+  instead of `meeting_of_doc[doc as usize]`. The independent regression
+  `sparse_doc_ids_survive_delete_compaction_and_crash_replay`
+  (`vector_backend_benchmark.rs:1150-1297`) scores expected outputs from a
+  canonical expected-document map without touching `base_scan_mask`, and
+  compares them to the mask+scan pipeline after replay and after compaction;
+  R3's mutation proof confirms restoring the old ID-indexed mask fails it.
+- **RESOLVED — superseded 1.25 GiB transient verdict.** Distinct
+  `BAND_MAX_BYTES` (1.25 GiB steady) and `TRANSIENT_MAX_BYTES` (1.30 GiB
+  transient) constants govern separate assertions and printed verdicts
+  (`vector_backend_benchmark.rs:14-19,71-75,895-925`); the previous label that
+  called an approved state `FAIL` is gone.
+- **RESOLVED — manifest fail-closed / package-authority should-fix.**
+  `parse_manifest` runs `validate_approved_contract` after schema validation
+  (`upstream/frontend/src-tauri/src/model_bundle.rs:186-292,295-517`), binding
+  every field of the selected pair — model IDs and revisions, ONNX export
+  repo/revision/quantization, dimensions, prefixes, pooling, normalization,
+  tokenizer type/truncation, artifact paths, exact per-artifact pinned
+  revision-resolve URLs, and both license authorities — to the approved
+  constants at the top of the file. The 20-case
+  `selected_contract_substitutions_fail_parsing` mutation
+  (`model_bundle.rs:1442-1581`) asserts that every substitution fails
+  parsing itself, not merely a downstream check. The active workflow runs
+  this validator before staging (`.github/workflows/build-windows.yml:132-136`),
+  and the packaging config now surfaces exactly one retrieval resource —
+  `resources/retrieval/bundle` — with the duplicate manifest/licenses entries
+  removed (`upstream/frontend/src-tauri/tauri.conf.json:95-102`).
+- **RESOLVED — embedding-export redistribution provenance.** The generic MIT
+  template is gone; the packaged notice
+  `licenses/e5-base-MIT-NOTICE.txt` (3289 bytes, sha256 pinned in the
+  manifest) documents the intfloat→Xenova→microsoft/unilm chain, carries the
+  actual `Copyright (c) Microsoft Corporation`, and is enforced by both the
+  manifest validator (`upstream/frontend/src-tauri/src/model_bundle.rs:62-68,458-483`)
+  and the checked-in-manifest test asserting the notice contains no template
+  placeholders (`upstream/frontend/src-tauri/src/model_bundle.rs:1656-1683`).
+- **RESOLVED — publication/recovery ambiguity.** The staging script keeps a
+  single reusable `Assert-PackageIntegrity` gate that verifies every
+  candidate package (staged, backup, published) by byte-length, SHA-256,
+  byte-identical manifest copy against the checked-in publication authority,
+  the pinned README placeholder, and rejection of unmanifested content
+  (`upstream/frontend/src-tauri/scripts/stage-retrieval-models.ps1:82-119`);
+  `Restore-CrashedPublication` runs BEFORE stale-dir cleanup and applies the
+  same gate before renaming a sole backup into `bundle/`
+  (`stage-retrieval-models.ps1:121-132,321-330`). Ambiguous multi-backup
+  states are refused, and the 10-family `-SelfTest`
+  (`stage-retrieval-models.ps1:134-295`) proves intact recovery,
+  missing/corrupt/foreign/README-less backup rejection, ambiguous-recovery
+  refusal, unmanifested/tampered-placeholder/divergent-manifest rejection,
+  and the clean-package control.
+**Should-fix (non-blocking) noted during this review:**
+- The `1.R1` report (`upstream/docs/hybrid-rag/task-1.r1-active-ci.md:53`)
+  transcribes the same wrong path the workflow uses. Update the report line
+  alongside the workflow fix so a future reviewer does not treat the report
+  as evidence that the invocation is correct.
+- `MEETLY_RAG_VERIFY_STAGED_BUNDLE`/`MEETLY_RAG_BUNDLE_DIR` failure paths do
+  the right thing in the harness but there is no negative CI job asserting
+  fail-closed behavior on the runner itself (i.e., a scheduled run with a
+  deliberately empty `bundle/` should still exit non-zero on the
+  ten-artifact assertion and reference-inference gate). Adding one after the
+  primary staging fix lands would prove the whole gate chain end-to-end and
+  guard against future silent regressions.
+**Required follow-ups:**
+- Fix the active root workflow's staging step to invoke the script from
+  `upstream/` (either `working-directory: upstream` on the step, or a
+  multi-line pwsh block that changes directory first). Execute one full
+  active `build-windows` run through the ten-artifact assertion, reference
+  inference, and Tauri packaging, and attach the run's URL/logs as evidence.
+- Correct `task-1.r1-active-ci.md:53` to reference the corrected invocation
+  in the same change.
+- Verify that fresh cache and warm cache both reach a published bundle
+  containing manifest + README + ten artifacts on the runner (no local-only
+  substitute).
+**Remaining risks:**
+- The measured transient rebuild peak has a ~14.9 MiB margin against the
+  1.30 GiB ceiling. Sprint 2 MUST re-measure under production allocation and
+  batch shapes; any true third resident snapshot or a larger reranker depth
+  can push it over. R3's assertion already fails loudly if that happens.
+- Nothing calls `parse_manifest`/`verify_artifacts` at application startup
+  yet (`upstream/frontend/src-tauri/src/lib.rs:49`); Sprint 2 must invoke
+  the verifier exactly once off Tokio worker threads immediately before the
+  first ORT session, and convert failure to `semantic-unavailable`/FTS
+  fallback per `architecture.md`.
+- Sprint 2's task description still carries generic "exact or exact+ANN"
+  wording; architecture authority forbids ANN as a RAM remedy, but the
+  Sprint 1 addendum should be re-read before Sprint 2 dispatch (this is a
+  Sprint 2 hygiene item, not a Sprint 1 blocker).
+- Session residency measurement is Windows-specific (K32GetProcessMemoryInfo);
+  the macOS/Linux targets remain deferred with the platforms themselves, so
+  the measurement basis is aligned with the release scope.
+**Verification performed in this review (documentation and static checks
+only — no fresh benchmark or CI run):**
+- Read full `upstream/docs/hybrid-rag/architecture.md`, full
+  `sprint-1-quality-gates.md` including the Code Review, Architecture Review,
+  and Post-Remediation Architecture Review records; read task reports 1.4,
+  1.5, 1.R1, 1.R2, 1.R3 end-to-end.
+- Inspected every uncommitted Sprint 1 tracked/untracked change: root and
+  nested `build-windows.yml`, `upstream/rust-toolchain.toml`, workspace and
+  Tauri `Cargo.toml`, `Cargo.lock`, `upstream/.gitignore`, `tauri.conf.json`,
+  `src/lib.rs`, `src/model_bundle.rs`,
+  `scripts/stage-retrieval-models.ps1`, `tests/model_benchmark.rs`,
+  `tests/vector_backend_benchmark.rs`,
+  `resources/retrieval/model-bundle.manifest.json`, both packaged license
+  notices, and the `bundle/README.md` placeholder. Unrelated user
+  documentation edits under `docs/hybrid-rag/README.md` and
+  `docs/notes-chat-improvement-execution.md` were preserved and excluded.
+- Reproduced the staging-invocation defect by resolving
+  `./frontend/src-tauri/scripts/stage-retrieval-models.ps1` against the
+  checkout root: the path does not exist; the same file resolves under
+  `upstream/frontend/src-tauri/scripts/`. This mirrors the mechanism the
+  prior architecture re-review identified.
+- No source, script, workflow, manifest, resource, or test file was edited
+  by this review; only this record is appended.
+**Files reviewed:** `.github/workflows/build-windows.yml`,
+`upstream/.github/workflows/build-windows.yml`, `upstream/.gitignore`,
+`upstream/Cargo.toml`, `upstream/Cargo.lock`, `upstream/rust-toolchain.toml`,
+`upstream/frontend/src-tauri/Cargo.toml`,
+`upstream/frontend/src-tauri/src/lib.rs`,
+`upstream/frontend/src-tauri/src/model_bundle.rs`,
+`upstream/frontend/src-tauri/scripts/stage-retrieval-models.ps1`,
+`upstream/frontend/src-tauri/tauri.conf.json`,
+`upstream/frontend/src-tauri/tests/vector_backend_benchmark.rs`,
+`upstream/frontend/src-tauri/tests/model_benchmark.rs`,
+`upstream/frontend/src-tauri/resources/retrieval/model-bundle.manifest.json`,
+`upstream/frontend/src-tauri/resources/retrieval/licenses/e5-base-MIT-NOTICE.txt`,
+`upstream/frontend/src-tauri/resources/retrieval/licenses/mmarco-mMiniLMv2-Apache-2.0.txt`,
+`upstream/frontend/src-tauri/resources/retrieval/bundle/README.md`,
+`upstream/docs/hybrid-rag/architecture.md`,
+`upstream/docs/hybrid-rag/sprint-1-quality-gates.md`,
+`upstream/docs/hybrid-rag/task-1.4-vector-backend.md`,
+`upstream/docs/hybrid-rag/task-1.5-model-supply-chain.md`,
+`upstream/docs/hybrid-rag/task-1.r1-active-ci.md`,
+`upstream/docs/hybrid-rag/task-1.r2-package-provenance.md`, and
+`upstream/docs/hybrid-rag/task-1.r3-vector-envelope.md`. Unrelated user/main
+documentation changes in `upstream/docs/hybrid-rag/README.md` and
+`upstream/docs/notes-chat-improvement-execution.md` were preserved and
+excluded from the review scope.
+
+### Post-Remediation Architecture Review
+
+**Required because:** Model supply chain, packaging authority, exact-backend
+semantics, resource-envelope contract, and the Sprint 2 handoff are decisions
+that constrain every later sprint; this re-review determines whether the
+`1.R1`/`1.R2`/`1.R3` remediation actually closes the two prior review records
+against `architecture.md`'s normative requirements.
+
+**Reviewer:** `arch-reviewer` (`SPR1-HR-AR-POST2-20260825`, main-agent session
+`e762b0ec-7ac3-454d-a05c-49ad443b817d`)
+**Verdict:** Changes requested
+**Findings:**
+- **BLOCKER — the mandatory pre-Sprint-2 Windows reference-inference gate
+  remains architecturally unreachable in active CI.** `architecture.md`
+  requires the Windows runner to fetch/verify model artifacts and execute
+  tokenizer, embedding, and reranker inference against the staged resource
+  layout before Sprint 2 (`docs/hybrid-rag/architecture.md:1712-1719`), and
+  the Task 1.5 spec pins the same authority
+  (`docs/hybrid-rag/sprint-1-quality-gates.md:1318-1322`). The active root
+  workflow now contains the correct gate machinery — pinned Rust 1.88.0 with
+  assertion, model cache, manifest-contract validation, staging, ten-artifact
+  assertion, and reference inference against `MEETLY_RAG_BUNDLE_DIR`
+  (`.github/workflows/build-windows.yml:88-156`) — but the staging step at
+  `.github/workflows/build-windows.yml:138-140` is `shell: pwsh` with no
+  `cd`/`working-directory` and calls
+  `./frontend/src-tauri/scripts/stage-retrieval-models.ps1`, while every
+  neighbouring bash/Rust step in the same job explicitly enters `upstream/`
+  before invoking a crate-relative path
+  (`.github/workflows/build-windows.yml:135,147,155,166,217,264-266,345`).
+  The script exists only at
+  `upstream/frontend/src-tauri/scripts/stage-retrieval-models.ps1`, so
+  PowerShell fails with "term is not recognized" before the ten-artifact
+  assertion and reference inference can run, and before the Tauri build
+  begins. This is the same defect the prior architecture re-review named as
+  its sole blocker (`SPR1-HR-AR-POST-20260825`,
+  `docs/hybrid-rag/sprint-1-quality-gates.md:2523-2534`), and it is
+  transcribed verbatim in the `1.R1` report
+  (`upstream/docs/hybrid-rag/task-1.r1-active-ci.md:53`) — no downstream task
+  touched it. Cheapest correction: add `working-directory: upstream` to the
+  step (or wrap the invocation in a multi-line pwsh block whose first line
+  is `Set-Location upstream`); do not weaken the script, manifest, or gate.
+  Sprint 1 remains open until an actual root `build-windows` run passes
+  through staging, ten-artifact assertion, reference inference, and Tauri
+  packaging with attached run URL/logs.
+- **RESOLVED — exact-toolchain contract now enforced at the CI authority.**
+  Both root-workflow jobs read `channel` from `upstream/rust-toolchain.toml`
+  with POSIX sed, install `dtolnay/rust-toolchain@master` at that channel,
+  then assert `rustc --version` matches; drift fails the job
+  (`.github/workflows/build-windows.yml:88-111,306-329`). The pinned channel
+  is `1.88.0` (`upstream/rust-toolchain.toml:1-4`) and both manifests declare
+  `rust-version = "1.88"` (`upstream/Cargo.toml:8-11`,
+  `upstream/frontend/src-tauri/Cargo.toml:5-10`), matching the Task 1.5
+  MSRV evidence and the `architecture.md` toolchain contract addendum
+  (`docs/hybrid-rag/architecture.md:1730-1740`). No floating `stable`
+  remains in the active workflow.
+- **RESOLVED — singular signed bundle authority.** Tauri packages exactly
+  one retrieval resource, `resources/retrieval/bundle`
+  (`upstream/frontend/src-tauri/tauri.conf.json:95-102`); the duplicated
+  manifest and licenses resource entries flagged by the prior architecture
+  review are gone. `architecture.md` "Package Authority And Provenance"
+  requires the staged bundle to be the only packaged retrieval authority
+  and to reject unmanifested content
+  (`docs/hybrid-rag/architecture.md:499-506`); the staging script enforces
+  exactly that through one reusable `Assert-PackageIntegrity` gate applied
+  to staged, backup, and published states
+  (`upstream/frontend/src-tauri/scripts/stage-retrieval-models.ps1:82-119,321-330,395-415`).
+- **RESOLVED — fail-closed manifest contract binding the approved pair.**
+  `parse_manifest` now runs `validate_approved_contract` after schema
+  validation and binds every architecture-mandated identity — bundle ID,
+  chunker version, both model IDs and revisions, ONNX export
+  repo/revision/quantization, dimensions, prefixes, pooling, normalization,
+  tokenizer type/truncation/revision-to-export-revision equality, exact
+  artifact path sets per component, per-artifact pinned revision-resolve
+  URLs, and both license authorities
+  (`upstream/frontend/src-tauri/src/model_bundle.rs:186-292,295-517`). The
+  20-case `selected_contract_substitutions_fail_parsing` mutation
+  (`upstream/frontend/src-tauri/src/model_bundle.rs:1442-1581`) proves that
+  every substitution named by `architecture.md`'s approved bundle contract
+  (`docs/hybrid-rag/architecture.md:525-539`) fails parsing itself, not just
+  a downstream assertion. The active workflow runs the validator via
+  `cargo test --lib model_bundle` before staging
+  (`.github/workflows/build-windows.yml:132-136`); the parser is not on the
+  startup path yet (correct for Sprint 1) and will be wired off Tokio worker
+  threads in Sprint 2.
+- **RESOLVED — immutable provenance and applicable notice.** The generic
+  MIT template is gone; the packaged notice is
+  `licenses/e5-base-MIT-NOTICE.txt` (3289 bytes, sha256 pinned in the
+  manifest) documenting the intfloat→Xenova→microsoft/unilm chain with the
+  actual `Copyright (c) Microsoft Corporation`. The manifest validator
+  enforces the notice path, source URL, resource, attribution, and SPDX
+  values against the constants at the top of the file
+  (`upstream/frontend/src-tauri/src/model_bundle.rs:62-68,458-483`); a
+  separate checked-in-manifest test asserts the on-disk notice contains no
+  `<year>`/`<copyright holders>` placeholders and carries the required
+  copyright and export attributions
+  (`upstream/frontend/src-tauri/src/model_bundle.rs:1656-1683`). This meets
+  the `architecture.md` "Package Authority And Provenance" chain of custody
+  (`docs/hybrid-rag/architecture.md:499-515`).
+- **RESOLVED — validated recovery with full package integrity.**
+  `Restore-CrashedPublication` runs BEFORE stale-dir cleanup and applies
+  the same `Assert-PackageIntegrity` gate as staging/publish before
+  renaming a sole backup into `bundle/`
+  (`upstream/frontend/src-tauri/scripts/stage-retrieval-models.ps1:121-132,321-330`);
+  multiple backups refuse ambiguous recovery. The 10-family `-SelfTest`
+  proves intact recovery, missing/corrupt/foreign/README-less backup
+  rejection, ambiguous-recovery refusal, unmanifested/tampered-placeholder/
+  divergent-manifest rejection, and the clean-package control
+  (`upstream/frontend/src-tauri/scripts/stage-retrieval-models.ps1:134-295`).
+  The design remains single-publisher without a journal, consistent with
+  `architecture.md`'s recovery contract.
+- **RESOLVED — exact backend sparse-ID semantics.** `base_scan_mask` now
+  iterates `(row, doc)` pairs from `snap.doc_ids` and asks the overlay by
+  stable document ID
+  (`upstream/frontend/src-tauri/tests/vector_backend_benchmark.rs:244-254`);
+  `Snapshot::row_of_doc`/`Snapshot::meeting_of_doc_id` centralize every
+  ID-to-row translation
+  (`upstream/frontend/src-tauri/tests/vector_backend_benchmark.rs:178-184`);
+  `verify_no_leak` consumes `meeting_of_doc_id`
+  (`upstream/frontend/src-tauri/tests/vector_backend_benchmark.rs:1593-1615`).
+  The independent regression
+  `sparse_doc_ids_survive_delete_compaction_and_crash_replay`
+  (`upstream/frontend/src-tauri/tests/vector_backend_benchmark.rs:1150-1297`)
+  scores the expected side from a canonical expected-document map (no shared
+  mask/index helper) after crash-window replay and after compaction, and R3
+  reports a documented mutation-check proof that restoring the old
+  ID-indexed mask fails the regression
+  (`docs/hybrid-rag/task-1.r3-vector-envelope.md:52-75`). This preserves
+  `architecture.md`'s "Exact Option" invariants that stable identity
+  survives compaction and reload
+  (`docs/hybrid-rag/architecture.md:899-917`).
+- **RESOLVED — actual active+shadow+delta+both-session envelope with valid
+  two-snapshot semantics.** The R3 harness loads BOTH selected ONNX
+  sessions from the staged bundle before any measurement, warms each at
+  batch-1×512, holds the reader-held active snapshot plus the live
+  delta/tombstone overlay, streams the shadow via
+  `load_snapshot_streaming` with exact-capacity reservation and bounded
+  4,096-row chunks, and reads the Windows process peak working set at the
+  combined-holding sample; the 1.30 GiB transient ceiling and the 1.25 GiB
+  steady band are asserted in-process
+  (`upstream/frontend/src-tauri/tests/vector_backend_benchmark.rs:751-798,1897-2010`).
+  The `[envelope-transient]` line explicitly states "exactly two snapshots
+  held" and the ceiling is guarded by
+  `TRANSIENT_MAX_BYTES`/`BAND_MAX_BYTES` constants
+  (`upstream/frontend/src-tauri/tests/vector_backend_benchmark.rs:14-19,71-75,895-925`).
+  The independent 250k rerun records `1317.9 MiB` peak and `1134.8 MiB`
+  steady with a `13.3 MiB` margin
+  (`docs/hybrid-rag/task-1.r3-vector-envelope.md:127-169`), matching the
+  approved 2026-08-24 architecture amendment
+  (`docs/hybrid-rag/architecture.md:944-958`). A true third resident
+  snapshot or any higher peak still fails loudly as
+  `[blocked-resource-envelope]`.
+- **RESOLVED WITH NARROW HANDOFF RISK — Sprint 2 exact backend contract and
+  rollback story.** `architecture.md`'s "Approved Exact Backend Contract"
+  hands Sprint 2 an immutable base + delta + tombstones + publication
+  journal, measured initial limits (150 candidates, 2 scan permits, queue
+  8, 250 ms pause, 128-doc update batch, ≤2% compaction threshold), and
+  the requirement to re-measure under production allocation and to block
+  activation above 1.30 GiB (`docs/hybrid-rag/architecture.md:934-958`).
+  Sprint 2's task list must be read alongside this addendum before
+  dispatch; the prior architecture re-review flagged that Sprint 2's file
+  still carries generic "exact or exact+ANN" wording
+  (`docs/hybrid-rag/sprint-1-quality-gates.md:2569-2573`). Rollback stays
+  ordered lexical-first, then pause, then rebuild, then disable-semantic
+  ship, then binary rollback against a verified pre-upgrade DB backup
+  (`docs/hybrid-rag/architecture.md:1742-1769`); no destructive path was
+  introduced. Runtime invocation of `parse_manifest`/`verify_artifacts`
+  remains deferred to Sprint 2 and must be called exactly once off Tokio
+  worker threads immediately before first ORT session creation, converting
+  failure to semantic-unavailable/FTS fallback
+  (`upstream/frontend/src-tauri/src/model_bundle.rs:530-552`;
+  `docs/hybrid-rag/architecture.md:1400-1416`).
+**Required follow-ups:**
+- Fix the active root workflow's staging step to run from `upstream/`
+  (`working-directory: upstream` on the step, or a multi-line pwsh block
+  that changes directory first); execute one full active `build-windows`
+  run through staging, ten-artifact assertion, reference inference, and
+  Tauri packaging on a runner, and attach the run URL/logs as evidence.
+- Correct `upstream/docs/hybrid-rag/task-1.r1-active-ci.md:53` in the same
+  change so the report cannot be cited as evidence that the invocation is
+  correct.
+- Do not change the model/runtime/package/manifest/benchmark contracts for
+  this blocker; the failure is one workflow path/working-directory fix.
+**Assumptions/risks:**
+- The measured `1317.9 MiB` transient peak has a `13.3 MiB` margin against
+  the approved `1.30 GiB` ceiling; Sprint 2 MUST re-measure under
+  production allocation and reranker batch shapes and the assertion will
+  fail loudly if a true third snapshot or a larger reranker depth pushes
+  the peak over.
+- No successful GitHub-hosted `build-windows` run is available as evidence
+  yet; local reference-inference and 250k reruns prove their own mechanisms
+  but do not prove the active workflow can reach them until the blocker is
+  fixed.
+- Sprint 2 must own the run-once, off-Tokio-thread invocation of
+  `parse_manifest`/`verify_artifacts` before first ORT session creation and
+  the failure-to-FTS fallback conversion.
+- macOS/Linux workflows remain deferred with the platforms themselves; the
+  Windows-only measurement basis is aligned with the release scope.
+- The prior review's Sprint 2 documentation-wording risk still applies: the
+  Sprint 2 file's "exact or exact+ANN" phrasing must be read against the
+  Sprint 1 addendum that makes ANN unavailable as a RAM remedy.
+**Reviewed files:** `.github/workflows/build-windows.yml`,
+`upstream/.github/workflows/build-windows.yml`, `upstream/.gitignore`,
+`upstream/Cargo.toml`, `upstream/Cargo.lock`, `upstream/rust-toolchain.toml`,
+`upstream/frontend/src-tauri/Cargo.toml`,
+`upstream/frontend/src-tauri/src/lib.rs`,
+`upstream/frontend/src-tauri/src/model_bundle.rs`,
+`upstream/frontend/src-tauri/scripts/stage-retrieval-models.ps1`,
+`upstream/frontend/src-tauri/tauri.conf.json`,
+`upstream/frontend/src-tauri/tests/vector_backend_benchmark.rs`,
+`upstream/frontend/src-tauri/tests/model_benchmark.rs`,
+`upstream/frontend/src-tauri/resources/retrieval/model-bundle.manifest.json`,
+`upstream/frontend/src-tauri/resources/retrieval/licenses/e5-base-MIT-NOTICE.txt`,
+`upstream/frontend/src-tauri/resources/retrieval/licenses/mmarco-mMiniLMv2-Apache-2.0.txt`,
+`upstream/frontend/src-tauri/resources/retrieval/bundle/README.md`, full
+`upstream/docs/hybrid-rag/architecture.md`, full
+`upstream/docs/hybrid-rag/sprint-1-quality-gates.md` including the Code
+Review, Architecture Review, Post-Remediation Architecture Review, and
+Post-Remediation Code Review records above, and reports
+`upstream/docs/hybrid-rag/task-1.4-vector-backend.md`,
+`upstream/docs/hybrid-rag/task-1.5-model-supply-chain.md`,
+`upstream/docs/hybrid-rag/task-1.r1-active-ci.md`,
+`upstream/docs/hybrid-rag/task-1.r2-package-provenance.md`, and
+`upstream/docs/hybrid-rag/task-1.r3-vector-envelope.md`. Unrelated user/main
+documentation changes in `upstream/docs/hybrid-rag/README.md` and
+`upstream/docs/notes-chat-improvement-execution.md` were preserved and
+excluded from the review scope.
+
+### Final Post-Correction Code Review
+
+**Required because:** This is the final Sprint 1 code review after accepted
+corrective tasks `1.R1a` and `1.R3a`, covering every uncommitted Sprint 1
+change and the prior review findings.
+
+**Reviewer:** `reviewer` (`SPR1-HR-CR-FINAL-20260825`)
+**Verdict:** Approve
+**Findings:**
+- **Blocker:** None.
+- **Should-fix:** None. The active repository-root workflow now invokes the
+  staging script through the correct checkout-root-relative path, then performs
+  staged artifact verification and reference inference before either sidecar or
+  Tauri packaging (`.github/workflows/build-windows.yml:132-159,209-220`). The
+  invocation itself passes the exact checkout-root `-SelfTest`; no hosted run is
+  claimed.
+- **Journal correctness:** The benchmark schema requires every upsert journal
+  row to carry vector, scale, and meeting payload (`frontend/src-tauri/tests/vector_backend_benchmark.rs:552-562`), and `commit_updates` writes document state,
+  immutable journal payload, and canonical advancement in one SQLite
+  transaction (`frontend/src-tauri/tests/vector_backend_benchmark.rs:619-675`).
+  `publish_pending` captures canonical first; `publish_through` reads only
+  `(published, bound]` journal rows from one transaction snapshot, applies the
+  last bounded operation per document, and advances published only to the last
+  applied row (`frontend/src-tauri/tests/vector_backend_benchmark.rs:687-793`).
+  The regressions independently cover same-document commits beyond the bound,
+  repeated upserts, same/cross-transaction upsert-delete trails, crash replay,
+  and sparse IDs (`frontend/src-tauri/tests/vector_backend_benchmark.rs:1163-1585`).
+- **Regression context:** The approved model contract remains fail-closed and
+  hash-verifies every managed artifact (`frontend/src-tauri/src/model_bundle.rs:186-292,530-550`); staging/recovery share the complete package-integrity gate
+  (`frontend/src-tauri/scripts/stage-retrieval-models.ps1:82-130,321-415`);
+  Tauri has one retrieval resource authority
+  (`frontend/src-tauri/tauri.conf.json:96-100`); and Rust declarations remain
+  aligned at 1.88/1.88.0 (`Cargo.toml:8-12`,
+  `frontend/src-tauri/Cargo.toml:1-10`, `rust-toolchain.toml:1-4`). No new
+  privacy, analytics, secret-logging, or remote runtime path was introduced.
+- **Documentation:** The governing conservative peak is consistently recorded
+  as `1319.9 MiB`; the latest independent matrix is correctly distinguished as
+  p95 `61.1 ms`, recall@150 `1.0000`, steady `1133.8 MiB`, and peak
+  `1316.9 MiB` (`docs/hybrid-rag/sprint-1-quality-gates.md:364,1516,2341-2344`;
+  `docs/hybrid-rag/architecture.md:938-946`). Earlier `1.4`, `1.R3`, and worker
+  `1.R3a` measurements remain labeled as historical runs rather than replacing
+  the governing/latest-independent figures.
+
+**Evidence gap (not a source-code defect):** The corrected root workflow is
+uncommitted and unpushed, so GitHub-hosted staging, cache restore/fetch, staged
+verification, reference inference, and Tauri packaging cannot yet have run.
+Per the approved Sprint requirement, Sprint 1 close still requires one
+successful hosted root `build-windows` execution and attached run evidence; the
+absence of that run does not change this code-review verdict
+(`docs/hybrid-rag/task-1.r1a-ci-path.md:72-84`).
+
+**Residual risks:** The conservative rebuild result has only about `11.3 MiB`
+of headroom, so Sprint 2's production-shaped remeasurement remains
+activation-blocking. The journal here is benchmark-local; Sprint 2 must retain
+self-contained payloads or an equivalently immutable revision-addressed replay
+contract and a single serialized publisher. Runtime invocation of bundle
+verification and semantic-unavailable/FTS fallback also remains intentionally
+owned by Sprint 2.
+
+**Verification:** Reviewer rerun: deterministic vector suite 13/13, exact
+checkout-root staging `-SelfTest`, `cargo fmt --check`, `cargo check`, and `git
+diff --check` all passed (only pre-existing CRLF warnings). Accepted independent
+evidence additionally records the release-gated 250k matrix passing at p95
+`61.1 ms`, recall@150 `1.0000`, steady `1133.8 MiB`, and peak `1316.9 MiB`.
+
+**Files reviewed:** all uncommitted Sprint 1 tracked and untracked changes:
+root and nested Windows workflows; `.gitignore`; Cargo manifests, lockfile, and
+toolchain; `src/lib.rs`, `src/model_bundle.rs`, staging script, Tauri config,
+model/vector benchmarks, production manifest/licenses/bundle placeholder; and
+all changed/new Hybrid RAG reports, README, architecture, quality-gate, and
+cross-program execution documentation.
+
+**Follow-up tasks created:** None. The hosted workflow run is an outstanding
+Sprint approval-gate action, not a corrective source task.
 
 ## Approval Gates
 

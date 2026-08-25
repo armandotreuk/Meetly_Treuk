@@ -1,0 +1,62 @@
+multilingual-e5-base - copyright notice and MIT permission notice
+=================================================================
+
+Scope of this notice
+--------------------
+Covers every packaged embedding artifact derived from multilingual-e5-base:
+
+  Upstream model: intfloat/multilingual-e5-base
+    https://huggingface.co/intfloat/multilingual-e5-base/tree/d128750597153bb5987e10b1c3493a34e5a4502a
+  Packaged ONNX export: Xenova/multilingual-e5-base @
+    1ec9243030a27d1a115d5c340572074c125b58b2, a mechanical Transformers.js /
+    Optimum ONNX conversion of the upstream model, redistributed byte-unmodified:
+    https://huggingface.co/Xenova/multilingual-e5-base/raw/1ec9243030a27d1a115d5c340572074c125b58b2/README.md
+
+Redistribution authority
+------------------------
+The upstream model card declares license mit at the pinned revision (YAML front
+matter of
+https://huggingface.co/intfloat/multilingual-e5-base/raw/d128750597153bb5987e10b1c3493a34e5a4502a/README.md ,
+also exposed as the repository license tag at that same revision). The MIT
+grant covers use, copying, modification, merging, publication, distribution,
+and sublicensing, conditioned on retention of the copyright notice and the
+permission notice reproduced below. Neither the upstream model repository nor
+the export repository ships a standalone LICENSE file, and the export
+repository declares no separate license of its own: its card identifies the
+upstream model as its sole base ("base_model: intfloat/multilingual-e5-base"),
+so the packaged conversion redistributes under the upstream MIT grant.
+
+Copyright notice
+----------------
+The E5 development repository associated by that model card, and by the
+technical report the card cites (Multilingual E5 Text Embeddings: A Technical
+Report, arXiv 2402.05672), is microsoft/unilm ("e5";
+https://raw.githubusercontent.com/microsoft/unilm/59d0483d235a338fcd57a1f90d4a199a39e0f401/e5/README.md ).
+Its LICENSE file, pinned at
+https://raw.githubusercontent.com/microsoft/unilm/0e31c7c09737df491e7ff74ded19614b884c52b4/LICENSE ,
+carries this copyright notice:
+
+    Copyright (c) Microsoft Corporation
+
+MIT permission notice
+---------------------
+The canonical MIT text with the above copyright line substituted for the
+template placeholders:
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

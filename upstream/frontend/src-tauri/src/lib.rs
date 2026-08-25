@@ -46,6 +46,7 @@ pub mod database;
 pub mod export;
 pub mod groq;
 pub mod mcp;
+pub mod model_bundle;
 pub mod notifications;
 pub mod ollama;
 pub mod onboarding;

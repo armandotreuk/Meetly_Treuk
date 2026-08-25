@@ -85,16 +85,75 @@ jobs:
           pnpm install --no-frozen-lockfile
 
       # --- Rust setup ---
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Read pinned Rust channel from rust-toolchain.toml
+        id: rust-channel
+        shell: bash
+        run: |
+          CHANNEL=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' upstream/rust-toolchain.toml)
+          if [ -z "$CHANNEL" ]; then echo "no channel found in upstream/rust-toolchain.toml"; exit 1; fi
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.rust-channel.outputs.channel }}
           targets: x86_64-pc-windows-msvc
+
+      - name: Verify active toolchain matches rust-toolchain.toml
+        shell: pwsh
+        run: |
+          $expected = (Select-String -Path upstream/rust-toolchain.toml -Pattern 'channel\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $actual = ((rustc --version) -replace '^rustc ', '') -replace ' \(.*\)$', ''
+          Write-Host "rust-toolchain.toml channel: $expected; active rustc: $actual"
+          if ($actual -ne $expected) {
+            Write-Error "Active toolchain $actual does not match the pinned $expected"
+            exit 1
+          }
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
           workspaces: "upstream -> upstream/target"
           key: windows-x64-cpu-v2
+
+      # --- Task 1.R1 release gate: staged retrieval bundle + reference inference ---
+      - name: Locate retrieval model cache directory
+        shell: bash
+        run: echo "MODEL_CACHE_PATH=$LOCALAPPDATA\\meetily\\model-cache" >> $GITHUB_ENV
+
+      - name: Cache retrieval model artifacts
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.MODEL_CACHE_PATH }}
+          key: windows-x64-retrieval-models-${{ hashFiles('upstream/frontend/src-tauri/resources/retrieval/model-bundle.manifest.json') }}
+          restore-keys: |
+            windows-x64-retrieval-models-
+
+      - name: Validate checked-in production manifest contract
+        shell: bash
+        run: |
+          cd upstream
+          cargo test --manifest-path frontend/src-tauri/Cargo.toml --lib model_bundle
+
+      - name: Stage and verify retrieval model bundle
+        shell: pwsh
+        run: ./upstream/frontend/src-tauri/scripts/stage-retrieval-models.ps1
+
+      - name: Assert staged bundle contains all verified artifacts
+        shell: bash
+        env:
+          MEETLY_RAG_VERIFY_STAGED_BUNDLE: "1"
+        run: |
+          cd upstream
+          cargo test --manifest-path frontend/src-tauri/Cargo.toml --lib staged_production_bundle -- --nocapture
+
+      - name: Reference inference on staged production bundle (tokenizer + embedding + reranker)
+        shell: bash
+        env:
+          MEETLY_RAG_BUNDLE_DIR: ${{ github.workspace }}/upstream/frontend/src-tauri/resources/retrieval/bundle
+        run: |
+          cd upstream
+          cargo test --manifest-path frontend/src-tauri/Cargo.toml --test model_benchmark reference_inference_is_stable_finite_and_dimensional -- --nocapture
 
       # --- Build ---
       - name: Build llama-helper sidecar
@@ -244,10 +303,30 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Read pinned Rust channel from rust-toolchain.toml
+        id: rust-channel
+        shell: bash
+        run: |
+          CHANNEL=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' upstream/rust-toolchain.toml)
+          if [ -z "$CHANNEL" ]; then echo "no channel found in upstream/rust-toolchain.toml"; exit 1; fi
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.rust-channel.outputs.channel }}
           targets: x86_64-pc-windows-msvc
+
+      - name: Verify active toolchain matches rust-toolchain.toml
+        shell: pwsh
+        run: |
+          $expected = (Select-String -Path upstream/rust-toolchain.toml -Pattern 'channel\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $actual = ((rustc --version) -replace '^rustc ', '') -replace ' \(.*\)$', ''
+          Write-Host "rust-toolchain.toml channel: $expected; active rustc: $actual"
+          if ($actual -ne $expected) {
+            Write-Error "Active toolchain $actual does not match the pinned $expected"
+            exit 1
+          }
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
