@@ -187,8 +187,11 @@ highest valid same-process rebuild peak `1319.9 MiB` remains inside the
 explicitly approved 1.30 GiB transient ceiling. **Task `1.5` is complete:** the
 selected bundle is hash/license pinned and staged before packaging, and its lazy
 verifier is ready for Sprint 2 integration. `1.R1a` corrected the active CI
-staging path and `1.R3a` corrected bounded journal publication; final reviews
-approve, and a successful hosted Windows build remains before Sprint close.
+ staging path and `1.R3a` corrected bounded journal publication; final reviews
+ approve, and hosted Windows run
+ [`#31`](https://github.com/armandotreuk/Meetly_Treuk/actions/runs/32907148572)
+ passed all required gates. **The user approved Sprint 1 closure on 2026-08-25.**
+ Sprint 2 remains subject to its approved PRD and explicit batch-approval gate.
 
 Current execution state:
 

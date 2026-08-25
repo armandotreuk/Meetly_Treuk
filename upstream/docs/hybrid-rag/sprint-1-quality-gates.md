@@ -68,6 +68,8 @@ self-contained upsert payloads correctly across same-document concurrent
  sidecar build; manifest contract; staged-bundle verification; staged
  tokenizer/embedding/reranker reference inference; full Tauri CPU packaging;
  and MSI/NSIS artifact uploads. The hosted-root requirement is complete.
+ **The user approved Sprint 1 closure on 2026-08-25.** Sprint 2 remains subject
+ to its approved PRD and explicit batch-approval gate.
 
 Task `1.3`'s *resource* findings survive and are retained — admissibility
 arithmetic, measured pair RAM, derived disk, per-pair reranker latency,
