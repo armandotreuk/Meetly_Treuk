@@ -61,8 +61,13 @@ is 1317.9 MiB on independent rerun, within the approved 1.30 GiB transient
 ceiling. **Batch 13 `1.R1a` and `1.R3a` are complete:** the active CI staging
 path resolves from the checkout root, and bounded journal publication replays
 self-contained upsert payloads correctly across same-document concurrent
-updates. Final code and architecture reviews approve; one hosted root Windows
-workflow execution remains required before Sprint close.
+ updates. Final code and architecture reviews approve. **Hosted closure evidence
+ (2026-08-25):** root Windows workflow run
+ [`#31`](https://github.com/armandotreuk/Meetly_Treuk/actions/runs/32907148572)
+ at `8a7d566` passed both jobs: pinned-toolchain cargo check; llama-helper
+ sidecar build; manifest contract; staged-bundle verification; staged
+ tokenizer/embedding/reranker reference inference; full Tauri CPU packaging;
+ and MSI/NSIS artifact uploads. The hosted-root requirement is complete.
 
 Task `1.3`'s *resource* findings survive and are retained — admissibility
 arithmetic, measured pair RAM, derived disk, per-pair reranker latency,
