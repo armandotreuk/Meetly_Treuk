@@ -129,6 +129,16 @@ jobs:
           restore-keys: |
             windows-x64-retrieval-models-
 
+      # Cargo downloads/overwrites registry sources on a fresh cache, so fetch
+      # first, then restore the vendored whisper-rs-sys bindings into it
+      # (mirrors upstream/.github/workflows/ci.yml).
+      - name: Fetch deps and restore whisper-rs-sys bindings
+        shell: bash
+        run: |
+          cd upstream
+          cargo fetch
+          node frontend/scripts/restore-whisper-bindings.mjs
+
       - name: Validate checked-in production manifest contract
         shell: bash
         run: |
@@ -333,6 +343,13 @@ jobs:
         with:
           workspaces: "upstream -> upstream/target"
           key: windows-x64-check-v2
+
+      - name: Fetch deps and restore whisper-rs-sys bindings
+        shell: bash
+        run: |
+          cd upstream
+          cargo fetch
+          node frontend/scripts/restore-whisper-bindings.mjs
 
       - name: Cargo check workspace
         id: cargo-check
