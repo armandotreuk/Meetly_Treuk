@@ -139,33 +139,6 @@ jobs:
           cargo fetch
           node frontend/scripts/restore-whisper-bindings.mjs
 
-      - name: Validate checked-in production manifest contract
-        shell: bash
-        run: |
-          cd upstream
-          cargo test --manifest-path frontend/src-tauri/Cargo.toml --lib model_bundle
-
-      - name: Stage and verify retrieval model bundle
-        shell: pwsh
-        run: ./upstream/frontend/src-tauri/scripts/stage-retrieval-models.ps1
-
-      - name: Assert staged bundle contains all verified artifacts
-        shell: bash
-        env:
-          MEETLY_RAG_VERIFY_STAGED_BUNDLE: "1"
-        run: |
-          cd upstream
-          cargo test --manifest-path frontend/src-tauri/Cargo.toml --lib staged_production_bundle -- --nocapture
-
-      - name: Reference inference on staged production bundle (tokenizer + embedding + reranker)
-        shell: bash
-        env:
-          MEETLY_RAG_BUNDLE_DIR: ${{ github.workspace }}/upstream/frontend/src-tauri/resources/retrieval/bundle
-        run: |
-          cd upstream
-          cargo test --manifest-path frontend/src-tauri/Cargo.toml --test model_benchmark reference_inference_is_stable_finite_and_dimensional -- --nocapture
-
-      # --- Build ---
       - name: Build llama-helper sidecar
         id: llama-helper
         shell: bash
@@ -216,6 +189,33 @@ jobs:
           echo "llama-helper build failed with exit code ${{ steps.llama-helper.outputs.llama_helper_exit_code }}"
           exit 1
 
+      - name: Validate checked-in production manifest contract
+        shell: bash
+        run: |
+          cd upstream
+          cargo test --manifest-path frontend/src-tauri/Cargo.toml --lib model_bundle
+
+      - name: Stage and verify retrieval model bundle
+        shell: pwsh
+        run: ./upstream/frontend/src-tauri/scripts/stage-retrieval-models.ps1
+
+      - name: Assert staged bundle contains all verified artifacts
+        shell: bash
+        env:
+          MEETLY_RAG_VERIFY_STAGED_BUNDLE: "1"
+        run: |
+          cd upstream
+          cargo test --manifest-path frontend/src-tauri/Cargo.toml --lib staged_production_bundle -- --nocapture
+
+      - name: Reference inference on staged production bundle (tokenizer + embedding + reranker)
+        shell: bash
+        env:
+          MEETLY_RAG_BUNDLE_DIR: ${{ github.workspace }}/upstream/frontend/src-tauri/resources/retrieval/bundle
+        run: |
+          cd upstream
+          cargo test --manifest-path frontend/src-tauri/Cargo.toml --test model_benchmark reference_inference_is_stable_finite_and_dimensional -- --nocapture
+
+      # --- Build ---
       - name: Build Tauri app (CPU, no GPU acceleration)
         id: tauri-build
         shell: bash
