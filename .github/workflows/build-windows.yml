@@ -168,9 +168,9 @@ jobs:
           echo "=== LLAMA-HELPER BUILD EXIT CODE: $RC ==="
           cat "$LOG"
           if [ "$RC" -ne 0 ]; then exit 0; fi
-          # Copy to sidecar location (Tauri expects binaries/llama-helper on Windows, .exe appended automatically)
+          # Copy to sidecar location (Tauri externalBin expects the target-triple-qualified name)
           mkdir -p frontend/src-tauri/binaries
-          cp "$SRC" "frontend/src-tauri/binaries/llama-helper"
+          cp "$SRC" "frontend/src-tauri/binaries/llama-helper-$TARGET$EXT"
           ls -la frontend/src-tauri/binaries/
 
       - name: Upload llama-helper build output (for public debugging)
