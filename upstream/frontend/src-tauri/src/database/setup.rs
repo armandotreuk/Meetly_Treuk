@@ -2,6 +2,7 @@ use log::info;
 use tauri::{AppHandle, Emitter, Manager};
 
 use super::manager::DatabaseManager;
+use crate::retrieval::worker::RetrievalLifecycle;
 use crate::state::AppState;
 
 /// Initialize database on app startup
@@ -31,8 +32,25 @@ pub async fn initialize_database_on_startup(app: &AppHandle) -> Result<(), Strin
             .map_err(|e| format!("Failed to initialize database manager: {}", e))?;
 
         app.manage(AppState { db_manager });
+        attach_retrieval_worker(app);
         info!("Database initialized successfully");
     }
 
     Ok(())
+}
+
+/// Idempotently starts the shared retrieval index worker once database state
+/// exists. Called after AppState installation in all three paths (normal
+/// startup, fresh creation, legacy import); duplicate calls are no-ops.
+pub fn attach_retrieval_worker<R: tauri::Runtime>(app: &AppHandle<R>) {
+    let Some(lifecycle) = app.try_state::<RetrievalLifecycle>() else {
+        log::warn!("Retrieval lifecycle not managed; index worker not started");
+        return;
+    };
+    let Some(app_state) = app.try_state::<AppState>() else {
+        log::warn!("AppState not available; index worker not started");
+        return;
+    };
+    let pool = app_state.db_manager.pool().clone();
+    lifecycle.attach_database(pool);
 }

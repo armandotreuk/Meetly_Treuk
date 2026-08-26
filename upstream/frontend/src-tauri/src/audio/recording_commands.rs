@@ -846,6 +846,12 @@ pub async fn is_recording() -> bool {
     IS_RECORDING.load(Ordering::SeqCst)
 }
 
+/// Synchronous capture-state probe for background services that must pause
+/// during active recording (e.g. the retrieval index worker).
+pub fn is_recording_active() -> bool {
+    IS_RECORDING.load(Ordering::SeqCst)
+}
+
 /// Get recording statistics
 pub async fn get_transcription_status() -> TranscriptionStatus {
     TranscriptionStatus {

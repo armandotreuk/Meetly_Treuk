@@ -363,8 +363,11 @@ impl FtsRepository {
     /// Delete all FTS rows for a meeting and re-insert from current data.
     /// Called after transcript save or summary completion.
     pub async fn refresh_meeting(pool: &SqlitePool, meeting_id: &str) -> Result<(), sqlx::Error> {
-        // Remove old rows
-        Self::remove_meeting(pool, meeting_id).await?;
+        let mut tx = pool.begin().await?;
+        sqlx::query("DELETE FROM meeting_fts WHERE meeting_id = ?")
+            .bind(meeting_id)
+            .execute(&mut *tx)
+            .await?;
 
         // Re-insert transcripts
         sqlx::query(
@@ -381,7 +384,7 @@ impl FtsRepository {
             "#,
         )
         .bind(meeting_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
 
         // Re-insert summaries
@@ -396,13 +399,13 @@ impl FtsRepository {
             JOIN meetings m ON sp.meeting_id = m.id
             LEFT JOIN meeting_folders f ON m.folder_id = f.id
             WHERE sp.meeting_id = ?1
-              AND sp.result IS NOT NULL
+               AND sp.result IS NOT NULL AND json_valid(sp.result)
               AND json_extract(sp.result, '$.markdown') IS NOT NULL
               AND json_extract(sp.result, '$.markdown') != ''
             "#,
         )
         .bind(meeting_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
 
         // Re-insert notes
@@ -421,9 +424,10 @@ impl FtsRepository {
             "#,
         )
         .bind(meeting_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
 
+        tx.commit().await?;
         info!("Refreshed FTS index for meeting {}", meeting_id);
         Ok(())
     }
@@ -895,6 +899,34 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].chunk_type, "summary");
+    }
+
+    #[tokio::test]
+    async fn malformed_summary_json_does_not_erase_the_meeting_projection() {
+        let pool = setup_fts_db().await;
+        sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES ('m-json', 'Meeting', 'now', 'now')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO transcripts (id, meeting_id, transcript, timestamp) VALUES ('t-json', 'm-json', 'durable lexical text', '10:00')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO summary_processes (meeting_id, template_id, status, created_at, updated_at, result) VALUES ('m-json', 'summary', 'completed', 'now', 'now', '{not json')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        FtsRepository::refresh_meeting(&pool, "m-json")
+            .await
+            .unwrap();
+        assert_eq!(
+            FtsRepository::search(&pool, "durable lexical", 10, Some("m-json"))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

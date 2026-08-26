@@ -57,6 +57,7 @@ mod tests {
 
     #[test]
     fn test_module_integration() {
+        let _lock = acquire_template_test_lock();
         // Test that we can load all built-in templates
         let ids = list_template_ids();
         assert!(!ids.is_empty());
@@ -74,6 +75,7 @@ mod tests {
 
     #[test]
     fn test_template_metadata() {
+        let _lock = acquire_template_test_lock();
         let templates = list_templates();
         assert!(!templates.is_empty());
 

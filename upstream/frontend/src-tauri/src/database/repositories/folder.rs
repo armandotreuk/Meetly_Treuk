@@ -175,47 +175,53 @@ impl FolderRepository {
             return Err(SqlxError::Protocol("folder id cannot be empty".to_string()));
         }
 
-        let mut conn = pool.acquire().await?;
-        let mut tx = conn.begin().await?;
+        // Transactional part runs in its own scope so the acquired
+        // connection returns to the pool before the best-effort FTS queries
+        // below; holding it across them starves a max-1 pool.
+        let subtree: Vec<(String,)> = {
+            let mut conn = pool.acquire().await?;
+            let mut tx = conn.begin().await?;
 
-        // Collect id + all descendants.
-        let subtree: Vec<(String,)> = sqlx::query_as(
-            r#"
-            WITH RECURSIVE subtree(id) AS (
-                SELECT id FROM meeting_folders WHERE id = ?
-                UNION ALL
-                SELECT f.id FROM meeting_folders f
-                JOIN subtree s ON f.parent_id = s.id
+            // Collect id + all descendants.
+            let subtree: Vec<(String,)> = sqlx::query_as(
+                r#"
+                WITH RECURSIVE subtree(id) AS (
+                    SELECT id FROM meeting_folders WHERE id = ?
+                    UNION ALL
+                    SELECT f.id FROM meeting_folders f
+                    JOIN subtree s ON f.parent_id = s.id
+                )
+                SELECT id FROM subtree
+                "#,
             )
-            SELECT id FROM subtree
-            "#,
-        )
-        .bind(id)
-        .fetch_all(&mut *tx)
-        .await?;
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
 
-        if subtree.is_empty() {
-            tx.rollback().await?;
-            return Ok(false);
-        }
+            if subtree.is_empty() {
+                tx.rollback().await?;
+                return Ok(false);
+            }
 
-        // Detach all meetings in the subtree -> "Sem pasta".
-        for (fid,) in &subtree {
-            sqlx::query("UPDATE meetings SET folder_id = NULL WHERE folder_id = ?")
-                .bind(fid)
-                .execute(&mut *tx)
-                .await?;
-        }
+            // Detach all meetings in the subtree -> "Sem pasta".
+            for (fid,) in &subtree {
+                sqlx::query("UPDATE meetings SET folder_id = NULL WHERE folder_id = ?")
+                    .bind(fid)
+                    .execute(&mut *tx)
+                    .await?;
+            }
 
-        // Delete folder rows.
-        for (fid,) in &subtree {
-            sqlx::query("DELETE FROM meeting_folders WHERE id = ?")
-                .bind(fid)
-                .execute(&mut *tx)
-                .await?;
-        }
+            // Delete folder rows.
+            for (fid,) in &subtree {
+                sqlx::query("DELETE FROM meeting_folders WHERE id = ?")
+                    .bind(fid)
+                    .execute(&mut *tx)
+                    .await?;
+            }
 
-        tx.commit().await?;
+            tx.commit().await?;
+            subtree
+        };
         info!(
             "Deleted folder {} and {} descendants; affected meetings -> Sem pasta",
             id,
@@ -416,5 +422,60 @@ mod tests {
             .await
             .unwrap();
         assert!(!ok, "should refuse unknown folder id");
+    }
+
+    /// Regression: the post-commit best-effort FTS updates must run with the
+    /// transaction connection already released, or a max-1 pool waits out its
+    /// whole acquire timeout inside delete_with_cascade.
+    #[tokio::test]
+    async fn delete_with_cascade_returns_promptly_on_one_connection_pool() {
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        use std::str::FromStr;
+
+        let options = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("connect one-connection sqlite");
+        sqlx::query(
+            r#"
+            CREATE TABLE meeting_folders (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                parent_id TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE meetings (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                folder_path TEXT,
+                folder_id TEXT
+            );
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create schema");
+        seed_meeting(&pool, "m-1").await;
+        let folder = FolderRepository::create(&pool, "Work", None).await.unwrap();
+        assert!(
+            FolderRepository::set_meeting_folder(&pool, "m-1", Some(&folder.id))
+                .await
+                .unwrap()
+        );
+
+        let deleted = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            FolderRepository::delete_with_cascade(&pool, &folder.id),
+        )
+        .await
+        .expect("delete_with_cascade must not starve a max-1 pool")
+        .expect("delete succeeds");
+        assert!(deleted);
     }
 }

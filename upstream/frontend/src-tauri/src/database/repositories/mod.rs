@@ -3,6 +3,7 @@ pub mod folder;
 pub mod fts;
 pub mod meeting;
 pub mod meeting_notes;
+pub mod retrieval;
 pub mod setting;
 pub mod summary;
 pub mod templates;

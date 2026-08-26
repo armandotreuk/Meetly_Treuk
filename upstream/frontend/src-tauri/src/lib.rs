@@ -53,6 +53,7 @@ pub mod onboarding;
 pub mod openai;
 pub mod openrouter;
 pub mod parakeet_engine;
+pub mod retrieval;
 pub mod security;
 pub mod state;
 pub mod summary;
@@ -572,6 +573,20 @@ pub fn run() {
             //     });
             // }
 
+            // Create the one detached retrieval lifecycle before any database
+            // exists; it idempotently attaches after each database
+            // installation path below, is shared with MCP by clone, and must
+            // be shut down before the database pool closes.
+            let retrieval_bundle_root = _app
+                .handle()
+                .path()
+                .resource_dir()
+                .ok()
+                .map(|dir| retrieval::model::bundle_dir(&dir));
+            _app.manage(retrieval::worker::RetrievalLifecycle::new(
+                retrieval::worker::LifecycleConfig::production(retrieval_bundle_root),
+            ));
+
             // Initialize database (handles first launch detection and conditional setup)
             tauri::async_runtime::block_on(async {
                 database::setup::initialize_database_on_startup(&_app.handle()).await
@@ -876,6 +891,11 @@ pub fn run() {
             audio::import::start_import_audio_command,
             audio::import::cancel_import_command,
             audio::import::is_import_in_progress_command,
+            // Retrieval index status/rebuild/pause contract (Task 2.5)
+            retrieval::commands::retrieval_index_status,
+            retrieval::commands::retrieval_rebuild_index,
+            retrieval::commands::retrieval_cancel_rebuild,
+            retrieval::commands::retrieval_set_index_paused,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -888,6 +908,15 @@ pub fn run() {
                 tauri::RunEvent::Exit => {
                     log::info!("Application exiting, cleaning up resources...");
                     tauri::async_runtime::block_on(async {
+                        // Cancel and join retrieval model work BEFORE the
+                        // database pool closes so nothing publishes after
+                        // teardown.
+                        if let Some(lifecycle) =
+                            _app_handle.try_state::<retrieval::worker::RetrievalLifecycle>()
+                        {
+                            lifecycle.shutdown().await;
+                        }
+
                         // Clean up database connection and checkpoint WAL
                         if let Some(app_state) = _app_handle.try_state::<state::AppState>() {
                             log::info!("Starting database cleanup...");

@@ -19,6 +19,9 @@ pub struct McpState {
     pub pool: SqlitePool,
     pub app_data_dir: Option<std::path::PathBuf>,
     pub client: reqwest::Client,
+    /// Clone of the process-wide retrieval lifecycle. MCP shares the Tauri
+    /// runtime instead of constructing duplicate workers or model sessions.
+    pub retrieval: Option<crate::retrieval::worker::RetrievalLifecycle>,
 }
 
 // ---------- JSON-RPC request/response ----------
@@ -362,9 +365,12 @@ pub fn spawn_from_app<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     use tauri::Manager;
     if let Some(state) = app.try_state::<crate::state::AppState>() {
         let pool = state.db_manager.pool().clone();
+        let retrieval = app
+            .try_state::<crate::retrieval::worker::RetrievalLifecycle>()
+            .map(|lifecycle| lifecycle.inner().clone());
         let app_data_dir = app.path().app_data_dir().ok();
         tauri::async_runtime::spawn(async move {
-            start_server(pool, app_data_dir, None).await;
+            start_server(pool, app_data_dir, None, retrieval).await;
         });
     } else {
         tracing::warn!("AppState not available, MCP server not started");
@@ -375,12 +381,14 @@ pub async fn start_server(
     pool: SqlitePool,
     app_data_dir: Option<std::path::PathBuf>,
     port: Option<u16>,
+    retrieval: Option<crate::retrieval::worker::RetrievalLifecycle>,
 ) {
     let port = port.unwrap_or(DEFAULT_PORT);
     let state = McpState {
         pool,
         app_data_dir,
         client: reqwest::Client::new(),
+        retrieval,
     };
 
     let listener = match TcpListener::bind(format!("127.0.0.1:{}", port)).await {

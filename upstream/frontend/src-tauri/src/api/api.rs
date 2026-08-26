@@ -10,6 +10,7 @@ use crate::{
         repositories::{
             fts::{FtsRepository, FtsSearchResult},
             meeting::MeetingsRepository,
+            retrieval::RetrievalRepository,
             setting::SettingsRepository,
             transcript::TranscriptsRepository,
         },
@@ -908,6 +909,7 @@ pub async fn api_delete_api_key<R: Runtime>(
 pub async fn api_delete_meeting<R: Runtime>(
     _app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
+    retrieval: tauri::State<'_, crate::retrieval::worker::RetrievalLifecycle>,
     meeting_id: String,
     auth_token: Option<String>,
 ) -> Result<serde_json::Value, String> {
@@ -919,8 +921,27 @@ pub async fn api_delete_meeting<R: Runtime>(
 
     let pool = state.db_manager.pool();
 
+    let index = retrieval.index_service();
+    let active_generation = index.active_generation();
+    let stale_epoch = index.mark_stale();
     match MeetingsRepository::delete_meeting(pool, &meeting_id).await {
         Ok(true) => {
+            match active_generation {
+                Some(generation_id) => {
+                    match RetrievalRepository::publication_lag(pool, &generation_id).await {
+                        Ok(Some((canonical_change_id, published_change_id))) => {
+                            index.commit_stale(
+                                stale_epoch,
+                                &generation_id,
+                                canonical_change_id,
+                                Some(published_change_id),
+                            );
+                        }
+                        _ => index.commit_stale(stale_epoch, &generation_id, i64::MAX, None),
+                    }
+                }
+                _ => index.restore_stale(stale_epoch),
+            }
             log_info!("Successfully deleted meeting {}", meeting_id);
             Ok(serde_json::json!({
                 "status": "success",
@@ -928,6 +949,7 @@ pub async fn api_delete_meeting<R: Runtime>(
             }))
         }
         Ok(false) => {
+            index.restore_stale(stale_epoch);
             log_warn!("Meeting not found or already deleted: {}", meeting_id);
             Err(format!(
                 "Meeting not found or could not be deleted: {}",
@@ -935,6 +957,7 @@ pub async fn api_delete_meeting<R: Runtime>(
             ))
         }
         Err(e) => {
+            index.restore_stale(stale_epoch);
             log_error!("Error deleting meeting {}: {}", meeting_id, e);
             Err(format!("Failed to delete meeting: {}", e))
         }

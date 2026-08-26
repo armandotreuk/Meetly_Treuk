@@ -161,6 +161,9 @@ pub async fn import_and_initialize_database(
     // Update app state with the new manager
     app.manage(AppState { db_manager });
 
+    // Start the shared retrieval index worker now that database state exists
+    super::setup::attach_retrieval_worker(&app);
+
     info!("Legacy database imported and initialized successfully");
 
     // Start MCP server now that AppState is available (first-launch path)
@@ -189,6 +192,9 @@ pub async fn initialize_fresh_database(app: AppHandle) -> Result<(), String> {
     app.manage(AppState {
         db_manager: db_manager.clone(),
     });
+
+    // Start the shared retrieval index worker now that database state exists
+    super::setup::attach_retrieval_worker(&app);
 
     // Start MCP server now that AppState is available (first-launch path)
     crate::mcp::server::spawn_from_app(&app);
