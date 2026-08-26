@@ -556,6 +556,77 @@ retrieval-stage contamination, and exact-term no-regression. It did not test
 every gate for those configurations and MUST NOT be cited as proof that an
 alternative fully-passing configuration exists.
 
+### Prior-Model Retention Across Upgrade (2026-08-26)
+
+A vector generation is queryable only with the embedding model that produced
+its vectors. A bundled-model upgrade replaces the single packaged bundle in
+place, so at the restart that installs the upgrade the prior model's
+artifacts no longer exist. "Generation Activation" requires the prior active
+generation to stay queryable while the new shadow generation builds; without
+retention that requirement is unmet across exactly the restart it matters
+for, and the prior generation becomes stored, still pointed to by the
+singleton, and semantically unavailable.
+
+**Status: no prior bundle exists yet.** Only `meetily-retrieval-bundle-1` has
+ever shipped, so there is nothing to retain today and nothing in this
+subsection is implementable now. It becomes implementable in the release that
+introduces a second bundle; at that point the prior bundle is whichever one
+shipped immediately before it, and its identity, artifacts, byte lengths, and
+digests are read from its already-checked-in manifest. A prior-bundle
+identity MUST NEVER be authored, guessed, or reconstructed: if it is not
+already pinned in a shipped manifest, it is not a prior bundle.
+
+**Only the prior embedding engine is retained.** The cross-encoder scores
+`(question, evidence)` text pairs and has no dependency on which generation
+produced a hit, so the current reranker serves hits from either generation.
+Retention covers the prior embedding ONNX export and its tokenizer
+artifacts; it does not cover the prior reranker.
+
+**Retention lives inside package authority.** A transition release packages
+the current bundle and at most one immediately-prior bundle under
+`resources/retrieval/`, each with its own manifest and each validated
+against the approved contract. The approved-contract check becomes an
+ordered two-entry allowlist — one current bundle, at most one prior bundle —
+and the release after the transition drops the prior entry. Copying a prior
+bundle into app data remains forbidden: it would leave an unsigned, mutable
+model store outside "Package Authority And Provenance" and outside the
+pinned provenance chain, and the prior bundle would fail the current
+binary's own contract validation.
+
+**Query routing follows generation identity.** Query embedding is dispatched
+by the active generation's model identity. Index work is never dispatched to
+a retained prior engine: due-work selection continues to admit only
+generations whose model matches the current bundle, so the prior generation
+stops accepting updates the moment the upgrade lands. Meetings mutated
+during the rebuild window are therefore dirty against the prior generation
+and fall to FTS under the existing "Meeting dirty" rule, which is the
+already-approved behavior rather than a new exception.
+
+**Retention is bounded by the resource envelope.** Retention adds one
+resident embedding session for the duration of the rebuild, concurrent with
+the active and shadow snapshots the 1.30 GiB transient ceiling already
+covers. That combination is unmeasured; the approved ceiling was measured
+for two snapshots plus one session set. Retention MUST NOT be enabled until
+a measured peak for active + shadow snapshots plus current + prior embedding
+sessions is recorded and approved. The activation RAM gate MUST refuse to
+load the prior engine — degrading to FTS-only — rather than exceed the
+approved ceiling. A prior reranker session is never resident, and a third
+embedding session remains unapproved regardless.
+
+**Lexical fallback is required, not optional.** Retention is best-effort. An
+install that skips the transition release has no prior bundle; so does one
+whose prior bundle fails verification or is refused by the RAM gate. In each
+case semantic retrieval degrades to FTS-only until the new generation
+activates, reported as an explicit state. Prior-generation vectors MUST
+NEVER be scored against query embeddings produced by a different model.
+
+**Identity precondition.** Retention is meaningless unless the persisted
+model identity changes on every model change. Model identity MUST be derived
+from the full approved contract — bundle id, embedding model id, revision,
+quantization, dimensions, and chunker version — not from `bundleId` alone. A
+model swap that reuses an identity aliases the new model onto the prior
+generation, and there is then no prior generation to preserve.
+
 ## Semantic Document Model
 
 ### Meeting Profiles
@@ -889,11 +960,29 @@ shadow's staging/derived state and leaves a healthy active generation intact.
 Crash/restart resumes the shadow from revisions/staging; concurrent readers see
 the old active generation until one atomic pointer/snapshot switch.
 
+Across the restart that installs a bundled-model upgrade, the prior active
+generation stays queryable only while its own embedding engine is retained
+and admissible; see "Prior-Model Retention Across Upgrade". When it is not,
+the singleton keeps pointing at the prior generation, semantic retrieval
+reports itself unavailable, and every surface uses FTS until the new
+generation activates.
+
 Retain at most two complete generations. The previous generation becomes
 eligible for garbage collection only after the new active generation survives
 one clean application restart and one successful Fast hybrid query. Cleanup is
 idempotent and never removes the active generation, active snapshot, or a
 generation with unacknowledged journal changes.
+
+**Transitional clause (2026-08-26; expires at Sprint 3 close).** The Fast
+hybrid query surface does not exist before Sprint 3, so the
+successful-query condition above is unsatisfiable until then — and against
+the two-generation retention ceiling that makes manual rebuild a single-use
+operation and eventually dead-ends corrupt-active recovery. While no semantic
+query surface exists, that condition is satisfied instead by one clean
+application restart with the new generation active and its publication lag
+zero. The restart condition itself is never relaxed, and every other cleanup
+guard stands unchanged. When Sprint 3 lands the Fast hybrid path this clause
+is removed and the successful-query condition applies as originally written.
 
 ## Vector Search Backend
 
@@ -1403,6 +1492,8 @@ raw embeddings.
 |---|---|
 | Model resource missing/corrupt | Mark semantic unavailable, report diagnostics, use FTS. |
 | Tokenizer/model mismatch | Reject bundle, never publish vectors, use FTS. |
+| Prior-model bundle absent or unverifiable after upgrade | Report the prior generation's model as unavailable; use FTS-only until the new generation activates. Never score prior-generation vectors with another model's query embeddings. |
+| Prior-model engine refused by the RAM gate | Same as absent: FTS-only, reported as a measured envelope state, never partially resident. |
 | Initial backfill incomplete | Use FTS-only retrieval until complete activation. |
 | Meeting dirty | Exclude stale semantic rows for that meeting; allow current FTS/hydration. |
 | Vector BLOB malformed | Quarantine/requeue affected meeting; continue without that vector. |
@@ -1767,7 +1858,11 @@ Rollback principles, ordered from cheapest to most disruptive:
   separately approved migrator-policy change and old-binary startup test proves
   it.
 - Model upgrade activation retains the old semantic generation until the new
-  one is complete and validated.
+  one is complete and validated. Retention keeps that generation *queryable*
+  across the upgrading restart only when its own embedding engine is
+  retained and admissible; otherwise the old generation remains stored and
+  pointed to but semantically unavailable, and retrieval is FTS-only until
+  the new generation activates.
 - External lexical API contracts remain available.
 
 ## Test Strategy
@@ -1966,3 +2061,5 @@ Any failure to resolve one of these gates blocks Sprint 2 approval.
 | 2026-08-24 | Record that a lexicographic-minimizing tuning objective is stricter than a threshold gate, and require threshold semantics for Sprint 3 fusion tuning. | The final run's feasibility probe showed every gate-passing configuration paying `+2` semantic and `+2` overall Recall@3 misses against the tuned configuration — yet 28/30 semantic still clears its gate overwhelmingly against a 0/30 baseline, and ~133/135 still clears the 95% floor. An objective that minimizes misses lexicographically can therefore never trade two semantic misses for three critical rank-1 hits, even when every gate would accept that trade. Sprint 3 Task 3.2 must gate on thresholds and optimize only within the feasible set, or it inherits the same blind spot on real data. | Leave the objective shape unexamined and let Sprint 3 rediscover it. | User |
 | 2026-08-24 | Require a supervised admissibility proof for every zero-tolerance gate, on production-implementable channels only, before any model is benchmarked against it. | The same defect shape consumed two L-sized benchmark tasks in one sprint: `1.2` shipped an unwinnable corpus past a falsifiability-only rule, and the `1.2R` corpus certified three critical cases "solvable" via a hand-authored concept lexicon no production channel implements. An existence proof from fixture text (expected IDs as labels only) makes the trap structurally impossible to re-author. | User |
 | 2026-08-24 | Clarify two-snapshot rebuild accounting and approve a 1.30 GiB transient rebuild ceiling for the selected e5-base int8 bundle; select exact vector search and do not evaluate ANN. | A reader's `Arc` to the active snapshot does not allocate a third vector copy, so rebuild accounting is active plus shadow snapshots. The measured two-snapshot peak is 1296.5 MiB, inside the explicit 1.30 GiB transient ceiling; steady state remains 1113.4 MiB inside the existing approved 1-1.25 GiB band. Exact search passes p95 48.2 ms at 250k with recall@150 1.0000, while ANN would add memory and its only trigger (latency miss with passing RAM) did not occur. Any true third allocation or peak above 1.30 GiB remains blocking. | User |
+| 2026-08-26 | Preserve a prior bundled embedding model across an upgrading restart by packaging at most one prior bundle in the transition release, retaining only the embedding engine, and making FTS-only the required fallback when it is absent or inadmissible. | A vector generation is queryable only with the model that produced it, and the single packaged bundle is replaced in place on upgrade — so the prior active generation becomes unqueryable at the next restart (`retrieval/index.rs:564`, `:795` set and consume `model_mismatch`), while "Generation Activation" requires it to stay queryable while the shadow builds. Copying the prior bundle to app data would create an unsigned mutable model store outside package authority and outside the pinned provenance chain. The reranker needs no retention: it scores text pairs and is generation-independent, so retention is one embedding session, not two. Version-skipping installs make a lexical fallback unavoidable regardless, so it is specified rather than left implicit. No bundled-model upgrade has shipped yet, so this is forward-looking with no migration burden today. Enabling retention additionally requires a measured active + shadow snapshot plus current + prior embedding session peak, and the identity derivation fix; this decision approves neither by implication. | User |
+| 2026-08-26 | Amend the garbage-collection gate with a transitional clause: while no semantic query surface exists, the successful-Fast-hybrid-query condition is satisfied by one clean application restart with the new generation active and publication lag zero. The clause expires at Sprint 3 close. | The Fast hybrid surface is Sprint 3 work, so the condition as written is unsatisfiable in Sprint 2 — `retrieval/index.rs:1630` gates cleanup on a counter that only a Sprint 3 consumer increments. Against the two-generation retention ceiling that makes `retrieval_rebuild_index` succeed exactly once per install and eventually dead-ends the corrupt-active recovery path, which depends on registering a replacement generation. The restart condition is not relaxed and no other cleanup guard changes; only the query condition is substituted, and only while no query surface exists to satisfy it. | User |
