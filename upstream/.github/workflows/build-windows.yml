@@ -495,10 +495,22 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pnpm-store-
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.88.0
           targets: x86_64-pc-windows-msvc
+
+      - name: Verify active toolchain matches rust-toolchain.toml
+        shell: pwsh
+        run: |
+          $expected = (Select-String -Path rust-toolchain.toml -Pattern 'channel\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $actual = ((rustc --version) -replace '^rustc ', '') -replace ' \(.*\)$', ''
+          Write-Host "rust-toolchain.toml channel: $expected; active rustc: $actual"
+          if ($actual -ne $expected) {
+            Write-Error "Active toolchain $actual does not match the pinned $expected"
+            exit 1
+          }
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
@@ -636,6 +648,18 @@ jobs:
         run: |
           cd frontend
           pnpm install
+
+      - name: Cache retrieval model artifacts
+        uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/meetily/model-cache
+          key: windows-x64-retrieval-bundle-${{ hashFiles('frontend/src-tauri/resources/retrieval/model-bundle.manifest.json') }}
+          restore-keys: |
+            windows-x64-retrieval-bundle-
+
+      - name: Stage and verify retrieval model bundle
+        shell: pwsh
+        run: ./frontend/src-tauri/scripts/stage-retrieval-models.ps1
 
       - name: Build llama-helper sidecar
         shell: pwsh

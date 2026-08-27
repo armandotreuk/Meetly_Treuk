@@ -371,3 +371,11 @@ cargo check --manifest-path upstream/frontend/src-tauri/Cargo.toml
 - **`speaker` column already exists** on `transcripts` but stores audio source (`'mic'`/`'system'`), not speaker identity. F5 must use `speaker_label` / `speaker_id` instead (ARCHITECTURE.md updated).
 - **Telemetry and auto-update decisions are applied** — analytics call sites/module were removed for the fork and the Tauri auto-updater is disabled.
 - **Existing migrations** include licensing schema (`add_pro_license_custom_openai`, `add_grace_period_to_licensing`) — harmless with 0 rows, can be left in place.
+
+### Graphify-discovered technical debt (2026-08-27)
+
+- [ ] **Restore SQL graph coverage** — Graphify omitted 29 SQL files because its `tree_sitter_sql` extra is not installed. Add the parser support or an equivalent extraction path, then verify migrations participate in the graph.
+- [ ] **Resolve partial parser coverage** — Graphify reported syntax-recovery extraction for `upstream/backend/whisper-custom/server/httplib.h` and `upstream/frontend/src/components/About.tsx` (line 60). Determine whether the sources need correction or Graphify needs parser configuration so structural edges are complete.
+- [ ] **Define the monorepo graph boundary** — default Graphify entity deduplication rejects the current `src`/`src-tauri` multi-root layout. Document canonical scan roots and node-ID rules, then restore safe deduplication instead of relying on `dedup=False` for incremental merges.
+- [ ] **Investigate weak graph connectivity** — 1,231 nodes are weakly connected in the updated graph. Review the largest islands for missing structural/semantic edges or documentation gaps before treating graph-based architecture answers as complete.
+- [ ] **Make Graphify usage accounting reproducible** — semantic-worker token usage is not exposed by the current task runtime, so `graphify-out/cost.json` records zero tokens for the 641-file update. Capture per-worker usage or explicitly record unavailable accounting in future runs.
