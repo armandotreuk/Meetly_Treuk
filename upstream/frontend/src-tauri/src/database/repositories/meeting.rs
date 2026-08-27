@@ -283,12 +283,33 @@ async fn delete_meeting_with_transaction(
         .execute(&mut *transaction)
         .await?;
 
-    // 6. Remove denormalized snippets/navigation while preserving answer text.
+    // 6. Keep per-generation document_count exact across the derived-row
+    // cascade below: canonical replacements move that counter by incremental
+    // deltas (never an O(corpus) recount inside their write transaction), so
+    // a deletion performed outside that path applies its own decrement. The
+    // MAX(...) clamp only guards pre-existing legacy drift from going
+    // negative; steady state equals the true row count.
+    sqlx::query(
+        "UPDATE retrieval_generations
+         SET document_count = MAX(document_count - (
+                 SELECT COUNT(*) FROM retrieval_documents d
+                  WHERE d.meeting_id = ?1
+                    AND d.generation_id = retrieval_generations.generation_id), 0)
+         WHERE EXISTS (
+             SELECT 1 FROM retrieval_documents d2
+              WHERE d2.meeting_id = ?1
+                AND d2.generation_id = retrieval_generations.generation_id)",
+    )
+    .bind(meeting_id)
+    .execute(&mut *transaction)
+    .await?;
+
+    // 7. Remove denormalized snippets/navigation while preserving answer text.
     ChatRepository::remove_meeting_sources_in_transaction(transaction, meeting_id)
         .await
         .map_err(|error| SqlxError::Protocol(error.to_string()))?;
 
-    // 7. Finally, delete the meeting
+    // 8. Finally, delete the meeting
     let result = sqlx::query("DELETE FROM meetings WHERE id = ?")
         .bind(meeting_id)
         .execute(&mut *transaction)
@@ -320,6 +341,12 @@ mod tests {
             "CREATE TABLE summary_processes (meeting_id TEXT)",
             "CREATE TABLE meeting_notes (meeting_id TEXT)",
             "CREATE TABLE transcripts (meeting_id TEXT)",
+            // Minimal derived-retrieval subset mirroring the production
+            // schema, since deletion now adjusts generation document counts
+            // before the meeting cascade removes those rows.
+            "CREATE TABLE retrieval_generations (generation_id TEXT PRIMARY KEY NOT NULL, model_id TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'building', document_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT '')",
+            "CREATE TABLE retrieval_documents (id INTEGER PRIMARY KEY AUTOINCREMENT, generation_id TEXT NOT NULL REFERENCES retrieval_generations(generation_id) ON DELETE CASCADE, document_id TEXT NOT NULL, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, source_kind TEXT NOT NULL DEFAULT '', ordinal INTEGER NOT NULL DEFAULT 0, content TEXT NOT NULL DEFAULT '', content_hash BLOB NOT NULL DEFAULT x'', dimensions INTEGER NOT NULL DEFAULT 2 CHECK (dimensions > 0), vector_encoding TEXT NOT NULL DEFAULT 'int8', vector BLOB NOT NULL DEFAULT x'', source_revision INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT '', UNIQUE (generation_id, document_id))",
+            "CREATE INDEX retrieval_documents_by_meeting ON retrieval_documents(generation_id, meeting_id)",
             "CREATE TABLE chat_conversations (id TEXT PRIMARY KEY NOT NULL, meeting_id TEXT REFERENCES meetings(id) ON DELETE SET NULL, origin TEXT NOT NULL, scope_kind TEXT NOT NULL, scope_key TEXT NOT NULL, scope_data TEXT, promoted_from_live_scope_key TEXT, title TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
             "CREATE TABLE chat_messages (id TEXT PRIMARY KEY NOT NULL, conversation_id TEXT NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE, role TEXT NOT NULL, content TEXT NOT NULL, sources_json TEXT, is_error INTEGER DEFAULT 0, created_at TEXT NOT NULL)",
             "CREATE TRIGGER chat_conversations_orphan_deleted_meeting AFTER UPDATE OF meeting_id ON chat_conversations WHEN OLD.meeting_id IS NOT NULL AND NEW.meeting_id IS NULL AND NEW.origin != 'global' BEGIN UPDATE chat_conversations SET scope_kind = 'orphaned_meeting' WHERE id = NEW.id; END",

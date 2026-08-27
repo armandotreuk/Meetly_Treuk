@@ -73,6 +73,31 @@ const APPROVED_APACHE_RESOURCE: &str =
     "https://huggingface.co/cross-encoder/mmarco-mMiniLMv2-L12-H384-v1/tree/1427fd652930e4ba29e8149678df786c240d8825";
 const APPROVED_APACHE_SOURCE_URL: &str = "https://www.apache.org/licenses/LICENSE-2.0.txt";
 
+/// The manifest-pinned contract fields that discriminate the persisted
+/// retrieval model identity (the identity precondition in `architecture.md`
+/// "Prior-Model Retention Across Upgrade"). Mirrors the approved constants the
+/// parser enforces, so persisting this view keeps a single source of truth.
+pub struct ApprovedEmbeddingContract {
+    pub bundle_id: &'static str,
+    pub embedding_model_id: &'static str,
+    pub embedding_revision: &'static str,
+    pub onnx_export_revision: &'static str,
+    pub onnx_export_quantization: &'static str,
+    pub dimensions: u32,
+}
+
+/// Returns the pinned approved-contract identity inputs.
+pub const fn approved_embedding_contract() -> ApprovedEmbeddingContract {
+    ApprovedEmbeddingContract {
+        bundle_id: APPROVED_BUNDLE_ID,
+        embedding_model_id: APPROVED_EMBEDDING_MODEL_ID,
+        embedding_revision: APPROVED_EMBEDDING_REVISION,
+        onnx_export_revision: APPROVED_EMBEDDING_EXPORT_REVISION,
+        onnx_export_quantization: APPROVED_EMBEDDING_QUANTIZATION,
+        dimensions: APPROVED_EMBEDDING_DIMENSIONS,
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ModelBundleError {
     #[error(

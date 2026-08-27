@@ -20,9 +20,12 @@
 //! activates completed shadow generations through the singleton pointer once
 //! every gate passes, deactivates known-corrupt active generations to
 //! FTS-only, and garbage-collects retired generations that survived one clean
-//! restart plus one successful query. Status labels derived-disk payload
-//! sums as estimates; the activation gate consumes a conservative SQLite
-//! backing-store upper bound against the approved 3 GiB peak.
+//! restart plus one successful query. Status reports the derived-disk
+//! measurement over the approved derived tables alone (exact `dbstat` pages
+//! where the linked SQLite exposes them, otherwise an unavailable status with
+//! an admission-ineligible payload estimate), and the activation gate consumes
+//! only an exact derived figure against the approved 3 GiB peak - never
+//! primary storage or RAM.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,7 +37,8 @@ use sqlx::SqlitePool;
 use tokio_util::sync::CancellationToken;
 
 use crate::database::repositories::retrieval::{
-    CanonicalSnapshotRead, GenerationStatus, RetrievalRepository, SnapshotDocument,
+    CanonicalSnapshotRead, DerivedDiskUsage, GenerationStatus, RetrievalRepository,
+    SnapshotDocument,
 };
 use crate::retrieval::worker::{
     quantize_int8, RetrievalScheduler, APPROVED_INT8_DEQUANTIZATION_SCALE,
@@ -55,30 +59,47 @@ pub const MAX_QUERY_LIMIT: usize = 150;
 pub const DERIVED_DISK_STEADY_TARGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Approved envelope: activation blocks above the 3 GiB shadow-rebuild peak.
 pub const DERIVED_DISK_ACTIVATION_LIMIT_BYTES: u64 = 3 * 1024 * 1024 * 1024;
-/// Approved transient RAM ceiling measured for the approved two-snapshot
-/// e5-base int8 bundle (`architecture.md` "Approved Exact Backend Contract"):
-/// any activation peak at or above it blocks until a user-approved remedy
-/// exists. A third resident snapshot remains unapproved regardless.
+/// Fixed whole-process resident-memory budget for the approved two-snapshot
+/// e5-base int8 activation envelope. A third resident snapshot remains
+/// unapproved regardless.
 pub const ACTIVATION_RAM_CEILING_BYTES: u64 = 1_073_741_824 * 13 / 10;
+/// RAM gate scope. The ceiling and the sampled value both include every
+/// resident allocation in the application process.
+pub const ACTIVATION_RAM_SCOPE: &str = "whole-process RSS";
+/// How long a BLOCKING derived-disk reading may be reused without re-measuring.
+/// Exact values above [`DERIVED_DISK_ACTIVATION_LIMIT_BYTES`] and unavailable
+/// results are safe to reuse only as blockers; expiry forces a re-probe so
+/// shrinking data eventually unblocks. Exact sub-limit readings are never
+/// cached-served because a stale LOW cannot admit activation safely.
+const ENVELOPE_WATERMARK_REUSE_WINDOW: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 
 /// Measured process resident physical memory, or `None` when the platform
 /// facility is unavailable (which itself blocks activation).
 pub(crate) type RamProbe = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
 
+/// Test-injected derived-disk measurement source (deterministic measurements
+/// for gate tests without materializing multi-GiB databases).
+#[cfg(test)]
+type DiskProbe = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = DerivedDiskUsage> + Send>>
+        + Send
+        + Sync,
+>;
+
 fn measure_resident_ram() -> Option<u64> {
     memory_stats::memory_stats().map(|stats| stats.physical_mem as u64)
 }
 
-/// Activation RAM gate over one real process measurement: below the ceiling
-/// admits; at/above the ceiling blocks with the measured value; an
-/// unavailable measurement blocks fail-closed rather than guessing.
+/// Activation RAM gate over one whole-process resident-memory measurement:
+/// below the ceiling admits; at/above the ceiling blocks with the measured
+/// value; an unavailable measurement blocks fail-closed rather than guessing.
 fn ram_gate_blocker(measured_bytes: Option<u64>) -> Option<String> {
     match measured_bytes {
         None => Some(
             "resident memory measurement unavailable; refusing activation".to_string(),
         ),
         Some(bytes) if bytes >= ACTIVATION_RAM_CEILING_BYTES => Some(format!(
-            "measured resident memory {bytes} bytes meets or exceeds the {ACTIVATION_RAM_CEILING_BYTES} byte activation ceiling"
+            "measured {ACTIVATION_RAM_SCOPE} {bytes} bytes meets or exceeds the {ACTIVATION_RAM_CEILING_BYTES} byte activation ceiling"
         )),
         Some(_) => None,
     }
@@ -217,16 +238,11 @@ impl IndexSnapshot {
         }
     }
 
-    fn tombstoned_base_documents(&self) -> usize {
-        self.overlay
-            .deleted
+    fn shadowed_base_documents(&self) -> usize {
+        self.base_meeting_document_counts
             .iter()
-            .map(|meeting_id| {
-                self.base_meeting_document_counts
-                    .get(meeting_id)
-                    .copied()
-                    .unwrap_or(0)
-            })
+            .filter(|(meeting_id, _)| self.overlay.shadows_meeting(meeting_id))
+            .map(|(_, count)| *count)
             .sum()
     }
 
@@ -503,6 +519,10 @@ struct ServiceState {
     committed_stale: BTreeMap<u64, (String, i64)>,
     activation_transition: bool,
     pending_blockers: Vec<String>,
+    /// Last derived-disk reading with its measurement instant, reusable only
+    /// when it blocks (an exact high watermark or unavailable measurement);
+    /// permissive decisions always measure freshly.
+    envelope_gate_cache: Option<(tokio::time::Instant, DerivedDiskUsage)>,
 }
 
 /// The one retrieval query-index service. Owned by the shared Task 2.4
@@ -514,6 +534,8 @@ pub struct QueryIndexService {
     scheduler: RetrievalScheduler,
     acknowledged_fast_hybrid_queries: AtomicU64,
     ram_probe: StdMutex<RamProbe>,
+    #[cfg(test)]
+    envelope_probe: StdMutex<Option<DiskProbe>>,
     created_at: DateTime<Utc>,
 }
 
@@ -524,6 +546,8 @@ impl QueryIndexService {
             scheduler,
             acknowledged_fast_hybrid_queries: AtomicU64::new(0),
             ram_probe: StdMutex::new(Arc::new(measure_resident_ram) as RamProbe),
+            #[cfg(test)]
+            envelope_probe: StdMutex::new(None),
             created_at: Utc::now(),
         }
     }
@@ -754,6 +778,74 @@ impl QueryIndexService {
             .unwrap_or_else(PoisonError::into_inner) = probe;
     }
 
+    /// Injects a deterministic derived-disk measurement for activation-gate
+    /// tests instead of materializing multi-GiB databases.
+    #[cfg(test)]
+    pub(crate) fn set_envelope_probe(&self, probe: DiskProbe) {
+        *self
+            .envelope_probe
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(probe);
+    }
+
+    /// Backdates the envelope watermark past its reuse window so gate tests
+    /// exercise expiry against the real clock without sleeping.
+    #[cfg(test)]
+    pub(crate) fn expire_envelope_cache(&self) {
+        self.lock_state().envelope_gate_cache = Some((
+            tokio::time::Instant::now()
+                - ENVELOPE_WATERMARK_REUSE_WINDOW
+                - tokio::time::Duration::from_secs(1),
+            DerivedDiskUsage::exact(DERIVED_DISK_ACTIVATION_LIMIT_BYTES + 1),
+        ));
+    }
+
+    /// The cached derived-disk reading, surfaced ONLY while it blocks and
+    /// stays inside [`ENVELOPE_WATERMARK_REUSE_WINDOW`]. A stale blocking
+    /// result can never admit activation; expiry bounds over-blocking and
+    /// forces a fresh measurement.
+    fn cached_blocking_watermark(&self) -> Option<DerivedDiskUsage> {
+        let state = self.lock_state();
+        state
+            .envelope_gate_cache
+            .filter(|(measured_at, usage)| {
+                (usage.gate_bytes().is_none()
+                    || usage
+                        .gate_bytes()
+                        .is_some_and(|bytes| bytes > DERIVED_DISK_ACTIVATION_LIMIT_BYTES))
+                    && measured_at.elapsed() < ENVELOPE_WATERMARK_REUSE_WINDOW
+            })
+            .map(|(_, usage)| usage)
+    }
+
+    /// Measures the derived-table figure anew (via the optional test
+    /// injection) and records it as the current gate input. Every permissive
+    /// decision and every admission goes through here - never a cache.
+    async fn fresh_envelope_gate_input(
+        &self,
+        pool: &SqlitePool,
+    ) -> Result<DerivedDiskUsage, String> {
+        #[cfg(test)]
+        let injected = self
+            .envelope_probe
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        #[cfg(test)]
+        let measured = match injected {
+            Some(probe) => probe().await,
+            None => RetrievalRepository::derived_disk_usage(pool)
+                .await
+                .map_err(|error| format!("measuring derived disk failed: {error}"))?,
+        };
+        #[cfg(not(test))]
+        let measured = RetrievalRepository::derived_disk_usage(pool)
+            .await
+            .map_err(|error| format!("measuring derived disk failed: {error}"))?;
+        self.lock_state().envelope_gate_cache = Some((tokio::time::Instant::now(), measured));
+        Ok(measured)
+    }
+
     /// Process-start proxy for garbage-collection eligibility: anything
     /// retired after this instant was retired inside the current process and
     /// has not yet survived a restart.
@@ -886,7 +978,7 @@ async fn publish_tick_inner(
         return Ok(());
     }
 
-    drain_retired_journals_and_gc(pool, service, cancel).await;
+    gc_retired_generations(pool, service, cancel).await;
 
     let pointer = RetrievalRepository::active_generation_id(pool)
         .await
@@ -1195,7 +1287,7 @@ async fn compact_if_needed(service: &QueryIndexService, cancel: &CancellationTok
     let Some(snapshot) = service.active_snapshot() else {
         return;
     };
-    let overlay_units = snapshot.overlay_documents + snapshot.tombstoned_base_documents();
+    let overlay_units = snapshot.overlay_documents + snapshot.shadowed_base_documents();
     if overlay_units == 0 || overlay_units * COMPACTION_DENOMINATOR < snapshot.base.len().max(1) {
         return;
     }
@@ -1342,33 +1434,20 @@ fn coverage_blockers(status: &GenerationStatus) -> Vec<String> {
     blockers
 }
 
-/// Activation disk gate: usage at or below the approved 3 GiB shadow-rebuild
-/// peak is admissible; anything above blocks activation (and is reported,
-/// never auto-deleted).
-fn disk_envelope_blocker(usage_bytes: u64) -> Option<String> {
+/// Activation disk gate: only an exact derived-table measurement at or below
+/// the approved 3 GiB shadow-rebuild peak is admissible. An unavailable
+/// measurement blocks activation rather than admitting a status-only estimate.
+/// Primary storage, shared WAL bytes, process RAM, and resident snapshots stay
+/// outside this gate.
+fn disk_envelope_blocker(usage: DerivedDiskUsage) -> Option<String> {
+    let Some(usage_bytes) = usage.gate_bytes() else {
+        return Some("derived disk measurement unavailable; refusing activation".to_string());
+    };
     (usage_bytes > DERIVED_DISK_ACTIVATION_LIMIT_BYTES).then(|| {
         format!(
             "derived disk usage {usage_bytes} bytes exceeds the {DERIVED_DISK_ACTIVATION_LIMIT_BYTES} byte activation limit"
         )
     })
-}
-
-/// Conservative envelope usage feeding the activation disk gate: the SQLite
-/// backing-store upper bound (allocated pages plus uncheckpointed WAL frames,
-/// which counts primary storage and therefore can overcount but never
-/// undercount), building shadows' persisted vector bytes, and the resident
-/// active snapshot.
-async fn envelope_usage_bytes(
-    pool: &SqlitePool,
-    service: &QueryIndexService,
-) -> Result<u64, String> {
-    let backing_store = RetrievalRepository::derived_backing_store_upper_bound_bytes(pool)
-        .await
-        .map_err(|error| format!("measuring derived disk failed: {error}"))?;
-    let shadow = RetrievalRepository::estimated_shadow_snapshot_bytes(pool)
-        .await
-        .map_err(|error| format!("estimating shadow snapshot size failed: {error}"))?;
-    Ok(backing_store + shadow + service.resident_vector_bytes())
 }
 
 /// Promotes completed shadow generations (initial build, manual rebuild, or
@@ -1413,14 +1492,23 @@ async fn try_activate_shadow_generation(
             continue;
         };
 
-        // Cheap gates first; the expensive snapshot load runs only for a
-        // generation that already looks complete. Journal acknowledgement is
-        // deliberately excluded here: shadows catch up during validation and
-        // acknowledge only after installation.
-        let usage = envelope_usage_bytes(pool, service).await?;
+        // Cheap gates first, and no size probe at all for a candidate that is
+        // still coverage-blocked: during backfill the shadow stays incomplete,
+        // so every tick short-circuits before touching the envelope watermark
+        // or the database aggregate. A cached reading prunes candidates only
+        // while it BLOCKS; permissive decisions measure freshly (see
+        // [`QueryIndexService::cached_blocking_watermark`]). Journal
+        // acknowledgement is deliberately excluded here: shadows catch up
+        // during validation and acknowledge only after installation.
         let mut blockers = coverage_blockers(&status);
-        if let Some(disk_blocker) = disk_envelope_blocker(usage) {
-            blockers.push(disk_blocker);
+        if blockers.is_empty() {
+            let usage = match service.cached_blocking_watermark() {
+                Some(watermark) => Ok(watermark),
+                None => service.fresh_envelope_gate_input(pool).await,
+            }?;
+            if let Some(disk_blocker) = disk_envelope_blocker(usage) {
+                blockers.push(disk_blocker);
+            }
         }
         if !blockers.is_empty() {
             reported_blockers.extend(blockers);
@@ -1509,6 +1597,20 @@ async fn try_activate_shadow_generation(
             continue;
         }
 
+        // Admission-grade freshness: the pointer flip is the moment the gate
+        // actually admits whatever derived data exists NOW, and the earlier
+        // readings may predate a long validation/replay window during which
+        // backfill kept writing. Measure again (never from the watermark);
+        // only an on-the-spot sub-limit reading authorizes promotion.
+        let admission_usage = service.fresh_envelope_gate_input(pool).await?;
+        if let Some(disk_blocker) = disk_envelope_blocker(admission_usage) {
+            reported_blockers.push(format!("generation {generation_id}: {disk_blocker}"));
+            continue;
+        }
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+
         if !promote_shadow_generation(pool, service, &generation_id, current, caught_up_to, cancel)
             .await?
         {
@@ -1590,12 +1692,11 @@ async fn update_publication_lag(pool: &SqlitePool, service: &QueryIndexService) 
     service.set_lag(lag);
 }
 
-/// Terminal generations stop being served, so their journal rows exist only
-/// for historical publishers; draining them to canonical records exactly
-/// that fact before cleanup, letting [`RetrievalRepository::delete_generation`]
-/// enforce its own unacknowledged-changes guard honestly. Deletion itself
-/// additionally waits for one clean restart plus one successful query.
-async fn drain_retired_journals_and_gc(
+/// Terminal generations stop being served, but unacknowledged journal changes
+/// still block cleanup. Deletion additionally waits for one clean restart plus
+/// one successful Fast hybrid query - or, until that surface exists, its
+/// approved transitional stand-in ([`transitional_replacement_serving`]).
+async fn gc_retired_generations(
     pool: &SqlitePool,
     service: &QueryIndexService,
     cancel: &CancellationToken,
@@ -1611,25 +1712,13 @@ async fn drain_retired_journals_and_gc(
         if cancel.is_cancelled() {
             return;
         }
-        if let Ok(Some((canonical, published))) =
-            RetrievalRepository::publication_lag(pool, &generation_id).await
-        {
-            if canonical > published && !cancel.is_cancelled() {
-                if let Err(error) =
-                    RetrievalRepository::acknowledge_journal(pool, &generation_id, canonical).await
-                {
-                    log::warn!("Draining retired journal failed for {generation_id}: {error}");
-                }
-            }
-        }
         let survived_restart = retired_at
             .parse::<DateTime<Utc>>()
             .map(|retired| retired < service.process_start())
             .unwrap_or(false);
-        if survived_restart
-            && service.acknowledged_fast_hybrid_queries() > 0
-            && !cancel.is_cancelled()
-        {
+        let query_condition =
+            acknowledged_fast_hybrid_query_or_transitional(pool, service, &generation_id).await;
+        if survived_restart && query_condition && !cancel.is_cancelled() {
             match RetrievalRepository::delete_generation(pool, &generation_id).await {
                 Ok(true) => log::info!("Garbage-collected retired generation {generation_id}"),
                 Ok(false) => {}
@@ -1637,6 +1726,40 @@ async fn drain_retired_journals_and_gc(
             }
         }
     }
+}
+
+/// The successful-Fast-hybrid-query condition of "Generation Activation",
+/// together with its **transitional** stand-in.
+///
+/// ponytail: transitional Sprint 2 branch (architecture.md clause dated
+/// 2026-08-26; expires at Sprint 3 close when `acknowledge_fast_hybrid_query`
+/// gains its real caller): no semantic query surface exists yet, so the
+/// successful-query requirement counts as satisfied once the replacement
+/// generation is active with zero publication lag. Sprint 3 deletes the
+/// `_or_transitional` arm below; the restart term in
+/// [`gc_retired_generations`] and every other guard are permanent.
+async fn acknowledged_fast_hybrid_query_or_transitional(
+    pool: &SqlitePool,
+    service: &QueryIndexService,
+    retired: &str,
+) -> bool {
+    if service.acknowledged_fast_hybrid_queries() > 0 {
+        return true;
+    }
+    transitional_replacement_serving(pool, retired).await
+}
+
+async fn transitional_replacement_serving(pool: &SqlitePool, retired: &str) -> bool {
+    let Ok(Some(active)) = RetrievalRepository::active_generation_id(pool).await else {
+        return false;
+    };
+    if active == retired {
+        return false;
+    }
+    matches!(
+        RetrievalRepository::publication_lag(pool, &active).await,
+        Ok(Some((canonical, published))) if canonical <= published
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1722,25 +1845,38 @@ pub struct RetrievalStatusReport {
     pub published_change_id: Option<i64>,
     pub activation_blockers: Vec<String>,
     pub resident_index_bytes: u64,
-    /// Measured process resident physical memory at status time (`None` when
-    /// the platform facility is unavailable).
+    /// Measured whole-process resident physical memory at status time (`None`
+    /// when the platform facility is unavailable).
     pub resident_process_bytes: Option<u64>,
-    /// Approved transient activation ceiling (1.30 GiB); activation blocks at
-    /// or above it.
+    /// Whole-process activation budget (1.30 GiB); activation blocks at or
+    /// above it.
     pub activation_ram_ceiling_bytes: u64,
-    /// Payload-row ESTIMATE of derived bytes (excludes indexes, journal/state
-    /// rows, page fragmentation/free pages, and WAL). Always labeled by
-    /// [`Self::derived_disk_is_estimate`]; never presented as exact derived
-    /// bytes and never used as the activation gate.
-    pub derived_disk_bytes: u64,
-    /// True while [`Self::derived_disk_bytes`] is an estimate rather than a
-    /// measured exact value.
+    /// Scope shared by `resident_process_bytes` and the activation budget.
+    pub activation_ram_scope: &'static str,
+    /// Exact allocated-page bytes over the seven approved derived retrieval
+    /// tables and their indexes only. `None` means the linked SQLite lacks
+    /// `dbstat`; use [`Self::derived_disk_measurement_status`] and the optional
+    /// status-only estimate to explain that state.
+    pub derived_disk_bytes: Option<u64>,
+    /// True when the optional status-only payload estimate is present. It is
+    /// never used as an activation gate input.
     pub derived_disk_is_estimate: bool,
-    /// Conservative SQLite backing-store upper bound (allocated pages plus
-    /// uncheckpointed WAL frames). It counts primary storage too, so it can
-    /// overcount - safe for the block-only gate - but cannot undercount
-    /// material data.
-    pub derived_disk_backing_store_upper_bound_bytes: u64,
+    /// `exact` or `unavailable`; unavailable measurements fail closed for
+    /// activation.
+    pub derived_disk_measurement_status: &'static str,
+    /// Status-only payload estimate when `dbstat` is unavailable. It omits
+    /// material SQLite metadata and index-key storage and cannot admit
+    /// activation.
+    pub derived_disk_estimate_bytes: Option<u64>,
+    /// Exact value actually fed to `disk_envelope_blocker`, or `None` when the
+    /// measurement is unavailable. This is distinct from the RAM ceiling.
+    pub derived_disk_gate_input_bytes: Option<u64>,
+    /// Byte size of the committed-but-uncheckpointed WAL beside the database,
+    /// measured via a pure filesystem stat (`None` when there is no WAL file).
+    /// Diagnostics only, labeled separately from everything above: WAL pages
+    /// mix primary and derived content, so this size is deliberately NOT
+    /// attributed to the derived-table figure or its gate.
+    pub wal_file_size_bytes: Option<u64>,
     pub derived_disk_steady_target_bytes: u64,
     pub derived_disk_activation_limit_bytes: u64,
 }
@@ -1769,6 +1905,15 @@ pub async fn index_status(
         .map_err(|error| error.to_string())?;
     let lag = service.publication_lag();
     let (model_mismatch, activation_transition) = service.semantic_unavailable_state();
+    // Pure read-only measurements: SELECTs/compile-option PRAGMAs plus a
+    // filesystem stat of the WAL sibling - never a checkpoint or any other
+    // database mutation.
+    let derived = RetrievalRepository::derived_disk_usage(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    let wal_size = RetrievalRepository::wal_file_size(pool)
+        .await
+        .map_err(|error| error.to_string())?;
 
     let semantic_state = if paused {
         "paused".to_string()
@@ -1815,14 +1960,13 @@ pub async fn index_status(
         resident_index_bytes: service.resident_vector_bytes(),
         resident_process_bytes: measure_resident_ram(),
         activation_ram_ceiling_bytes: ACTIVATION_RAM_CEILING_BYTES,
-        derived_disk_bytes: RetrievalRepository::derived_disk_bytes(pool)
-            .await
-            .map_err(|error| error.to_string())?,
-        derived_disk_is_estimate: true,
-        derived_disk_backing_store_upper_bound_bytes:
-            RetrievalRepository::derived_backing_store_upper_bound_bytes(pool)
-                .await
-                .map_err(|error| error.to_string())?,
+        activation_ram_scope: ACTIVATION_RAM_SCOPE,
+        derived_disk_bytes: derived.bytes,
+        derived_disk_is_estimate: derived.estimate_bytes.is_some(),
+        derived_disk_measurement_status: derived.status_label(),
+        derived_disk_estimate_bytes: derived.estimate_bytes,
+        derived_disk_gate_input_bytes: derived.gate_bytes(),
+        wal_file_size_bytes: wal_size,
         derived_disk_steady_target_bytes: DERIVED_DISK_STEADY_TARGET_BYTES,
         derived_disk_activation_limit_bytes: DERIVED_DISK_ACTIVATION_LIMIT_BYTES,
     })
@@ -1836,11 +1980,16 @@ pub async fn index_status(
 mod tests {
     use super::*;
     use crate::database::repositories::retrieval::{
-        ModelSpec, ReplacementJob, ReplacementOutcome, StagedDocument, VectorEncoding,
+        DerivedDiskMeasurementStatus, ModelSpec, ReplacementJob, ReplacementOutcome,
+        StagedDocument, VectorEncoding,
     };
-    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use sqlx::sqlite::{
+        SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
+    };
+    use std::collections::VecDeque;
     use std::str::FromStr;
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
+    use std::time::{Duration, Instant};
 
     const DIMS: usize = 4;
     const MODEL_ID: &str = "test-e5-int8";
@@ -1978,6 +2127,42 @@ mod tests {
         let service = QueryIndexService::new(RetrievalScheduler::new());
         service.set_loaded_model(MODEL_ID);
         service
+    }
+
+    /// Deterministic derived-disk measurement source reading the CURRENT
+    /// value of `bytes` (tests may grow/shrink it mid-scenario to prove the
+    /// gate reacts to written data rather than cached numbers) and recording
+    /// each measurement into `counter`. Feeds the production watermark cache.
+    fn mutable_probe(counter: Arc<AtomicUsize>, bytes: Arc<AtomicU64>) -> DiskProbe {
+        Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let value = bytes.load(Ordering::SeqCst);
+            Box::pin(std::future::ready(DerivedDiskUsage::exact(value)))
+                as std::pin::Pin<Box<dyn std::future::Future<Output = DerivedDiskUsage> + Send>>
+        })
+    }
+
+    /// Derived-disk source yielding `values` in order and repeating the last
+    /// one afterwards, so one tick's successive measurements (early gate,
+    /// then admission) can observe grown data. Records each measurement.
+    fn queued_probe(
+        counter: Arc<AtomicUsize>,
+        values: Arc<StdMutex<(VecDeque<u64>, Option<u64>)>>,
+    ) -> DiskProbe {
+        Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let mut queue = values.lock().unwrap_or_else(PoisonError::into_inner);
+            let held = match queue.0.pop_front() {
+                Some(value) => {
+                    queue.1 = Some(value);
+                    value
+                }
+                None => queue.1.unwrap_or(0),
+            };
+            drop(queue);
+            Box::pin(std::future::ready(DerivedDiskUsage::exact(held)))
+                as std::pin::Pin<Box<dyn std::future::Future<Output = DerivedDiskUsage> + Send>>
+        })
     }
 
     async fn search_all(
@@ -2157,13 +2342,13 @@ mod tests {
         RetrievalRepository::ensure_generation(&pool, "gen-delta", MODEL_ID)
             .await
             .unwrap();
-        // A 120-row base keeps the overlay below the 3-doc compaction floor,
+        // A 250-row base keeps the overlay below the 5-unit compaction floor,
         // so delta behavior is observable without compaction interfering.
-        for index in 0..60 {
+        for index in 0..125 {
             let meeting = format!("m{index}");
             insert_meeting(&pool, &meeting, &meeting).await;
         }
-        for index in 0..60 {
+        for index in 0..125 {
             let meeting = format!("m{index}");
             publish_meeting(
                 &pool,
@@ -2195,8 +2380,8 @@ mod tests {
         assert_eq!(after.overlay_documents, 2);
 
         // Readers holding the old Arc still observe the complete old state.
-        assert_eq!(before.document_count(), 120);
-        assert_eq!(after.document_count(), 122);
+        assert_eq!(before.document_count(), 250);
+        assert_eq!(after.document_count(), 252);
         let updated_hits = service
             .search(
                 &query_for("echo"),
@@ -2223,12 +2408,12 @@ mod tests {
         RetrievalRepository::ensure_generation(&pool, "gen-compaction", MODEL_ID)
             .await
             .unwrap();
-        // 60 meetings x 2 docs = 120 base rows; the 2% threshold is ceil(120/50)=3 docs.
-        for index in 0..60 {
+        // 125 meetings x 2 docs = 250 base rows; the 2% threshold is ceil(250/50)=5 units.
+        for index in 0..125 {
             let meeting = format!("m{index}");
             insert_meeting(&pool, &meeting, &meeting).await;
         }
-        for index in 0..60 {
+        for index in 0..125 {
             let meeting = format!("m{index}");
             publish_meeting(
                 &pool,
@@ -2249,7 +2434,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(baseline_hits.len(), 120);
+        assert_eq!(baseline_hits.len(), MAX_QUERY_LIMIT);
         let pre_base = Arc::clone(&service.lock_state().active.as_ref().unwrap().base);
 
         // Two overlay docs stay below the threshold...
@@ -3133,79 +3318,334 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retired_generation_requires_explicit_fast_hybrid_acknowledgement() {
+    async fn retired_generation_needs_survived_restart_zero_lag_and_an_active_replacement() {
         let pool = migrated_pool().await;
         insert_meeting(&pool, "m", "Meeting").await;
         register_test_model(&pool).await;
-        for generation in ["old", "active"] {
+        for generation in ["old", "replacement"] {
             RetrievalRepository::ensure_generation(&pool, generation, MODEL_ID)
                 .await
                 .unwrap();
             publish_meeting(&pool, generation, "m", &["content"]).await;
         }
-        RetrievalRepository::set_generation_state(&pool, "old", "retired")
+        let old_bound = RetrievalRepository::publication_lag(&pool, "old")
+            .await
+            .unwrap()
+            .unwrap()
+            .0;
+        RetrievalRepository::acknowledge_journal(&pool, "old", old_bound)
             .await
             .unwrap();
+        // retired_at in the future relative to any service created below:
+        // the retirement happened inside the process these services belong
+        // to, so the untouched restart guard must refuse cleanup even once
+        // everything else is satisfied.
+        sqlx::query("UPDATE retrieval_generations SET state = 'retired', retired_at = '2099-01-01T00:00:00Z' WHERE generation_id = 'old'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let process = fresh_service();
+        publish_tick(&pool, &process).await.unwrap();
+        assert_eq!(
+            RetrievalRepository::active_generation_id(&pool)
+                .await
+                .unwrap(),
+            Some("replacement".to_string())
+        );
+        assert!(search_all(&process, "content").await.is_ok());
+        let (canonical, published) = RetrievalRepository::publication_lag(&pool, "replacement")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(canonical, published, "the replacement must be caught up");
+        assert!(
+            retired_listed(&pool, "old").await,
+            "no cleanup inside the process that owns the retirement"
+        );
+
+        // Clean restart. First with a publication backlog on the active
+        // replacement: the transitional gate reads durable bounds BEFORE this
+        // pass replays the backlog, so one tick proves the refusal.
+        add_transcript(&pool, "backlog", "m", "queued backlog content").await;
+        publish_meeting(
+            &pool,
+            "replacement",
+            "m",
+            &["content", "queued backlog content"],
+        )
+        .await;
+        let restarted = fresh_service();
         sqlx::query("UPDATE retrieval_generations SET retired_at = '2000-01-01T00:00:00Z' WHERE generation_id = 'old'")
             .execute(&pool)
             .await
             .unwrap();
-        RetrievalRepository::set_generation_state(&pool, "active", "ready")
-            .await
-            .unwrap();
-        RetrievalRepository::switch_active_generation(&pool, "active")
-            .await
-            .unwrap();
+        publish_tick(&pool, &restarted).await.unwrap();
+        assert!(
+            retired_listed(&pool, "old").await,
+            "non-zero publication lag must block reclamation"
+        );
 
-        let restarted = fresh_service();
+        // The backlog drained during that pass, so the next tick satisfies
+        // the transitional clause - WITHOUT any Fast hybrid query having run.
         publish_tick(&pool, &restarted).await.unwrap();
-        assert!(search_all(&restarted, "content").await.is_ok());
-        publish_tick(&pool, &restarted).await.unwrap();
-        assert!(RetrievalRepository::retired_generations(&pool)
-            .await
-            .unwrap()
-            .iter()
-            .any(|(id, _)| id == "old"));
-
-        restarted.acknowledge_fast_hybrid_query();
-        publish_tick(&pool, &restarted).await.unwrap();
-        assert!(!RetrievalRepository::retired_generations(&pool)
-            .await
-            .unwrap()
-            .iter()
-            .any(|(id, _)| id == "old"));
+        assert!(
+            !retired_listed(&pool, "old").await,
+            "one clean restart plus an active zero-lag replacement reclaims"
+        );
     }
 
     #[tokio::test]
-    async fn failed_non_active_generation_counts_and_is_gc_eligible() {
+    async fn restarted_retired_generation_with_lag_is_retained_without_acknowledgement() {
         let pool = migrated_pool().await;
         insert_meeting(&pool, "m", "Meeting").await;
         register_test_model(&pool).await;
-        RetrievalRepository::ensure_generation(&pool, "failed", MODEL_ID)
-            .await
-            .unwrap();
-        publish_meeting(&pool, "failed", "m", &["content"]).await;
-        RetrievalRepository::set_generation_state(&pool, "failed", "failed")
-            .await
-            .unwrap();
-        sqlx::query("UPDATE retrieval_generations SET retired_at = '2000-01-01T00:00:00Z' WHERE generation_id = 'failed'")
+        for generation in ["old", "replacement"] {
+            RetrievalRepository::ensure_generation(&pool, generation, MODEL_ID)
+                .await
+                .unwrap();
+            publish_meeting(&pool, generation, "m", &["content"]).await;
+        }
+        let service = fresh_service();
+        publish_tick(&pool, &service).await.unwrap();
+        sqlx::query("UPDATE retrieval_generations SET state = 'retired', retired_at = '2000-01-01T00:00:00Z' WHERE generation_id = 'old'")
             .execute(&pool)
             .await
             .unwrap();
-        assert_eq!(
-            RetrievalRepository::count_retained_generations(&pool)
-                .await
-                .unwrap(),
-            1
-        );
-
-        let restarted = fresh_service();
-        restarted.acknowledge_fast_hybrid_query();
-        publish_tick(&pool, &restarted).await.unwrap();
-        assert!(RetrievalRepository::retired_generations(&pool)
+        sqlx::query(
+            "UPDATE retrieval_generations SET state = 'ready' WHERE generation_id = 'replacement'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        RetrievalRepository::switch_active_generation(&pool, "replacement")
+            .await
+            .unwrap();
+        let before = RetrievalRepository::publication_lag(&pool, "old")
             .await
             .unwrap()
-            .is_empty());
+            .unwrap();
+
+        publish_meeting(&pool, "old", "m", &["lagging retired content"]).await;
+        let lagging = RetrievalRepository::publication_lag(&pool, "old")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(lagging.0 > lagging.1);
+        assert_eq!(lagging.1, before.1);
+
+        let restarted = fresh_service();
+        publish_tick(&pool, &restarted).await.unwrap();
+
+        assert!(retired_listed(&pool, "old").await);
+        assert_eq!(
+            RetrievalRepository::publication_lag(&pool, "old")
+                .await
+                .unwrap()
+                .unwrap()
+                .1,
+            before.1,
+            "cleanup must not acknowledge a lagging retired journal"
+        );
+    }
+
+    async fn retired_listed(pool: &SqlitePool, generation_id: &str) -> bool {
+        RetrievalRepository::retired_generations(pool)
+            .await
+            .unwrap()
+            .iter()
+            .any(|(id, _)| id == generation_id)
+    }
+
+    #[tokio::test]
+    async fn terminal_generations_survive_until_a_replacement_is_active_and_caught_up() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "m", "Meeting").await;
+        register_test_model(&pool).await;
+        // Corrupt-active recovery start: the active generation deactivates to
+        // FTS-only (singleton cleared, generation failed) and nothing replaces
+        // it yet.
+        RetrievalRepository::ensure_generation(&pool, "old", MODEL_ID)
+            .await
+            .unwrap();
+        publish_meeting(&pool, "old", "m", &["content"]).await;
+        let service = fresh_service();
+        publish_tick(&pool, &service).await.unwrap();
+        sqlx::query("UPDATE retrieval_documents SET vector = x'0102'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let restarted = fresh_service();
+        publish_tick(&pool, &restarted).await.unwrap();
+        assert!(RetrievalRepository::active_generation_id(&pool)
+            .await
+            .unwrap()
+            .is_none());
+        sqlx::query("UPDATE retrieval_generations SET retired_at = '2000-01-01T00:00:00Z' WHERE generation_id = 'old'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The terminal generation stays retained while no replacement is
+        // active and caught up.
+        publish_tick(&pool, &restarted).await.unwrap();
+        assert!(
+            retired_listed(&pool, "old").await,
+            "without an active zero-lag replacement there is no cleanup"
+        );
+
+        // Completing a rebuild replacement flips every guard: coverage fills,
+        // activation installs a caught-up active pointer, and the next pass
+        // reclaims the corrupt generation - corrupt-active recovery works.
+        let shadow = request_rebuild(&pool).await.unwrap();
+        publish_meeting(&pool, &shadow, "m", &["rebuilt content"]).await;
+        // Promotion happens this tick; the reclamation pass sees the new
+        // active pointer on the NEXT tick (GC decisions run first within a
+        // publisher pass).
+        publish_tick(&pool, &restarted).await.unwrap();
+        assert_eq!(
+            RetrievalRepository::active_generation_id(&pool)
+                .await
+                .unwrap(),
+            Some(shadow.clone()),
+            "the rebuilt replacement must be serving before cleanup may run"
+        );
+        publish_tick(&pool, &restarted).await.unwrap();
+        assert!(!retired_listed(&pool, "old").await);
+    }
+
+    #[tokio::test]
+    async fn consecutive_rebuilds_succeed_across_transitional_reclaims() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "m", "Meeting").await;
+        register_test_model(&pool).await;
+        RetrievalRepository::ensure_generation(&pool, "gen1", MODEL_ID)
+            .await
+            .unwrap();
+        publish_meeting(&pool, "gen1", "m", &["original content"]).await;
+        let service = fresh_service();
+        publish_tick(&pool, &service).await.unwrap();
+        assert_eq!(
+            RetrievalRepository::active_generation_id(&pool)
+                .await
+                .unwrap(),
+            Some("gen1".to_string())
+        );
+
+        // Manual rebuild #1 shadows the same model and promotes normally.
+        let gen2 = request_rebuild(&pool).await.unwrap();
+        publish_meeting(&pool, &gen2, "m", &["rebuild one content"]).await;
+        publish_tick(&pool, &service).await.unwrap();
+        assert_eq!(
+            RetrievalRepository::active_generation_id(&pool)
+                .await
+                .unwrap(),
+            Some(gen2.clone())
+        );
+        assert!(
+            matches!(
+                request_rebuild(&pool).await,
+                Err(RebuildRequestError::RetentionLimit)
+            ),
+            "two retained generations must refuse a third before reclamation"
+        );
+
+        // One clean restart with gen2 active and fully published reclaims
+        // gen1 under the transitional clause; the retention slot frees.
+        sqlx::query("UPDATE retrieval_generations SET retired_at = '2000-01-01T00:00:00Z' WHERE generation_id = 'gen1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let restarted = fresh_service();
+        publish_tick(&pool, &restarted).await.unwrap();
+        assert!(!retired_listed(&pool, "gen1").await);
+
+        // Manual rebuild #2 therefore succeeds and promotes as well.
+        let gen3 = request_rebuild(&pool).await.unwrap();
+        publish_meeting(&pool, &gen3, "m", &["rebuild two content"]).await;
+        publish_tick(&pool, &restarted).await.unwrap();
+        assert_eq!(
+            RetrievalRepository::active_generation_id(&pool)
+                .await
+                .unwrap(),
+            Some(gen3.clone()),
+            "the second consecutive rebuild must promote"
+        );
+        let hits = search_all(&restarted, "rebuild two").await.unwrap();
+        assert!(contains_hit(&hits, "doc-m-0"));
+    }
+
+    #[tokio::test]
+    async fn corrupt_active_recovery_rebuild_succeeds_twice_under_transitional_reclaim() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "m", "Meeting").await;
+        register_test_model(&pool).await;
+        RetrievalRepository::ensure_generation(&pool, "gen1", MODEL_ID)
+            .await
+            .unwrap();
+        publish_meeting(&pool, "gen1", "m", &["first healthy content"]).await;
+        let service = fresh_service();
+        publish_tick(&pool, &service).await.unwrap();
+
+        // Corruption cycle #1: known-corrupt canonical vectors deactivate the
+        // active generation to FTS-only at the restart catch-up.
+        sqlx::query("UPDATE retrieval_documents SET vector = x'0102' WHERE generation_id = 'gen1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let restarted = fresh_service();
+        publish_tick(&pool, &restarted).await.unwrap();
+        assert!(RetrievalRepository::active_generation_id(&pool)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Deactivation followed by a rebuild succeeds (first time).
+        let gen2 = request_rebuild(&pool).await.unwrap();
+        publish_meeting(&pool, &gen2, "m", &["second healthy content"]).await;
+        publish_tick(&pool, &restarted).await.unwrap();
+        assert_eq!(
+            RetrievalRepository::active_generation_id(&pool)
+                .await
+                .unwrap(),
+            Some(gen2.clone()),
+            "first corrupt-active recovery rebuild must activate"
+        );
+
+        // Transitional reclaim frees the failed generation across a restart.
+        sqlx::query("UPDATE retrieval_generations SET retired_at = '2000-01-01T00:00:00Z' WHERE generation_id = 'gen1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let second_restart = fresh_service();
+        publish_tick(&pool, &second_restart).await.unwrap();
+        assert!(!retired_listed(&pool, "gen1").await);
+
+        // Corruption cycle #2 on the now-active generation, again followed by
+        // a successful deactivation + rebuild. A fresh service must reload
+        // from canonical state for the corruption to be detected.
+        sqlx::query("UPDATE retrieval_documents SET vector = x'0304' WHERE generation_id = ?")
+            .bind(&gen2)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let third_process = fresh_service();
+        publish_tick(&pool, &third_process).await.unwrap();
+        assert!(RetrievalRepository::active_generation_id(&pool)
+            .await
+            .unwrap()
+            .is_none());
+        let gen3 = request_rebuild(&pool).await.unwrap();
+        publish_meeting(&pool, &gen3, "m", &["third healthy content"]).await;
+        publish_tick(&pool, &third_process).await.unwrap();
+        assert_eq!(
+            RetrievalRepository::active_generation_id(&pool)
+                .await
+                .unwrap(),
+            Some(gen3.clone()),
+            "second corrupt-active recovery rebuild must activate"
+        );
+        assert!(search_all(&third_process, "third").await.is_ok());
     }
 
     #[tokio::test]
@@ -3266,7 +3706,7 @@ mod tests {
     }
 
     #[test]
-    fn tombstone_threshold_counts_hidden_base_vectors_not_meetings() {
+    fn shadow_threshold_counts_hidden_base_vectors_not_meetings() {
         let base = BaseRows {
             metas: (0..100)
                 .map(|ordinal| DocumentMeta {
@@ -3292,7 +3732,42 @@ mod tests {
                 deleted: ["large".to_string()].into_iter().collect(),
             },
         );
-        assert_eq!(snapshot.tombstoned_base_documents(), 100);
+        assert_eq!(snapshot.shadowed_base_documents(), 100);
+    }
+
+    #[tokio::test]
+    async fn upsert_replacing_large_base_meeting_reaches_compaction_threshold() {
+        let service = fresh_service();
+        let snapshot = Arc::new(IndexSnapshot::new(
+            "gen-upsert-compact".to_string(),
+            MODEL_ID.to_string(),
+            DIMS,
+            BaseRows {
+                metas: (0..100)
+                    .map(|ordinal| meta_for(&format!("old-{ordinal}"), "meeting", ordinal))
+                    .collect(),
+                vectors: vec![127_u8; 100 * DIMS],
+            },
+            Overlay {
+                upserted: BTreeMap::from([(
+                    "meeting".to_string(),
+                    vec![OverlayDoc {
+                        meta: meta_for("new", "meeting", 0),
+                        vector: vec![127_u8; DIMS],
+                    }],
+                )]),
+                deleted: BTreeSet::new(),
+            },
+        ));
+        service.install_active(Arc::clone(&snapshot));
+
+        compact_if_needed(&service, &CancellationToken::new()).await;
+
+        let compacted = service.active_snapshot().unwrap();
+        assert_eq!(compacted.base.len(), 1);
+        assert_eq!(compacted.overlay_documents, 0);
+        assert_eq!(compacted.document_count(), 1);
+        assert_eq!(compacted.base.metas[0].document_id, "new");
     }
 
     #[tokio::test]
@@ -3341,11 +3816,58 @@ mod tests {
 
     #[test]
     fn disk_envelope_gate_blocks_only_above_the_approved_peak() {
-        assert!(disk_envelope_blocker(DERIVED_DISK_ACTIVATION_LIMIT_BYTES).is_none());
-        let blocker = disk_envelope_blocker(DERIVED_DISK_ACTIVATION_LIMIT_BYTES + 1).unwrap();
+        assert!(disk_envelope_blocker(DerivedDiskUsage::exact(
+            DERIVED_DISK_ACTIVATION_LIMIT_BYTES,
+        ))
+        .is_none());
+        let blocker = disk_envelope_blocker(DerivedDiskUsage::exact(
+            DERIVED_DISK_ACTIVATION_LIMIT_BYTES + 1,
+        ))
+        .unwrap();
         assert!(blocker.contains("activation limit"));
+        let unavailable = disk_envelope_blocker(DerivedDiskUsage::unavailable(1_000)).unwrap();
+        assert!(unavailable.contains("measurement unavailable"));
         // Steady target sits below the activation ceiling by construction.
         assert!(DERIVED_DISK_STEADY_TARGET_BYTES < DERIVED_DISK_ACTIVATION_LIMIT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn unavailable_derived_disk_measurement_blocks_activation() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "m", "Unavailable").await;
+        register_test_model(&pool).await;
+        RetrievalRepository::ensure_generation(&pool, "gen-unavailable", MODEL_ID)
+            .await
+            .unwrap();
+        publish_meeting(&pool, "gen-unavailable", "m", &["unavailable content"]).await;
+
+        let probes = Arc::new(AtomicUsize::new(0));
+        let service = fresh_service();
+        let counter = probes.clone();
+        service.set_envelope_probe(Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::ready(DerivedDiskUsage::unavailable(1_000)))
+                as std::pin::Pin<Box<dyn std::future::Future<Output = DerivedDiskUsage> + Send>>
+        }));
+
+        publish_tick(&pool, &service).await.unwrap();
+
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+        assert!(RetrievalRepository::active_generation_id(&pool)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(service
+            .pending_activation_blockers()
+            .iter()
+            .any(|blocker| blocker.contains("measurement unavailable")));
+
+        publish_tick(&pool, &service).await.unwrap();
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+        assert!(RetrievalRepository::active_generation_id(&pool)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -3358,29 +3880,391 @@ mod tests {
             .unwrap();
         publish_meeting(&pool, "gen-disk", "measured", &["measured content"]).await;
 
-        // SQLite derived data and the building shadow both count before activation.
-        let sqlite_derived = RetrievalRepository::derived_disk_bytes(&pool)
+        // The derived measurement exists and is the exact gate input reported.
+        let usage = RetrievalRepository::derived_disk_usage(&pool)
             .await
             .unwrap();
-        assert!(sqlite_derived > 0);
-        assert!(
-            RetrievalRepository::estimated_shadow_snapshot_bytes(&pool)
-                .await
-                .unwrap()
-                >= DIMS as u64,
-            "building generations count their persisted vector bytes"
-        );
+        assert!(usage.bytes.or(usage.estimate_bytes).unwrap_or_default() > 0);
 
         let service = fresh_service();
         publish_tick(&pool, &service).await.unwrap();
         let report = index_status(&pool, &service, false).await.unwrap();
-        assert_eq!(report.derived_disk_bytes, sqlite_derived);
+        assert_eq!(report.derived_disk_bytes, usage.bytes);
+        assert_eq!(report.derived_disk_gate_input_bytes, usage.gate_bytes());
+        assert_eq!(report.derived_disk_measurement_status, usage.status_label());
+        assert_eq!(report.derived_disk_estimate_bytes, usage.estimate_bytes);
+        assert_eq!(
+            report.derived_disk_is_estimate,
+            usage.estimate_bytes.is_some()
+        );
         assert_eq!(report.resident_index_bytes, service.resident_vector_bytes());
-        assert!(report.resident_index_bytes >= DIMS as u64);
+        if usage.status == DerivedDiskMeasurementStatus::Exact {
+            assert!(report.resident_index_bytes >= DIMS as u64);
+        } else {
+            assert_eq!(report.resident_index_bytes, 0);
+            assert!(service
+                .pending_activation_blockers()
+                .iter()
+                .any(|blocker| blocker.contains("measurement unavailable")));
+        }
         assert_eq!(
             report.activation_ram_ceiling_bytes,
             ACTIVATION_RAM_CEILING_BYTES
         );
+        assert_eq!(report.activation_ram_scope, ACTIVATION_RAM_SCOPE);
+    }
+
+    /// Large primary storage with tiny derived data: the derived figure stays
+    /// far below the activation limit and the shadow still activates.
+    #[tokio::test]
+    async fn large_primary_storage_does_not_block_a_small_derived_index() {
+        let pool = migrated_pool().await;
+        register_test_model(&pool).await;
+        // Bulk primary payload that dwarfs any derived bytes in this database.
+        for ordinal in 0..4 {
+            let meeting_id = format!("primary-{ordinal}");
+            insert_meeting(&pool, &meeting_id, "Primary bulk").await;
+            add_transcript(
+                &pool,
+                &format!("t-{ordinal}"),
+                &meeting_id,
+                &"primary transcript body ".repeat(2_000),
+            )
+            .await;
+        }
+        RetrievalRepository::ensure_generation(&pool, "gen-primary", MODEL_ID)
+            .await
+            .unwrap();
+        publish_meeting(&pool, "gen-primary", "primary-0", &["derived content"]).await;
+        publish_meeting(&pool, "gen-primary", "primary-1", &["more derived"]).await;
+        publish_meeting(&pool, "gen-primary", "primary-2", &["even more derived"]).await;
+        publish_meeting(&pool, "gen-primary", "primary-3", &["final derived"]).await;
+
+        let usage = RetrievalRepository::derived_disk_usage(&pool)
+            .await
+            .unwrap();
+        let service = fresh_service();
+        publish_tick(&pool, &service).await.unwrap();
+        if usage.status
+            == crate::database::repositories::retrieval::DerivedDiskMeasurementStatus::Exact
+        {
+            assert_eq!(
+                RetrievalRepository::active_generation_id(&pool)
+                    .await
+                    .unwrap(),
+                Some("gen-primary".to_string()),
+                "a primary-heavy, derived-light database must not block activation"
+            );
+        } else {
+            assert!(RetrievalRepository::active_generation_id(&pool)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(service
+                .pending_activation_blockers()
+                .iter()
+                .any(|blocker| blocker.contains("measurement unavailable")));
+        }
+
+        let report = index_status(&pool, &service, false).await.unwrap();
+        assert_eq!(report.derived_disk_bytes, usage.bytes);
+        assert_eq!(report.derived_disk_gate_input_bytes, usage.gate_bytes());
+        assert!(
+            report
+                .derived_disk_bytes
+                .or(report.derived_disk_estimate_bytes)
+                .unwrap_or_default()
+                < report.derived_disk_activation_limit_bytes
+        );
+    }
+
+    /// Coverage ordering: an incomplete shadow never reaches the size probe;
+    /// once coverage completes, the two fresh measurements of one successful
+    /// activation (early prune + admission) run exactly once, and later ticks
+    /// target no candidate at all.
+    #[tokio::test]
+    async fn coverage_blocked_candidates_skip_the_size_probe() {
+        let pool = migrated_pool().await;
+        register_test_model(&pool).await;
+        insert_meeting(&pool, "first", "First").await;
+        insert_meeting(&pool, "second", "Second").await;
+        RetrievalRepository::ensure_generation(&pool, "gen-cover", MODEL_ID)
+            .await
+            .unwrap();
+
+        let probes = Arc::new(AtomicUsize::new(0));
+        let counter = probes.clone();
+        let bytes = Arc::new(AtomicU64::new(1_000));
+        let service = fresh_service();
+        service.set_envelope_probe(mutable_probe(counter, bytes));
+
+        // Coverage incomplete (1/2 meetings): every tick must short-circuit
+        // before probing.
+        publish_meeting(&pool, "gen-cover", "first", &["half covered"]).await;
+        for _ in 0..3 {
+            publish_tick(&pool, &service).await.unwrap();
+        }
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            0,
+            "no disk probe while coverage-blocked"
+        );
+        assert_eq!(
+            RetrievalRepository::active_generation_id(&pool)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(service
+            .pending_activation_blockers()
+            .iter()
+            .any(|blocker| blocker.contains("coverage")));
+
+        // Coverage completes; the next tick measures twice (early prune and
+        // admission) and activates. Two probes per activating tick is the
+        // whole bound - no per-meeting coupling anywhere in this scenario.
+        publish_meeting(&pool, "gen-cover", "second", &["fully covered"]).await;
+        publish_tick(&pool, &service).await.unwrap();
+        assert_eq!(probes.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            RetrievalRepository::active_generation_id(&pool)
+                .await
+                .unwrap(),
+            Some("gen-cover".to_string())
+        );
+
+        // Post-activation ticks target no candidate at all - zero new probes.
+        publish_tick(&pool, &service).await.unwrap();
+        assert_eq!(probes.load(Ordering::SeqCst), 2);
+    }
+
+    /// A persistently over-limit candidate is throttled by the blocking
+    /// high-watermark: backfill ticks reuse the cached BLOCKING reading (a
+    /// stale HIGH can never admit), so probe count stays bounded by the reuse
+    /// window rather than by meeting or tick count.
+    #[tokio::test]
+    async fn envelope_probes_are_throttled_across_repeated_backfill_ticks() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "m", "Throttled").await;
+        register_test_model(&pool).await;
+        RetrievalRepository::ensure_generation(&pool, "gen-throttle", MODEL_ID)
+            .await
+            .unwrap();
+        publish_meeting(&pool, "gen-throttle", "m", &["throttle content"]).await;
+
+        let probes = Arc::new(AtomicUsize::new(0));
+        let counter = probes.clone();
+        let service = fresh_service();
+        // Conservative poison value: permanently above the activation limit so
+        // repeated ticks keep re-evaluating the gate without activating.
+        let bytes = Arc::new(AtomicU64::new(DERIVED_DISK_ACTIVATION_LIMIT_BYTES + 1));
+        service.set_envelope_probe(mutable_probe(counter, bytes));
+
+        // First tick measures once and blocks on disk usage.
+        publish_tick(&pool, &service).await.unwrap();
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+        assert!(service
+            .pending_activation_blockers()
+            .iter()
+            .any(|blocker| blocker.contains("activation limit")));
+
+        // Nine further immediate ticks (a meeting-indexed backfill cadence)
+        // all reuse the blocking watermark: still exactly one probe, same
+        // blocker preserved from the last real measurement. Note the safety
+        // direction - a HIGH reading kept blocking, which is always sound.
+        for _ in 0..9 {
+            publish_tick(&pool, &service).await.unwrap();
+        }
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+
+        // Past the reuse window the gate measures again (probe #2).
+        service.expire_envelope_cache();
+        publish_tick(&pool, &service).await.unwrap();
+        assert_eq!(probes.load(Ordering::SeqCst), 2);
+        assert!(RetrievalRepository::active_generation_id(&pool)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// The required 2.R2 safety regression: derived data grows AFTER a cached
+    /// sub-limit reading exists. A permissive number must never be served from
+    /// the cache - the next gate evaluation must measure freshly and block on
+    /// the grown value instead of admitting on the stale LOW figure.
+    #[tokio::test]
+    async fn stale_permissive_cache_cannot_admit_grown_derived_data() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "m", "Grown").await;
+        register_test_model(&pool).await;
+        RetrievalRepository::ensure_generation(&pool, "gen-grow", MODEL_ID)
+            .await
+            .unwrap();
+        publish_meeting(&pool, "gen-grow", "m", &["grow content"]).await;
+
+        let probes = Arc::new(AtomicUsize::new(0));
+        let bytes = Arc::new(AtomicU64::new(1_000));
+        let service = fresh_service();
+        service.set_envelope_probe(mutable_probe(probes.clone(), bytes.clone()));
+        // Block the first activation attempt on RAM so the candidate survives
+        // tick one with only a cached PERMISSIVE disk reading.
+        let unavailable: RamProbe = Arc::new(|| None);
+        service.set_ram_probe(unavailable);
+
+        publish_tick(&pool, &service).await.unwrap();
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+        assert!(service
+            .pending_activation_blockers()
+            .iter()
+            .any(|blocker| blocker.contains("unavailable")));
+        assert!(RetrievalRepository::active_generation_id(&pool)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Derived data grows past the limit after the permissive reading was
+        // recorded. The next tick's early gate MUST take a fresh measurement
+        // (the stale LOW is not reusable) and block before any validation.
+        bytes.store(DERIVED_DISK_ACTIVATION_LIMIT_BYTES + 1, Ordering::SeqCst);
+        publish_tick(&pool, &service).await.unwrap();
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            2,
+            "a sub-limit cache entry forces a fresh measurement"
+        );
+        assert!(service
+            .pending_activation_blockers()
+            .iter()
+            .any(|blocker| blocker.contains("activation limit")));
+        assert!(RetrievalRepository::active_generation_id(&pool)
+            .await
+            .unwrap()
+            .is_none());
+
+        // A blocking watermark, in turn, IS reused without re-probing until
+        // its window expires - the safe direction of the asymmetry.
+        publish_tick(&pool, &service).await.unwrap();
+        assert_eq!(probes.load(Ordering::SeqCst), 2);
+    }
+
+    /// The promotion path itself measures freshly: even inside ONE tick,
+    /// derived data written while validation/replay ran cannot slip behind an
+    /// earlier permissive reading - admission re-checks the gate at the exact
+    /// moment the pointer flips.
+    #[tokio::test]
+    async fn admission_remeasures_derived_disk_after_validation() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "m", "Admission").await;
+        register_test_model(&pool).await;
+        RetrievalRepository::ensure_generation(&pool, "gen-admit", MODEL_ID)
+            .await
+            .unwrap();
+        publish_meeting(&pool, "gen-admit", "m", &["admission content"]).await;
+
+        let probes = Arc::new(AtomicUsize::new(0));
+        let counter = probes.clone();
+        let values = Arc::new(StdMutex::new((
+            VecDeque::from([1_000, DERIVED_DISK_ACTIVATION_LIMIT_BYTES + 1]),
+            None,
+        )));
+        let service = fresh_service();
+        // Early gate reads permissive (1_000); simulated writes land; the
+        // admission re-measurement then sees the over-limit figure.
+        service.set_envelope_probe(queued_probe(counter, values));
+        // Keep the real RAM measurement out of the picture deterministically.
+        let admitted: RamProbe = Arc::new(|| Some(0));
+        service.set_ram_probe(admitted);
+
+        publish_tick(&pool, &service).await.unwrap();
+        assert_eq!(probes.load(Ordering::SeqCst), 2);
+        assert!(service
+            .pending_activation_blockers()
+            .iter()
+            .any(|blocker| blocker.contains("activation limit")));
+        assert!(RetrievalRepository::active_generation_id(&pool)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            search_all(&service, "anything").await.is_err(),
+            "no snapshot may be queryable when admission blocked"
+        );
+    }
+
+    /// Neither the status path nor any measurement mutates the database:
+    /// byte lengths and WAL frame counts of both files are identical before
+    /// and after `index_status` plus the repository measurement.
+    #[tokio::test]
+    async fn status_and_measurement_never_checkpoint_or_mutate_wal() {
+        let db_path = std::env::temp_dir().join(format!(
+            "meetly-retrieval-wal-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let options = SqliteConnectOptions::from_str(db_path.to_str().unwrap())
+            .unwrap()
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        register_test_model(&pool).await;
+        insert_meeting(&pool, "wal", "Wal").await;
+        RetrievalRepository::ensure_generation(&pool, "gen-wal", MODEL_ID)
+            .await
+            .unwrap();
+        publish_meeting(&pool, "gen-wal", "wal", &["wal content"]).await;
+
+        let wal_path = db_path.with_extension("sqlite-wal");
+        let read_state = || {
+            let wal = std::fs::read(&wal_path).unwrap_or_default();
+            let main = std::fs::read(&db_path).expect("main db readable");
+            // WAL header is 32 bytes; each frame adds a 24-byte header plus
+            // one page. Parsed without opening a second connection.
+            let page_size_bytes = wal.get(8..12).unwrap_or(&[0u8; 4]);
+            let page_size = u32::from_be_bytes(page_size_bytes.try_into().unwrap_or([0, 0, 0, 1]));
+            let frames = if wal.len() >= 32 && page_size > 0 {
+                (wal.len() - 32) as u64 / (24 + page_size as u64)
+            } else {
+                0
+            };
+            (main.len() as u64, wal.len() as u64, frames)
+        };
+        let (before_main, before_wal_len, before_frames) = read_state();
+        assert!(
+            before_frames > 0,
+            "committed writes left uncheckpointed WAL frames to observe"
+        );
+
+        let service = fresh_service();
+        let report = index_status(&pool, &service, false).await.unwrap();
+        let _usage = RetrievalRepository::derived_disk_usage(&pool)
+            .await
+            .unwrap();
+        // The WAL gauge reads the same bytes the filesystem reports and never
+        // itself disturbs them.
+        assert_eq!(
+            report.wal_file_size_bytes,
+            Some(before_wal_len),
+            "status exposes the read-only WAL size"
+        );
+        assert_eq!(
+            RetrievalRepository::wal_file_size(&pool).await.unwrap(),
+            Some(before_wal_len)
+        );
+
+        let (after_main, after_wal_len, after_frames) = read_state();
+        assert_eq!(before_main, after_main, "main file untouched");
+        assert_eq!(before_wal_len, after_wal_len, "WAL length untouched");
+        assert_eq!(before_frames, after_frames, "no checkpoint reset the WAL");
+
+        drop(pool); // Clean up temp files only after closing the pool.
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(wal_path);
+        let _ = std::fs::remove_file(db_path.with_extension("sqlite-shm"));
     }
 
     #[test]
@@ -3390,6 +4274,7 @@ mod tests {
         // At and above the ceiling block with the measured value named.
         let at_limit = ram_gate_blocker(Some(ACTIVATION_RAM_CEILING_BYTES)).unwrap();
         assert!(at_limit.contains("activation ceiling"));
+        assert!(at_limit.contains(ACTIVATION_RAM_SCOPE));
         assert!(ram_gate_blocker(Some(ACTIVATION_RAM_CEILING_BYTES + 1)).is_some());
         // An unavailable measurement blocks fail-closed.
         let unavailable = ram_gate_blocker(None).unwrap();
@@ -4269,7 +5154,7 @@ mod tests {
             source_start_id: None,
             source_end_id: None,
             source_template_id: Some("tpl".to_string()),
-            heading: Some("Decisões finais".to_string()),
+            heading: Some("DecisÃµes finais".to_string()),
             ordinal: 0,
             content: "headed body text".to_string(),
             content_hash: vec![7; 32],
@@ -4307,6 +5192,496 @@ mod tests {
         publish_tick(&pool, &service).await.unwrap();
         let hits = search_all(&service, "headed").await.unwrap();
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].heading.as_deref(), Some("Decisões finais"));
+        assert_eq!(hits[0].heading.as_deref(), Some("DecisÃµes finais"));
+    }
+
+    // -----------------------------------------------------------------------
+    // 2.R6 release-gated production-representation activation envelope.
+    //
+    // The retained release benchmark (`tests/vector_backend_benchmark.rs`)
+    // measures a compact numeric-metadata mirror, so its result cannot by
+    // itself validate production activation memory. This gated benchmark runs
+    // the PRODUCTION paths end to end at 250k documents per generation:
+    // repository staging + revision-fenced replacement transactions store
+    // fixed `1/127` int8 rows under the approved model identity, two
+    // `publish_tick` passes drive the real activation sequence (validation
+    // load, journal catch-up, coverage/disk/RAM gates, pointer promotion,
+    // snapshot install), and the Windows process peak working set bounds the
+    // moment the fully validated shadow snapshot coexists with the installed
+    // active snapshot against the unchanged approved 1.30 GiB transient
+    // ceiling. Output carries counts, byte figures, timings, and verdicts
+    // only - never raw text, tokens, or vector bytes.
+    //
+    // 2.R12 extends the same release-gated benchmark with the stage-1 session
+    // envelope: get_or_load builds and warms only the embedding session, while
+    // the first rerank request below the activation assertions builds and
+    // validates the reranker. Both generations still use the one approved
+    // bundle-derived identity, and the process-global cache resolves that
+    // identity through `cached_model`. Peak working set remains monotonic per
+    // process, so the activation peak measures the embedding-only production
+    // path rather than a reranker that Sprint 2 never consumes.
+    //
+    // Run explicitly (from `upstream/`, release build required):
+    //
+    // ```powershell
+    // $env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA "meetily-cargo-target"
+    // $env:MEETLY_RAG_INDEX_BENCH = "1"
+    // cargo test --release --manifest-path "frontend/src-tauri/Cargo.toml" `
+    //     --lib retrieval::index::tests::bench_2r6_production_activation_envelope -- --nocapture
+    // Remove-Item Env:MEETLY_RAG_INDEX_BENCH -ErrorAction SilentlyContinue
+    // ```
+    // -----------------------------------------------------------------------
+
+    /// Approved e5-base corpus scale: 250,000 documents per generation, so the
+    /// active and the shadow snapshots are simultaneously full-size at peak.
+    const BENCH_CORPUS: usize = 250_000;
+    /// 251 meetings x ~995 documents (same corpus shape as the retained lock
+    /// span fixture); fewer meetings bound fixture time while every
+    /// representation-level property of the snapshots stays identical.
+    const BENCH_MEETINGS: usize = 251;
+    /// Approved model dimensionality (e5-base).
+    const BENCH_DIMS: usize = 768;
+
+    struct BenchProcessMemory {
+        working_set: u64,
+        peak_working_set: u64,
+    }
+
+    /// Same metric family as the retained Sprint 1 evidence: Windows process
+    /// working-set counters. Peak working set is monotonic per process, so the
+    /// fixture phases stay far below the measured two-snapshot window below.
+    #[cfg(windows)]
+    fn bench_process_memory() -> Option<BenchProcessMemory> {
+        #[repr(C)]
+        struct ProcessMemoryCounters {
+            cb: u32,
+            page_fault_count: u32,
+            peak_working_set_size: usize,
+            working_set_size: usize,
+            quota_peak_paged_pool_usage: usize,
+            quota_paged_pool_usage: usize,
+            quota_peak_non_paged_pool_usage: usize,
+            quota_non_paged_pool_usage: usize,
+            pagefile_usage: usize,
+            peak_pagefile_usage: usize,
+        }
+        extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn K32GetProcessMemoryInfo(
+                process: isize,
+                counters: *mut ProcessMemoryCounters,
+                cb: u32,
+            ) -> i32;
+        }
+        let mut counters = ProcessMemoryCounters {
+            cb: std::mem::size_of::<ProcessMemoryCounters>() as u32,
+            page_fault_count: 0,
+            peak_working_set_size: 0,
+            working_set_size: 0,
+            quota_peak_paged_pool_usage: 0,
+            quota_paged_pool_usage: 0,
+            quota_peak_non_paged_pool_usage: 0,
+            quota_non_paged_pool_usage: 0,
+            pagefile_usage: 0,
+            peak_pagefile_usage: 0,
+        };
+        let ok =
+            unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+        (ok != 0).then_some(BenchProcessMemory {
+            working_set: counters.working_set_size as u64,
+            peak_working_set: counters.peak_working_set_size as u64,
+        })
+    }
+
+    #[cfg(not(windows))]
+    fn bench_process_memory() -> Option<BenchProcessMemory> {
+        None
+    }
+
+    /// Resolves the one approved staged bundle (same contract as the model
+    /// unit tests): `MEETLY_RAG_BUNDLE_DIR` override, else the packaged
+    /// resource location this build stages at.
+    fn bench_staged_bundle_dir() -> std::path::PathBuf {
+        if let Ok(dir) = std::env::var("MEETLY_RAG_BUNDLE_DIR") {
+            let path = std::path::PathBuf::from(dir);
+            assert!(
+                path.is_dir(),
+                "MEETLY_RAG_BUNDLE_DIR '{}' is not a directory; 2.R9 requires the approved staged bundle",
+                path.display()
+            );
+            return path;
+        }
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join("retrieval")
+            .join("bundle");
+        assert!(
+            dir.is_dir(),
+            "approved staged retrieval bundle missing at '{}'; 2.R9 cannot measure production sessions",
+            dir.display()
+        );
+        dir
+    }
+
+    /// Loads the single approved bundle through the exact production cache path
+    /// (`model::get_or_load`), which warms only the embedding session. The
+    /// reranker is deliberately not touched until the post-activation check.
+    fn bench_load_warm_embedding() -> crate::retrieval::model::RetrievalModels {
+        let models = crate::retrieval::model::get_or_load(&bench_staged_bundle_dir())
+            .expect("approved staged retrieval bundle must load through the production path");
+        assert!(!models.reranker_loaded());
+        models
+    }
+
+    fn bench_unit_embedding(axis: usize) -> Vec<f32> {
+        let mut embedding = vec![0.0_f32; BENCH_DIMS];
+        embedding[axis % BENCH_DIMS] = 1.0;
+        embedding
+    }
+
+    fn bench_document(meeting_index: usize, ordinal: usize) -> StagedDocument {
+        StagedDocument {
+            document_id: format!("doc-bench-m{meeting_index}-{ordinal}"),
+            source_kind: "transcript".to_string(),
+            source_start_id: None,
+            source_end_id: None,
+            source_template_id: None,
+            heading: None,
+            ordinal: ordinal as i64,
+            content: format!("bench window {meeting_index}-{ordinal}"),
+            content_hash: vec![((meeting_index * 256 + ordinal) % 256) as u8; 32],
+            dimensions: BENCH_DIMS as i64,
+            vector_encoding: VectorEncoding::Int8,
+            vector: quantize_int8(&bench_unit_embedding(meeting_index * 4_099 + ordinal)).unwrap(),
+        }
+    }
+
+    /// Backfills one meeting of one generation through the production staging
+    /// plus revision-fenced atomic replacement transaction, so canonical rows,
+    /// meeting state, journal entry, validation, and the incremental counter
+    /// all move exactly as the worker moves them.
+    async fn bench_publish_meeting(
+        pool: &SqlitePool,
+        generation_id: &str,
+        index: usize,
+        document_count: usize,
+    ) {
+        let meeting = format!("bench-m{index}");
+        let revision = current_revision(pool, &meeting).await;
+        let staged: Vec<StagedDocument> = (0..document_count)
+            .map(|ordinal| bench_document(index, ordinal))
+            .collect();
+        let job_id = format!("job-{generation_id}-{index}-{revision}");
+        RetrievalRepository::stage_documents(
+            pool,
+            &job_id,
+            generation_id,
+            &meeting,
+            revision,
+            &staged,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            RetrievalRepository::replace_meeting_documents(
+                pool,
+                ReplacementJob {
+                    generation_id,
+                    meeting_id: &meeting,
+                    expected_source_revision: revision,
+                    job_id: &job_id,
+                },
+            )
+            .await
+            .unwrap(),
+            ReplacementOutcome::Published { .. }
+        ));
+    }
+
+    async fn bench_seed_generation(pool: &SqlitePool, generation_id: &str) {
+        let per_meeting = BENCH_CORPUS / BENCH_MEETINGS;
+        let mut remainder = BENCH_CORPUS % BENCH_MEETINGS;
+        for index in 0..BENCH_MEETINGS {
+            let count = per_meeting + usize::from(remainder > 0);
+            remainder = remainder.saturating_sub(1);
+            bench_publish_meeting(pool, generation_id, index, count).await;
+        }
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM retrieval_documents WHERE generation_id = ?")
+                .bind(generation_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, BENCH_CORPUS as i64, "{generation_id} corpus drifted");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bench_2r6_production_activation_envelope() {
+        if std::env::var("MEETLY_RAG_INDEX_BENCH").as_deref() != Ok("1") {
+            println!("SKIP 2.R6 production-envelope benchmark (set MEETLY_RAG_INDEX_BENCH=1)");
+            return;
+        }
+        let baseline = bench_process_memory()
+            .expect("process memory counters unavailable; 2.R6 requires Windows process metrics");
+
+        // 2.R12 stage-1 session residency phase: the one approved staged
+        // bundle's embedding session loads and warms through the production
+        // cache before any fixture exists; reranker construction is measured
+        // separately after activation.
+        let t_sessions = Instant::now();
+        let models = bench_load_warm_embedding();
+        let after_sessions = bench_process_memory()
+            .expect("process memory counters disappeared during session load");
+        let embedding_weight = after_sessions
+            .working_set
+            .saturating_sub(baseline.working_set);
+        let model_id = crate::retrieval::worker::bundled_model_identity();
+        assert_eq!(
+            models.dimensions() as usize,
+            BENCH_DIMS,
+            "staged bundle dimensionality must match the approved e5-base contract"
+        );
+        assert!(
+            crate::retrieval::model::cached_model(&model_id).is_some(),
+            "the production session cache must resolve the persisted bundled identity"
+        );
+        println!(
+            "[envelope-sessions] approved bundle embedding session loaded+warm in {:.0} ms; working set {:.1} MiB, peak {:.1} MiB, embedding-only weight {} bytes ({:.1} MiB)",
+            t_sessions.elapsed().as_secs_f64() * 1000.0,
+            after_sessions.working_set as f64 / (1024.0 * 1024.0),
+            after_sessions.peak_working_set as f64 / (1024.0 * 1024.0),
+            embedding_weight,
+            embedding_weight as f64 / (1024.0 * 1024.0),
+        );
+
+        // File-backed WAL: an in-memory database would hide SQLite paging from
+        // the measurement instead of behaving like production storage.
+        let db_path = std::env::temp_dir().join(format!(
+            "meetly-index-bench-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let options = SqliteConnectOptions::from_str(db_path.to_str().unwrap())
+            .unwrap()
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(Duration::from_secs(30))
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        for index in 0..BENCH_MEETINGS {
+            sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES (?, 'Bench', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')")
+                .bind(format!("bench-m{index}"))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        // One approved model row: Int8 encoding at fixed 1/127 dequantization;
+        // every stored vector goes through the production `quantize_int8`.
+        // 2.R9: the identity is the real bundle-derived production identity,
+        // not a synthetic label.
+        RetrievalRepository::register_model(
+            &pool,
+            &ModelSpec {
+                model_id: model_id.clone(),
+                dimensions: BENCH_DIMS as u32,
+                vector_encoding: VectorEncoding::Int8,
+                chunker_version: crate::retrieval::chunking::APPROVED_CHUNKER_VERSION,
+                dequantization_scale: Some(APPROVED_INT8_DEQUANTIZATION_SCALE),
+                dequantization_zero_point: Some(0),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Phase A - ACTIVE generation: registration, canonical backfill
+        // through the repository transactions, then ONE publisher pass whose
+        // `try_activate_shadow_generation` performs the production validation
+        // load, journal catch-up, RAM/disk/coverage gates, and promotion.
+        RetrievalRepository::ensure_generation(&pool, "gen-bench-active", &model_id)
+            .await
+            .unwrap();
+        bench_seed_generation(&pool, "gen-bench-active").await;
+        let service = QueryIndexService::new(RetrievalScheduler::new());
+        service.set_loaded_model(&model_id);
+
+        let t_active = Instant::now();
+        publish_tick(&pool, &service).await.unwrap();
+        assert_eq!(
+            RetrievalRepository::active_generation_id(&pool)
+                .await
+                .unwrap(),
+            Some("gen-bench-active".to_string()),
+            "publisher did not activate the active generation; blockers {:?}",
+            service.pending_activation_blockers()
+        );
+        {
+            let active = service
+                .active_snapshot()
+                .expect("active snapshot installed");
+            assert_eq!(active.document_count(), BENCH_CORPUS);
+            assert_eq!(active.overlay_documents, 0);
+            assert_eq!(active.model_id(), model_id);
+        }
+        println!(
+            "[active] production snapshot activated ({BENCH_CORPUS} documents) in {:.0} ms",
+            t_active.elapsed().as_secs_f64() * 1000.0
+        );
+
+        // Phase B - SHADOW generation: the manual-rebuild shape (a second live
+        // generation for the SAME approved model holding copies of the same
+        // documents), fully backfilled before activation begins.
+        RetrievalRepository::ensure_generation(&pool, "gen-bench-shadow", &model_id)
+            .await
+            .unwrap();
+        bench_seed_generation(&pool, "gen-bench-shadow").await;
+
+        // Phase C - measured activation window: the publisher reloads and
+        // journal-catches-up the whole shadow candidate WHILE the active
+        // snapshot stays installed, measures its own RAM gate at exactly that
+        // state, then promotes. Peak working set across the window therefore
+        // bounds everything this process has ever touched, fixtures included.
+        let before_window =
+            bench_process_memory().expect("process memory counters disappeared mid-run");
+        let t_shadow = Instant::now();
+        publish_tick(&pool, &service).await.unwrap();
+        let window_elapsed = t_shadow.elapsed();
+        let after_window =
+            bench_process_memory().expect("process memory counters disappeared mid-run");
+
+        // The envelope verdict is printed BEFORE any post-promotion assertion
+        // so a refusal by the production RAM gate still reports the complete
+        // measured numbers instead of dying on a state assert.
+        let peak_ws = after_window.peak_working_set.max(baseline.peak_working_set);
+        let peak_margin = ACTIVATION_RAM_CEILING_BYTES.saturating_sub(peak_ws);
+        println!(
+            "[envelope-parts] working set before activation window {:.1} MiB, after {:.1} MiB; resident index vectors {} MiB",
+            before_window.working_set as f64 / (1024.0 * 1024.0),
+            after_window.working_set as f64 / (1024.0 * 1024.0),
+            service.resident_vector_bytes() as f64 / (1024.0 * 1024.0)
+        );
+        println!(
+            "[envelope-peak] measured active+shadow process peak working set {} bytes ({:.1} MiB; {:.0} ms window), margin {} bytes ({:.1} MiB) vs the approved {:.2} GiB transient ceiling -> {}",
+            peak_ws,
+            peak_ws as f64 / (1024.0 * 1024.0),
+            window_elapsed.as_secs_f64() * 1000.0,
+            peak_margin,
+            peak_margin as f64 / (1024.0 * 1024.0),
+            ACTIVATION_RAM_CEILING_BYTES as f64 / (1024.0 * 1024.0 * 1024.0),
+            if peak_ws >= ACTIVATION_RAM_CEILING_BYTES { "FAIL" } else { "PASS" }
+        );
+        if peak_ws >= ACTIVATION_RAM_CEILING_BYTES {
+            println!(
+                "[envelope-gate] production RAM gate refused shadow activation: {:?}",
+                service.pending_activation_blockers()
+            );
+        }
+        assert!(
+            peak_ws < ACTIVATION_RAM_CEILING_BYTES,
+            "[blocked-resource-envelope] measured production active+shadow activation peak \
+             {peak_ws} bytes meets or exceeds the {ACTIVATION_RAM_CEILING_BYTES}-byte approved \
+             ceiling (resident index vectors {} bytes); blocking stands until a user-approved \
+             remedy exists",
+            service.resident_vector_bytes()
+        );
+
+        assert_eq!(
+            RetrievalRepository::active_generation_id(&pool)
+                .await
+                .unwrap(),
+            Some("gen-bench-shadow".to_string()),
+            "shadow was not promoted; blockers {:?}",
+            service.pending_activation_blockers()
+        );
+        {
+            let shadow = service
+                .active_snapshot()
+                .expect("shadow snapshot installed");
+            assert_eq!(shadow.generation_id(), "gen-bench-shadow");
+            assert_eq!(shadow.document_count(), BENCH_CORPUS);
+            assert_eq!(shadow.overlay_documents, 0);
+        }
+        assert!(
+            matches!(
+                RetrievalRepository::publication_lag(&pool, "gen-bench-shadow")
+                    .await
+                    .unwrap(),
+                Some((canonical, published)) if canonical > 0 && canonical == published
+            ),
+            "activated generation must start fully acknowledged"
+        );
+        let (retired_state,): (String,) = sqlx::query_as(
+            "SELECT state FROM retrieval_generations WHERE generation_id = 'gen-bench-active'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(retired_state, "retired", "previous generation must retire");
+
+        // Readers serve straight out of the freshly activated production
+        // snapshot through the normal query path.
+        let hits = service
+            .search(
+                &bench_unit_embedding(0),
+                ScopeFilter::All,
+                MAX_QUERY_LIMIT,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), MAX_QUERY_LIMIT.min(BENCH_CORPUS));
+        assert!(
+            hits.iter()
+                .all(|hit| hit.score > 0.95 && hit.meeting_id.starts_with("bench-")),
+            "exact-axis query must surface matching production rows only"
+        );
+
+        // Reranking is not part of Sprint 2 activation, but this first real
+        // request proves the deferred engine still loads and validates under
+        // the same cached BundleIdentity. Its own weight is sampled after the
+        // activation window so it cannot turn the stage-1 gate into R9 again.
+        let before_reranker = bench_process_memory()
+            .expect("process memory counters disappeared before reranker load");
+        let t_reranker = Instant::now();
+        models
+            .rerank_sync(
+                &[(
+                    "bench validation query".to_string(),
+                    "bench validation evidence".to_string(),
+                )],
+                &CancellationToken::new(),
+            )
+            .expect("deferred reranker load and validation failed");
+        let after_reranker = bench_process_memory()
+            .expect("process memory counters disappeared after reranker load");
+        let reranker_weight = after_reranker
+            .working_set
+            .saturating_sub(before_reranker.working_set);
+        println!(
+            "[envelope-reranker] deferred reranker built+validated in {:.0} ms; own weight {} bytes ({:.1} MiB), working set {:.1} MiB, peak {:.1} MiB",
+            t_reranker.elapsed().as_secs_f64() * 1000.0,
+            reranker_weight,
+            reranker_weight as f64 / (1024.0 * 1024.0),
+            after_reranker.working_set as f64 / (1024.0 * 1024.0),
+            after_reranker.peak_working_set as f64 / (1024.0 * 1024.0),
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&db_path);
+        for suffix in ["-wal", "-shm"] {
+            let mut path = db_path.clone().into_os_string();
+            path.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(path));
+        }
     }
 }

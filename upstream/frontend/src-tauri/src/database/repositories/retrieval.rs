@@ -11,6 +11,11 @@ pub const GENERATION_STATES: [&str; 4] = ["building", "ready", "failed", "retire
 /// search; Task 2.5 owns any future backend vocabulary.
 pub const EXACT_INDEX_BACKEND: &str = "exact";
 
+/// Approved staged-batch ceiling reused as the streaming page size of
+/// [`RetrievalRepository::replace_meeting_documents`]: one revision-fenced
+/// transaction never materializes more documents than one approved batch.
+const REPLACEMENT_PAGE_DOCUMENTS: i64 = crate::retrieval::worker::MAX_STAGE_DOCUMENTS as i64;
+
 /// Encodings admitted at the repository boundary. The approved production
 /// bundle stores int8; f32 is the reference encoding. There is intentionally
 /// no fixed byte-width rule in SQL — byte length is validated here against
@@ -20,6 +25,75 @@ pub enum VectorEncoding {
     F32,
     Fp16,
     Int8,
+}
+
+/// Approved derived retrieval tables measured by the disk envelope gate. The
+/// list is closed: primary meeting/transcript/FTS storage never enters the
+/// derived figure.
+const DERIVED_TABLES: [&str; 7] = [
+    "retrieval_documents",
+    "retrieval_document_staging",
+    "retrieval_meeting_state",
+    "retrieval_index_state",
+    "retrieval_index_changes",
+    "retrieval_generations",
+    "retrieval_models",
+];
+
+/// Heuristic multiplier for the status-only payload estimate. It is not an
+/// activation bound because payload bytes cannot account for all SQLite
+/// metadata and index-key storage without `dbstat`.
+const FALLBACK_FACTOR: u64 = 3;
+/// Fixed per-row allowance used only by the status-only payload estimate.
+const PAYLOAD_ROW_OVERHEAD_BYTES: u64 = 192;
+/// Flat per-row allowance used only by the status-only payload estimate.
+const META_ROW_OVERHEAD_BYTES: u64 = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DerivedDiskMeasurementStatus {
+    Exact,
+    Unavailable,
+}
+
+/// One derived-disk measurement for reporting and the activation disk gate.
+/// `bytes` is populated only by the exact allocated-page measurement; the
+/// status-only estimate is never a gate input when `dbstat` is unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DerivedDiskUsage {
+    pub bytes: Option<u64>,
+    pub status: DerivedDiskMeasurementStatus,
+    pub estimate_bytes: Option<u64>,
+}
+
+impl DerivedDiskUsage {
+    pub(crate) fn exact(bytes: u64) -> Self {
+        Self {
+            bytes: Some(bytes),
+            status: DerivedDiskMeasurementStatus::Exact,
+            estimate_bytes: None,
+        }
+    }
+
+    pub(crate) fn unavailable(estimate_bytes: u64) -> Self {
+        Self {
+            bytes: None,
+            status: DerivedDiskMeasurementStatus::Unavailable,
+            estimate_bytes: Some(estimate_bytes),
+        }
+    }
+
+    pub(crate) fn gate_bytes(self) -> Option<u64> {
+        (self.status == DerivedDiskMeasurementStatus::Exact)
+            .then_some(self.bytes)
+            .flatten()
+    }
+
+    pub(crate) fn status_label(self) -> &'static str {
+        match self.status {
+            DerivedDiskMeasurementStatus::Exact => "exact",
+            DerivedDiskMeasurementStatus::Unavailable => "unavailable",
+        }
+    }
 }
 
 impl VectorEncoding {
@@ -684,6 +758,24 @@ impl RetrievalRepository {
         Ok(rows)
     }
 
+    /// The live ('building' or 'ready') generation already registered for
+    /// `model_id`, if any. Generation resumption looks this up instead of
+    /// recomputing any id: generation ids are opaque and never derived.
+    pub async fn find_live_generation(
+        pool: &SqlitePool,
+        model_id: &str,
+    ) -> Result<Option<String>, SqlxError> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT generation_id FROM retrieval_generations
+              WHERE model_id = ? AND state IN ('building', 'ready')
+              ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        )
+        .bind(model_id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(row.map(|(id,)| id))
+    }
+
     /// Idempotent model registration; reports whether this call created the row.
     pub async fn ensure_model(pool: &SqlitePool, spec: &ModelSpec) -> Result<bool, SqlxError> {
         let exists: Option<(i64,)> =
@@ -891,43 +983,21 @@ impl RetrievalRepository {
         Ok(())
     }
 
-    /// Reads a staged job back (validated against the owning generation's
-    /// model) so a crashed worker can resume instead of re-embedding batches
-    /// that were already staged before the crash.
-    pub async fn list_staged_documents(
+    /// Staged-job identity read for resume/reuse selection: document ids only,
+    /// ordered by insertion. Payloads are never deserialized here and no
+    /// vector bytes leave the database; a poisoned payload is not even an
+    /// error at this boundary - it surfaces when the replacement validates the
+    /// exact inserted bytes.
+    pub async fn list_staged_document_ids(
         pool: &SqlitePool,
         job_id: &str,
-    ) -> Result<Vec<StagedDocument>, SqlxError> {
-        let rows: Vec<(String, String, Vec<u8>)> = sqlx::query_as(
-            "SELECT generation_id, document_id, payload
-             FROM retrieval_document_staging WHERE job_id = ? ORDER BY id",
+    ) -> Result<Vec<String>, SqlxError> {
+        sqlx::query_scalar(
+            "SELECT document_id FROM retrieval_document_staging WHERE job_id = ? ORDER BY id",
         )
         .bind(job_id)
         .fetch_all(pool)
-        .await?;
-        let Some((generation_id, _, _)) = rows.first() else {
-            return Ok(Vec::new());
-        };
-        let model = generation_model(pool, generation_id)
-            .await?
-            .ok_or_else(|| SqlxError::Protocol(format!("unknown generation '{generation_id}'")))?;
-        rows.into_iter()
-            .map(|(_, document_id, payload)| {
-                let document: StagedDocument = serde_json::from_slice(&payload).map_err(|_| {
-                    SqlxError::Protocol(format!(
-                        "staged payload for '{}' is unreadable",
-                        document_id
-                    ))
-                })?;
-                if document.document_id != document_id {
-                    return Err(SqlxError::Protocol(
-                        "staged payload identity does not match its key".into(),
-                    ));
-                }
-                validate_document(&model, &document)?;
-                Ok(document)
-            })
-            .collect()
+        .await
     }
 
     /// Removes staged rows that no longer belong to the current chunk set for
@@ -992,9 +1062,25 @@ impl RetrievalRepository {
     /// Atomically replaces every active document of one meeting/generation
     /// from a staged job. The transaction re-reads the current source revision
     /// and aborts (keeping prior documents intact) unless it still equals the
-    /// caller's extraction-time revision. On success it clears retry state,
-    /// appends an `upsert` journal entry, and advances that generation's
-    /// canonical change ID in the same commit.
+    /// caller's extraction-time revision. Staged rows stream through in bounded
+    /// pages of [`REPLACEMENT_PAGE_DOCUMENTS`]: read, validate, and insert one
+    /// page at a time so memory stays independent of the meeting's document
+    /// count; validation always sees exactly the bytes the INSERT binds.
+    /// `retrieval_generations.document_count` moves by this commit's exact
+    /// removed/inserted deltas, so no O(corpus) recount ever runs inside the
+    /// fence (deletions performed outside this path apply their own
+    /// decrement). On success (or revision conflict) staging is discarded
+    /// inside that same commit together with the retry-state clear, the
+    /// `upsert` journal entry, and the canonical change advance; any
+    /// abort/crash rolls every part of it back with prior documents active
+    /// and staging resumable.
+    ///
+    /// Lock caveat: SQLite offers no atomic multi-page commit that releases the
+    /// writer lock between pages, so this single transaction holds the write
+    /// lock for the whole replacement even though only one page is resident.
+    /// Concurrent writers wait behind it and proceed on commit - they are
+    /// never lost or starved (SQLite's pending-byte/busy-timeout semantics)
+    /// - but they do queue once per replacement rather than once per page.
     pub async fn replace_meeting_documents(
         pool: &SqlitePool,
         job: ReplacementJob<'_>,
@@ -1022,58 +1108,75 @@ impl RetrievalRepository {
             .ok_or_else(|| {
                 SqlxError::Protocol(format!("unknown generation '{}'", job.generation_id))
             })?;
-        let staged: Vec<(String, Vec<u8>)> = sqlx::query_as(
-            "SELECT document_id, payload FROM retrieval_document_staging WHERE job_id = ? ORDER BY id",
-        )
-        .bind(job.job_id)
-        .fetch_all(&mut *tx)
-        .await?;
-        let mut documents = Vec::with_capacity(staged.len());
-        for (document_id, payload) in staged {
-            let document: StagedDocument = serde_json::from_slice(&payload).map_err(|_| {
-                SqlxError::Protocol(format!(
-                    "staged payload for '{}' is unreadable",
-                    document_id
-                ))
-            })?;
-            if document.document_id != document_id {
-                return Err(SqlxError::Protocol(
-                    "staged payload identity does not match its key".into(),
-                ));
-            }
-            validate_document(&model, &document)?;
-            documents.push(document);
-        }
 
-        sqlx::query("DELETE FROM retrieval_documents WHERE generation_id = ? AND meeting_id = ?")
-            .bind(job.generation_id)
-            .bind(job.meeting_id)
-            .execute(&mut *tx)
-            .await?;
+        let removed_prior = sqlx::query(
+            "DELETE FROM retrieval_documents WHERE generation_id = ? AND meeting_id = ?",
+        )
+        .bind(job.generation_id)
+        .bind(job.meeting_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
         let now = Utc::now().to_rfc3339();
-        for document in &documents {
-            sqlx::query(
-                "INSERT INTO retrieval_documents (generation_id, document_id, meeting_id, source_kind, source_start_id, source_end_id, source_template_id, heading, ordinal, content, content_hash, dimensions, vector_encoding, vector, source_revision, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        // Incremental document_count bookkeeping: prior rows removed plus this
+        // replacement's inserted page totals. The delta is exact for every
+        // mutation that goes through this path, stays inside the same commit
+        // as everything else, and never scans the generation's whole corpus -
+        // the O(total rows) recount subquery this replaced held the write lock
+        // for one full index walk on every meeting publication.
+        let mut inserted = 0_u64;
+        let mut last_id = 0_i64;
+        loop {
+            let page: Vec<(i64, String, Vec<u8>)> = sqlx::query_as(
+                "SELECT id, document_id, payload FROM retrieval_document_staging
+                 WHERE job_id = ? AND id > ? ORDER BY id LIMIT ?",
             )
-            .bind(job.generation_id)
-            .bind(&document.document_id)
-            .bind(job.meeting_id)
-            .bind(&document.source_kind)
-            .bind(&document.source_start_id)
-            .bind(&document.source_end_id)
-            .bind(&document.source_template_id)
-            .bind(&document.heading)
-            .bind(document.ordinal)
-            .bind(&document.content)
-            .bind(&document.content_hash)
-            .bind(document.dimensions)
-            .bind(document.vector_encoding.as_str())
-            .bind(&document.vector)
-            .bind(job.expected_source_revision)
-            .bind(&now)
-            .execute(&mut *tx)
+            .bind(job.job_id)
+            .bind(last_id)
+            .bind(REPLACEMENT_PAGE_DOCUMENTS)
+            .fetch_all(&mut *tx)
             .await?;
+            if page.is_empty() {
+                break;
+            }
+            last_id = page[page.len() - 1].0;
+            inserted += page.len() as u64;
+            for (_, document_id, payload) in page {
+                let document: StagedDocument = serde_json::from_slice(&payload).map_err(|_| {
+                    SqlxError::Protocol(format!(
+                        "staged payload for '{}' is unreadable",
+                        document_id
+                    ))
+                })?;
+                if document.document_id != document_id {
+                    return Err(SqlxError::Protocol(
+                        "staged payload identity does not match its key".into(),
+                    ));
+                }
+                validate_document(&model, &document)?;
+                sqlx::query(
+                    "INSERT INTO retrieval_documents (generation_id, document_id, meeting_id, source_kind, source_start_id, source_end_id, source_template_id, heading, ordinal, content, content_hash, dimensions, vector_encoding, vector, source_revision, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(job.generation_id)
+                .bind(&document.document_id)
+                .bind(job.meeting_id)
+                .bind(&document.source_kind)
+                .bind(&document.source_start_id)
+                .bind(&document.source_end_id)
+                .bind(&document.source_template_id)
+                .bind(&document.heading)
+                .bind(document.ordinal)
+                .bind(&document.content)
+                .bind(&document.content_hash)
+                .bind(document.dimensions)
+                .bind(document.vector_encoding.as_str())
+                .bind(&document.vector)
+                .bind(job.expected_source_revision)
+                .bind(&now)
+                .execute(&mut *tx)
+                .await?;
+            }
         }
         sqlx::query("DELETE FROM retrieval_document_staging WHERE job_id = ?")
             .bind(job.job_id)
@@ -1122,9 +1225,11 @@ impl RetrievalRepository {
         .await?;
         sqlx::query(
             "UPDATE retrieval_generations
-             SET document_count = (SELECT COUNT(*) FROM retrieval_documents WHERE generation_id = retrieval_generations.generation_id)
+             SET document_count = document_count + ? - ?
              WHERE generation_id = ?",
         )
+        .bind(inserted as i64)
+        .bind(removed_prior as i64)
         .bind(job.generation_id)
         .execute(&mut *tx)
         .await?;
@@ -1476,14 +1581,73 @@ impl RetrievalRepository {
         .await
     }
 
-    /// Payload-row ESTIMATE of derived bytes: `retrieval_documents`
-    /// content/hash/vector bytes plus staging payloads, with a fixed per-row
-    /// overhead allowance for identity columns. This is a lower-bound-ish
-    /// estimate only - it excludes indexes, journal/state rows, page
-    /// fragmentation, free pages, and WAL - so status labels it as an
-    /// estimate and the activation gate must use
-    /// [`Self::derived_backing_store_upper_bound_bytes`] instead.
-    pub async fn derived_disk_bytes(pool: &SqlitePool) -> Result<u64, SqlxError> {
+    /// Measured derived-storage bytes over the approved derived retrieval
+    /// tables and their indexes only (`retrieval_documents`,
+    /// `retrieval_document_staging`, `retrieval_meeting_state`,
+    /// `retrieval_index_state`, `retrieval_index_changes`,
+    /// `retrieval_generations`, `retrieval_models`). Primary meeting/FTS data,
+    /// process RAM, and any separately summed building-shadow term are
+    /// excluded by construction: only btrees rooted at these seven tables are
+    /// counted. Reading is pure - no checkpoint, write, or any other database
+    /// mutation; shared WAL bytes are not attributed here because a WAL mixes
+    /// primary and derived pages and cannot be decomposed without mutating
+    /// reads ([`Self::dbstat_derived_bytes`] instead measures committed btree
+    /// pages directly).
+    ///
+    /// This figure feeds status reporting and the block-only activation disk
+    /// gate. [`Self::dbstat_derived_bytes`] gives exact allocated pages where
+    /// the linked SQLite exposes dbstat; otherwise the payload calculation is
+    /// retained only as a clearly labelled status estimate and the gate input
+    /// is unavailable.
+    pub async fn derived_disk_usage(pool: &SqlitePool) -> Result<DerivedDiskUsage, SqlxError> {
+        if let Some(bytes) = Self::dbstat_derived_bytes(pool).await? {
+            return Ok(DerivedDiskUsage::exact(bytes));
+        }
+        Ok(DerivedDiskUsage::unavailable(
+            Self::payload_derived_bytes(pool).await?,
+        ))
+    }
+
+    /// Exact allocated-page bytes of the seven approved derived tables and
+    /// every index hanging off them, via the `dbstat` virtual table. Returns
+    /// `Ok(None)` when the linked SQLite build lacks `ENABLE_DBSTAT_VTAB`;
+    /// callers then retain only a status estimate from
+    /// [`Self::payload_derived_bytes`].
+    async fn dbstat_derived_bytes(pool: &SqlitePool) -> Result<Option<u64>, SqlxError> {
+        let supported: (i64,) =
+            sqlx::query_as("SELECT sqlite_compileoption_used('ENABLE_DBSTAT_VTAB')")
+                .fetch_one(pool)
+                .await?;
+        if supported.0 == 0 {
+            return Ok(None);
+        }
+        let list = DERIVED_TABLES
+            .iter()
+            .enumerate()
+            .map(|(index, _)| format!("?{}", index + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // dbstat emits one row per btree page whose `name` column matches the
+        // table itself or one of its indexes, so the sqlite_master filter
+        // collects exactly the btrees belonging to the derived tables.
+        let sql = format!(
+            "SELECT CAST(COALESCE(SUM(pgsize), 0) AS INTEGER) FROM dbstat \
+             WHERE name IN (SELECT name FROM sqlite_master WHERE tbl_name IN ({list}))"
+        );
+        let mut query = sqlx::query_scalar::<_, i64>(&sql);
+        for name in DERIVED_TABLES {
+            query = query.bind(name);
+        }
+        Ok(query.fetch_one(pool).await?.max(0) as u64).map(Some)
+    }
+
+    /// Status-only payload estimate used when dbstat is unavailable. It is not
+    /// a conservative activation bound: material SQLite metadata and index-key
+    /// storage are not fully represented, so callers must fail closed.
+    /// ponytail ceiling: a fixed factor cannot bound adversarial deletion
+    /// churn; if a useful diagnostic bound ever matters, upgrade to per-table
+    /// page accounting rather than inflating this constant.
+    async fn payload_derived_bytes(pool: &SqlitePool) -> Result<u64, SqlxError> {
         let documents: (i64, i64) = sqlx::query_as(
             "SELECT COUNT(*), COALESCE(SUM(length(content) + length(vector) + length(content_hash)), 0)
              FROM retrieval_documents",
@@ -1495,49 +1659,53 @@ impl RetrievalRepository {
         )
         .fetch_one(pool)
         .await?;
-        const PER_ROW_OVERHEAD: u64 = 192;
-        Ok(documents.0 as u64 * PER_ROW_OVERHEAD
-            + staging.0 as u64 * PER_ROW_OVERHEAD
-            + documents.1.max(0) as u64
-            + staging.1.max(0) as u64)
-    }
-
-    /// Conservative upper bound on the SQLite backing store this database can
-    /// occupy: every allocated main-file page (measured via `PRAGMA
-    /// page_count * page_size`) plus any committed-but-uncheckpointed WAL
-    /// frames (`PRAGMA wal_checkpoint(PASSIVE)` frame count). It necessarily
-    /// counts primary storage alongside derived data, so it may overcount -
-    /// which is safe for a block-only activation gate - but it cannot
-    /// undercount material data the way the payload estimate can.
-    pub async fn derived_backing_store_upper_bound_bytes(
-        pool: &SqlitePool,
-    ) -> Result<u64, SqlxError> {
-        let page_size: (i64,) = sqlx::query_as("PRAGMA page_size").fetch_one(pool).await?;
-        let page_count: (i64,) = sqlx::query_as("PRAGMA page_count").fetch_one(pool).await?;
-        // Non-WAL databases report no usable frame counts; tolerating a failed
-        // probe there measures 0 WAL bytes, which is exact rather than lazy.
-        let wal_frames = sqlx::query_as::<_, (i64, i64, i64)>("PRAGMA wal_checkpoint(PASSIVE)")
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten()
-            .map_or(0, |(_, log_frames, _)| log_frames.max(0) as u64);
-        Ok(page_count.0.max(0) as u64 * page_size.0.max(0) as u64
-            + wal_frames * page_size.0.max(0) as u64)
-    }
-
-    /// Resident-size estimate for building shadow generations
-    /// (`document_count * dimensions` int8 bytes each), used by the
-    /// activation envelope gate while a shadow snapshot does not exist yet.
-    pub async fn estimated_shadow_snapshot_bytes(pool: &SqlitePool) -> Result<u64, SqlxError> {
-        let row: (i64,) = sqlx::query_as(
-            "SELECT COALESCE(SUM(g.document_count * m.dimensions), 0)
-             FROM retrieval_generations g JOIN retrieval_models m ON m.model_id = g.model_id
-             WHERE g.state = 'building'",
-        )
+        let metadata_rows: i64 = sqlx::query_scalar(&format!(
+            "SELECT {}",
+            DERIVED_TABLES[2..]
+                .iter()
+                .map(|table| format!("(SELECT COUNT(*) FROM {table})"))
+                .collect::<Vec<_>>()
+                .join(" + ")
+        ))
         .fetch_one(pool)
         .await?;
-        Ok(row.0.max(0) as u64)
+        Ok(FALLBACK_FACTOR.saturating_mul(
+            documents.0.max(0) as u64 * PAYLOAD_ROW_OVERHEAD_BYTES
+                + staging.0.max(0) as u64 * PAYLOAD_ROW_OVERHEAD_BYTES
+                + documents.1.max(0) as u64
+                + staging.1.max(0) as u64
+                + metadata_rows.max(0) as u64 * META_ROW_OVERHEAD_BYTES,
+        ))
+    }
+
+    /// Read-only byte size of the committed-but-uncheckpointed WAL beside
+    /// this database: `PRAGMA database_list` supplies the main file path (a
+    /// plain catalog read), then the `<file>-wal` sibling is stat'ed on the
+    /// filesystem. No connection is opened, no checkpoint is issued, and no
+    /// byte of either file changes. Returns `None` when there is no WAL to
+    /// report (in-memory/temp database, or journal mode without a WAL file).
+    ///
+    /// The result is diagnostics only and deliberately NOT attributed to
+    /// [`Self::derived_disk_usage`]: WAL pages mix primary and derived
+    /// content, so adding it anywhere would reintroduce whole-primary-database
+    /// attribution that 2.R2 removed.
+    pub async fn wal_file_size(pool: &SqlitePool) -> Result<Option<u64>, SqlxError> {
+        let entries = sqlx::query_as::<_, (i64, String, String)>("PRAGMA database_list")
+            .fetch_all(pool)
+            .await?;
+        let main_file = entries
+            .into_iter()
+            .find(|(_, name, _)| name == "main")
+            .map(|(_, _, file)| file)
+            .unwrap_or_default();
+        if main_file.is_empty() {
+            return Ok(None);
+        }
+        match std::fs::metadata(format!("{main_file}-wal")) {
+            Ok(meta) => Ok(Some(meta.len())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(SqlxError::Io(error)),
+        }
     }
 
     // -- Publication journal ----------------------------------------------
@@ -1623,6 +1791,26 @@ impl RetrievalRepository {
         .fetch_optional(pool)
         .await?;
         Ok(row)
+    }
+
+    /// Reclaims acknowledged journal rows ONLY at or below the minimum
+    /// `published_change_id` across every generation still holding index
+    /// state. Every generation's replay reads strictly above its own bound,
+    /// which is at or above this minimum, so a deleted row can never be owed;
+    /// tombstones not yet acknowledged by their generation sit above it and
+    /// survive. Callers must run this outside the replacement transaction and
+    /// must not treat the returned count as a bound change - no bound moves.
+    pub async fn prune_acknowledged_index_changes(pool: &SqlitePool) -> Result<u64, SqlxError> {
+        let result = sqlx::query(
+            "DELETE FROM retrieval_index_changes
+              WHERE change_id <= (
+                  SELECT COALESCE(MIN(published_change_id), 0)
+                  FROM retrieval_index_state
+              )",
+        )
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     // -- Status and coverage ------------------------------------------------
@@ -1748,6 +1936,18 @@ pub struct CanonicalSnapshotRead {
 
 fn truncate_safe_error(error: &str) -> String {
     error.chars().take(300).collect()
+}
+
+/// True for the replacement failures that mean this staging can never
+/// publish: an unreadable payload or a payload whose identity does not match
+/// its key. Resuming such a job deterministically fails again, so callers
+/// discard exactly that job and restage fresh on the next attempt; every other
+/// failure leaves staging untouched and resumable.
+pub fn is_unreadable_staged_payload(error: &SqlxError) -> bool {
+    matches!(
+        error,
+        SqlxError::Protocol(message) if message.starts_with("staged payload")
+    )
 }
 
 async fn generation_model<'e, E>(
@@ -2018,6 +2218,10 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
+    }
+
+    fn diagnostic_bytes(usage: DerivedDiskUsage) -> u64 {
+        usage.bytes.or(usage.estimate_bytes).unwrap_or_default()
     }
 
     async fn add_transcript(pool: &SqlitePool, id: &str, meeting_id: &str, text: &str) {
@@ -2553,6 +2757,437 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[test]
+    fn unreadable_payload_failures_are_typed_for_the_discard_heal() {
+        assert!(is_unreadable_staged_payload(&SqlxError::Protocol(
+            "staged payload for 'd' is unreadable".into()
+        )));
+        assert!(is_unreadable_staged_payload(&SqlxError::Protocol(
+            "staged payload identity does not match its key".into()
+        )));
+        // Any other failure must keep staging resumable - no discard heal.
+        assert!(!is_unreadable_staged_payload(&SqlxError::Protocol(
+            "database is locked".into()
+        )));
+    }
+
+    #[tokio::test]
+    async fn document_count_moves_by_exact_deltas_and_survives_meeting_deletes() {
+        let pool = migrated_pool().await;
+        RetrievalRepository::register_model(&pool, &f32_spec("model", 2))
+            .await
+            .unwrap();
+        insert_meeting(&pool, "m1", "Delta One").await;
+        insert_meeting(&pool, "m2", "Delta Two").await;
+        RetrievalRepository::register_generation(&pool, "gen-dc", "model")
+            .await
+            .unwrap();
+        // A second live generation for the same meetings must never inherit
+        // another generation's publication deltas.
+        RetrievalRepository::register_generation(&pool, "gen-idle", "model")
+            .await
+            .unwrap();
+
+        let stored = |generation: &str, pool: &SqlitePool| {
+            let pool = pool.clone();
+            let generation = generation.to_string();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT document_count FROM retrieval_generations WHERE generation_id = ?",
+                )
+                .bind(generation)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let live_rows = |pool: &SqlitePool| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM retrieval_documents WHERE generation_id = 'gen-dc'",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let replace =
+            |meeting: &str, job: &str, documents: &[StagedDocument], pool: &SqlitePool| {
+                let pool = pool.clone();
+                let meeting = meeting.to_string();
+                let job = job.to_string();
+                let documents = documents.to_vec();
+                async move {
+                    RetrievalRepository::stage_documents(
+                        &pool, &job, "gen-dc", &meeting, 1, &documents,
+                    )
+                    .await
+                    .unwrap();
+                    RetrievalRepository::replace_meeting_documents(
+                        &pool,
+                        ReplacementJob {
+                            generation_id: "gen-dc",
+                            meeting_id: &meeting,
+                            expected_source_revision: 1,
+                            job_id: &job,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+            };
+
+        let three = vec![
+            doc("a", 2, VectorEncoding::F32, normalized_f32(&[1.0, 0.0])),
+            doc("b", 2, VectorEncoding::F32, normalized_f32(&[1.0, 0.0])),
+            doc("c", 2, VectorEncoding::F32, normalized_f32(&[1.0, 0.0])),
+        ];
+        replace("m1", "job-a", &three, &pool).await;
+        assert_eq!(
+            stored("gen-dc", &pool).await,
+            live_rows(&pool).await,
+            "counter matches reality after the first publication"
+        );
+        assert_eq!(stored("gen-dc", &pool).await, 3);
+
+        // Grow and shrink the same meeting; totals track remove/add deltas.
+        // Fresh ids keep staging UNIQUE(job_id, document_id) trivially legal.
+        let docs = |prefix: &str, count: usize| {
+            (0..count)
+                .map(|index| {
+                    doc(
+                        &format!("{prefix}-{index}"),
+                        2,
+                        VectorEncoding::F32,
+                        normalized_f32(&[1.0, 0.0]),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let five = docs("grow", 5);
+        replace("m1", "job-b", &five, &pool).await;
+        assert_eq!(stored("gen-dc", &pool).await, 5);
+        let one = docs("shrink", 1);
+        replace("m1", "job-c", &one, &pool).await;
+        assert_eq!(stored("gen-dc", &pool).await, 1);
+
+        // A second meeting's independent deltas accumulate.
+        let seven = docs("second", 7);
+        replace("m2", "job-d", &seven, &pool).await;
+        assert_eq!(stored("gen-dc", &pool).await, 8);
+        assert_eq!(stored("gen-idle", &pool).await, 0);
+
+        // Deleting a meeting cascades its canonical rows away outside any
+        // replacement transaction; the decrement happens in the same delete
+        // transaction so the counter never learns to drift.
+        assert!(MeetingsRepository::delete_meeting(&pool, "m2")
+            .await
+            .unwrap());
+        assert_eq!(stored("gen-dc", &pool).await, 1);
+        assert_eq!(stored("gen-dc", &pool).await, live_rows(&pool).await);
+    }
+
+    #[tokio::test]
+    async fn oversized_replacement_publishes_every_row_across_bounded_pages() {
+        let pool = migrated_pool().await;
+        RetrievalRepository::register_model(&pool, &f32_spec("model", 2))
+            .await
+            .unwrap();
+        insert_meeting(&pool, "m", "Oversized").await;
+        RetrievalRepository::register_generation(&pool, "gen-page", "model")
+            .await
+            .unwrap();
+
+        // Far above one approved page: publication must stream the staged job
+        // through page-sized SELECTs (LIMIT == MAX_STAGE_DOCUMENTS by
+        // construction of REPLACEMENT_PAGE_DOCUMENTS), never a whole-job fetch.
+        let total = 2 * crate::retrieval::worker::MAX_STAGE_DOCUMENTS as i64 + 37;
+        let documents: Vec<StagedDocument> = (0..total)
+            .map(|index| {
+                doc(
+                    &format!("d-{index}"),
+                    2,
+                    VectorEncoding::F32,
+                    normalized_f32(&[1.0, 0.0]),
+                )
+            })
+            .collect();
+        RetrievalRepository::stage_documents(&pool, "job-big", "gen-page", "m", 1, &documents)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            RetrievalRepository::replace_meeting_documents(
+                &pool,
+                ReplacementJob {
+                    generation_id: "gen-page",
+                    meeting_id: "m",
+                    expected_source_revision: 1,
+                    job_id: "job-big",
+                },
+            )
+            .await
+            .unwrap(),
+            ReplacementOutcome::Published { .. }
+        ));
+        assert_eq!(
+            scalar_count(
+                &pool,
+                "SELECT COUNT(*) FROM retrieval_documents WHERE meeting_id = 'm'"
+            )
+            .await,
+            total,
+            "every row past the ceiling is published exactly once"
+        );
+        assert_eq!(
+            scalar_count(
+                &pool,
+                "SELECT COUNT(DISTINCT document_id) FROM retrieval_documents WHERE meeting_id = 'm'"
+            )
+            .await,
+            total,
+            "no row may be duplicated or skipped across page boundaries"
+        );
+        assert_eq!(
+            scalar_count(&pool, "SELECT COUNT(*) FROM retrieval_document_staging").await,
+            0,
+            "staging is consumed with the commit even when it spanned pages"
+        );
+    }
+
+    #[tokio::test]
+    async fn poisoned_page_aborts_replacement_and_keeps_prior_documents_and_staging_resumable() {
+        let pool = migrated_pool().await;
+        RetrievalRepository::register_model(&pool, &f32_spec("model", 4))
+            .await
+            .unwrap();
+        insert_meeting(&pool, "m", "Poisoned Page").await;
+        RetrievalRepository::register_generation(&pool, "gen-poison", "model")
+            .await
+            .unwrap();
+
+        // Baseline canonical documents exist and one journal entry was made.
+        let baseline = [doc(
+            "old",
+            4,
+            VectorEncoding::F32,
+            normalized_f32(&[1.0, 0.0, 0.0, 0.0]),
+        )];
+        RetrievalRepository::stage_documents(&pool, "job-old", "gen-poison", "m", 1, &baseline)
+            .await
+            .unwrap();
+        assert!(matches!(
+            RetrievalRepository::replace_meeting_documents(
+                &pool,
+                ReplacementJob {
+                    generation_id: "gen-poison",
+                    meeting_id: "m",
+                    expected_source_revision: 1,
+                    job_id: "job-old",
+                },
+            )
+            .await
+            .unwrap(),
+            ReplacementOutcome::Published { .. }
+        ));
+
+        // Next-revision staging where one payload carries vector bytes that
+        // fail validation for the declared dimensions (valid JSON, so this is
+        // exactly the byte-validation the replacement performs per page).
+        let good = doc(
+            "next",
+            4,
+            VectorEncoding::F32,
+            normalized_f32(&[1.0, 0.0, 0.0, 0.0]),
+        );
+        RetrievalRepository::stage_documents(
+            &pool,
+            "job-poison",
+            "gen-poison",
+            "m",
+            1,
+            std::slice::from_ref(&good),
+        )
+        .await
+        .unwrap();
+        let mut bad = serde_json::to_value(doc(
+            "bad",
+            4,
+            VectorEncoding::F32,
+            normalized_f32(&[1.0, 0.0, 0.0, 0.0]),
+        ))
+        .unwrap();
+        bad["vector"] = serde_json::json!([1, 2, 3]);
+        sqlx::query(
+            "INSERT INTO retrieval_document_staging (job_id, generation_id, meeting_id, source_revision, document_id, payload)
+             VALUES ('job-poison', 'gen-poison', 'm', 1, 'bad', ?)",
+        )
+        .bind(serde_json::to_vec(&bad).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = RetrievalRepository::replace_meeting_documents(
+            &pool,
+            ReplacementJob {
+                generation_id: "gen-poison",
+                meeting_id: "m",
+                expected_source_revision: 1,
+                job_id: "job-poison",
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("bad"),
+            "the failing document is named typed/safely: {error}"
+        );
+
+        // Prior documents remain active, staging survives untouched and
+        // resumable, and no journal/retry state moved.
+        let surviving = RetrievalRepository::read_validated_documents(&pool, "gen-poison", "m")
+            .await
+            .unwrap();
+        assert_eq!(surviving.len(), 1);
+        assert_eq!(surviving[0].0, "old");
+        assert_eq!(
+            scalar_count(
+                &pool,
+                "SELECT COUNT(*) FROM retrieval_document_staging WHERE job_id = 'job-poison'"
+            )
+            .await,
+            2
+        );
+        let work: (String, i64, i64) = sqlx::query_as(
+            "SELECT state, attempt_count, indexed_source_revision
+             FROM retrieval_meeting_state WHERE generation_id = 'gen-poison' AND meeting_id = 'm'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(work, ("ready".to_string(), 0, 1));
+        assert_eq!(
+            scalar_count(
+                &pool,
+                "SELECT COUNT(*) FROM retrieval_index_changes WHERE generation_id = 'gen-poison'"
+            )
+            .await,
+            1,
+            "the aborted replacement must not journal anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_primary_write_progresses_behind_an_oversized_replacement() {
+        // The injected contention needs real concurrent connections on one
+        // file-backed WAL database.
+        let db_path = std::env::temp_dir().join(format!(
+            "meetly-retrieval-starve-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let options = SqliteConnectOptions::from_str(db_path.to_str().unwrap())
+            .unwrap()
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        let spec = ModelSpec {
+            model_id: "int8-model".to_string(),
+            dimensions: 2,
+            vector_encoding: VectorEncoding::Int8,
+            chunker_version: 1,
+            dequantization_scale: Some(1.0 / 127.0),
+            dequantization_zero_point: Some(0),
+        };
+        RetrievalRepository::register_model(&pool, &spec)
+            .await
+            .unwrap();
+        insert_meeting(&pool, "big", "Oversized").await;
+        insert_meeting(&pool, "peer", "Peer").await;
+        RetrievalRepository::register_generation(&pool, "gen-big", "int8-model")
+            .await
+            .unwrap();
+
+        let documents: Vec<StagedDocument> =
+            (0..(2 * crate::retrieval::worker::MAX_STAGE_DOCUMENTS + 37))
+                .map(|index| {
+                    doc(
+                        &format!("d-{index}"),
+                        2,
+                        VectorEncoding::Int8,
+                        vec![96u8, 84u8],
+                    )
+                })
+                .collect();
+        RetrievalRepository::stage_documents(&pool, "job-big", "gen-big", "big", 1, &documents)
+            .await
+            .unwrap();
+
+        // The oversized replacement holds the write lock across its pages in
+        // ONE revision-fenced transaction (atomicity requires nothing less).
+        // A concurrent primary write must queue and proceed - never fail, never
+        // starve - which SQLite's pending-byte/busy-timeout semantics ensure
+        // while every transaction stays bounded like this one.
+        let publisher_pool = pool.clone();
+        let publisher = tokio::spawn(async move {
+            RetrievalRepository::replace_meeting_documents(
+                &publisher_pool,
+                ReplacementJob {
+                    generation_id: "gen-big",
+                    meeting_id: "big",
+                    expected_source_revision: 1,
+                    job_id: "job-big",
+                },
+            )
+            .await
+        });
+        let mut peer_writes = 0_u64;
+        for index in 0..25 {
+            add_transcript(&pool, &format!("p{index}"), "peer", "primary progress").await;
+            peer_writes += 1;
+        }
+        let published = tokio::time::timeout(std::time::Duration::from_secs(10), publisher)
+            .await
+            .expect("an oversized replacement completes alongside primary writes");
+        assert!(matches!(
+            published.unwrap().unwrap(),
+            ReplacementOutcome::Published { .. }
+        ));
+        assert_eq!(peer_writes, 25);
+        assert_eq!(
+            scalar_count(
+                &pool,
+                "SELECT COUNT(*) FROM retrieval_documents WHERE meeting_id = 'big'"
+            )
+            .await,
+            documents.len() as i64
+        );
+        assert_eq!(
+            scalar_count(
+                &pool,
+                "SELECT COUNT(*) FROM search_source_state WHERE meeting_id = 'peer'"
+            )
+            .await,
+            1,
+            "concurrent primary writes all committed"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("sqlite-shm"));
     }
 
     #[tokio::test]
@@ -3108,7 +3743,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retired_generation_tombstones_block_cleanup_until_acknowledged() {
+    async fn meeting_delete_does_not_journal_retired_generation() {
         let pool = migrated_pool().await;
         RetrievalRepository::register_model(&pool, &f32_spec("model", 2))
             .await
@@ -3148,36 +3783,30 @@ mod tests {
             .await
             .unwrap();
 
-        // Retire the built generation; it still retains derived state and its
-        // publisher may still be draining, so it keeps earning tombstones.
+        // Retire the built generation; terminal generations have no publisher
+        // and therefore must not receive a future delete tombstone.
         RetrievalRepository::set_generation_state(&pool, "gen", "retired")
             .await
             .unwrap();
         assert!(MeetingsRepository::delete_meeting(&pool, "m")
             .await
             .unwrap());
-        let tombstone: (i64,) = sqlx::query_as(
-            "SELECT change_id FROM retrieval_index_changes WHERE meeting_id = 'm' AND operation = 'delete'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
         assert_eq!(
             RetrievalRepository::publication_lag(&pool, "gen")
                 .await
                 .unwrap(),
-            Some((tombstone.0, published)),
-            "a retired generation must observe canonical ahead of published"
+            Some((published, published)),
+            "a retired generation must not receive an unpublishable tombstone"
         );
-
-        // Cleanup stays blocked until the publisher acknowledges the delete...
-        assert!(RetrievalRepository::delete_generation(&pool, "gen")
-            .await
-            .is_err());
-        RetrievalRepository::acknowledge_journal(&pool, "gen", tombstone.0)
-            .await
-            .unwrap();
-        // ...then the acknowledged generation can be garbage collected.
+        assert_eq!(
+            scalar_count(
+                &pool,
+                "SELECT COUNT(*) FROM retrieval_index_changes
+                 WHERE generation_id = 'gen' AND operation = 'delete'",
+            )
+            .await,
+            0
+        );
         assert!(RetrievalRepository::delete_generation(&pool, "gen")
             .await
             .unwrap());
@@ -3189,6 +3818,139 @@ mod tests {
             .await,
             0,
             "acknowledged journal rows are pruned with their generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn journal_pruning_stops_at_the_minimum_published_bound() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "m", "Journal").await;
+        RetrievalRepository::register_model(&pool, &f32_spec("model", 2))
+            .await
+            .unwrap();
+        for generation in ["gen-a", "gen-b"] {
+            RetrievalRepository::ensure_generation(&pool, generation, "model")
+                .await
+                .unwrap();
+        }
+
+        // Deterministic journal: change ids 1..=12 split across the two
+        // generations; only rows at or below EVERY generation's published
+        // bound are reclaimable.
+        for (generation, meeting) in [
+            ("gen-a", "m"), // 1..=4 -> gen-a upserts + a delete tombstone
+            ("gen-a", "m"),
+            ("gen-a", "m"),
+            ("gen-a", "m"),
+            ("gen-b", "m"), // 5..=7 -> gen-b
+            ("gen-b", "m"),
+            ("gen-b", "m"),
+            ("gen-a", "m"), // 8..=10 -> gen-a, still unacknowledged
+            ("gen-a", "m"),
+            ("gen-a", "m"),
+            ("gen-b", "m"), // 11..=12 -> gen-b, still unacknowledged
+            ("gen-b", "m"),
+        ] {
+            sqlx::query(
+                "INSERT INTO retrieval_index_changes (generation_id, meeting_id, operation, source_revision, created_at)
+                 VALUES (?, ?, 'upsert', 1, 'now')",
+            )
+            .bind(generation)
+            .bind(meeting)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("UPDATE retrieval_index_state SET canonical_change_id = 12 WHERE generation_id IN ('gen-a', 'gen-b')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // gen-a published through 4, gen-b through 7: the global minimum is 4.
+        RetrievalRepository::acknowledge_journal(&pool, "gen-a", 4)
+            .await
+            .unwrap();
+        RetrievalRepository::acknowledge_journal(&pool, "gen-b", 7)
+            .await
+            .unwrap();
+
+        let pruned = RetrievalRepository::prune_acknowledged_index_changes(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            pruned, 4,
+            "only rows at/below the minimum bound are reclaimed"
+        );
+        assert_eq!(
+            scalar_count(&pool, "SELECT COUNT(*) FROM retrieval_index_changes").await,
+            8
+        );
+        // Every survivor sits above the global minimum, and gen-a's
+        // unacknowledged tombstone row (ids 9..=10 here are plain upserts but
+        // equally above the bound) is untouched.
+        let min_remaining: i64 =
+            sqlx::query_scalar("SELECT MIN(change_id) FROM retrieval_index_changes")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(min_remaining, 5);
+        assert_eq!(
+            scalar_count(
+                &pool,
+                "SELECT COUNT(*) FROM retrieval_index_changes WHERE change_id <= 4"
+            )
+            .await,
+            0
+        );
+
+        // Pruning never advances any bound.
+        assert_eq!(
+            RetrievalRepository::publication_lag(&pool, "gen-a")
+                .await
+                .unwrap(),
+            Some((12, 4))
+        );
+        assert_eq!(
+            RetrievalRepository::publication_lag(&pool, "gen-b")
+                .await
+                .unwrap(),
+            Some((12, 7))
+        );
+
+        // Raising gen-a's bound to 8 lifts the global minimum to 7: the next
+        // prune reclaims ids 5..=7 while everything above 8 survives.
+        RetrievalRepository::acknowledge_journal(&pool, "gen-a", 8)
+            .await
+            .unwrap();
+        let pruned = RetrievalRepository::prune_acknowledged_index_changes(&pool)
+            .await
+            .unwrap();
+        assert_eq!(pruned, 3);
+        assert_eq!(
+            scalar_count(
+                &pool,
+                "SELECT COUNT(*) FROM retrieval_index_changes WHERE change_id <= 7"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            scalar_count(&pool, "SELECT COUNT(*) FROM retrieval_index_changes").await,
+            5
+        );
+
+        // A freshly registered building generation publishes nothing yet
+        // (published_change_id = 0, exactly what ensure_generation writes),
+        // so its zero bound freezes pruning completely.
+        sqlx::query("UPDATE retrieval_index_state SET published_change_id = 0 WHERE generation_id = 'gen-b'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            RetrievalRepository::prune_acknowledged_index_changes(&pool)
+                .await
+                .unwrap(),
+            0,
+            "an unpublished generation's zero bound must block reclamation"
         );
     }
 
@@ -3577,17 +4339,10 @@ mod tests {
         RetrievalRepository::register_generation(&pool, "gen-disk", "model")
             .await
             .unwrap();
-        assert_eq!(
-            RetrievalRepository::derived_disk_bytes(&pool)
+        let before_docs = diagnostic_bytes(
+            RetrievalRepository::derived_disk_usage(&pool)
                 .await
                 .unwrap(),
-            0
-        );
-        assert_eq!(
-            RetrievalRepository::estimated_shadow_snapshot_bytes(&pool)
-                .await
-                .unwrap(),
-            0
         );
 
         let docs = [doc(
@@ -3599,10 +4354,12 @@ mod tests {
         RetrievalRepository::stage_documents(&pool, "job", "gen-disk", "m", 1, &docs)
             .await
             .unwrap();
-        let with_staging = RetrievalRepository::derived_disk_bytes(&pool)
-            .await
-            .unwrap();
-        assert!(with_staging > 0);
+        let with_staging = diagnostic_bytes(
+            RetrievalRepository::derived_disk_usage(&pool)
+                .await
+                .unwrap(),
+        );
+        assert!(with_staging >= before_docs);
         RetrievalRepository::replace_meeting_documents(
             &pool,
             ReplacementJob {
@@ -3624,10 +4381,11 @@ mod tests {
             0
         );
         assert!(
-            RetrievalRepository::derived_disk_bytes(&pool)
-                .await
-                .unwrap()
-                > 0,
+            diagnostic_bytes(
+                RetrievalRepository::derived_disk_usage(&pool)
+                    .await
+                    .unwrap(),
+            ) > 0,
             "published documents count against the envelope"
         );
         assert_eq!(
@@ -3783,11 +4541,15 @@ mod tests {
             .await
             .unwrap();
 
-        // Staging round-trips the heading (serde payload keeps it).
-        let resumed = RetrievalRepository::list_staged_documents(&pool, "job-h")
-            .await
-            .unwrap();
-        assert_eq!(resumed[0].heading.as_deref(), Some("Decisões"));
+        // Staging round-trips the heading through the serde payload.
+        let heading: Option<String> = sqlx::query_scalar(
+            "SELECT json_extract(CAST(payload AS TEXT), '$.heading')
+             FROM retrieval_document_staging WHERE document_id = 'h0'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(heading.as_deref(), Some("Decisões"));
 
         RetrievalRepository::replace_meeting_documents(
             &pool,
@@ -3818,47 +4580,161 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backing_store_measurement_reports_allocated_pages_conservatively() {
+    async fn derived_disk_usage_covers_only_derived_tables_and_is_conservative() {
         let pool = migrated_pool().await;
-        insert_meeting(&pool, "m", "Backing").await;
-        let upper_bound = RetrievalRepository::derived_backing_store_upper_bound_bytes(&pool)
+        // Primary data large enough to sit far above the derived footprint.
+        let big_primary = "x".repeat(64_000);
+        insert_meeting(&pool, "primary", "Primary").await;
+        add_transcript(&pool, "t0", "primary", &big_primary).await;
+
+        let (dbstat_enabled,): (i64,) =
+            sqlx::query_as("SELECT sqlite_compileoption_used('ENABLE_DBSTAT_VTAB')")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let before = RetrievalRepository::derived_disk_usage(&pool)
             .await
             .unwrap();
-        assert!(upper_bound > 0, "any allocated database reports pages");
-        let (page_size,): (i64,) = sqlx::query_as("PRAGMA page_size")
+
+        RetrievalRepository::register_model(&pool, &f32_spec("model", 2))
+            .await
+            .unwrap();
+        RetrievalRepository::register_generation(&pool, "gen-disk", "model")
+            .await
+            .unwrap();
+        let docs = [doc(
+            "d",
+            2,
+            VectorEncoding::F32,
+            normalized_f32(&[1.0, 0.0]),
+        )];
+        RetrievalRepository::stage_documents(&pool, "job", "gen-disk", "primary", 1, &docs)
+            .await
+            .unwrap();
+        let after = RetrievalRepository::derived_disk_usage(&pool)
+            .await
+            .unwrap();
+        assert!(diagnostic_bytes(after) >= diagnostic_bytes(before));
+
+        if dbstat_enabled == 1 {
+            assert_eq!(after.status, DerivedDiskMeasurementStatus::Exact);
+            assert!(after.bytes.is_some(), "dbstat is an exact measure");
+            assert!(after.estimate_bytes.is_none());
+        } else {
+            assert_eq!(after.status, DerivedDiskMeasurementStatus::Unavailable);
+            assert!(after.bytes.is_none());
+            assert!(after.estimate_bytes.is_some());
+        }
+
+        // The fallback formula stays a conservative bound over raw stored
+        // payloads (verified on every environment, not only where dbstat is
+        // absent): at least the documented factor over stored content,
+        // vector/hash, and staging-payload bytes.
+        let fallback = RetrievalRepository::payload_derived_bytes(&pool)
+            .await
+            .unwrap();
+        let raw_payload: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(
+                    (SELECT SUM(length(content) + length(vector) + length(content_hash))
+                     FROM retrieval_documents), 0)
+                 + COALESCE(
+                    (SELECT SUM(length(payload))
+                     FROM retrieval_document_staging), 0)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            fallback >= FALLBACK_FACTOR * raw_payload.max(0) as u64,
+            "the scaled payload sum must never undercount stored payloads"
+        );
+
+        // Derived tables only: the whole-database page total must dwarf what
+        // the measurement attributes, proving a primary-heavy database cannot
+        // leak into the derived envelope.
+        let page_size: (i64,) = sqlx::query_as("PRAGMA page_size")
             .fetch_one(&pool)
             .await
             .unwrap();
+        let page_count: (i64,) = sqlx::query_as("PRAGMA page_count")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let whole_db = page_count.0.max(0) as u64 * page_size.0.max(0) as u64;
         assert!(
-            upper_bound % page_size.max(1) as u64 == 0 || upper_bound >= page_size as u64,
-            "the measurement must be page-granular backing storage, not payload sums"
+            whole_db > diagnostic_bytes(after),
+            "a primary-large/derived-small database must report derived bytes below total size"
+        );
+    }
+
+    #[tokio::test]
+    async fn wal_file_size_is_read_only_and_never_enters_the_derived_gate() {
+        // In-memory/temp databases have no WAL sibling to report.
+        let memory = migrated_pool().await;
+        assert_eq!(
+            RetrievalRepository::wal_file_size(&memory).await.unwrap(),
+            None
         );
 
-        // Material data moves the bound: staging a document cannot shrink it.
-        let spec = ModelSpec {
-            model_id: "int8-model".to_string(),
-            dimensions: 2,
-            vector_encoding: VectorEncoding::Int8,
-            chunker_version: 1,
-            dequantization_scale: Some(1.0 / 127.0),
-            dequantization_zero_point: Some(0),
-        };
-        RetrievalRepository::register_model(&pool, &spec)
+        let db_path = std::env::temp_dir().join(format!(
+            "meetly-retrieval-walsize-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let options = SqliteConnectOptions::from_str(db_path.to_str().unwrap())
+            .unwrap()
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
             .await
             .unwrap();
-        RetrievalRepository::register_generation(&pool, "gen-b", "int8-model")
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        insert_meeting(&pool, "m", "WalSize").await;
+
+        let wal_path = db_path.with_extension("sqlite-wal");
+        let direct_len = || std::fs::metadata(&wal_path).unwrap().len();
+        assert!(direct_len() > 0, "committed migration writes left a WAL");
+        for _ in 0..3 {
+            assert_eq!(
+                RetrievalRepository::wal_file_size(&pool).await.unwrap(),
+                Some(direct_len()),
+                "every read is a pure filesystem stat"
+            );
+        }
+
+        let derived_before = RetrievalRepository::derived_disk_usage(&pool)
             .await
             .unwrap();
-        let staged = doc("d", 2, VectorEncoding::Int8, vec![96u8, 84u8]);
-        RetrievalRepository::stage_documents(&pool, "job", "gen-b", "m", 1, &[staged])
-            .await
-            .unwrap();
+        let wal_before = direct_len();
+
+        // More committed WAL bytes (big primary payload) must move the WAL
+        // gauge and never the derived-table figure.
+        add_transcript(&pool, "t-big", "m", &"primary bulk ".repeat(4_000)).await;
+        let wal_after = direct_len();
         assert!(
-            RetrievalRepository::derived_backing_store_upper_bound_bytes(&pool)
-                .await
-                .unwrap()
-                >= upper_bound
+            wal_after >= wal_before,
+            "sanity: reads did not truncate the WAL"
         );
+        assert_eq!(
+            RetrievalRepository::wal_file_size(&pool).await.unwrap(),
+            Some(wal_after),
+            "the gauge reports current WAL bytes without mutating them"
+        );
+        assert_eq!(
+            RetrievalRepository::derived_disk_usage(&pool)
+                .await
+                .unwrap(),
+            derived_before,
+            "WAL bytes are not attributed to the derived gate"
+        );
+
+        drop(pool);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&wal_path);
+        let _ = std::fs::remove_file(db_path.with_extension("sqlite-shm"));
     }
 
     #[tokio::test]

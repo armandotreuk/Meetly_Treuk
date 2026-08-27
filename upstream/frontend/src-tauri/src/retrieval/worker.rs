@@ -9,7 +9,11 @@
 //! Ordering rules this module guarantees:
 //! - FTS repair runs first and is model-independent: stale projections heal
 //!   even when the bundled models fail to load, and the indexed revision is
-//!   marked only after a complete refresh.
+//!   marked only after a complete refresh. A mark superseded mid-refresh keeps
+//!   the meeting due with no error state, but consecutive supersessions of the
+//!   same meeting fall through to the sleep quantum after a small bound so a
+//!   continuously mutating meeting cannot monopolize the loop; a failed mark
+//!   records persisted backoff exactly like a failed refresh.
 //! - Semantic work processes one bounded due item at a time, extracting
 //!   authoritative rows through the Task 2.1 repository, chunking with the
 //!   exact packaged tokenizer (Task 2.3), and embedding through bounded CPU
@@ -34,7 +38,7 @@
 //! because model or index work failed. Logs carry counts, IDs, stages, and
 //! safe error kinds - never source text, tokens, or vectors.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
@@ -47,8 +51,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::database::repositories::fts::FtsRepository;
 use crate::database::repositories::retrieval::{
-    FtsDueItem, GenerationWorkItem, ModelSpec, ReplacementJob, ReplacementOutcome,
-    RetrievalRepository, StagedDocument, VectorEncoding,
+    is_unreadable_staged_payload, FtsDueItem, GenerationWorkItem, ModelSpec, ReplacementJob,
+    ReplacementOutcome, RetrievalRepository, StagedDocument, VectorEncoding,
 };
 use crate::retrieval::chunking::{
     chunk_meeting, ChunkerConfig, SemanticDocument, TokenizerPolicy, APPROVED_CHUNKER_VERSION,
@@ -65,10 +69,19 @@ const MAX_QUEUED_INTERACTIVE: usize = 8;
 /// an active recording/import/retranscription signal. The same quantum is the
 /// worker's idle poll interval, bounding wake latency for durable revisions.
 pub const PAUSE_QUANTUM: Duration = Duration::from_millis(250);
-/// Approved staging ceiling from the sprint contract.
-const MAX_STAGE_DOCUMENTS: usize = 256;
+/// Approved staging ceiling from the sprint contract. Also the streaming page
+/// size of the repository's revision-fenced replacement, so resume selection,
+/// staging, and publication all stay bounded by one batch.
+pub(crate) const MAX_STAGE_DOCUMENTS: usize = 256;
 /// Approved staging ceiling: 64 MiB estimated working memory per batch.
 const MAX_STAGE_BYTES: u64 = 64 * 1024 * 1024;
+/// Consecutive superseded marks tolerated for the SAME meeting before a tick
+/// falls through to the sleep quantum instead of immediately repairing it
+/// again. Each supersession is normal (the projection advanced mid-refresh and
+/// nothing persisted), but a meeting whose projection advances on every pass
+/// would otherwise be re-refreshed back-to-back forever; this bound leaves the
+/// rest of every tick for other due work until the mutation storm passes.
+const MAX_CONSECUTIVE_FTS_SUPERSESSIONS: u32 = 4;
 /// Retry schedule: exponential backoff from 2 s capped at 1 h.
 const BASE_BACKOFF_SECS: i64 = 2;
 const BACKOFF_CAP_SECS: i64 = 3600;
@@ -103,7 +116,10 @@ pub trait DocumentEmbedder: Send + Sync + 'static {
 
 impl DocumentEmbedder for RetrievalModels {
     fn model_id(&self) -> String {
-        self.identity().bundle_id.clone()
+        // The persisted identity is derived from the complete approved bundle
+        // contract (which `parse_manifest` enforces for every loadable
+        // bundle), not from the raw bundle id.
+        bundled_model_identity()
     }
 
     fn dimensions(&self) -> usize {
@@ -501,8 +517,9 @@ impl RetrievalLifecycle {
         Arc::clone(&self.0.index)
     }
 
-    /// Manual pause for the later status UI: stops lexical repair and
-    /// semantic indexing at item boundaries without discarding durable work.
+    /// Manual pause for the later status UI: stops semantic indexing at item
+    /// boundaries without discarding durable work. Lexical repair and query
+    /// publication/catch-up continue.
     /// Query publication/catch-up continues so the active snapshot stays
     /// truthful.
     pub fn set_index_paused(&self, paused: bool) {
@@ -533,6 +550,8 @@ async fn run_worker(state: WorkerState) {
     let mut embedders: BTreeMap<String, Arc<dyn DocumentEmbedder>> = BTreeMap::new();
     let mut last_load_attempt: Option<std::time::Instant> = None;
     let mut staging_recovered = false;
+    // (meeting id, consecutive superseded marks) for the pacing bound below.
+    let mut fts_supersessions: Option<(String, u32)> = None;
 
     loop {
         if state.cancel.is_cancelled() {
@@ -566,7 +585,21 @@ async fn run_worker(state: WorkerState) {
             log::warn!("Query-index publication tick failed: {error}");
         }
 
-        if pressure() || state.paused.load(Ordering::SeqCst) {
+        // Best-effort journal reclamation runs outside every replacement
+        // transaction and never advances any bound; rows at or above the
+        // minimum published bound (including unacknowledged tombstones)
+        // always survive.
+        if !state.cancel.is_cancelled() {
+            match RetrievalRepository::prune_acknowledged_index_changes(&state.pool).await {
+                Ok(pruned) if pruned > 0 => {
+                    log::info!("Pruned {pruned} acknowledged semantic journal rows")
+                }
+                Ok(_) => {}
+                Err(error) => log::warn!("Journal pruning failed: {error}"),
+            }
+        }
+
+        if pressure() {
             if !sleep_quantum(&state.cancel).await {
                 break;
             }
@@ -578,11 +611,44 @@ async fn run_worker(state: WorkerState) {
             .await
         {
             Ok(items) if !items.is_empty() => {
-                repair_fts_item(&state.pool, &state.cancel, &items[0]).await;
-                continue;
+                match repair_fts_item(&state.pool, &state.cancel, &items[0]).await {
+                    FtsRepairOutcome::Indexed | FtsRepairOutcome::BackedOff => {
+                        fts_supersessions = None;
+                        continue;
+                    }
+                    // Normal outcome: nothing persisted and the meeting stays
+                    // due. Re-repair immediately only while the consecutive
+                    // streak for this meeting is small; past the bound let the
+                    // rest of the tick run (model availability, semantic due
+                    // items, idle quantum) so a continuously mutating meeting
+                    // cannot eat every pass before other work progresses.
+                    FtsRepairOutcome::Superseded => {
+                        let streak = match &fts_supersessions {
+                            Some((meeting, count)) if *meeting == items[0].meeting_id => {
+                                count.saturating_add(1)
+                            }
+                            _ => 1,
+                        };
+                        fts_supersessions = Some((items[0].meeting_id.clone(), streak));
+                        if streak < MAX_CONSECUTIVE_FTS_SUPERSESSIONS {
+                            continue;
+                        }
+                        log::debug!(
+                            "FTS repair for meeting {} superseded {streak} times consecutively; yielding the rest of this tick",
+                            items[0].meeting_id
+                        );
+                    }
+                }
             }
             Ok(_) => {}
             Err(error) => log::warn!("FTS due-work selection failed: {error}"),
+        }
+
+        if state.paused.load(Ordering::SeqCst) {
+            if !sleep_quantum(&state.cancel).await {
+                break;
+            }
+            continue;
         }
 
         // 2) Semantic indexing needs the bundled engine; loading failures keep
@@ -668,16 +734,62 @@ async fn load_embedder(loader: &EngineLoader) -> Result<Arc<dyn DocumentEmbedder
         .map_err(|error| format!("model loader join failed: {error}"))?
 }
 
-/// Deterministic generation identity for the initial bundled-model build, so
-/// restarts resume the same generation instead of registering duplicates.
-/// Manual rebuilds (Task 2.5) register distinct shadow generations.
-fn generation_id_for(model_id: &str) -> String {
-    let digest = Sha256::digest(model_id.as_bytes());
-    let prefix: String = digest[..8]
+/// Derives the persisted retrieval model identity from the complete approved
+/// contract (`architecture.md` "Prior-Model Retention Across Upgrade"): bundle
+/// id, embedding model id and revision, ONNX export revision, quantization,
+/// dimensions, vector encoding, and chunker version. The readable prefix keeps
+/// logs/status diagnosable; the SHA-256 digest carries the discrimination, so
+/// any contract change mints a distinct identity.
+pub(crate) fn derived_model_identity(
+    bundle_id: &str,
+    embedding_model_id: &str,
+    embedding_revision: &str,
+    export_revision: &str,
+    export_quantization: &str,
+    dimensions: u32,
+    vector_encoding: &str,
+    chunker_version: u32,
+) -> String {
+    let payload = [
+        bundle_id,
+        embedding_model_id,
+        embedding_revision,
+        export_revision,
+        export_quantization,
+        &dimensions.to_string(),
+        vector_encoding,
+        &chunker_version.to_string(),
+    ]
+    .join("\u{1f}");
+    let digest = Sha256::digest(payload.as_bytes());
+    let short: String = digest[..8]
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    format!("gen-{prefix}")
+    format!("mid-{bundle_id}-{vector_encoding}-c{chunker_version}-{short}")
+}
+
+/// The persisted identity of the bundled production runtime, folding the
+/// manifest-pinned contract with the approved storage contract
+/// ([`semantic_model_spec`]).
+pub(crate) fn bundled_model_identity() -> String {
+    let contract = crate::model_bundle::approved_embedding_contract();
+    derived_model_identity(
+        contract.bundle_id,
+        contract.embedding_model_id,
+        contract.embedding_revision,
+        contract.onnx_export_revision,
+        contract.onnx_export_quantization,
+        contract.dimensions,
+        VectorEncoding::Int8.as_str(),
+        APPROVED_CHUNKER_VERSION,
+    )
+}
+
+/// Mints one opaque generation id. Nothing may depend on a generation id
+/// equalling a hash of anything; uniqueness comes from the random UUID.
+fn mint_generation_id() -> String {
+    format!("gen-{}", uuid::Uuid::new_v4())
 }
 
 /// Approved storage contract (`architecture.md`, Sprint 1 bundle table):
@@ -704,8 +816,18 @@ async fn register_semantic_identity(
     let model_id = embedder.model_id();
     let spec = semantic_model_spec(&model_id, embedder.dimensions());
     RetrievalRepository::ensure_model(pool, &spec).await?;
-    RetrievalRepository::ensure_generation(pool, &generation_id_for(&model_id), &model_id).await?;
-    Ok(())
+    // Resumption is a lookup: an existing live generation for this exact
+    // model identity keeps its id (and its documents), so restarts never
+    // re-register and never depend on any id derivation.
+    if RetrievalRepository::find_live_generation(pool, &model_id)
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+    RetrievalRepository::ensure_generation(pool, &mint_generation_id(), &model_id)
+        .await
+        .map(|_| ())
 }
 
 /// Selects the next due (generation, meeting) item. When an engine is
@@ -738,11 +860,27 @@ async fn next_due_item(
     Ok(None)
 }
 
+/// How a lexical repair pass ended, feeding the worker loop's pacing:
+/// indexed, superseded (normal non-advance, meeting stays due), or backed off
+/// (persisted failure state). Supersession is deliberately not an error and
+/// never touches the durable retry columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FtsRepairOutcome {
+    Indexed,
+    Superseded,
+    BackedOff,
+}
+
 /// Model-independent lexical healing: refresh completely, then mark indexed.
-/// Any failure schedules bounded backoff and never fails a caller.
-async fn repair_fts_item(pool: &SqlitePool, cancel: &CancellationToken, item: &FtsDueItem) {
+/// A superseded mark keeps the meeting due untouched; any failure schedules
+/// bounded backoff. Never fails a caller.
+async fn repair_fts_item(
+    pool: &SqlitePool,
+    cancel: &CancellationToken,
+    item: &FtsDueItem,
+) -> FtsRepairOutcome {
     if cancel.is_cancelled() {
-        return;
+        return FtsRepairOutcome::BackedOff;
     }
     match FtsRepository::refresh_meeting(pool, &item.meeting_id).await {
         Ok(()) => {
@@ -759,19 +897,33 @@ async fn repair_fts_item(pool: &SqlitePool, cancel: &CancellationToken, item: &F
             {
                 Ok(true) => {
                     log::info!("Repaired FTS projection for meeting {}", item.meeting_id);
+                    FtsRepairOutcome::Indexed
                 }
                 Ok(false) => {
                     log::debug!(
                         "FTS repair superseded mid-refresh for meeting {}; staying due",
                         item.meeting_id
                     );
+                    FtsRepairOutcome::Superseded
                 }
                 Err(error) => {
+                    let safe_error = format!("fts mark failed: {error}");
                     log::warn!(
                         "Marking FTS indexed failed for meeting {}: {}",
                         item.meeting_id,
-                        error
+                        safe_error
                     );
+                    if let Err(record_error) = RetrievalRepository::record_fts_failure(
+                        pool,
+                        &item.meeting_id,
+                        &safe_error,
+                        &backoff_timestamp(item.attempt_count + 1),
+                    )
+                    .await
+                    {
+                        log::warn!("Recording FTS failure state failed: {record_error}");
+                    }
+                    FtsRepairOutcome::BackedOff
                 }
             }
         }
@@ -792,6 +944,7 @@ async fn repair_fts_item(pool: &SqlitePool, cancel: &CancellationToken, item: &F
             {
                 log::warn!("Recording FTS failure state failed: {record_error}");
             }
+            FtsRepairOutcome::BackedOff
         }
     }
 }
@@ -848,30 +1001,59 @@ async fn process_semantic_item(
     let keep: Vec<String> = documents.iter().map(|d| d.document_id.clone()).collect();
     if let Err(error) = RetrievalRepository::retain_staged_documents(pool, &job_id, &keep).await {
         log::warn!("Pruning divergent staged documents failed: {error}");
-        if let Err(discard_error) = RetrievalRepository::discard_staging_job(pool, &job_id).await {
-            log::warn!("Discarding divergent staged job also failed: {discard_error}");
+        match RetrievalRepository::discard_staging_job(pool, &job_id).await {
+            Ok(()) => {}
+            Err(discard_error) => {
+                log::warn!("Discarding divergent staged job also failed: {discard_error}");
+                record_item_failure(
+                    pool,
+                    index,
+                    generation_id,
+                    meeting_id,
+                    item,
+                    &format!("staging cleanup failed: {error}; discard failed: {discard_error}"),
+                )
+                .await;
+                return;
+            }
         }
     }
-    let staged = match RetrievalRepository::list_staged_documents(pool, &job_id).await {
-        Ok(staged) => staged,
+    // Resume selection reads staged identities only: deciding what still
+    // needs embedding never deserializes payloads or clones vector bytes. A
+    // poisoned payload stays invisible here by design; publication validates
+    // the exact inserted bytes, and its failure below heals the job.
+    let reusable: HashSet<String> = match RetrievalRepository::list_staged_document_ids(
+        pool, &job_id,
+    )
+    .await
+    {
+        Ok(ids) => ids.into_iter().collect(),
         Err(error) => {
             log::warn!("Staged job unreadable, restaging fresh: {error}");
             if let Err(discard_error) =
                 RetrievalRepository::discard_staging_job(pool, &job_id).await
             {
                 log::warn!("Discarding unreadable staged job failed: {discard_error}");
+                record_item_failure(
+                        pool,
+                        index,
+                        generation_id,
+                        meeting_id,
+                        item,
+                        &format!(
+                            "unreadable staging recovery failed: {error}; discard failed: {discard_error}"
+                        ),
+                    )
+                    .await;
+                return;
             }
-            Vec::new()
+            HashSet::new()
         }
     };
-    let reusable: HashMap<String, Vec<u8>> = staged
-        .into_iter()
-        .map(|document| (document.document_id, document.vector))
-        .collect();
 
     let pending: Vec<&SemanticDocument> = documents
         .iter()
-        .filter(|document| !reusable.contains_key(&document.document_id))
+        .filter(|document| !reusable.contains(&document.document_id))
         .collect();
     let dimensions = embedder.dimensions();
 
@@ -1043,6 +1225,17 @@ async fn process_semantic_item(
         Err(error) => {
             if let Some(stale_epoch) = stale_epoch {
                 index.restore_stale(stale_epoch);
+            }
+            if is_unreadable_staged_payload(&error) {
+                // A staged row that can never validate would poison every
+                // future resume; drop exactly this job so the next attempt
+                // restages fresh instead of burning bounded attempts.
+                if let Err(discard_error) =
+                    RetrievalRepository::discard_staging_job(pool, &job_id).await
+                {
+                    log::warn!("Discarding poisoned staged job failed: {discard_error}");
+                }
+                log::warn!("Discarded poisoned staged job for meeting {meeting_id}");
             }
             record_item_failure(
                 pool,
@@ -1291,6 +1484,28 @@ mod tests {
         .unwrap()
     }
 
+    /// Durable proof of how many times the publisher journaled a generation:
+    /// ids are dense from 1, so (canonical, published) equals that count once
+    /// fully acknowledged - even after acknowledged rows are reclaimed.
+    async fn published_bounds(pool: &SqlitePool, generation: &str) -> (i64, i64) {
+        RetrievalRepository::publication_lag(pool, generation)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Waits until the durable bound of `generation` is non-zero and fully
+    /// acknowledged (the lagging subscriber race out of the assertion).
+    async fn wait_fully_acknowledged(pool: &SqlitePool, generation: &str) {
+        let pool_ref = pool;
+        let generation_ref = generation;
+        wait_until(async || {
+            let (canonical, published) = published_bounds(pool_ref, generation_ref).await;
+            canonical > 0 && canonical == published
+        })
+        .await;
+    }
+
     async fn fts_is_current(pool: &SqlitePool, meeting: &str) -> bool {
         sqlx::query_as::<_, (i64, i64)>(
             "SELECT fts_indexed_revision, fts_projection_revision
@@ -1452,19 +1667,34 @@ mod tests {
     }
 
     async fn ensure_test_generation(pool: &SqlitePool) -> String {
-        // Same approved int8 spec the production worker registers, so manual
-        // staging in tests validates exactly like pipeline output.
-        let spec = semantic_model_spec(FAKE_MODEL_ID, FAKE_DIMENSIONS);
-        assert!(RetrievalRepository::ensure_model(pool, &spec)
+        // The exact production registration path (same approved int8 spec and
+        // resumption logic), so manual staging in tests validates exactly
+        // like pipeline output.
+        let embedder = FakeEmbedder::new();
+        register_semantic_identity(pool, embedder.as_ref())
             .await
-            .unwrap());
-        let generation = generation_id_for(FAKE_MODEL_ID);
-        assert!(
-            RetrievalRepository::ensure_generation(pool, &generation, FAKE_MODEL_ID)
+            .unwrap();
+        RetrievalRepository::find_live_generation(pool, FAKE_MODEL_ID)
+            .await
+            .unwrap()
+            .expect("registration must leave a live generation to resume")
+    }
+
+    /// Waits until the attached worker registered its generation and returns
+    /// the looked-up (never recomputed) id.
+    async fn worker_generation(pool: &SqlitePool) -> String {
+        let pool_ref = pool;
+        wait_until(async || {
+            RetrievalRepository::find_live_generation(pool_ref, FAKE_MODEL_ID)
                 .await
                 .unwrap()
-        );
-        generation
+                .is_some()
+        })
+        .await;
+        RetrievalRepository::find_live_generation(pool, FAKE_MODEL_ID)
+            .await
+            .unwrap()
+            .expect("worker registration must produce a resumable generation")
     }
 
     #[tokio::test]
@@ -1665,12 +1895,13 @@ mod tests {
             1
         );
 
-        let resumed =
-            RetrievalRepository::list_staged_documents(&pool, &staging_job_id(&generation, "m", 2))
-                .await
-                .unwrap();
-        assert_eq!(resumed.len(), 1);
-        assert_eq!(resumed[0].document_id, "current");
+        let resumed = RetrievalRepository::list_staged_document_ids(
+            &pool,
+            &staging_job_id(&generation, "m", 2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resumed, vec!["current".to_string()]);
 
         // Pruning keeps exactly the current chunk set...
         let removed = RetrievalRepository::retain_staged_documents(
@@ -1686,8 +1917,10 @@ mod tests {
             0
         );
 
-        // ...and an unreadable payload surfaces as an error the worker heals
-        // by discarding and restaging.
+        // ...and an unreadable payload is invisible to the identity-only
+        // resume read: it yields its id, and validation - with its atomic
+        // abort plus poisoned-job discard/restage heal - happens exactly at
+        // publication instead.
         RetrievalRepository::stage_documents(
             &pool,
             &staging_job_id(&generation, "m", 2),
@@ -1702,12 +1935,119 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        assert!(RetrievalRepository::list_staged_documents(
+        assert_eq!(
+            RetrievalRepository::list_staged_document_ids(
+                &pool,
+                &staging_job_id(&generation, "m", 2)
+            )
+            .await
+            .unwrap(),
+            vec!["corrupt".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_divergent_staging_cleanup_retries_without_publishing() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "m", "Cleanup failure").await;
+        add_transcript(&pool, "t1", "m", "stable source").await;
+        let generation = ensure_test_generation(&pool).await;
+        let embedder = FakeEmbedder::new();
+        let revision = RetrievalRepository::current_source_revision(&pool, "m")
+            .await
+            .unwrap()
+            .unwrap();
+        let job_id = staging_job_id(&generation, "m", revision);
+
+        RetrievalRepository::stage_documents(
             &pool,
-            &staging_job_id(&generation, "m", 2)
+            &job_id,
+            &generation,
+            "m",
+            revision,
+            &[test_document("canonical", "canonical")],
         )
         .await
-        .is_err());
+        .unwrap();
+        assert!(matches!(
+            RetrievalRepository::replace_meeting_documents(
+                &pool,
+                ReplacementJob {
+                    generation_id: &generation,
+                    meeting_id: "m",
+                    expected_source_revision: revision,
+                    job_id: &job_id,
+                },
+            )
+            .await
+            .unwrap(),
+            ReplacementOutcome::Published { .. }
+        ));
+        let published_before = published_bounds(&pool, &generation).await;
+
+        sqlx::query("UPDATE meetings SET title = 'Changed source' WHERE id = 'm'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let revision = RetrievalRepository::current_source_revision(&pool, "m")
+            .await
+            .unwrap()
+            .unwrap();
+        let job_id = staging_job_id(&generation, "m", revision);
+        RetrievalRepository::stage_documents(
+            &pool,
+            &job_id,
+            &generation,
+            "m",
+            revision,
+            &[test_document("stale", "stale")],
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER reject_staging_cleanup BEFORE DELETE ON retrieval_document_staging
+             BEGIN SELECT RAISE(ABORT, 'synthetic cleanup failure'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let item = GenerationWorkItem {
+            meeting_id: "m".to_string(),
+            indexed_source_revision: revision - 1,
+            source_revision: revision,
+            state: "pending".to_string(),
+            attempt_count: 0,
+        };
+        let scheduler = RetrievalScheduler::new();
+        let index = crate::retrieval::index::QueryIndexService::new(scheduler.clone());
+        let embedder_trait: Arc<dyn DocumentEmbedder> = embedder.clone();
+        process_semantic_item(
+            &pool,
+            &CancellationToken::new(),
+            &free_pressure(),
+            &scheduler,
+            &index,
+            &embedder_trait,
+            &generation,
+            &item,
+        )
+        .await;
+
+        assert_eq!(published_bounds(&pool, &generation).await, published_before);
+        let canonical = RetrievalRepository::read_validated_documents(&pool, &generation, "m")
+            .await
+            .unwrap();
+        assert_eq!(canonical.len(), 1);
+        assert_eq!(canonical[0].0, "canonical");
+        assert_eq!(
+            scalar(&pool, "SELECT COUNT(*) FROM retrieval_document_staging").await,
+            1
+        );
+        let (state, attempts, _) = meeting_state(&pool, &generation, "m").await;
+        assert_eq!(state, "retry");
+        assert_eq!(attempts, 1);
+        assert!(embedder.embedded_texts().is_empty());
     }
 
     // -- Scheduler policy ----------------------------------------------------
@@ -2189,17 +2529,345 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(published.len(), documents.len());
+        wait_fully_acknowledged(&pool, &generation).await;
         assert_eq!(
-            scalar(
-                &pool,
-                "SELECT COUNT(*) FROM retrieval_index_changes WHERE operation = 'upsert'"
-            )
-            .await,
-            1
+            published_bounds(&pool, &generation).await,
+            (1, 1),
+            "exactly one journal insertion was acknowledged for the resume"
         );
         assert_eq!(
             scalar(&pool, "SELECT COUNT(*) FROM retrieval_document_staging").await,
             0
+        );
+        lifecycle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn oversized_resume_reuses_staged_ids_and_publishes_within_the_page_ceiling() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "big", "Resumed Oversized").await;
+        // One very long utterance splits into far more than one approved batch
+        // of transcript windows, so resume selection and publication both
+        // cross multiple pages/batches.
+        add_transcript(
+            &pool,
+            "t-long",
+            "big",
+            &"palavra ".repeat(crate::retrieval::chunking::WINDOW_TOKENS * 300),
+        )
+        .await;
+        let embedder = FakeEmbedder::new();
+        let documents = chunk_with_fake(&pool, "big", &embedder).await;
+        assert!(
+            documents.len() > MAX_STAGE_DOCUMENTS,
+            "the synthetic meeting must exceed the batch ceiling: {} documents",
+            documents.len()
+        );
+
+        // Crash simulation right before the last batch staged.
+        let generation = ensure_test_generation(&pool).await;
+        let revision = RetrievalRepository::current_source_revision(&pool, "big")
+            .await
+            .unwrap()
+            .unwrap();
+        let job_id = staging_job_id(&generation, "big", revision);
+        let survivors: Vec<StagedDocument> = documents[..documents.len() - 1]
+            .iter()
+            .map(|document| {
+                staged_document(
+                    document,
+                    &FakeEmbedder::vector_for(&document.content),
+                    FAKE_DIMENSIONS,
+                )
+                .unwrap()
+            })
+            .collect();
+        RetrievalRepository::stage_documents(
+            &pool,
+            &job_id,
+            &generation,
+            "big",
+            revision,
+            &survivors,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            RetrievalRepository::list_staged_document_ids(&pool, &job_id)
+                .await
+                .unwrap()
+                .len(),
+            documents.len() - 1,
+            "staging holds the full job minus one identity"
+        );
+
+        // Restart reuses the survivors by identity only - no survivor payload
+        // is ever deserialized for the decision or re-embedded - and streams
+        // the oversized job into canonical rows inside the fenced transaction.
+        let lifecycle = lifecycle_for_test(free_pressure(), ok_loader(&embedder));
+        lifecycle.attach_database(pool.clone());
+        let pool_ref = &pool;
+        let generation_ref = &generation;
+        wait_until(async || {
+            matches!(
+                meeting_state(pool_ref, generation_ref, "big").await,
+                (state, _, _) if state == "ready"
+            )
+        })
+        .await;
+
+        let embedded = embedder.embedded_texts();
+        // Pigeonhole reuse proof: staging held every document except the last
+        // (IDs verified above), and exactly one text was embedded - so every
+        // other survivor resumed by ID alone without re-embedding. Content
+        // strings are meaningless here (identical windows repeat text); IDs
+        // carry the identity.
+        assert_eq!(embedded.len(), 1, "only the missing tail was embedded");
+        assert_eq!(
+            scalar(
+                &pool,
+                "SELECT COUNT(*) FROM retrieval_documents WHERE meeting_id = 'big'"
+            )
+            .await,
+            documents.len() as i64,
+            "every oversized document published exactly once"
+        );
+        assert_eq!(
+            scalar(&pool, "SELECT COUNT(*) FROM retrieval_document_staging").await,
+            0
+        );
+        wait_fully_acknowledged(&pool, &generation).await;
+        assert_eq!(
+            published_bounds(&pool, &generation).await,
+            (1, 1),
+            "the oversized publication journaled once"
+        );
+        lifecycle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn superseded_mark_is_normal_and_never_touches_retry_backoff() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "spin", "Spinner").await;
+
+        let item = RetrievalRepository::list_due_fts_repairs(&pool, &Utc::now().to_rfc3339(), 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|item| item.meeting_id == "spin")
+            .expect("a fresh meeting is due");
+
+        // A mutation lands between selection and marking; the stale mark is a
+        // typed non-advance, not an error.
+        let folder = FolderRepository::create(&pool, "Work", None).await.unwrap();
+        FolderRepository::set_meeting_folder(&pool, "spin", Some(&folder.id))
+            .await
+            .unwrap();
+        let outcome = repair_fts_item(&pool, &CancellationToken::new(), &item).await;
+        assert_eq!(outcome, FtsRepairOutcome::Superseded);
+
+        // Nothing persisted: indexed stayed behind, retry columns untouched,
+        // meeting still due so the next repair covers the newer projection -
+        // durability is never lost and supersession is never terminal.
+        let (_, projection, indexed) = source_state_worker(&pool, "spin").await;
+        assert_eq!(indexed, 0);
+        assert!(projection > item.fts_projection_revision);
+        let (attempt_count, next_attempt): (i64, Option<String>) = sqlx::query_as(
+            "SELECT fts_attempt_count, fts_next_attempt_at FROM search_source_state WHERE meeting_id = 'spin'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((attempt_count, next_attempt), (0, None));
+        assert!(
+            RetrievalRepository::list_due_fts_repairs(&pool, &Utc::now().to_rfc3339(), 10)
+                .await
+                .unwrap()
+                .iter()
+                .any(|due| due.meeting_id == "spin")
+        );
+
+        // A fresh selection marks cleanly.
+        let refreshed =
+            RetrievalRepository::list_due_fts_repairs(&pool, &Utc::now().to_rfc3339(), 10)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|item| item.meeting_id == "spin")
+                .unwrap();
+        assert_eq!(
+            repair_fts_item(&pool, &CancellationToken::new(), &refreshed).await,
+            FtsRepairOutcome::Indexed
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_worker_repairs_fts_without_starting_semantic_work() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "paused", "Paused lexical repair").await;
+        add_transcript(
+            &pool,
+            "paused-t1",
+            "paused",
+            "lexical repair remains active",
+        )
+        .await;
+        let embedder = FakeEmbedder::new();
+        let lifecycle = lifecycle_for_test(free_pressure(), ok_loader(&embedder));
+        lifecycle.set_index_paused(true);
+        lifecycle.attach_database(pool.clone());
+
+        let pool_ref = &pool;
+        wait_until(async || fts_is_current(pool_ref, "paused").await).await;
+        assert!(embedder.embedded_texts().is_empty());
+        assert_eq!(
+            scalar(&pool, "SELECT COUNT(*) FROM retrieval_generations").await,
+            0,
+            "manual pause must not start semantic registration"
+        );
+        lifecycle.shutdown().await;
+    }
+
+    async fn source_state_worker(pool: &SqlitePool, meeting: &str) -> (i64, i64, i64) {
+        sqlx::query_as(
+            "SELECT source_revision, fts_projection_revision, fts_indexed_revision
+             FROM search_source_state WHERE meeting_id = ?",
+        )
+        .bind(meeting)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn continuously_superseded_meeting_yields_ticks_to_other_due_work() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "spinner", "Monopolizer").await;
+        insert_meeting(&pool, "healthy", "Healthy").await;
+        add_transcript(&pool, "h1", "healthy", "conteudo saudavel de teste").await;
+
+        // The healthy meeting's lexical side is already current, so `spinner`
+        // is the ONLY durable FTS-due item. This trigger makes every mark on
+        // it affect zero rows - the deterministic equivalent of a projection
+        // that advances on every pass - reproducing an endless supersession
+        // monopoly that older loop logic would have spun on.
+        let (_, spinner_projection, _) = source_state_worker(&pool, "spinner").await;
+        assert!(RetrievalRepository::mark_fts_indexed(
+            &pool,
+            "healthy",
+            source_state_worker(&pool, "healthy").await.1
+        )
+        .await
+        .unwrap());
+        sqlx::query(
+            "CREATE TRIGGER spin_never_converges BEFORE UPDATE ON search_source_state
+             WHEN NEW.meeting_id = 'spinner'
+             BEGIN SELECT RAISE(IGNORE); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            !RetrievalRepository::mark_fts_indexed(&pool, "spinner", spinner_projection)
+                .await
+                .unwrap()
+        );
+
+        // Every worker tick starts with the FTS step; only the bounded
+        // consecutive-supersession fall-through lets the semantic step below
+        // run at all in this scenario.
+        let embedder = FakeEmbedder::new();
+        let lifecycle = lifecycle_for_test(free_pressure(), ok_loader(&embedder));
+        lifecycle.attach_database(pool.clone());
+        let pool_ref = &pool;
+        wait_until(async || {
+            matches!(
+                sqlx::query_as::<_, (String,)>(
+                    "SELECT state FROM retrieval_meeting_state WHERE meeting_id = 'healthy'",
+                )
+                .fetch_optional(pool_ref)
+                .await,
+                Ok(Some((state,))) if state == "ready"
+            )
+        })
+        .await;
+        assert!(
+            !embedder.embedded_texts().is_empty(),
+            "healthy semantic work progressed despite the supersession storm"
+        );
+
+        // The monopolizer itself was treated as normal the whole time: still
+        // durably due, zero recorded failures, no backoff invented for it.
+        let (attempt_count, next_attempt): (i64, Option<String>) = sqlx::query_as(
+            "SELECT fts_attempt_count, fts_next_attempt_at FROM search_source_state WHERE meeting_id = 'spinner'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((attempt_count, next_attempt), (0, None));
+        lifecycle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn persistently_failing_mark_records_bounded_persisted_backoff() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "fmb", "Failing Mark").await;
+        // Refresh reads other tables, and record_fts_failure changes the
+        // attempt counter, so this outage (attempt count unchanged) hits
+        // exactly mark_fts_indexed - deterministically - with a database
+        // error on every attempt while persisted backoff stays writable.
+        sqlx::query(
+            "CREATE TRIGGER fmb_mark_outage BEFORE UPDATE ON search_source_state
+             WHEN NEW.meeting_id = 'fmb'
+               AND NEW.fts_attempt_count = OLD.fts_attempt_count
+             BEGIN SELECT RAISE(ABORT, 'synthetic persistent mark outage'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The model-less lifecycle proves lexical repair keeps running while
+        // every refresh succeeds and every mark fails.
+        let lifecycle = lifecycle_for_test(free_pressure(), failing_loader());
+        lifecycle.attach_database(pool.clone());
+        let pool_ref = &pool;
+        wait_until(async || {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT fts_attempt_count FROM search_source_state WHERE meeting_id = 'fmb'",
+            )
+            .fetch_one(pool_ref)
+            .await
+            .unwrap_or(0)
+                >= 1
+        })
+        .await;
+
+        // Exactly like a failed refresh: persisted exponential backoff with
+        // the attempt counter advanced and a safe error string stored, so the
+        // scheduler cannot hot-retry it within any fixed window.
+        let now_text = Utc::now().to_rfc3339();
+        let (attempt_count, next_attempt, last_error): (i64, String, String) = sqlx::query_as(
+            "SELECT fts_attempt_count, fts_next_attempt_at, fts_last_error
+             FROM search_source_state WHERE meeting_id = 'fmb'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            attempt_count >= 1,
+            "the failed mark advanced the persisted attempt counter"
+        );
+        assert!(
+            next_attempt.as_str() > now_text.as_str(),
+            "backoff ({next_attempt}) must schedule beyond {now_text}"
+        );
+        assert!(last_error.contains("synthetic persistent mark outage"));
+        assert!(
+            RetrievalRepository::list_due_fts_repairs(&pool, &now_text, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a backed-off repair leaves the due list until its slot"
         );
         lifecycle.shutdown().await;
     }
@@ -2247,13 +2915,13 @@ mod tests {
             )
         })
         .await;
+        // The fenced-out attempt must never journal: only the recovered
+        // replacement inserted (and acknowledged) change id 1.
+        let generation_for_bounds = worker_generation(&pool).await;
+        wait_fully_acknowledged(&pool, &generation_for_bounds).await;
         assert_eq!(
-            scalar(
-                &pool,
-                "SELECT COUNT(*) FROM retrieval_index_changes WHERE operation = 'upsert'"
-            )
-            .await,
-            1,
+            published_bounds(&pool, &generation_for_bounds).await,
+            (1, 1),
             "the fenced-out attempt must not journal"
         );
         assert_eq!(
@@ -2281,7 +2949,7 @@ mod tests {
         // processed on independent passes, so observe the poison failure
         // itself rather than assuming it landed before healthy turned ready.
         let pool_ref = &pool;
-        let generation = generation_id_for(FAKE_MODEL_ID);
+        let generation = worker_generation(&pool).await;
         wait_until(async || {
             matches!(
                 sqlx::query_as::<_, (String,)>(
@@ -2481,12 +3149,9 @@ mod tests {
             "a partial embedding response must never publish partial documents"
         );
         assert_eq!(
-            scalar(
-                &pool,
-                "SELECT COUNT(*) FROM retrieval_index_changes WHERE operation = 'upsert'"
-            )
-            .await,
-            0
+            published_bounds(&pool, &generation).await,
+            (0, 0),
+            "malformed responses must not journal anything"
         );
 
         // Once responses are healthy again the item publishes completely.
@@ -2563,12 +3228,9 @@ mod tests {
             0
         );
         assert_eq!(
-            scalar(
-                &pool,
-                "SELECT COUNT(*) FROM retrieval_index_changes WHERE operation = 'upsert'"
-            )
-            .await,
-            0
+            published_bounds(&pool, &generation).await,
+            (0, 0),
+            "a paused boundary must not journal"
         );
         assert_eq!(
             scalar(
@@ -2623,13 +3285,11 @@ mod tests {
             embedded_before,
             "resumed staging is reused"
         );
+        wait_fully_acknowledged(&pool, &generation).await;
         assert_eq!(
-            scalar(
-                &pool,
-                "SELECT COUNT(*) FROM retrieval_index_changes WHERE operation = 'upsert'"
-            )
-            .await,
-            1
+            published_bounds(&pool, &generation).await,
+            (1, 1),
+            "the resumed job published exactly once"
         );
         let published = RetrievalRepository::read_validated_documents(&pool, &generation, "m")
             .await
@@ -2761,13 +3421,11 @@ mod tests {
             !embedder.embedded_texts().contains(&window.content),
             "current-revision staging must remain resumable"
         );
+        wait_fully_acknowledged(&pool, &generation).await;
         assert_eq!(
-            scalar(
-                &pool,
-                "SELECT COUNT(*) FROM retrieval_index_changes WHERE operation = 'upsert'"
-            )
-            .await,
-            1
+            published_bounds(&pool, &generation).await,
+            (1, 1),
+            "the superseded attempt must not journal; the resumed one publishes once"
         );
         let published = RetrievalRepository::read_validated_documents(&pool, &generation, "m")
             .await
@@ -2805,7 +3463,7 @@ mod tests {
         assert!(!lifecycle.is_running());
 
         // Nothing published for the in-flight meeting...
-        let generation = generation_id_for(FAKE_MODEL_ID);
+        let generation = worker_generation(&pool).await;
         let published = sqlx::query_scalar::<_, i64>(
             "SELECT COALESCE(MAX(indexed_source_revision), 0) FROM retrieval_meeting_state
              WHERE generation_id = ? AND meeting_id = 'fenced'",
@@ -2856,7 +3514,7 @@ mod tests {
         // Releasing interactive ownership lets indexing proceed.
         drop(holder);
         let pool_ref = &pool;
-        let generation = generation_id_for(FAKE_MODEL_ID);
+        let generation = worker_generation(&pool).await;
         let generation_ref = &generation;
         wait_until(async || {
             matches!(
@@ -2892,7 +3550,7 @@ mod tests {
         lifecycle.attach_database(pool.clone());
 
         // The engine's own generation indexes and publishes normally...
-        let current = generation_id_for(FAKE_MODEL_ID);
+        let current = worker_generation(&pool).await;
         let pool_ref = &pool;
         let current_ref = &current;
         wait_until(async || {
@@ -2927,5 +3585,158 @@ mod tests {
             0
         );
         lifecycle.shutdown().await;
+    }
+
+    // -- Generation identity and resumption ----------------------------------
+
+    #[test]
+    fn bundled_identity_prefix_is_readable_and_digest_discriminates_every_contract_field() {
+        let contract = crate::model_bundle::approved_embedding_contract();
+        let base = derived_model_identity(
+            contract.bundle_id,
+            contract.embedding_model_id,
+            contract.embedding_revision,
+            contract.onnx_export_revision,
+            contract.onnx_export_quantization,
+            contract.dimensions,
+            VectorEncoding::Int8.as_str(),
+            APPROVED_CHUNKER_VERSION,
+        );
+        assert_eq!(bundled_model_identity(), base);
+        // Readable prefix keeps logs/status diagnosable; 16 hex digest chars
+        // carry the discrimination.
+        let prefix = format!(
+            "mid-{}-int8-c{APPROVED_CHUNKER_VERSION}-",
+            contract.bundle_id
+        );
+        assert!(base.starts_with(&prefix), "{base}");
+        assert_eq!(base.len(), prefix.len() + 16);
+
+        // Every approved-contract field participates: changing any one of
+        // them (chunker bump, embedding model/revision swap under an
+        // unchanged bundle id, export/quantization/encoding/dimension
+        // change) must mint a distinct identity.
+        for changed in [
+            derived_model_identity(
+                "other-bundle",
+                contract.embedding_model_id,
+                contract.embedding_revision,
+                contract.onnx_export_revision,
+                contract.onnx_export_quantization,
+                contract.dimensions,
+                VectorEncoding::Int8.as_str(),
+                APPROVED_CHUNKER_VERSION,
+            ),
+            derived_model_identity(
+                contract.bundle_id,
+                "other/embedding-model",
+                contract.embedding_revision,
+                contract.onnx_export_revision,
+                contract.onnx_export_quantization,
+                contract.dimensions,
+                VectorEncoding::Int8.as_str(),
+                APPROVED_CHUNKER_VERSION,
+            ),
+            derived_model_identity(
+                contract.bundle_id,
+                contract.embedding_model_id,
+                "other-embedding-revision",
+                contract.onnx_export_revision,
+                contract.onnx_export_quantization,
+                contract.dimensions,
+                VectorEncoding::Int8.as_str(),
+                APPROVED_CHUNKER_VERSION,
+            ),
+            derived_model_identity(
+                contract.bundle_id,
+                contract.embedding_model_id,
+                contract.embedding_revision,
+                "other-export-revision",
+                contract.onnx_export_quantization,
+                contract.dimensions,
+                VectorEncoding::Int8.as_str(),
+                APPROVED_CHUNKER_VERSION,
+            ),
+            derived_model_identity(
+                contract.bundle_id,
+                contract.embedding_model_id,
+                contract.embedding_revision,
+                contract.onnx_export_revision,
+                "other-quantization",
+                contract.dimensions,
+                VectorEncoding::Int8.as_str(),
+                APPROVED_CHUNKER_VERSION,
+            ),
+            derived_model_identity(
+                contract.bundle_id,
+                contract.embedding_model_id,
+                contract.embedding_revision,
+                contract.onnx_export_revision,
+                contract.onnx_export_quantization,
+                contract.dimensions + 1,
+                VectorEncoding::Int8.as_str(),
+                APPROVED_CHUNKER_VERSION,
+            ),
+            derived_model_identity(
+                contract.bundle_id,
+                contract.embedding_model_id,
+                contract.embedding_revision,
+                contract.onnx_export_revision,
+                contract.onnx_export_quantization,
+                contract.dimensions,
+                VectorEncoding::F32.as_str(),
+                APPROVED_CHUNKER_VERSION,
+            ),
+            derived_model_identity(
+                contract.bundle_id,
+                contract.embedding_model_id,
+                contract.embedding_revision,
+                contract.onnx_export_revision,
+                contract.onnx_export_quantization,
+                contract.dimensions,
+                VectorEncoding::Int8.as_str(),
+                APPROVED_CHUNKER_VERSION + 1,
+            ),
+        ] {
+            assert_ne!(base, changed, "a changed contract field altered the digest");
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_resumes_live_generations_and_mints_opaque_ids_only_when_absent() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "m", "Resumed").await;
+
+        let first = FakeEmbedder::new();
+        register_semantic_identity(&pool, first.as_ref())
+            .await
+            .unwrap();
+        let generation = RetrievalRepository::find_live_generation(&pool, FAKE_MODEL_ID)
+            .await
+            .unwrap()
+            .expect("first registration mints one live generation");
+        let hashed_prefix: String = Sha256::digest(FAKE_MODEL_ID.as_bytes())[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_ne!(
+            generation,
+            format!("gen-{hashed_prefix}"),
+            "generation ids are minted opaquely, never hashed from the model identity"
+        );
+
+        // A later process reloads its engine and must resume the same
+        // generation instead of registering a duplicate.
+        let second = FakeEmbedder::new();
+        register_semantic_identity(&pool, second.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(
+            RetrievalRepository::list_live_generations(&pool)
+                .await
+                .unwrap(),
+            vec![(generation.clone(), FAKE_MODEL_ID.to_string())],
+            "resumption looks up the existing live generation by model identity"
+        );
     }
 }

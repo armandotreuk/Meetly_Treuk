@@ -4,7 +4,8 @@
 //! directory, lazily re-verifies artifact byte lengths and SHA-256 digests
 //! through the Task 1.5 verifier before the first process load, and produces
 //! reference-correct tokenizer, embedding, and reranker outputs through two
-//! bounded CPU ORT sessions. Session sets are cached per exact bundle
+//! bounded CPU ORT sessions, with the reranker deferred until its first use.
+//! Session sets are cached per exact bundle
 //! identity with room for the architecture's active + shadow generations, so
 //! loading a shadow-model bundle never evicts the still-active one. Inference
 //! runs on blocking threads (never on Tokio workers or while holding an async
@@ -128,7 +129,8 @@ struct Engine {
 struct RuntimeInner {
     identity: BundleIdentity,
     embedding: Engine,
-    reranker: Engine,
+    reranker: Mutex<Option<Arc<Engine>>>,
+    manifest: Arc<ModelBundleManifest>,
     query_prefix: String,
     document_prefix: String,
     dimensions: u32,
@@ -163,12 +165,14 @@ pub fn bundle_dir(resource_dir: &Path) -> PathBuf {
 
 /// Returns the cached runtime for the bundle at `bundle_root`, or loads it
 /// once: parse and validate the manifest, lazily recheck every artifact's
-/// byte length and SHA-256, then build both bounded CPU sessions. Entries are
-/// keyed by the full parsed [`BundleIdentity`] with room for exactly the
-/// architecture's active + shadow generations; requesting a third distinct
-/// identity fails typed with [`RetrievalModelError::CacheCapacity`] instead of
-/// displacing either one. Failed loads are never cached and retry on the next
-/// call, and concurrent callers of one identity share that single load.
+/// byte length and SHA-256, then build and warm only the bounded CPU embedding
+/// session. The reranker is constructed by the first non-empty rerank request
+/// through the same cached runtime. Entries are keyed by the full parsed
+/// [`BundleIdentity`] with room for exactly the architecture's active + shadow
+/// generations; requesting a third distinct identity fails typed with
+/// [`RetrievalModelError::CacheCapacity`] instead of displacing either one.
+/// Failed loads are never cached and retry on the next call, and concurrent
+/// callers of one identity share that single load.
 pub fn get_or_load(bundle_root: &Path) -> Result<RetrievalModels, RetrievalModelError> {
     let canonical =
         bundle_root
@@ -187,7 +191,7 @@ pub fn get_or_load(bundle_root: &Path) -> Result<RetrievalModels, RetrievalModel
     // Parse first so the cache key carries the manifest-parsed bundle id, not
     // just the directory: identities collide only when every identity field
     // matches.
-    let manifest = parse_manifest(&json)?;
+    let manifest = Arc::new(parse_manifest(&json)?);
     let identity = BundleIdentity {
         bundle_id: manifest.bundle_id.clone(),
         root: canonical,
@@ -205,17 +209,27 @@ pub fn get_or_load(bundle_root: &Path) -> Result<RetrievalModels, RetrievalModel
     manifest.verify_artifacts(&identity.root)?;
     let models = RetrievalModels(Arc::new(load_runtime(
         &identity.root,
-        &manifest,
+        Arc::clone(&manifest),
         identity.clone(),
     )?));
+    models.embed_documents_sync(
+        &["meetly retrieval embedding warmup"],
+        &CancellationToken::new(),
+    )?;
     cache.push((identity, models.clone()));
     Ok(models)
 }
 
+/// Returns the cached runtime registered under `model_id`. The persisted
+/// identity a generation points at is the worker's derived contract identity
+/// (`worker::bundled_model_identity`), which every loadable bundle shares
+/// because `parse_manifest` admits only that one approved contract.
 pub(crate) fn cached_model(model_id: &str) -> Option<RetrievalModels> {
+    if crate::retrieval::worker::bundled_model_identity() != model_id {
+        return None;
+    }
     locked(&SESSION_CACHE)
-        .iter()
-        .find(|(identity, _)| identity.bundle_id == model_id)
+        .first()
         .map(|(_, models)| models.clone())
 }
 
@@ -243,7 +257,7 @@ fn reserve_cache_slot(
 
 fn load_runtime(
     root: &Path,
-    manifest: &ModelBundleManifest,
+    manifest: Arc<ModelBundleManifest>,
     identity: BundleIdentity,
 ) -> Result<RuntimeInner, RetrievalModelError> {
     let intra_threads = approved_intra_threads();
@@ -274,35 +288,91 @@ fn load_runtime(
     expect_rank("embedding", hidden_state, 3)?;
     validate_embedding_output(hidden_state, embedding_contract.dimensions)?;
 
-    let reranker_contract = &manifest.reranker_model;
-    let label_output = &reranker_contract.outputs[reranker_contract.output_label_index];
-    let (reranker, reranker_io) = load_engine(
-        root,
-        "reranker",
-        &reranker_contract.artifacts[0],
-        &reranker_contract.tokenizer.artifacts,
-        &label_output.name,
-        reranker_contract.max_sequence_length,
-        intra_threads,
-    )?;
-    validate_session_io("reranker", &reranker_contract.inputs, &reranker_io.inputs)?;
-    validate_session_io("reranker", &reranker_contract.outputs, &reranker_io.outputs)?;
-    for spec in &reranker_io.inputs {
-        expect_rank("reranker", spec, 2)?;
-    }
-    let logits = &reranker_io.outputs[reranker_contract.output_label_index];
-    expect_rank("reranker", logits, 2)?;
-    validate_label_output(logits, reranker_contract.output_label_index)?;
+    let query_prefix = embedding_contract.query_prefix.clone();
+    let document_prefix = embedding_contract.document_prefix.clone();
+    let dimensions = embedding_contract.dimensions;
+    let reranker_label_index = manifest.reranker_model.output_label_index;
 
     Ok(RuntimeInner {
         identity,
         embedding,
-        reranker,
-        query_prefix: embedding_contract.query_prefix.clone(),
-        document_prefix: embedding_contract.document_prefix.clone(),
-        dimensions: embedding_contract.dimensions,
-        reranker_label_index: reranker_contract.output_label_index,
+        reranker: Mutex::new(None),
+        manifest,
+        query_prefix,
+        document_prefix,
+        dimensions,
+        reranker_label_index,
     })
+}
+
+impl RuntimeInner {
+    fn reranker(&self, cancel: &CancellationToken) -> Result<Arc<Engine>, RetrievalModelError> {
+        lazy_engine(&self.reranker, cancel, || {
+            let contract = &self.manifest.reranker_model;
+            let label_output = &contract.outputs[contract.output_label_index];
+            let (engine, io) = load_engine(
+                &self.identity.root,
+                "reranker",
+                &contract.artifacts[0],
+                &contract.tokenizer.artifacts,
+                &label_output.name,
+                contract.max_sequence_length,
+                approved_intra_threads(),
+            )?;
+            if contract.score_transform != "identity" {
+                return Err(RetrievalModelError::ContractMismatch {
+                    role: "reranker",
+                    reason: format!(
+                        "score transform '{}' is not the approved identity transform",
+                        contract.score_transform
+                    ),
+                });
+            }
+            validate_session_io("reranker", &contract.inputs, &io.inputs)?;
+            validate_session_io("reranker", &contract.outputs, &io.outputs)?;
+            for spec in &io.inputs {
+                expect_rank("reranker", spec, 2)?;
+            }
+            let logits = &io.outputs[contract.output_label_index];
+            expect_rank("reranker", logits, 2)?;
+            validate_label_output(logits, contract.output_label_index)?;
+            Ok(engine)
+        })
+    }
+}
+
+fn lazy_engine<T, F>(
+    slot: &Mutex<Option<Arc<T>>>,
+    cancel: &CancellationToken,
+    build: F,
+) -> Result<Arc<T>, RetrievalModelError>
+where
+    F: FnOnce() -> Result<T, RetrievalModelError>,
+{
+    loop {
+        if cancel.is_cancelled() {
+            return Err(RetrievalModelError::Cancelled);
+        }
+        let mut slot = match slot.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // ponytail: the 1 ms poll bounds cancellation latency; use a
+                // cancellation-aware condition variable if contention warrants it.
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+        };
+        if let Some(engine) = slot.as_ref() {
+            return Ok(Arc::clone(engine));
+        }
+        if cancel.is_cancelled() {
+            return Err(RetrievalModelError::Cancelled);
+        }
+        let engine = Arc::new(build()?);
+        *slot = Some(Arc::clone(&engine));
+        return Ok(engine);
+    }
 }
 
 fn load_engine(
@@ -541,6 +611,11 @@ impl RetrievalModels {
         &self.0.identity
     }
 
+    #[cfg(test)]
+    pub(crate) fn reranker_loaded(&self) -> bool {
+        locked(&self.0.reranker).is_some()
+    }
+
     /// Manifest-pinned embedding dimension count.
     pub fn dimensions(&self) -> u32 {
         self.0.dimensions
@@ -581,6 +656,13 @@ impl RetrievalModels {
         pairs: &[(String, String)],
         cancel: &CancellationToken,
     ) -> Result<Vec<f32>, RetrievalModelError> {
+        if pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+        if cancel.is_cancelled() {
+            return Err(RetrievalModelError::Cancelled);
+        }
+        let reranker = self.0.reranker(cancel)?;
         let mut scores = Vec::with_capacity(pairs.len());
         for chunk in pairs.chunks(RERANKER_BATCH) {
             if cancel.is_cancelled() {
@@ -593,12 +675,12 @@ impl RetrievalModels {
                     partner: Some(evidence.clone()),
                 })
                 .collect();
-            let (ids, mask) = self.0.reranker.tokenize(&rows)?;
-            let logits = self.0.reranker.run_batch(&ids, &mask)?;
+            let (ids, mask) = reranker.tokenize(&rows)?;
+            let logits = reranker.run_batch(&ids, &mask)?;
             scores.extend(label_scores(
                 &logits,
                 self.0.reranker_label_index,
-                self.0.reranker.role,
+                reranker.role,
             )?);
         }
         Ok(scores)
@@ -931,6 +1013,10 @@ mod tests {
     fn staged_models_ready(dir: &Path) -> bool {
         dir.join("models/embedding/model_int8.onnx").is_file()
             && dir.join("models/reranker/model_quint8_avx2.onnx").is_file()
+    }
+
+    fn clear_session_cache() {
+        locked(&SESSION_CACHE).clear();
     }
 
     fn sigmoid(value: f32) -> f64 {
@@ -1311,6 +1397,7 @@ mod tests {
             println!("SKIP reference token IDs: no staged retrieval bundle");
             return;
         };
+        let _serial = locked(&TEST_LOCK);
         let models = get_or_load(&dir).expect("load staged bundle");
         let engine = &models.0.embedding;
 
@@ -1338,6 +1425,30 @@ mod tests {
         );
         assert_eq!(pair_ids[0], 0, "pair starts with <s>");
         assert_eq!(*pair_ids.last().unwrap(), 2, "pair ends with </s>");
+    }
+
+    #[test]
+    fn get_or_load_defers_reranker_until_first_rerank_request() {
+        let Some(dir) = staged_bundle_dir() else {
+            println!("SKIP lazy reranker: no staged retrieval bundle");
+            return;
+        };
+        if !staged_models_ready(&dir) {
+            println!("SKIP lazy reranker: staged bundle lacks model weights");
+            return;
+        }
+        let _serial = locked(&TEST_LOCK);
+        clear_session_cache();
+
+        let models = get_or_load(&dir).expect("embedding session must load and warm");
+        assert!(locked(&models.0.reranker).is_none());
+        models
+            .rerank_sync(
+                &[("lazy query".to_string(), "lazy evidence".to_string())],
+                &CancellationToken::new(),
+            )
+            .expect("first rerank request must build and validate the reranker");
+        assert!(locked(&models.0.reranker).is_some());
     }
 
     #[test]
@@ -1380,6 +1491,125 @@ mod tests {
             );
             assert_eq!(models.identity(), first.identity());
         }
+    }
+
+    #[test]
+    fn concurrent_first_reranker_load_shares_one_initialized_engine() {
+        let slot = Arc::new(Mutex::new(None));
+        let build_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let start = Arc::new(Barrier::new(5));
+        let build_started = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let slot = Arc::clone(&slot);
+                let build_count = Arc::clone(&build_count);
+                let start = Arc::clone(&start);
+                let build_started = Arc::clone(&build_started);
+                let release = Arc::clone(&release);
+                std::thread::spawn(move || {
+                    start.wait();
+                    lazy_engine(&slot, &CancellationToken::new(), || {
+                        build_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        build_started.wait();
+                        release.wait();
+                        Ok(42_u8)
+                    })
+                })
+            })
+            .collect();
+        start.wait();
+        build_started.wait();
+        release.wait();
+
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread panicked"))
+            .collect();
+        let first = results[0].as_ref().expect("first load must succeed");
+        assert_eq!(build_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        for result in &results {
+            let engine = result.as_ref().expect("concurrent load must succeed");
+            assert!(Arc::ptr_eq(engine, first));
+            assert_eq!(**engine, 42);
+        }
+    }
+
+    #[test]
+    fn waiting_rerank_initialization_observes_cancellation_before_building() {
+        let slot = Arc::new(Mutex::new(None));
+        let build_started = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let initializer = {
+            let slot = Arc::clone(&slot);
+            let build_started = Arc::clone(&build_started);
+            let release = Arc::clone(&release);
+            std::thread::spawn(move || {
+                lazy_engine(&slot, &CancellationToken::new(), || {
+                    build_started.wait();
+                    release.wait();
+                    Ok(1_u8)
+                })
+            })
+        };
+        build_started.wait();
+
+        let cancel = CancellationToken::new();
+        let waiter = {
+            let slot = Arc::clone(&slot);
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                lazy_engine(&slot, &cancel, || {
+                    panic!("a cancelled waiter must not start construction")
+                })
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        cancel.cancel();
+        let result = waiter.join().expect("waiter panicked");
+        assert!(matches!(result, Err(RetrievalModelError::Cancelled)));
+        assert!(matches!(
+            slot.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+
+        release.wait();
+        assert_eq!(
+            initializer
+                .join()
+                .expect("initializer panicked")
+                .unwrap()
+                .as_ref(),
+            &1
+        );
+    }
+
+    #[test]
+    fn failed_reranker_load_is_retryable() {
+        let slot = Mutex::new(None);
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let build = || {
+            if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Err(RetrievalModelError::SessionLoad {
+                    role: "reranker",
+                    reason: "test construction failure".to_string(),
+                })
+            } else {
+                Ok(7_u8)
+            }
+        };
+
+        let first = lazy_engine(&slot, &CancellationToken::new(), &build);
+        assert!(matches!(
+            first,
+            Err(RetrievalModelError::SessionLoad { .. })
+        ));
+        assert!(locked(&slot).is_none());
+
+        let second = lazy_engine(&slot, &CancellationToken::new(), &build)
+            .expect("a failed construction must not poison the lazy slot");
+        assert_eq!(*second, 7);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
