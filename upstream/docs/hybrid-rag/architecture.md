@@ -936,6 +936,12 @@ meetings. A building generation cannot activate while any current meeting is
 behind or failed; active-generation failed meetings are excluded semantically and remain
 available through durably repaired FTS.
 
+This is the named **quarantined coverage** state: an active generation may
+serve complete-minus-quarantined coverage when a terminal per-meeting semantic
+failure occurs. Its canonical derived rows remain for retry/rebuild provenance,
+but loaders and snapshots exclude the failed meeting; `failed_meetings` reports
+the omission rather than silently presenting it as complete semantic coverage.
+
 If the process crashes after SQLite replacement but before in-memory
 publication, startup replays `retrieval_index_changes` from published through
 canonical change ID. Queries never use a semantic snapshot whose published ID
@@ -959,6 +965,11 @@ use FTS-only until the shadow validates. Rebuild cancellation deletes only the
 shadow's staging/derived state and leaves a healthy active generation intact.
 Crash/restart resumes the shadow from revisions/staging; concurrent readers see
 the old active generation until one atomic pointer/snapshot switch.
+
+An otherwise active generation with a terminal per-meeting failure instead
+serves the named quarantined-coverage state: the failed meeting's canonical
+rows survive but are excluded from semantic snapshots, its omission is reported
+through `failed_meetings`, and durable FTS remains the fallback for that meeting.
 
 Across the restart that installs a bundled-model upgrade, the prior active
 generation stays queryable only while its own embedding engine is retained
@@ -1034,6 +1045,30 @@ measurement holding active snapshot, streamed shadow, delta/tombstones, and
   governing observed peak is therefore 1319.9 MiB, inside the explicitly
   approved 1.30 GiB transient ceiling by 11.3 MiB. These figures cover exactly
   two snapshots; a third remains unapproved.
+
+### Activation RAM gate scope (2.R12)
+
+The fixed `ACTIVATION_RAM_CEILING_BYTES` remains exactly `1,395,864,371`
+bytes (1.30 GiB). Stage 3 deliberately re-derives its gate scope as a
+**whole-process RSS budget**, rather than comparing whole-process RSS with the
+retrieval-only arithmetic above. The production gate samples the process's
+resident physical memory immediately before activation; its limit is therefore
+the same quantity:
+
+```text
+whole_process_activation_residency =
+    retrieval snapshots + retrieval sessions + Whisper/audio + Tauri/webview
+    + allocator and other process overhead
+<= 1,395,864,371 bytes
+```
+
+The retrieval arithmetic remains a model-selection/pre-filter bound and is not
+used as an unscoped RSS comparator. This whole-process choice is intentionally
+conservative: the release benchmark measures the same process scope but does
+not load a full application's optional Whisper/webview state, so a real
+application can consume part of the fixed budget before retrieval activation.
+The status payload names the scope next to the measured resident value and
+ceiling.
 
 Sprint 2 MUST implement one immutable contiguous base snapshot, an exact
 upsert delta, and tombstones. It MUST preserve canonical SQLite plus the
@@ -1497,6 +1532,7 @@ raw embeddings.
 | Initial backfill incomplete | Use FTS-only retrieval until complete activation. |
 | Meeting dirty | Exclude stale semantic rows for that meeting; allow current FTS/hydration. |
 | Vector BLOB malformed | Quarantine/requeue affected meeting; continue without that vector. |
+| Terminal per-meeting semantic failure | Serve named quarantined coverage: retain canonical rows for retry/rebuild, exclude that meeting from semantic snapshots, report `failed_meetings`, and use durable FTS for it. |
 | Exact cache unavailable | Rebuild asynchronously; use FTS. |
 | ANN sidecar missing/corrupt | Rebuild from SQLite; use exact if available, otherwise FTS. |
 | Query embedding error | Continue with FTS and hydration. |
@@ -1842,7 +1878,8 @@ Rollback principles, ordered from cheapest to most disruptive:
 1. **Force lexical-only setting.** Runtime, reversible, no data change, no
    restart. This is the first response to a retrieval-quality problem in the
    field and the only one a user can perform themselves.
-2. **Pause indexing.** Stops derived work; active generation stays queryable.
+2. **Pause indexing.** Stops semantic indexing only; FTS repair and
+   publication/catch-up continue, and the active generation stays queryable.
 3. **Rebuild semantic index.** Deletes derived state only; primary data and FTS
    are untouched.
 4. **Ship a build with semantic paths disabled.** Requires a release.

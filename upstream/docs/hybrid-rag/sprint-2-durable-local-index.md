@@ -628,7 +628,9 @@ cache/sidecar format, corruption behavior, and memory/latency results.
 | 2026-08-26 | Authorize sequential implementation of all remaining Sprint 2 tasks without separate batch approval, retaining the required sprint-end code and architecture reviews. | Dependencies still govern dispatch order; removing approval pauses avoids unnecessary idle time. | Continue requesting each batch separately. | User |
 | 2026-08-26 | Continue through Sprint 2B before an intermediate 2A close review. | The user requested all remaining implementations continue and requested both reviews at sprint end, superseding the interim close gate for this sprint. | Stop at 2A for the originally planned half-sprint reviews. | User |
 | 2026-08-26 | Amend the garbage-collection gate with a transitional clause expiring at Sprint 3 close, unblocking Task `2.R1`. | The successful-Fast-hybrid-query condition cannot be met before Sprint 3 ships that surface, which made manual rebuild single-use and eventually dead-ended corrupt-active recovery. Substituting one clean restart with the new generation active and publication lag zero restores both, without relaxing the restart requirement or any other cleanup guard. | Leave the gate as written and accept single-use rebuild until Sprint 3. | User |
+| 2026-08-27 | Remedy the measured 1,482.7 MiB activation peak by cutting session residency and fixing the gate's measurement scope, rather than raising the 1.30 GiB transient ceiling. | The peak is 63% warm ONNX sessions and only 25% snapshot overlap, yet the ceiling's approving decision reasons about snapshot overlap; `2.R6` measured 573.3 MiB for the same activation with no sessions resident. Sprint 2 has no production rerank consumer, so a warm cross-encoder is residency nothing in this sprint uses. Raising the ceiling would also calibrate a retrieval-scoped budget against a whole-process RSS sample that moves with Whisper and webview state - `2.R9` recorded that its benchmark excludes exactly those - so the limit would need raising again for reasons unrelated to retrieval. | Raise the ceiling to 1.60 GiB; redesign activation to avoid two coexisting snapshots; leave Sprint 2 blocked at the gate. | User |
 | 2026-08-26 | Record prior-embedding-model retention across an upgrading restart as an architecture amendment; implementation deferred to the sprint that ships a bundled-model upgrade. | Sprint 2B built the activation path this constrains, and the post-remediation reviews found the prior active generation is unqueryable after an upgrading restart. Sprint 2 ships one bundle and never upgrades one, so the defect is latent here and the fix belongs where the upgrade ships. See `architecture.md` "Prior-Model Retention Across Upgrade". | Copy the prior bundle into app data on upgrade; accept FTS-only for the entire rebuild window as the contract; implement retention inside Sprint 2. | User |
+| 2026-08-26 | Keep Task `2.R3`'s one revision-fenced transaction; paging bounds memory, not writer-lock duration. Replace the lock-scaling criterion with a corpus-scale before/after lock measurement around the `document_count` recompute fix. | SQLite cannot release the writer lock between pages while preserving all-or-nothing replacement, canonical advance, and journal append under the current schema. Atomicity and bounded memory are the demonstrated requirements. | Add versioned document sets now; allow partial page publication. | User |
 
 ## Task Execution Log
 
@@ -767,7 +769,7 @@ cache/sidecar format, corruption behavior, and memory/latency results.
 - Added journal publication inside the shared Task 2.4 worker loop: startup/attach performs a full canonical load, acknowledges the loaded bound first (so pre-bound changes are never re-applied onto a complete load), then replays only changes beyond it; steady-state replay folds last-writer-wins per meeting through sparse IDs and upsert/delete ordering without copying the base, acknowledges durably per batch, and compacts at the approved 2% delta threshold on a blocking thread. Deferred batches (quarantined delta reloads) keep publication lag visible and pause semantic queries typed until healed.
 - Added deterministic normalized-query exact search over base+delta with post-search authoritative scope re-filtering, symmetric int8 cosine scoring under the approved 1/127 contract, two-permit vector-scan scheduler integration with queued cancellation, typed availability outcomes (`NoActiveGeneration`, `CatchUpPending`, `InvalidQuery`, `Cancelled`), and hydration-ready metadata on every hit.
 - Added generation activation: completed shadow generations load+validate, catch up their own journals, pass coverage/permanent-failure/publication/disk gates, mark `ready`, switch the singleton pointer in one transaction, and swap memory atomically while the previous active generation stays resident and queryable; initial partial coverage never activates; known-corrupt active generations are deactivated to FTS-only with quarantined meetings requeued; at most two generations are retained and a third rebuild is refused typed.
-- Added measured status data (backend, semantic state, active model/generation, coverage counts, canonical/published IDs, activation blockers, resident index bytes, derived disk bytes against the approved 2 GiB target / 3 GiB activation limit) and additive Tauri commands `retrieval_index_status`, `retrieval_rebuild_index`, and `retrieval_set_index_paused` (manual pause stops lexical repair and indexing at item boundaries without disabling queries or publication).
+- Added measured status data (backend, semantic state, active model/generation, coverage counts, canonical/published IDs, activation blockers, resident index bytes, derived disk bytes against the approved 2 GiB target / 3 GiB activation limit) and additive Tauri commands `retrieval_index_status`, `retrieval_rebuild_index`, `retrieval_cancel_rebuild`, and `retrieval_set_index_paused` (manual pause stops semantic indexing at item boundaries without disabling FTS repair, queries, or publication).
 - Added retired-generation GC: retired journals drain to canonical (a retired generation is never served again), and deletion waits for one clean restart plus one successful query; cleanup deletes only derived rows via the repository guards.
 **Implementation:**
 - Files: `frontend/src-tauri/src/retrieval/index.rs`, `frontend/src-tauri/src/retrieval/commands.rs`, `frontend/src-tauri/src/retrieval/mod.rs`, `frontend/src-tauri/src/retrieval/worker.rs`, `frontend/src-tauri/src/database/repositories/retrieval.rs`, `frontend/src-tauri/src/lib.rs`, `frontend/src-tauri/Cargo.toml`.
@@ -787,14 +789,485 @@ cache/sidecar format, corruption behavior, and memory/latency results.
 - `git diff --check` - pass (pre-existing CRLF notice on `.github/workflows/build-windows.yml`).
 - Frontend regression safety: `npx tsc --noEmit` pass; `npx vitest run` 95/95 pass (no frontend changes).
 **Rollback:**
-- Leave `publish_tick` unhooked or remove the `retrieval::index` module: SQLite vectors, journal, and FTS behavior remain unchanged and lexical fallback covers every failure path. The three commands are additive and unregisterable independently.
+- Leave `publish_tick` unhooked or remove the `retrieval::index` module: SQLite vectors, journal, and FTS behavior remain unchanged and lexical fallback covers every failure path. The four commands are additive and unregisterable independently.
 **Decisions and follow-ups:**
 - The publisher acknowledges the full-load bound BEFORE replaying so a complete canonical load is never double-counted into the overlay; deferred (quarantined) delta batches return unapplied and keep `published < canonical`, which disables semantic queries typed until the worker heals the meeting.
 - Retired generations' journals are drained to canonical before GC because nothing serves them anymore; deletion additionally requires one clean restart plus one successful query, matching "Retain at most two complete generations".
-- Manual pause does not stop publication/catch-up: pausing indexing must not freeze deletion tombstones out of the query path.
+- Manual pause does not stop FTS repair or publication/catch-up: pausing semantic indexing must not freeze lexical healing or deletion tombstones out of the query path.
 - Disk-envelope accounting approximates page overhead from row counts (`ponytail:` marker); the activation gate blocks above 3 GiB and never deletes primary data.
 - The publisher samples actual process RSS through `memory-stats` before activation and blocks when unavailable or at/above the approved 1.30 GiB ceiling; re-measure production RAM/disk during a real 250k-scale shadow activation because the governing transient margin from Sprint 1 was ~0.9%.
 - Follow-ups for Sprint 3: consume `SearchFailure` as the typed lexical-fallback trigger and `VectorHit.score` as an internal diagnostic only.
+
+### 2.R1 - Generation identity, retention, and journal reclamation
+
+**Status:** Complete
+**Owner:** `worker-l` (`ses_fc0343942ffe7YJNtxi3mC6OqN`)
+**Completed:** 2026-08-26
+**Implemented:**
+- Derived the persisted model identity from the complete approved embedding and storage contract, with a readable prefix and SHA-256 discriminator.
+- Replaced hash-derived generation resumption with a live-generation lookup and opaque UUID generation IDs.
+- Added the forward-only legacy identity migration, the approved Option A GC transition, and acknowledged-journal pruning.
+- Added focused regressions for legacy migration/no-reindex behavior, identity discrimination, GC guards/rebuild recovery, opaque resumption, and pruning bounds.
+**Implementation:**
+- Files: `frontend/src-tauri/src/model_bundle.rs`, `frontend/src-tauri/src/retrieval/model.rs`, `frontend/src-tauri/src/retrieval/worker.rs`, `frontend/src-tauri/src/retrieval/index.rs`, `frontend/src-tauri/src/database/repositories/retrieval.rs`, `frontend/src-tauri/src/database/migration_tests.rs`, `frontend/src-tauri/migrations/20260827000000_derive_legacy_bundle_model_identity.sql`.
+- Approach: `mid-<bundle>-<encoding>-c<chunker>-<digest>` derives from the pinned bundle ID, embedding model/revision, ONNX export revision/quantization, dimensions, encoding, and chunker version. The legacy migration repoints generations while preserving documents, state, bounds, journals, and the active pointer. GC keeps every permanent guard and substitutes only the unavailable Fast-hybrid-query condition with the approved clean-restart, active-replacement, zero-lag condition until Sprint 3 close.
+**Not implemented:**
+- Tasks `2.R2` through `2.R4`, dual-bundle packaging, or any model/chunker/encoding/backend contract change.
+**Why not implemented:**
+- They are separate sequential tasks or explicitly deferred scope.
+**Verification:**
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib database::repositories::retrieval::tests` - pass, 26 tests.
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib database::migration_tests` - pass, 5 tests.
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib retrieval::` - pass, 130 tests.
+- `cargo check --manifest-path "frontend/src-tauri/Cargo.toml"` - pass.
+- `cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check` - pass.
+- `git diff --check` - pass; the pre-existing CRLF notice remains for `.github/workflows/build-windows.yml`.
+**Rollback:**
+- The migration is forward-only. A rollback after it has run requires a new compatibility migration or purging/rebuilding only derived retrieval state; FTS and primary meeting data remain unaffected.
+**Decisions and follow-ups:**
+- Option A is the user-approved transitional clause and carries a `ponytail:` expiry path to Sprint 3 close.
+- Journal pruning deletes only rows at or below the minimum durable published bound and runs outside replacement transactions, so it does not advance any generation bound.
+
+### 2.R2 - Envelope measurement and activation gate ordering
+
+**Status:** Complete
+**Owner:** `worker-l` (`ses_fbfc32efdffeMRd0ff1535QQ6O`)
+**Completed:** 2026-08-26
+**Implemented:**
+- Replaced whole-database/shadow/RAM disk accounting with a seven-derived-table measurement that includes each table's indexes through SQLite `dbstat` when available.
+- Added a conservative payload fallback, separate read-only WAL diagnostic, coverage-first activation gating, and safe derived-disk high-watermark reuse.
+- Added regressions for primary-data isolation, checkpoint-free status, coverage-first probing, bounded probes, status labeling, stale permissive values, and post-validation admission remeasurement.
+**Implementation:**
+- Files: `frontend/src-tauri/src/database/repositories/retrieval.rs`, `frontend/src-tauri/src/retrieval/index.rs`.
+- Approach: `dbstat` is available in this SQLite build and reports exact allocated pages for the approved derived btrees. The fallback applies a documented 3x payload/row allowance. WAL size is read with `PRAGMA database_list` plus filesystem metadata and remains an unattributed diagnostic because shared WAL pages cannot be safely allocated to derived versus primary data. Only a cached over-limit watermark may block; every permissive and final admission decision remeasures.
+**Not implemented:**
+- Tasks `2.R3` and `2.R4`, dual-bundle packaging, or any change to the model, chunker, vector encoding, or backend contracts.
+**Why not implemented:**
+- They are separate sequential tasks or explicitly deferred scope.
+**Verification:**
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib retrieval::index::tests` - pass, 55 tests.
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib database::repositories::retrieval::tests` - pass, 27 tests.
+- `cargo check --manifest-path "frontend/src-tauri/Cargo.toml"` - pass.
+- `cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check` - pass.
+- `git diff --check` - pass; the pre-existing CRLF notice remains for `.github/workflows/build-windows.yml`.
+**Rollback:**
+- Revert the measurement path; activation remains block-only and no primary or derived data is deleted. WAL reporting is diagnostics-only and independently removable.
+**Decisions and follow-ups:**
+- A cached permissive disk reading is not conservative after writes and is never reused. A cached over-limit reading can only temporarily over-block; it expires after 30 seconds and cannot admit an unsafe activation.
+- `wal_file_size_bytes` is intentionally separate from the derived-disk gate to avoid allowing primary-data WAL activity to block semantic activation.
+
+### 2.R3 - Bounded resume/publication memory and repair backoff
+
+**Status:** Complete
+**Owner:** `worker-l` (`ses_fbf9b5f32ffeC9OENE2QGQFM4W`)
+**Completed:** 2026-08-26
+**Implemented:**
+- Replaced staged-payload resume selection with an ID-only read and streamed replacement pages through the unchanged atomic revision-fenced transaction.
+- Preserved prior canonical documents and resumable staging on invalid pages, while restoring typed poisoned-staging cleanup at publication.
+- Bounded repeated FTS supersessions and persisted failed-mark backoff.
+- Replaced corpus-wide `document_count` recounts with exact replacement and meeting-deletion deltas.
+**Implementation:**
+- Files: `frontend/src-tauri/src/database/repositories/retrieval.rs`, `frontend/src-tauri/src/database/repositories/meeting.rs`, `frontend/src-tauri/src/retrieval/worker.rs`, `frontend/src-tauri/tests/document_count_lock_hold.rs`.
+- Approach: replacement pages contain at most 256 staged documents and validate the exact payload bytes inserted. The one SQLite transaction retains the writer lock for atomic publication; paging is a memory bound. `document_count` now adds inserted rows and subtracts removed rows, with the meeting-deletion path applying its matching decrement.
+**Not implemented:**
+- Task `2.R4`, versioned document sets, dual-bundle packaging, or non-atomic page publication.
+**Why not implemented:**
+- The user retained atomic replacement. Versioned document sets are an evidence-gated, separately approved escalation only if the corrected 250k-scale measurement exceeds 250 ms.
+**Verification:**
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib retrieval::worker::tests` - pass, 32 tests.
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib database::repositories::retrieval::tests` - pass, 32 tests.
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib database::repositories::meeting` - pass, 4 tests.
+- `cargo test --release --manifest-path "frontend/src-tauri/Cargo.toml" --test document_count_lock_hold -- --ignored --nocapture` - pass: file-backed WAL fixture with 250,000 canonical rows and a 1,024-document replacement measured 23.05 ms minimum, 24.63 ms median, and 26.42 ms maximum. The worker's pre-correction replay measured 35.1-58.1 ms; that overwritten baseline was not independently replayed.
+- `cargo check --manifest-path "frontend/src-tauri/Cargo.toml"` - pass.
+- `cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check` - pass.
+- `git diff --check` - pass; the pre-existing CRLF notice remains for `.github/workflows/build-windows.yml`.
+**Rollback:**
+- The counter can revert to a full recount without primary-data impact, but the delta path is required to retain the measured 250k-corpus lock headroom. FTS remains independent.
+**Decisions and follow-ups:**
+- The corrected measurement is below the 250 ms pause quantum, so no versioned-document-set scope change is triggered. Re-measure before approving that separate architecture if corpus scale or storage behavior materially changes.
+- Benchmark limits are documented in `frontend/src-tauri/tests/document_count_lock_hold.rs`: synthetic text, a single process, and no concurrent scanner load; the test uses production migrations and repository code in a file-backed WAL database.
+
+### 2.R4 - Contract records and small corrections
+
+**Status:** Complete
+**Owner:** `worker-s` (`ses_fbefce03fffeSXAonXmkbnkUne`)
+**Completed:** 2026-08-26
+**Implemented:**
+- Named quarantined coverage in the architecture's worker, generation-activation, and fallback contracts.
+- Made manual pause defer semantic indexing only, while FTS repair and publication/catch-up continue.
+- Corrected the heading migration timestamp expression and documented the previously omitted `retrieval_cancel_rebuild` command.
+**Implementation:**
+- Files: `docs/hybrid-rag/architecture.md`, `docs/hybrid-rag/sprint-2-durable-local-index.md`, `frontend/src-tauri/src/retrieval/worker.rs`, `frontend/src-tauri/src/database/migration_tests.rs`, `frontend/src-tauri/migrations/20260826000000_add_semantic_document_heading.sql`.
+- Approach: the worker performs durable FTS repair before observing the semantic-pause branch. The still-uncommitted heading migration now uses `strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`, compatible with Rust's RFC 3339 UTC writers and parser.
+**Not implemented:**
+- The persisted `force_lexical_retrieval` Settings control, UI/Chat/MCP semantic consumers, or any model/encoding change.
+**Why not implemented:**
+- The kill switch remains approved Sprint 3.4 scope; consumer integration belongs to later sprints.
+**Verification:**
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib retrieval::worker::tests` - pass, 33 tests.
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib database::migration_tests` - pass, 5 tests.
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib` - pass, 569 tests, 0 failed, 2 ignored.
+- `cargo test --release --manifest-path "frontend/src-tauri/Cargo.toml" --test vector_backend_benchmark full_matrix_benchmark -- --nocapture` with `MEETLY_RAG_VECTOR_BENCH=1` - pass. At 250,000 documents: global query p95 51.3 ms; two-snapshot active/shadow peak 1,329.3 MiB, within the approved 1.30 GiB ceiling; two retained generations used 0.40 GiB versus the 3 GiB rebuild envelope.
+- `cargo check --manifest-path "frontend/src-tauri/Cargo.toml"` - pass.
+- `cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check` - pass.
+- `git diff --check` - pass; the pre-existing CRLF notice remains for `.github/workflows/build-windows.yml`.
+- `npx tsc --noEmit` - pass; `npx vitest run` - pass, 95 tests. Existing React `act(...)` warnings and mocked disk-error logs remain non-failing test output.
+**Rollback:**
+- The pause branch and documentation changes revert independently. The heading migration remains uncommitted and was corrected in place; once shipped, timestamp changes require a forward-only follow-up migration.
+**Decisions and follow-ups:**
+- Quarantined coverage is explicit rather than an implicit semantic omission: canonical rows remain for retry/rebuild, `failed_meetings` exposes the state, and durable FTS remains available.
+- The full 250k matrix is recorded here for Sprint 2 close. The resource headroom is narrow by design; later changes that add a retained prior model must remeasure the combined envelope before activation.
+
+### 2.R5 - Retired-generation lag cleanup guard
+
+**Status:** Complete
+**Owner:** `worker-l`
+**Completed:** 2026-08-27
+**Implemented:**
+- Retired-generation cleanup no longer acknowledges or drains a journal before attempting deletion. A generation whose canonical change ID is ahead of its published change ID remains retained.
+- Added a restart regression proving a lagging retired generation is not deleted and its published bound is unchanged.
+**Implementation:**
+- Files: `frontend/src-tauri/src/retrieval/index.rs`.
+- Approach: Let the repository's existing unacknowledged-journal deletion guard decide eligibility without mutating the retired generation's publication bound.
+**Not implemented:**
+- None.
+**Why not implemented:**
+- Not applicable.
+**Verification:**
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib retrieval::index::tests restarted_retired_generation_with_lag_is_retained_without_acknowledgement` - pass.
+- `cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check` - pass.
+- `git diff --check` - pass.
+**Rollback:**
+- Revert the cleanup guard change and focused regression; the repository deletion guard remains unchanged.
+**Decisions and follow-ups:**
+- Retired journals remain durable until their published bound catches up through the normal publisher path; cleanup must never make a lagging generation delete-eligible by acknowledging it.
+
+### 2.R6 - Production-representation activation-envelope evidence
+
+**Status:** Complete
+**Owner:** `worker-l`
+**Completed:** 2026-08-27
+**Implemented:**
+- Added a release-gated 250k benchmark that exercises the production representation and activation path end to end, closing the Final Code Review blocker that the retained compact-mirror benchmark cannot validate production activation (`frontend/src-tauri/src/retrieval/index.rs`, tests module: `bench_2r6_production_activation_envelope`, gated by `MEETLY_RAG_INDEX_BENCH=1`; skipped without cost otherwise).
+- The fixture registers one approved model row (768 dimensions, Int8, fixed `1/127` dequantization) and two live generations of the same identity ("gen-bench-active", then the manual-rebuild-shaped "gen-bench-shadow"), each backfilled through the repository's staging plus revision-fenced atomic replacement transactions: canonical rows carry production bytes produced by the worker's own `quantize_int8`, and meeting state, journal entries, validation, and the incremental counter all move exactly as in production.
+- Two `publish_tick` passes drive the real sequence: the first performs the full active-generation validation load, journal catch-up, coverage/disk/RAM gates, pointer promotion, and snapshot install; the second reloads and journal-catches-up the entire shadow candidate while the active snapshot stays installed - the exact state the production RAM gate measures - then promotes and retires the previous generation.
+- Measurement methodology: Windows process working-set counters via `K32GetProcessMemoryInfo` (same metric family as the retained Sprint 1/2.R4 evidence) sampled at process start and around the measured activation window; peak working set is monotonic per process, so the reported peak bounds every prior phase including the two-snapshot coexistence moment. The asserted limit is the unchanged `ACTIVATION_RAM_CEILING_BYTES` (1.30 GiB transient ceiling); nothing was relaxed. A reader-path `QueryIndexService::search` over the freshly activated 250k-row snapshot verifies serveability. Output carries counts, byte figures, timings, and verdicts only - no raw text, tokens, or vector bytes are ever logged.
+**Implementation:**
+- Files: `frontend/src-tauri/src/retrieval/index.rs`.
+- Approach: exercised code is production code only (`publish_tick`, `try_activate_shadow_generation`, `base_snapshot`, journal replay, repository transactions); the benchmark owns fixtures, not logic. `IndexSnapshot` holds owned provenance metadata and contiguous validated int8 rows allocated during real activation instead of the benchmark-local compact numeric-metadata mirror the review flagged.
+**Not implemented:**
+- Bundled ONNX session residency is not loaded in this process; no second bundle exists to load, and fabricating one was out of scope.
+**Why not implemented:**
+- Model/session residency at scale is already evidenced by the retained 2.R4 full-matrix run recorded below; this task closes the remaining unproven component (the production two-snapshot envelope). Additively: 573.3 MiB snapshot-envelope peak + the session increments logged by `[envelope-sessions]` in that run remain what any future combined remeasure must compare against the same 1.30 GiB ceiling.
+**Verification:**
+- `$env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA 'meetily-cargo-target'; $env:MEETLY_RAG_INDEX_BENCH = "1"; cargo test --release --manifest-path "frontend/src-tauri/Cargo.toml" --lib retrieval::index::tests::bench_2r6_production_activation_envelope -- --nocapture` - pass: `[active] production snapshot activated (250000 documents) in 10606 ms`; `[envelope-parts] working set before activation window 275.8 MiB, after 268.3 MiB; resident index vectors 183.1 MiB`; `[envelope-peak] measured active+shadow process peak working set 573.3 MiB (11085 ms window) vs the approved 1.30 GiB transient ceiling -> PASS`. Total run time ~53 s; result is stable across repeat runs (earlier pass: 589.3 MiB).
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib retrieval::index::tests` - pass, 57 tests (gated test skips without the env flag).
+- `cargo check --manifest-path "frontend/src-tauri/Cargo.toml" --lib` - pass.
+- `cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check` - pass.
+- `git diff --check` - pass; the pre-existing CRLF notice remains for `.github/workflows/build-windows.yml`.
+- `pnpm run typecheck` (`npx tsc --noEmit`) - pass; `npx vitest run` - pass, 95 tests. Unrelated to this change; rerun as standard verification hygiene.
+**Rollback:**
+- Delete the gated test block; production behavior is untouched (test-module-only change). The measurement stands independently of any other remediation file.
+**Decisions and follow-ups:**
+- Envelope arithmetic sanity: peak ≈ 2 × (183.1 MiB vectors + owned provenance metadata) + process overhead, matching the two-full-snapshot shape rather than a partial load; headroom to the ceiling is now wide in isolation, so future model-session residency growth is visible against its separately retained evidence.
+- Fixture corpus shape mirrors the retained lock-span fixture precedent (251 meetings x ~995 documents): fewer meetings bound fixture time while every byte-level property of the snapshots is unchanged.
+- The heading-provenance unit test in this file asserts a doubly-encoded `"DecisÃµes finais"` string (self-consistent write/assert, so passing). Pre-existing encoding drift unrelated to 2.R6; flagged for later cleanup.
+
+### 2.R7 - Before/after lock and concurrent-writer benchmark evidence
+
+**Status:** Complete
+**Owner:** `worker-l`
+**Completed:** 2026-08-27
+**Implemented:**
+- Strengthened the ignored release-only lock benchmark with a test-only reference replacement that independently replays the prior full-corpus `COUNT(*)` document-count update inside the prior replacement transaction shape; production remains on the exact-delta path.
+- Added equivalent independent 250,000-row file-backed WAL fixtures for baseline/current measurement and a real primary `meetings` writer on a separate SQLite connection. The test asserts the writer overlaps the replacement, observes a non-trivial acquisition wait, and completes successfully without exposing source data.
+- Retained the current-path 250 ms pause-quantum assertion and labeled replacement, writer-acquisition, and writer-completion timings as upper bounds rather than exact lock durations.
+**Implementation:**
+- Files: `frontend/src-tauri/tests/document_count_lock_hold.rs`, this file.
+- Approach: each fixture applies the real migrations, seeds 250,000 canonical rows across 251 meetings, and replaces the 750-row worst-case set with 1,024 staged documents after two warmups and across seven measured iterations. Release results were baseline full-count min/median/max **52.2198/53.677/55.0496 ms**, current exact-delta **31.1563/32.9156/33.4253 ms**, and concurrent current replacement **32.5342 ms** with a separate-writer `BEGIN IMMEDIATE` wait upper bound of **46.2643 ms** and completion upper bound of **47.1465 ms** (writer started after a 1 ms scheduling delay; `blocked=true`).
+**Limitations:**
+- The 2-dimensional int8 vectors and synthetic bodies are shape-valid equivalent fixtures, not production 768-dimensional model payloads; contention covers one primary writer and no scanner or interactive search load.
+**Not implemented:**
+- Versioned document sets or any production replacement/contract change.
+**Why not implemented:**
+- The current replacement upper-bound maximum is 33.4253 ms, and the contended current replacement is 32.5342 ms, both below the approved 250 ms pause quantum; the evidence does not trigger the separate versioned-document-set escalation.
+**Verification:**
+- `$env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA 'meetily-cargo-target'; cargo test --release --manifest-path "frontend/src-tauri/Cargo.toml" --test document_count_lock_hold -- --ignored --nocapture` - pass: baseline/current/concurrent-writer results above; current-path gate PASS.
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --test document_count_lock_hold --no-run` - pass.
+- `cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check` - pass.
+- `git diff --check` - pass.
+**Rollback:**
+- Remove the test-only reference/concurrency harness and this execution entry; production implementation and atomic replacement remain unchanged.
+**Decisions and follow-ups:**
+- The benchmark proves a competing primary writer completed after overlapping the replacement, but its attempt-to-acquisition and completion clocks include scheduler, connection, transaction, and commit/return overhead. They are upper bounds and must not be read as exact writer-lock duration.
+- No versioned document-set scope change is escalated. Re-run this benchmark before changing corpus scale, storage representation, or the 250 ms gate.
+
+### 2.R8 - Fail-closed no-dbstat derived-disk activation gate
+
+**Status:** Complete
+**Owner:** `implementation subagent` (`openai/gpt-5.6-luna`)
+**Completed:** 2026-08-27
+**Implemented:**
+- Changed the shared derived-disk measurement result to distinguish exact `dbstat` bytes from an unavailable measurement. The payload/row calculation remains available only as an explicitly labelled status estimate.
+- Made the activation gate accept only exact derived-table bytes; an unavailable `dbstat` measurement now blocks activation with `derived disk measurement unavailable; refusing activation` and cannot be admitted through the cached path.
+- Kept the seven-table/index allow-list, primary meeting/transcript/FTS exclusion, exact `dbstat` page accounting, and read-only WAL diagnostic behavior unchanged.
+- Added a test-injected unavailable measurement regression that proves a fully covered candidate is not promoted without relying on the linked SQLite build lacking `dbstat`.
+**Implementation:**
+- Files: `frontend/src-tauri/src/database/repositories/retrieval.rs`, `frontend/src-tauri/src/retrieval/index.rs`, this file.
+- Approach: exact measurements expose `bytes` and gate input; no-`dbstat` measurements expose `status = unavailable`, `bytes = null`, and an optional payload estimate for diagnostics only. The shared gate and blocking cache consume the typed measurement, so no caller can accidentally authorize activation with the estimate.
+**Not implemented:**
+- No schema, model, memory, chunking, vector-backend, primary-data, FTS, or WAL behavior changes.
+**Why not implemented:**
+- These areas are outside the remediation and the existing exact `dbstat`/diagnostics paths already satisfy their contracts.
+**Verification:**
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib retrieval::index::tests` - pass, 58 tests (includes unavailable-measurement gate).
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib database::repositories::retrieval::tests` - pass, 32 tests.
+- `cargo check --manifest-path "frontend/src-tauri/Cargo.toml"` - pass.
+- `cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check` - pass.
+- `git diff --check` - pass; the pre-existing CRLF notice remains for `.github/workflows/build-windows.yml`.
+- From `frontend`: `pnpm run typecheck` - pass; `npx vitest run` - pass, 95 tests across 20 files.
+**Compatibility/Rollback:**
+- No migration or persisted-data change is required. Builds with `dbstat` retain the exact existing measurement and primary/WAL separation; builds without it remain FTS-compatible but keep semantic activation disabled until an exact measurement is available. Reverting the code and focused test is safe because retrieval rows and primary data remain rebuildable and untouched.
+**Decisions and follow-ups:**
+- A no-`dbstat` payload estimate is status-only and never enters the activation gate; `derived_disk_bytes` and `derived_disk_gate_input_bytes` are null with an explicit `unavailable` status, while `derived_disk_estimate_bytes` is diagnostic only.
+- The existing cached high-watermark optimization also caches unavailable results only as blockers; permissive exact readings continue to be remeasured.
+
+### 2.R9 - Warmed-session combined activation-envelope measurement
+
+**Status:** Blocked
+**Owner:** implementation subagent (`z-ai/glm-5.3-flash`)
+**Completed:** 2026-08-27
+**Implemented:**
+- Closed the Final Code Review (R12) measurement gap by extending the release-gated R6 benchmark (`bench_2r6_production_activation_envelope`): the one existing approved staged bundle now loads its embedding and reranker ONNX sessions through the production `model::get_or_load` cache path and warms them (one document embed through the production batch path, one rerank pair) before any snapshot fixture is built. No second bundle or synthetic identity was fabricated.
+- Both benchmark generations register under the real bundle-derived `bundled_model_identity()` instead of the former synthetic `"test-e5-int8"` label, keeping the unchanged fixed Int8 / `1/127` storage contract, and an assertion proves `model::cached_model` resolves that identity from the process-global session cache.
+- The envelope verdict now prints before post-promotion assertions, so a refusal by the production RAM gate reports complete counts/MiB/timings plus the gate's own blocker instead of dying on a state assertion first.
+**Implementation:**
+- Files: `frontend/src-tauri/src/retrieval/index.rs` (tests module), this file.
+- Approach: methodology unchanged from 2.R6 apart from session residency: Windows process working-set counters via `K32GetProcessMemoryInfo` (monotonic per-process peak bounds every phase including fixtures) plus the production gate's own `memory-stats` RSS sample inside the unchanged `ram_gate_blocker`; 250,000 documents per generation in two live generations of the single approved identity; two `publish_tick` passes drive the real validation load, journal catch-up, coverage/disk/RAM gates, promotion, and retirement. The asserted limit is the unchanged `ACTIVATION_RAM_CEILING_BYTES` (1,395,864,371-byte 1.30 GiB transient ceiling); nothing was relaxed, redefined, or worked around.
+**Blocker evidence (measured combined peak exceeds the fixed ceiling):**
+- `$env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA 'meetily-cargo-target'; $env:MEETLY_RAG_INDEX_BENCH = "1"; cargo test --release --manifest-path "frontend/src-tauri/Cargo.toml" --lib retrieval::index::tests::bench_2r6_production_activation_envelope -- --nocapture` - FAIL (activation blocked), stable across two runs: `[envelope-sessions] approved bundle embedding+reranker sessions loaded+warm in 2707 ms; working set 938.1 MiB, peak 1022.3 MiB`; `[active] production snapshot activated (250000 documents) in 17940 ms`; `[envelope-parts] working set before activation window 1192.7 MiB, after 1215.6 MiB; resident index vectors 183.1 MiB`; `[envelope-peak] measured active+shadow process peak working set 1482.7 MiB (16373 ms window) vs the approved 1.30 GiB transient ceiling -> FAIL`; panic: peak 1,554,751,488 bytes >= the 1,395,864,371-byte ceiling (~151.5 MiB over); `[envelope-gate] production RAM gate refused shadow activation: ["generation gen-bench-shadow: measured resident memory 1510690816 bytes meets or exceeds the 1395864371 byte activation ceiling"]`. First run agreed at gate level: gate-sampled resident memory 1,518,469,120 bytes vs the same ceiling (~117 MiB over). Total run time ~91-101 s.
+- Verdict: with production-representative warmed model sessions resident, the combined active+shadow activation peak exceeds the unchanged 1.30 GiB ceiling on both metrics (gate RSS ~1.41-1.45 GiB at sample point; monotonic peak working set 1.4827 GiB), so the production RAM gate refuses a 250k-scale two-snapshot activation exactly as designed. No behavior or architectural-contract change was made in response; production remains fail-closed blocked-only.
+**Not implemented:**
+- Any user-approved remedy for the excess, and therefore any unblock.
+**Why not implemented:**
+- Choosing a remedy (approved ceiling revision, smaller/slimmer bundle residency, different retention/shadow strategy) requires a user decision against the normative envelope; fabricating headroom was out of scope.
+**Limitations:**
+- Evidence is single-machine (this Windows x64 host); absolute numbers vary with hardware, but the structural contributor is the ~900 MiB resident session weight (int8 embedding + quint8 reranker ONNX artifacts), which dominates the previously recorded 573.3 MiB session-free snapshot-only peak.
+- Peak working set still counts every prior fixture phase (retained 2.R6 methodology); it excludes Whisper/webview/UI loads of a full application run beyond the retrieval session set.
+- Warm-up runs one embed batch and one rerank pair rather than extended corpus-scale inference; arena drift after heavier use could move the figure further up, never materially down.
+**Verification:**
+- See Blocker evidence above for the gated release benchmark outcome.
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib retrieval::index::tests` - pass, 58 tests (gated benchmark skips without the env flag).
+- `cargo check --manifest-path "frontend/src-tauri/Cargo.toml"` - pass.
+- `cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check` - pass.
+- From `frontend`: `pnpm run typecheck` - pass; `npx vitest run` - pass, 95 tests across 20 files.
+**Rollback:**
+- Revert the tests-module changes; production behavior is untouched (test-module-only diff). The 2.R6-era un-warmed benchmark shape restores independently.
+**Decisions and follow-ups:**
+- The 1.30 GiB activation ceiling stands as normative; the measured failure does not weaken any gate or contract. `2.R9` blocks until the user approves a remedy; re-running this benchmark requires no other changes once a remedy lands.
+- Session-cache identity coherence is now proven end to end: the cached bundle resolves `bundled_model_identity()`, and snapshot activations consume that same persisted identity.
+
+### 2.R10 - Terminal-generation tombstone repair
+
+**Status:** Complete
+**Owner:** `implementation subagent` (`openai/gpt-5.6-luna`)
+**Completed:** 2026-08-27
+**Implemented:**
+- Added a forward-only migration that replaces meeting-delete tombstone capture with live-generation-only publication and repairs obsolete terminal-generation journal tails.
+- Added populated-upgrade and future-delete regressions covering active/building preservation, retired/failed cleanup eligibility, and primary/derived deletion cascades.
+**Implementation:**
+- Files: `frontend/src-tauri/migrations/20260827010000_repair_terminal_generation_tombstones.sql`, `frontend/src-tauri/src/database/migration_tests.rs`, `frontend/src-tauri/src/database/repositories/retrieval.rs`.
+- Approach: terminal journal rows above each generation's existing `published_change_id` are discarded as obsolete terminal state; the published bound is never advanced. The replacement trigger journals deletes only for `building` and `ready` generations, leaving R5's GC guard unchanged.
+**Not implemented:**
+- No changes to GC acknowledgement/draining, primary-data deletion behavior, or model/encoding/backend contracts.
+**Why not implemented:**
+- Those behaviors are outside this remediation and remain the existing runtime contracts.
+**Verification:**
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib database::repositories::retrieval::tests` - pass, 32 tests.
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib database::repositories::meeting::tests` - pass, 1 test.
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib database::migration_tests` - pass, 6 tests.
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib retrieval::index::tests` - pass, 58 tests.
+- `cargo check --manifest-path "frontend/src-tauri/Cargo.toml"` - pass.
+- `cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check` - pass.
+- `git diff --check` - pass; the pre-existing CRLF notice remains for `.github/workflows/build-windows.yml`.
+- From `frontend`: `pnpm run typecheck` - pass; `npx vitest run` - pass, 95 tests across 20 files.
+**Rollback:**
+- The migration is forward-only; rollback requires a compatibility migration or rebuilding derived retrieval state. Primary meetings and existing FTS behavior remain unaffected.
+**Decisions and follow-ups:**
+- Terminal tails are removed without changing `published_change_id`, so migration repair is not synthetic publication acknowledgement. Future terminal deletion tails cannot be created by the replacement trigger.
+
+### 2.R11 - Upsert-aware compaction threshold
+
+**Status:** Complete
+**Owner:** `implementation subagent` (`openai/gpt-5.6-luna`)
+**Completed:** 2026-08-27
+**Implemented:**
+- Counted base rows shadowed by upserts together with deleted base rows when evaluating the approved 2% compaction threshold, without double counting meetings affected by both states.
+- Added a regression proving that replacing a 100-document base meeting with one upserted document triggers compaction and removes the stale vectors.
+**Implementation:**
+- Files: `frontend/src-tauri/src/retrieval/index.rs`.
+- Approach: The existing base meeting document counts are filtered through the overlay's shared shadow predicate, preserving immutable snapshot construction, cancellation, reader behavior, and the existing denominator.
+**Not implemented:**
+- None.
+**Why not implemented:**
+- Not applicable.
+**Verification:**
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib retrieval::index::tests` - pass, 59 tests.
+- `cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check` - pass.
+- `git diff --check` - pass; the pre-existing CRLF notice remains for `.github/workflows/build-windows.yml`.
+**Rollback:**
+- Revert the shared shadow-count correction and focused regression; compaction and reader/search semantics otherwise remain unchanged.
+**Decisions and follow-ups:**
+- The approved 2% denominator remains the base row count; each shadowed base row is counted once, whether hidden by upsert or deletion.
+
+### 2.R12 - Activation envelope remedy: session residency and gate scope
+
+**Status:** Complete
+**Owner:** `worker-l` (`openai/gpt-5.6-luna`)
+**Completed:** 2026-08-27
+**Implemented:**
+- Changed `get_or_load` to verify the complete approved bundle, build and warm only the embedding engine, and retain the reranker configuration without constructing its ONNX session. The first non-empty rerank request constructs the reranker through the same cached runtime and runs the existing input/output name, dtype, rank, label-index, and score-contract validation before inference.
+- Extended the release-gated `bench_2r6_production_activation_envelope` instead of adding a duplicate benchmark. It now measures embedding-only residency and the deferred reranker's own weight, then gates the real 250,000-document two-snapshot activation while only the embedding session is resident. Existing reference-parity reranker tests still build the reranker explicitly.
+- Made the RAM gate's scope explicit as whole-process RSS and exposed that scope beside the measured status value and unchanged ceiling.
+**Implementation:**
+- Files: `frontend/src-tauri/src/retrieval/model.rs`, `frontend/src-tauri/src/retrieval/index.rs`, `docs/hybrid-rag/architecture.md`, this file.
+- Approach: `RuntimeInner` owns one lazily initialized reranker slot and the manifest-backed `BundleIdentity`; failed deferred loads remain retryable and cancellation avoids starting a reranker load. Stage 1 passed, so no session eviction was added. Stage 3 keeps the process RSS sample and explicitly treats `ACTIVATION_RAM_CEILING_BYTES` as the same whole-process budget, including retrieval snapshots/sessions, Whisper/audio, Tauri/webview, allocator, and other process overhead.
+
+Component and gate measurement from the release benchmark:
+
+| Component | Bytes | MiB | Source/meaning |
+|---|---:|---:|---|
+| Embedding-only session weight | 583,065,600 | 556.1 | `get_or_load` after embedding warm-up, relative to process baseline |
+| Reranker own weight | 392,376,320 | 374.2 | first post-activation rerank request; built and validated then |
+| Snapshot-only activation peak | not emitted in bytes | 573.3 | retained `2.R6` no-session 250k two-snapshot measurement |
+| Stage-1 combined active+shadow peak | 1,172,094,976 | 1,117.8 | release benchmark with embedding only resident |
+
+The fixed ceiling is `1,395,864,371` bytes (1.30 GiB). Stage 1 therefore
+cleared it by **223,769,395 bytes (213.4 MiB)**. Stage 2 was not run because
+stage 1 passed; no eviction precondition measurement was required. The
+benchmark's deferred reranker load reported the own-weight row after the
+activation gate had passed.
+
+**Not implemented:**
+- Stage 2 session eviction, activation-window FTS-only transition, and
+  post-activation reload handling; the stage-1 margin makes them unnecessary.
+- No model, chunk, encoding, backend, bundle, or production rerank-consumer
+  change.
+**Why not implemented:**
+- Stage 1 is the first clearing remedy required by the task and its measured
+  peak is below the unchanged ceiling with substantial margin. There is no
+  production Sprint 2 rerank consumer whose residency would justify paying
+  the eviction complexity.
+**Verification:**
+- `$env:CARGO_TARGET_DIR = 'C:\Users\arman\cargo-target'; $env:MEETLY_RAG_INDEX_BENCH = '1'; cargo test --release --manifest-path 'frontend/src-tauri/Cargo.toml' --lib retrieval::index::tests::bench_2r6_production_activation_envelope -- --nocapture` - pass; latest 250,000-document stage-1 peak `1,172,094,976` bytes, margin `223,769,395` bytes; embedding weight `583,065,600` bytes; reranker weight `392,376,320` bytes. Earlier repeat also passed at peak `1,169,698,816` bytes.
+- `cargo test --manifest-path 'frontend/src-tauri/Cargo.toml' --lib retrieval::` - pass, 152 tests.
+- `cargo check --manifest-path 'frontend/src-tauri/Cargo.toml'` - pass.
+- `cargo fmt --manifest-path 'frontend/src-tauri/Cargo.toml' --check` - pass.
+- `git diff --check` - pass for the task files; the pre-existing CRLF notice remains on `.github/workflows/build-windows.yml`.
+- From `frontend`, `pnpm run typecheck` - pass; `npx vitest run` - pass, 95 tests across 20 files.
+**Rollback:**
+- Revert the lazy slot/warm-up and benchmark/status-scope changes; eager reranker construction and the prior whole-process gate behavior return. No persisted data or model contract changes are involved.
+**Decisions and follow-ups:**
+- Stage 1 selected; stage 2 intentionally stopped after the measured pass. The gate-scope decision is whole-process RSS, documented next to the ceiling in `architecture.md`; this avoids comparing an unscoped process measurement with retrieval-only arithmetic.
+- The `2.R6` snapshot-only baseline was recorded only to one decimal MiB by its original run, so its exact byte value is not claimed. Future benchmark output now emits exact component and peak bytes.
+- The benchmark is single-machine Windows x64 evidence and does not load a full application's optional Whisper/webview state; the whole-process gate remains conservative for production.
+
+### 2.R13 - Retrieval-scoped activation RAM gate (final-review blocker)
+
+**Status:** Blocked
+**Owner:** implementation subagent (`z-ai/glm-5.3-flash`)
+**Recorded:** 2026-08-27
+**Closes:** the Final Code Review (R13) blocker "R12 relabels a whole-process gate without whole-application calibration" - by technical proof that the requested retrieval-scoped remedy is not implementable, not by shipping a defective gate.
+
+**Task:** implement the retrieval-scoped alternative in the existing `2.R12` Stage 3 authority. The gate must measure/reason only about actual retrieval residency required at activation - approved retrieval model sessions plus active+shadow snapshots and their metadata/overlays - must never block solely on unrelated process RSS, must not subtract an arbitrary process baseline or use a fixed heuristic factor that can undercount, must prefer the smallest conservative mechanism available from the existing runtime and model/snapshot ownership, and must fail closed on any unavailable or unprovable retrieval term. The `ACTIVATION_RAM_CEILING_BYTES` value `1,395,864,371` stays unchanged; no second bundle or model may be invented.
+
+**Blocker proof - the session term cannot be measured without undercounting.** Every candidate mechanism was verified against the actual dependency sources (`ort-sys` 2.0.0-rc.10 binding ONNX Runtime 1.22.0, `ort` 2.0.0-rc.10, `memory-stats` 1.x) and fails at least one hard requirement:
+
+1. **No per-session query exists in the bound ONNX Runtime API.** The generated `OrtApi` surface in `ort-sys` 2.0.0-rc.10 declares no session memory/stat query of any kind. `OrtApi::CreateAllocator(session, mem_info)` exists, but the returned `OrtAllocator` struct exposes only `Alloc`/`Free`/`Info`/`Reserve` function pointers - no byte totals, no arena statistics. The `ort` 2.0.0-rc.10 Rust crate likewise exposes no session memory API (its `memory::Allocator`/`MemoryInfo` surface serves IO binding only). Model-session residency is therefore unreadable at runtime through existing public facilities.
+2. **Rust allocator accounting cannot see the sessions.** ONNX Runtime is native code allocating through the native Windows heap; FFI allocations never traverse the Rust `#[global_allocator]`. Ownership-based accounting can count Rust-owned bytes but structurally cannot observe the dominant session term.
+3. **Windows offers no per-component attribution.** `K32GetProcessMemoryInfo`, `QueryWorkingSetEx`, `GetProcessHeaps`/`HeapWalk`, and `VirtualQuery` are all process-wide enumerations with no owner tag for anonymous/native allocations; no Windows facility attributes pages to a component. The existing `memory-stats` 1.x returns only process totals (`GetProcessMemoryInfo` -> `WorkingSetSize`/`PagefileUsage`).
+4. **Whole-process deltas around a session load/drop can undercount.** Working-set size is not monotonic: concurrent frees by unrelated components during the window subtract from the delta, and freed-but-resident pages being reused keep RSS or peak-working-set deltas flat while the session's true residency grows. Such a sample is also exactly the whole-process quantity the review rejected, and it can block on unrelated allocations - both prohibited properties.
+5. **A fixed session-weight constant is a prohibited undercounting factor.** Session residency varies with the machine-dependent intra-op thread count (`approved_intra_threads()` = clamp(cores/2, 1, 4)), ORT arena growth over batch/sequence history, thread-pool stacks, and allocator behavior. Any constant - including 2.R12's measured 581-583 MB embedding weight - undercounts on some host or after heavier arena growth.
+6. **Weights-file bytes lower-bound, never upper-bound, session residency.** `models/embedding/model_int8.onnx` is 278,184,162 bytes and `models/reranker/model_quint8_avx2.onnx` is 118,620,016 bytes, but activation arena, runtime thread stacks, and tokenizer/runtime overhead are not bounded by any public data, so a file-size-derived figure undercounts.
+7. **The snapshot term alone is provably accountable - and proves the undercount.** `IndexSnapshot` ownership (base vector `Vec<u8>` capacity, `DocumentMeta`/`OverlayDoc` string capacities, `BTreeMap`/`BTreeSet` node accounting, a bounded per-allocation overhead margin) yields a conservative non-undercounting figure. But per the 2.R12 measured table, snapshots were ~25% of the combined peak (183.1 MiB resident vectors; 573.3 MiB snapshot-only peak) while sessions were 63% (~556-938 MiB). A "retrieval-scoped" gate over snapshots only would omit the dominant term - exactly the cosmetic scope label this task prohibits.
+8. **Evicting sessions across the activation window cannot make the term provably zero.** No ownership-time facility can prove ORT released its arena (2.R12 Stage 2's own precondition warns arena blocks may be retained and demands an RSS-delta proof - itself process-wide and undercount-capable), and gating a sessions-free quantity moves the real envelope peak (the post-activation session reload) outside the gate entirely. Stage 2 was also explicitly conditional on Stage 1 failing; Stage 1 passed with margin.
+
+**Conclusion.** The three hard requirements - retrieval-scoped, provably non-undercounting, and never blocking on unrelated process RSS - cannot be jointly satisfied for the session term with existing public/runtime facilities. The two implementable substitutes are both prohibited: a snapshots-only gate undercounts the dominant term (cosmetic scope), and a fail-closed-on-sessions gate would permanently block every activation (a feature regression masquerading as a measurement). `2.R13` is therefore recorded Blocked with no production change: the `2.R12` whole-process gate remains in force, unchanged, and still fails closed when the measurement is unavailable.
+
+**Not implemented:** everything - no production code, benchmark, status-payload, or `architecture.md` change. The requested `architecture.md` scope note next to the ceiling cannot be written truthfully: no retrieval scope was chosen, and the existing section documents the `2.R12` whole-process decision that remains in force.
+**Why not implemented:** the blocker proof above; both substitutes are prohibited by the task's own constraints.
+**What would unblock (user decisions, none taken here):**
+- Approve calibrating the whole-process gate against a real full-application run (Whisper/audio/Tauri/webview resident) and re-derive the whole-process ceiling from that measurement - requires a ceiling change.
+- Fund runtime attribution infrastructure so session bytes become measurable in production (e.g., an ORT-side counted allocator; not achievable through the ORT 1.22 C API as bound, since `CreateAllocator`/`RegisterAllocator` do not intercept the internal CPU arena).
+- Wait for an upstream ONNX Runtime per-session memory-stat API, then implement the scoped gate like-for-like.
+- Approve `2.R12` Stage 2 eviction plus snapshots-only accounting, explicitly accepting that the gate quantity excludes sessions by construction and the post-activation reload peak is ungated.
+- Relax the no-fixed-factor constraint and approve a constructed conservative session upper bound with its accepted undercount risk.
+**Verification** (all against the unchanged tree; the R12 gate remains functional as shipped):
+- `$env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA 'meetily-cargo-target'; $env:MEETLY_RAG_INDEX_BENCH = "1"; cargo test --release --manifest-path "frontend/src-tauri/Cargo.toml" --lib retrieval::index::tests::bench_2r6_production_activation_envelope -- --nocapture` - pass: `[envelope-sessions]` embedding loaded+warm in 1645 ms, embedding-only weight 581,218,304 bytes; `[active]` 250,000 documents activated in 10125 ms; `[envelope-peak]` peak working set 1,170,399,232 bytes (1116.2 MiB), margin 225,465,139 bytes (215.0 MiB) vs the unchanged 1.30 GiB ceiling -> PASS; `[envelope-reranker]` deferred reranker built+validated, own weight 391,102,464 bytes.
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib retrieval::` - pass, 152 tests.
+- `cargo check --manifest-path "frontend/src-tauri/Cargo.toml"` - pass.
+- `cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check` - pass.
+- `git diff --check` - pass; only the pre-existing CRLF notice on `.github/workflows/build-windows.yml` remains.
+- From `frontend`: `pnpm run typecheck` - pass; `npx vitest run` - pass, 95 tests across 20 files.
+**Rollback:**
+- None needed - no production or benchmark diff exists for this task; the working tree carries only the prior tasks' changes.
+**Decisions and follow-ups:**
+- The gate-scope decision returns to the user with the unblock options above; `2.R12`'s entry, the review records, and the `architecture.md` gate-scope section are intentionally untouched because no scope change shipped.
+- Verified source-level facts for this proof: `ort-sys` 2.0.0-rc.10 `OrtApi`/`OrtAllocator` declarations (no stats surface), `ort-sys` `build.rs` `ONNXRUNTIME_VERSION = "1.22.0"`, `ort` 2.0.0-rc.10 session API (no memory query), `memory-stats` 1.x Windows implementation (`GetProcessMemoryInfo`), and the staged bundle artifact byte lengths.
+
+### 2.R14 - Lazy reranker initialization ownership
+
+**Status:** Complete
+**Owner:** `implementation subagent` (`openai/gpt-5.6-luna`)
+**Completed:** 2026-08-27
+**Implemented:**
+- Changed the deferred reranker slot to own an `Arc<Engine>`, so initialization publishes one fully loaded and contract-validated engine while callers receive owned handles rather than a mutex guard.
+- Added cancellation-aware waiting and retry-safe lazy construction, with focused regressions for concurrent first load, cancellation while waiting, and failed-load retry.
+**Implementation:**
+- Files: `frontend/src-tauri/src/retrieval/model.rs`, this file.
+- Approach: `lazy_engine` holds the initialization mutex only through the build/validation and Arc publication; `rerank_sync` then tokenizes, batches, checks cancellation, and invokes the session without that mutex. `Engine.session` remains the sole serialization boundary for the existing ONNX session.
+**Not implemented:**
+- No model/bundle I/O, manifest, contract, or ONNX session configuration changes.
+**Why not implemented:**
+- Not applicable.
+**Verification:**
+- Focused tests `concurrent_first_reranker_load_shares_one_initialized_engine`, `waiting_rerank_initialization_observes_cancellation_before_building`, and `failed_reranker_load_is_retryable` - pass, 1 each.
+- `cargo test --manifest-path 'frontend/src-tauri/Cargo.toml' --lib retrieval::model::tests -- --nocapture` - pass, 18 tests.
+- `$env:CARGO_TARGET_DIR = 'C:\Users\arman\cargo-target'; cargo check --manifest-path 'frontend/src-tauri/Cargo.toml'` - pass.
+- `cargo fmt --manifest-path 'frontend/src-tauri/Cargo.toml' --check` - pass.
+- `git diff --check` - pass; the pre-existing CRLF notice remains on `.github/workflows/build-windows.yml`.
+**Rollback:**
+- Revert the lazy-slot ownership change and its focused regressions; bundled model contracts and persisted retrieval data are unaffected.
+**Decisions and follow-ups:**
+- Failed construction leaves the slot empty, so the next caller retries; a cancelled caller never starts deferred construction.
+- Waiting uses a 1 ms polling quantum, and cancellation cannot interrupt an already-started ONNX construction or a session run; the latter remains serialized by `Engine.session`.
+
+### 2.R15 - Fail-closed staging cleanup recovery
+
+**Status:** Complete
+**Owner:** `implementation subagent` (`openai/gpt-5.6-luna`)
+**Completed:** 2026-08-27
+**Implemented:**
+- Cleanup is now a worker boundary: if divergent-row pruning and its fallback discard both fail, or unreadable-staging recovery and discard both fail, the item records bounded retry/backoff and returns before embedding or publication.
+- Added a focused regression proving failed cleanup preserves prior canonical documents and publication state and schedules retry without embedding.
+**Implementation:**
+- Files: `frontend/src-tauri/src/retrieval/worker.rs`, this file.
+- Approach: retain successful cleanup and resumable staging unchanged; fail closed only when neither cleanup route can establish safe staging.
+**Not implemented:**
+- No data model, model/bundle contract, dependency, or logging-surface changes.
+**Why not implemented:**
+- Not applicable.
+**Verification:**
+- `cargo test --manifest-path 'frontend/src-tauri/Cargo.toml' --lib retrieval::worker::tests::failed_divergent_staging_cleanup_retries_without_publishing -- --nocapture` - pass.
+- `cargo test --manifest-path 'frontend/src-tauri/Cargo.toml' --lib retrieval::worker::tests` - pass, 34 tests.
+- `cargo test --manifest-path 'frontend/src-tauri/Cargo.toml' --lib database::repositories::retrieval::tests` - pass, 32 tests.
+- From `frontend`: `pnpm run typecheck` - pass; `npx vitest run` - pass, 95 tests across 20 files.
+- `$env:CARGO_TARGET_DIR = 'C:\Users\arman\cargo-target'; cargo check --manifest-path 'frontend/src-tauri/Cargo.toml'` - pass.
+- `cargo fmt --manifest-path 'frontend/src-tauri/Cargo.toml' --check` - pass; `git diff --check` - pass for the task files.
+**Rollback:**
+- Revert the worker guard and focused regression; staging remains durable and recoverable.
+**Decisions and follow-ups:**
+- Cleanup errors remain bounded and opaque: logs contain error context and identifiers only, never meeting text, tokens, or vectors.
 
 ### Task Entry Template
 
@@ -947,6 +1420,49 @@ Remediation has not started. The architecture review above additionally requires
 
 **Required follow-ups:** resolve findings 1-5 before sprint close; record the quarantine state (finding 4) in `architecture.md` as a scope-recorded decision rather than code-only behavior.
 
+### Final Code Review (R11)
+
+**Reviewer:** `gpt-5.6-sol` (`ses_fbef08e9affeCx7235RSW2Ljmr`), 2026-08-27
+**Verdict:** Changes requested
+
+**Findings:**
+1. **Blocker - retired-generation GC acknowledges lag before deciding whether deletion is eligible.** It can acknowledge a lagging retired journal through canonical and then delete in the same pass, bypassing the 2.R1 requirement that non-zero lag prevents reclamation. `frontend/src-tauri/src/retrieval/index.rs:1719-1737`.
+2. **Blocker - the 250k release benchmark does not exercise the production index representation.** Its compact numeric metadata and per-vector scale differ from `QueryIndexService`'s owned provenance and fixed int8 storage, so the narrow 1.30 GiB envelope result cannot validate production activation. `frontend/src-tauri/tests/vector_backend_benchmark.rs:121-139,170-177`; `frontend/src-tauri/src/retrieval/index.rs:106-128,470-478`.
+3. **Should-fix - the lock benchmark records only the post-fix path and no concurrent writer.** It does not independently reproduce the required before/after lock evidence. `frontend/src-tauri/tests/document_count_lock_hold.rs:236-270`.
+4. **Should-fix - the no-`dbstat` fallback is not demonstrated conservative.** Fixed row allowances omit metadata and index-key bytes despite feeding a block-only gate. `frontend/src-tauri/src/database/repositories/retrieval.rs:1615-1649`.
+
+**Verification:** `cargo test --lib` passed (569 passed, 2 ignored); `cargo check`, `cargo fmt --check`, and scoped `git diff --check` passed. The reviewer did not rerun the gated 250k matrix because its harness is the finding.
+
+**Required follow-ups:** fix GC lag ordering; add production-representation activation-envelope evidence; make before/after lock and concurrent-writer evidence reproducible; establish a demonstrably conservative no-`dbstat` bound.
+
+### Final Code Review (R12)
+
+**Reviewer:** `gpt-5.6-sol` (`ses_fbe5c3d22ffesxdBg925jA9aw9`), 2026-08-27
+**Verdict:** Changes requested
+
+**Findings:**
+1. **Blocker - the R6 activation-envelope test does not warm the bundled model sessions.** It sets a loaded identity rather than loading the embedding and reranker sessions, so its 574.4 MiB process peak cannot prove the normative combined 1.30 GiB envelope. `frontend/src-tauri/src/retrieval/index.rs:5402-5404,5436-5447`.
+2. **Blocker - a meeting deletion can permanently strand a retired generation.** The deletion trigger appends a tombstone to retired generations, but no publisher advances their bound; GC correctly refuses the lagging generation and the two-generation limit then prevents another rebuild. `frontend/src-tauri/migrations/20260825000000_add_semantic_retrieval.sql:333-357`; `frontend/src-tauri/src/retrieval/index.rs:986-996`; `frontend/src-tauri/src/database/repositories/retrieval.rs:744-758`.
+3. **Should-fix - upsert-shadowed base rows do not count toward compaction.** A large meeting replacement can leave stale base vectors below the 2% compaction threshold indefinitely. `frontend/src-tauri/src/retrieval/index.rs:239-249,1293-1295`.
+
+**Verification:** The reviewer relied on the completed closure suite and reran scoped `git diff --check`, which passed.
+
+**Required follow-ups:** measure production snapshots plus warmed sessions; make retired-generation deletion journals terminal without synthetic acknowledgement; count upsert-shadowed base rows in compaction.
+
+### Final Code Review (R13)
+
+**Reviewer:** `gpt-5.6-sol` (`ses_fbc7096b3ffe7EdD3BUig9xMFw`), 2026-08-27
+**Verdict:** Changes requested
+
+**Findings:**
+1. **Blocker - R12 relabels a whole-process gate without whole-application calibration.** The unchanged ceiling names Whisper/audio and Tauri/webview but the qualifying test excludes them, so the result is not like-for-like production evidence. `docs/hybrid-rag/architecture.md:1049-1069`; `frontend/src-tauri/src/retrieval/index.rs:5424-5437,5457-5487`.
+2. **Should-fix - lazy reranker initialization holds its initialization mutex through inference.** Concurrent requests cannot observe cancellation until the preceding rerank completes. `frontend/src-tauri/src/retrieval/model.rs:308-339,618-656`.
+3. **Should-fix - dual failure while cleaning divergent staging can publish stale rows.** Processing continues if pruning and fallback discard both fail. `frontend/src-tauri/src/retrieval/worker.rs:996-1024`; `frontend/src-tauri/src/database/repositories/retrieval.rs:1062-1076`.
+
+**Verification:** Rust library tests passed (575 passed, 2 ignored); Cargo check, rustfmt, and diff check passed. The reviewer accepted orchestrator TypeScript, Vitest, R7, and release-envelope evidence.
+
+**Required follow-ups:** use a like-for-like retrieval-scoped gate or a full-app calibrated budget; release the reranker initialization lock before inference; fail/repair the work item when all divergent-staging cleanup attempts fail.
+
 ## Sprint 2 Remediation
 
 Drafted 2026-08-26 from the two post-remediation reviews above. Task IDs
@@ -985,6 +1501,9 @@ branch; no further approval is outstanding for this task.
 | 2.R2 | Envelope gates | Measure derived disk as derived data, stop mutating the database to read it, and order the activation gates cheapest-first. | M | Unassigned `worker-l` | 2.R1 | The disk figure excludes primary storage and process RAM; no `wal_checkpoint` runs from a measurement path; coverage blocks before any size probe. | Revert to the prior gate; activation remains blocked-only and never deletes data. |
 | 2.R3 | Worker memory and repair backoff | Bound resume and publication memory to the approved batch ceiling, shorten the replacement write lock, and stop the FTS repair spin. | M | Unassigned `worker-l` | 2.R2 | A synthetic oversized meeting stays within the ceiling on resume and publish; a persistently failing FTS mark does not spin. | Revert the worker/repository changes; durable state and staging semantics are unchanged. |
 | 2.R4 | Contract records | Name the quarantine state, stop pause from freezing lexical repair, and clear the two documentation/format defects. | S | Unassigned `worker-l` | 2.R3 | `architecture.md` names the quarantined-coverage state; pause leaves FTS repair running; the command surface and timestamp format are consistent. | Documentation-only apart from the pause branch, which reverts independently. |
+| 2.R12 | Activation envelope | Cut session residency during the activation window and align the RAM gate's measurement scope with its ceiling. Closes the 2.R9 blocker without changing the 1.30 GiB ceiling. | M | `worker-l` | Complete | The 2.R9 benchmark passes against the unchanged ceiling with recorded margin; the reranker still passes load-time validation and Sprint 1 reference parity; gate and ceiling measure the same quantity. | Restore eager reranker loading and the prior gate; activation returns to blocked-only and never deletes data. |
+| 2.R13 | Activation envelope | Implement the retrieval-scoped activation RAM gate the Final Code Review (R13) blocker requires: the gate measures only approved retrieval sessions plus active+shadow snapshots and their metadata/overlays, cannot undercount, never blocks on unrelated process RSS, and keeps the unchanged 1.30 GiB ceiling. | M | `worker-l` | 2.R12 | Blocked with proof: no existing public/runtime facility can measure the session term without undercounting (see the 2.R13 execution entry). The R12 whole-process gate remains in force and still passes the release benchmark. | None needed - no production or benchmark diff exists; the R12 gate ships unchanged. |
+| 2.R15 | Staging cleanup fail-closed boundary | Abort semantic work and record bounded retry/backoff when divergent-staging pruning plus discard, or unreadable-staging recovery plus discard, both fail. | S | `implementation subagent` | Complete | Cleanup failure leaves prior canonical documents and publication bounds unchanged, performs no embedding or replacement, and schedules retry. | Revert the worker guard and regression; staging remains durable and recoverable. |
 
 ### Dependency Order
 
@@ -1169,6 +1688,13 @@ Closes code findings 4 and 5.
   advance stay in that same transaction.
 - Keep validation on exactly the bytes that are inserted; a page that fails
   validation aborts the whole replacement with prior documents intact.
+- Keep the one transaction: paging is a memory bound, not a writer-lock
+  release mechanism. Correct the `document_count` recompute in that
+  transaction, then measure and record realistic 250k-corpus-scale worst-case
+  replacement lock hold time before and after the correction. If the corrected
+  measurement exceeds the approved 250 ms pause quantum, record the evidence
+  and escalate versioned document sets as a separate scope-change task; do not
+  weaken atomic replacement here.
 - Distinguish the two non-advancing FTS repair outcomes. A superseded mark
   (`Ok(false)`) is normal: leave the meeting due, but count consecutive
   supersessions per item and fall through to the sleep quantum once a small
@@ -1183,9 +1709,11 @@ Closes code findings 4 and 5.
 - A synthetic meeting far above the batch ceiling resumes from staging and
   publishes without materializing its full document set; peak resident
   document count stays within the approved ceiling on both paths.
-- The replacement transaction's held-lock duration scales with page size, not
-  with the meeting's document count; a test asserts a concurrent primary
-  write is not starved.
+- A realistic worst-case replacement at corpus scale records before/after
+  write-lock hold time around the `document_count` recompute fix. A concurrent
+  primary write remains able to complete after the bounded transaction; if the
+  corrected hold time exceeds 250 ms, versioned document sets are proposed as
+  a separate, evidence-backed scope change.
 - A meeting whose projection revision advances on every pass does not prevent
   other due items from being processed.
 - A persistently failing `mark_fts_indexed` records backoff and does not spin;
@@ -1241,9 +1769,9 @@ Closes architecture findings 4 and 5, and code findings 7 and 8.
   edit; if either has been committed by the time this task runs, add a
   forward-only migration instead and say so in the report.
 - Confirm in the report that the persisted `force_lexical_retrieval` kill
-  switch remains Sprint 5 scope (`architecture.md` "Retrieval Kill Switch"
-  requires a Settings surface) and is deliberately not implemented here, so a
-  later review does not re-raise it as a Sprint 2 gap.
+  switch remains later Sprint 3.4 scope (`architecture.md` "Retrieval Kill
+  Switch" requires a Settings surface) and is deliberately not implemented
+  here, so a later review does not re-raise it as a Sprint 2 gap.
 
 **Acceptance criteria:**
 
@@ -1267,12 +1795,134 @@ git diff --check
 **Worker report additions:** the corrected pause semantics, and confirmation
 of the kill-switch deferral.
 
+### 2.R12 - Activation envelope remedy: session residency and gate scope [M]
+
+**Closes:** the `2.R9` blocker. **The 1.30 GiB transient ceiling is NOT
+changed by this task**, nor is the approved model, chunk, encoding, or backend
+contract. The remedy is to stop holding memory Sprint 2 does not need during
+the window that peaks, and to make the gate compare like with like.
+
+**Outcome:** the 250k two-snapshot activation peak fits inside the unchanged
+1.30 GiB ceiling with recorded margin, and the number the gate samples and the
+ceiling it is compared against measure the same thing.
+
+**Measured starting point (from `2.R6` and `2.R9`):**
+
+| Component | MiB | Note |
+|---|---|---|
+| Snapshot-only activation peak, no sessions (`2.R6`) | 573.3 | passes with 758 MiB spare |
+| Warm embedding + reranker sessions (`2.R9`) | 938.1 | working set; 1022.3 peak |
+| Two resident snapshots (2 x 183.1) | 366.2 | inside the 573.3 above |
+| Combined peak (`2.R9`) | 1482.7 | 151.5 MiB over the ceiling |
+
+Sessions are 63% of the peak. Snapshot overlap - the term the ceiling's
+approving decision actually reasons about - is 25%. Work the dominant term.
+
+**Likely touchpoints:**
+
+- `frontend/src-tauri/src/retrieval/model.rs`
+- `frontend/src-tauri/src/retrieval/index.rs`
+- `frontend/src-tauri/src/retrieval/worker.rs`
+- `upstream/docs/hybrid-rag/architecture.md` (stage 3 only)
+
+**Required implementation.** Three stages. Stages 1 and 2 are each gated on
+their own measurement; stop at the first stage that clears the ceiling with
+margin. Stage 3 is required regardless of where you stop.
+
+*Stage 1 - lazy reranker session.*
+
+- `get_or_load` builds and warms only the embedding engine. The reranker
+  engine is built on first rerank request, behind the same cache and the same
+  `BundleIdentity`.
+- The reranker's load-time contract validation - input/output names, dtypes,
+  ranks, label index, score transform - MUST still run when it is built. Defer
+  instantiation, never validation.
+- Sprint 1's reference-parity gate is unaffected: the CI reference-inference
+  test loads the reranker explicitly. No approved contract changes; only the
+  moment of instantiation.
+- Re-run the `2.R9` benchmark. Record the embedding-only session weight, the
+  reranker's own weight when built, and the new combined peak.
+- Sprint 2 has no production rerank consumer - the only `rerank_sync` caller
+  outside `model.rs` is in the `index.rs` test module - so this removes
+  residency that nothing in this sprint uses, and it lowers steady state as
+  well as the transient peak.
+
+*Stage 2 - session eviction across the activation window (only if stage 1
+leaves the peak at or above the ceiling).*
+
+- **Precondition, measured first:** prove that dropping the session handles
+  actually returns resident memory. ORT arena allocators may retain freed
+  blocks. Add a bench phase that loads, warms, drops every handle
+  (`SESSION_CACHE` entry and the worker's `embedders` map both), and samples
+  RSS. If RSS does not fall materially, **stop and report**: this remedy does
+  not work on this runtime and the decision returns to the user. Do not
+  implement eviction on the assumption that it frees.
+- If it does free: release retrieval sessions before the two-snapshot
+  activation window and reload after it. Activation runs only once a shadow
+  generation is complete, so no embedding work is owed at that moment.
+- Never evict while an embedding batch is in flight.
+- Semantic queries during the window fall to FTS-only, reported as an explicit
+  typed state, never as a failure.
+- A reload failure after activation is non-fatal: lexical fallback stands and
+  the newly activated generation stays installed.
+
+*Stage 3 - gate scope (required regardless of stage 1/2 outcome).*
+
+- `measure_resident_ram()` samples whole-process RSS;
+  `ACTIVATION_RAM_CEILING_BYTES` derives from retrieval-only arithmetic. Those
+  are different quantities and the gate currently compares them directly. This
+  is the same defect class as the derived-disk gate in `2.R2`.
+- `2.R9` recorded that its benchmark peak "excludes Whisper/webview/UI loads
+  of a full application run". Production includes them, so the shipped gate is
+  strictly more likely to block than the benchmark that calibrated it, for
+  reasons unrelated to retrieval.
+- Choose one and implement it: either measure retrieval's own residency
+  (sessions plus snapshots) against a retrieval-scoped ceiling, or keep
+  whole-process RSS and re-derive the ceiling as an explicit whole-process
+  budget that names what else may be resident.
+- Record the chosen scope in `architecture.md` next to the ceiling, so the
+  number and its limit are documented as measuring the same thing.
+
+**Acceptance criteria:**
+
+- The `2.R9` benchmark passes against the unchanged 1,395,864,371-byte
+  ceiling, with the margin recorded.
+- One table records embedding-only session weight, reranker session weight,
+  snapshot-only peak, and combined peak, so a future remeasure has a baseline.
+- The reranker still passes its load-time contract validation and Sprint 1
+  reference parity when built.
+- If stage 2 ran: a recorded before/after RSS measurement proving eviction
+  returns memory; semantic queries fall to FTS-only during the window; a
+  reload failure leaves lexical fallback and the activated generation intact.
+- If stage 2 did not run: the report says stage 1 alone cleared the ceiling
+  and by how much.
+- The gate's measurement scope and the ceiling's scope agree, and
+  `architecture.md` states which was chosen.
+- `ACTIVATION_RAM_CEILING_BYTES` is unchanged. Any proposal to change it is a
+  separate user decision and is out of scope here.
+
+**Required verification:**
+
+```powershell
+$env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA "meetily-cargo-target"
+$env:MEETLY_RAG_INDEX_BENCH = "1"
+cargo test --release --manifest-path "frontend/src-tauri/Cargo.toml" --lib retrieval::index::tests::bench_2r6_production_activation_envelope -- --nocapture
+cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib retrieval::
+cargo check --manifest-path "frontend/src-tauri/Cargo.toml"
+cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check
+git diff --check
+```
+
+**Worker report additions:** the component table, which stage cleared the
+ceiling and the resulting margin, the stage 2 eviction measurement if it ran,
+and the gate-scope decision with its rationale.
+
 ### Deliberately Not In This Remediation
 
 - **Architecture finding 6** (MCP holds the lifecycle but exposes no semantic
   surface). Correct for Sprint 2 scope; Sprints 3-5 consume it.
 - **The persisted force-lexical kill switch.** Approved architecture,
-  unimplemented, and Sprint 5 scope by its own Settings requirement.
+  unimplemented, and Sprint 3.4 scope by its own Settings requirement.
 - **Dual-bundle retention packaging itself.** `architecture.md` "Prior-Model
   Retention Across Upgrade" is a forward-looking contract. No prior bundle
   exists — `meetily-retrieval-bundle-1` is the only bundle that has ever
