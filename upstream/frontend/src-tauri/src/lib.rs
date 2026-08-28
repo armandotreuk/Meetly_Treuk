@@ -141,22 +141,37 @@ fn dbstat_smoke_exit_code(status: &DbstatSmokeStatus) -> i32 {
     }
 }
 
+/// Bound the packaged verdict to a stage without destroying the diagnostic
+/// detail. Only the exit code crosses the process boundary, so the underlying
+/// error can still be printed where a console exists; release builds are
+/// `windows_subsystem = "windows"` and compile this away.
+fn stage<E: std::fmt::Display>(
+    stage: DbstatSmokeFailureStage,
+) -> impl Fn(E) -> DbstatSmokeFailureStage {
+    move |error| {
+        #[cfg(debug_assertions)]
+        eprintln!("smoke-dbstat: {stage:?} stage failed: {error}");
+        let _ = &error;
+        stage
+    }
+}
+
 async fn smoke_dbstat_measurement() -> Result<DerivedDiskUsage, DbstatSmokeFailureStage> {
     let options = database::manager::sqlite_connect_options("sqlite::memory:")
-        .map_err(|_| DbstatSmokeFailureStage::Connection)?;
+        .map_err(stage(DbstatSmokeFailureStage::Connection))?;
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(options)
         .await
-        .map_err(|_| DbstatSmokeFailureStage::Connection)?;
+        .map_err(stage(DbstatSmokeFailureStage::Connection))?;
     sqlx::query("PRAGMA page_size = 4096")
         .execute(&pool)
         .await
-        .map_err(|_| DbstatSmokeFailureStage::Setup)?;
+        .map_err(stage(DbstatSmokeFailureStage::Setup))?;
     sqlx::migrate!("./migrations")
         .run(&pool)
         .await
-        .map_err(|_| DbstatSmokeFailureStage::Migration)?;
+        .map_err(stage(DbstatSmokeFailureStage::Migration))?;
     RetrievalRepository::register_model(
         &pool,
         &ModelSpec {
@@ -169,13 +184,13 @@ async fn smoke_dbstat_measurement() -> Result<DerivedDiskUsage, DbstatSmokeFailu
         },
     )
     .await
-    .map_err(|_| DbstatSmokeFailureStage::Setup)?;
+    .map_err(stage(DbstatSmokeFailureStage::Setup))?;
     RetrievalRepository::register_generation(&pool, "smoke-generation", "smoke-model")
         .await
-        .map_err(|_| DbstatSmokeFailureStage::Setup)?;
+        .map_err(stage(DbstatSmokeFailureStage::Setup))?;
     let measurement = RetrievalRepository::derived_disk_usage(&pool)
         .await
-        .map_err(|_| DbstatSmokeFailureStage::Measurement)?;
+        .map_err(stage(DbstatSmokeFailureStage::Measurement))?;
     pool.close().await;
     Ok(measurement)
 }
@@ -1122,13 +1137,26 @@ mod tests {
         }
     }
 
+    /// `unavailable` is the one condition the smoke exists to detect, so it
+    /// must never collapse into a pre-verdict failure code, and vice versa.
     #[test]
     fn dbstat_smoke_separates_unavailable_from_pre_verdict_failures() {
-        assert_eq!(
-            dbstat_smoke_exit_code(&dbstat_smoke_status(Ok(DerivedDiskUsage::unavailable(1)))),
-            SMOKE_EXIT_UNAVAILABLE
-        );
-        assert_ne!(SMOKE_EXIT_EXACT, SMOKE_EXIT_UNAVAILABLE);
+        let unavailable =
+            dbstat_smoke_exit_code(&dbstat_smoke_status(Ok(DerivedDiskUsage::unavailable(1))));
+        assert_eq!(unavailable, SMOKE_EXIT_UNAVAILABLE);
+        for stage in [
+            DbstatSmokeFailureStage::Runtime,
+            DbstatSmokeFailureStage::Connection,
+            DbstatSmokeFailureStage::Migration,
+            DbstatSmokeFailureStage::Setup,
+            DbstatSmokeFailureStage::Measurement,
+        ] {
+            assert_ne!(
+                dbstat_smoke_exit_code(&dbstat_smoke_status(Err(stage))),
+                unavailable,
+                "{stage:?} must not report as dbstat being unavailable"
+            );
+        }
     }
 
     #[test]

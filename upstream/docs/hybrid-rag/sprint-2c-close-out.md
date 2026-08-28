@@ -2,9 +2,13 @@
 
 ## Status
 
-Blocked. Tasks `2C.1`, `2C.2`, and `2C.4` are complete, but `2C.3` cannot
-safely produce qualifying full-application calibration evidence on this host.
-Sprint closure remains blocked on that evidence and its dependent reviews.
+Unblocked by decision, 2026-08-28. Tasks `2C.1`, `2C.2`, `2C.4` and `2C.R1`
+are complete. `2C.3` is **closed as accepted-with-obligation**, not delivered:
+the user accepted the existing whole-process gate for Sprint 2 with the ceiling
+unchanged, and moved full-application calibration into Sprint 3 as a close
+obligation recorded in `architecture.md`. Sprint closure now depends on `2C.6`
+(activation-refusal observability), a re-dispatched `2C.4` covering the current
+head, and `2C.5`.
 
 ## Goal
 
@@ -86,18 +90,24 @@ package verification.
 
 ## Task List
 
+The Owner column carries each task's current state. The `## Task Execution Log` below is authoritative for what was actually done; this table is a summary and
+must be updated whenever a log entry is appended.
+
 | ID | Feature | Task | Size | Owner | Dependencies | Acceptance check | Rollback |
 |---|---|---|---|---|---|---|---|
-| 2C.1 | Deletion reconciliation | Add the forward-only `(meeting_id, generation_id)` index and query-plan regression for affected-generation discovery. Preserve the bounded decrement and post-commit read-only reconciliation. | M, high risk | Pending `worker-m` | Sprint PRD and migration-risk approval | Upgrade and fresh-migration tests prove the index exists; `EXPLAIN QUERY PLAN` shows an indexed meeting lookup rather than a scan; affected-generation deletion regression passes. | Revert the new migration and lookup regression; existing deletion semantics remain intact but the debug lookup scan returns. |
-| 2C.2 | Packaged smoke diagnostics | Give every safe probe failure stage a bounded verdict that survives the GUI-subsystem executable; map it in the active root workflow; apply rustfmt. | M | Pending `worker-m` | 2C.1 complete | Focused status/exit-code tests cover exact, unavailable, and every failure stage; release diagnostic exits correctly; workflow YAML/order checks and `cargo fmt --check` pass. | Revert the exit-code/workflow mapping and tests; `dbstat` activation remains fail-closed. |
-| 2C.D1 | Envelope decision | Select one R13 resolution contract: full-application calibrated whole-process ceiling, runtime attribution infrastructure, upstream ORT API wait, sessions-excluded accounting, or an explicitly accepted conservative bound. | Decision | Main agent | Complete | Full-application calibrated whole-process scope is recorded with its ceiling consequences and rejected alternatives. | Keep R13 blocked; do not implement an unapproved approximation. |
-| 2C.3 | Activation envelope | Calibrate the existing whole-process gate against the production application and revise its ceiling only from recorded full-application evidence. | L, high risk | Pending `worker-l` | 2C.D1 complete | The gate measures the documented full-application quantity, fails closed on unavailable terms, passes its agreed benchmark, and does not alter model/chunk/encoding/backend contracts without separate approval. | Revert the R13 implementation and architecture amendment; retain the current R12 fail-closed gate. |
-| 2C.4 | Installed package evidence | Dispatch the root Windows workflow for the accepted 2C.1/2C.2 branch head and record actual MSI and NSIS silent-install, diagnostic, uninstall, cleanup, and pre-upload-gate outcomes. Rerun after any later R13 source change. | M | Main agent | 2C.2 complete | Both installed `meetily.exe --smoke-dbstat` runs pass; job summary records them; no smoke is skipped; CI URL and immutable addendum are recorded. | Revert only the diagnostic CI assertion if it prevents emergency packaging; semantic activation remains fail-closed without `dbstat`. |
-| 2C.5 | Sprint closure | Run final verification, append fresh code and architecture reviews, record deferrals, and request user Sprint 2 close approval. | M | Main agent and reviewers | 2C.4 complete | Full Rust suite, `cargo check`, rustfmt, diff check, typecheck, Vitest, and 250k benchmark pass; both reviews approve; user approves close. | Do not close Sprint 2; preserve the accepted tasks and keep the remaining finding open. |
+| 2C.1 | Deletion reconciliation | Add the forward-only `(meeting_id, generation_id)` index and query-plan regression for affected-generation discovery. Preserve the bounded decrement and post-commit read-only reconciliation. | M, high risk | `worker-m` (complete) | Sprint PRD and migration-risk approval | Upgrade and fresh-migration tests prove the index exists; `EXPLAIN QUERY PLAN` shows an indexed meeting lookup rather than a scan; affected-generation deletion regression passes. | Revert the new migration and lookup regression; existing deletion semantics remain intact but the debug lookup scan returns. |
+| 2C.2 | Packaged smoke diagnostics | Give every safe probe failure stage a bounded verdict that survives the GUI-subsystem executable; map it in the active root workflow; apply rustfmt. | M | `worker-m` (complete) | 2C.1 complete | Focused status/exit-code tests cover exact, unavailable, and every failure stage; release diagnostic exits correctly; workflow YAML/order checks and `cargo fmt --check` pass. | Revert the exit-code/workflow mapping and tests; `dbstat` activation remains fail-closed. |
+| 2C.D1 | Envelope decision | Select one R13 resolution contract: full-application calibrated whole-process ceiling, runtime attribution infrastructure, upstream ORT API wait, sessions-excluded accounting, or an explicitly accepted conservative bound. | Decision | Main agent (complete) | None | Full-application calibrated whole-process scope is recorded with its ceiling consequences and rejected alternatives. | Keep R13 blocked; do not implement an unapproved approximation. |
+| 2C.3 | Activation envelope | Calibrate the existing whole-process gate against the production application and revise its ceiling only from recorded full-application evidence. | L, high risk | `worker-l` (closed: accepted with Sprint 3 obligation) | 2C.D1 complete | The gate measures the documented full-application quantity, fails closed on unavailable terms, passes its agreed benchmark, and does not alter model/chunk/encoding/backend contracts without separate approval. | Revert the R13 implementation and architecture amendment; retain the current R12 fail-closed gate. |
+| 2C.4 | Installed package evidence | Dispatch the root Windows workflow for the accepted 2C.1/2C.2 branch head and record actual MSI and NSIS silent-install, diagnostic, uninstall, cleanup, and pre-upload-gate outcomes. Rerun after any later R13 source change. | M | Main agent (complete) | 2C.2 complete | Both installed `meetily.exe --smoke-dbstat` runs pass; job summary records them; no smoke is skipped; CI URL and immutable addendum are recorded. | Revert only the diagnostic CI assertion if it prevents emergency packaging; semantic activation remains fail-closed without `dbstat`. |
+| 2C.R1 | Review remediation | Apply the Final Code Review (R15) findings across the packaged smoke workflow, the diagnostic, the migration regression, and the three normative documents. | M | Main agent (complete) | 2C.4 complete | Full Rust suite, rustfmt, diff check, workflow YAML and PowerShell parse all pass; no finding left unaddressed or undocumented. | Revert the R15 commit; the prior behaviour returns along with its eleven findings. |
+| 2C.6 | Activation observability | Surface the activation-refusal reason through the application log so a refused activation is distinguishable from a normal run. Read-only: no gate, ceiling, or measurement change. | S | Pending `worker-s` | 2C.R1 complete | A refused activation emits one warn-level log line naming scope, measured bytes and ceiling; an admitted activation emits none; a test covers both; no meeting text, token, or vector appears in the line. | Revert the logging call; the gate is unchanged either way. |
+| 2C.5 | Sprint closure | Run final verification, append fresh code and architecture reviews, record deferrals, and request user Sprint 2 close approval. | M | Main agent and reviewers (pending) | 2C.4 complete | Full Rust suite, `cargo check`, rustfmt, diff check, typecheck, Vitest, and 250k benchmark pass; both reviews approve; user approves close. | Do not close Sprint 2; preserve the accepted tasks and keep the remaining finding open. |
 
 ## Dependency Order
 
-`2C.1 -> 2C.2 -> 2C.4`; `2C.D1 -> 2C.3`; `2C.3 + 2C.4 -> 2C.5`
+`2C.1 -> 2C.2 -> 2C.4 -> 2C.R1 -> 2C.6`; `2C.D1 -> 2C.3` (closed by decision);
+`2C.6 + 2C.4(re-dispatched) -> 2C.5`
 
 Task `2C.1` runs alone because it adds a migration. Task `2C.3` runs alone
 because it changes the activation-envelope authority. `2C.4` can establish the
@@ -131,6 +141,71 @@ source change creates the final closure head.
 | 2026-08-28 | Mark `2C.3` blocked and remove its incomplete implementation. | A safe isolated full-app run cannot make the audio stack resident without contending on live WASAPI/CPAL streams; the required Whisper artifact is absent on this host; no existing API proves WebView residency through its production path. The partial code was uncompilable and could not yield valid evidence. | Retain an environment-controlled gate bypass; accept a retrieval-only or partial-component measurement; raise the ceiling from unverifiable evidence. | Main agent under user delegation |
 | 2026-08-28 | Run `2C.4` ahead of blocked `2C.3`. | Installed-package `dbstat` coverage does not depend on the RAM gate and can be tested on the accepted 2C.1/2C.2 head. It is explicitly repeated if R13 later changes packaged source. | Delay all independent evidence until external calibration prerequisites exist. | Main agent under user delegation |
 | 2026-08-28 | Repair fresh-checkout package evidence before accepting `2C.4`. | CI proved the compile-time manifest probe used an unstaged path, the smoke looked in the wrong Tauri target directory, and GUI-process exit handling lost the bounded verdict. The workflow now uses the checked-in manifest, actual bundle directory, persisted runner verdicts, and explicit process exit codes. | Accept local staged artifacts as package evidence; weaken or remove the installed-package gate. | Main agent under user delegation |
+| 2026-08-28 | Accept the whole-process activation gate as-is for Sprint 2; close `2C.3` as accepted-with-obligation rather than delivered; move full-application calibration into Sprint 3. | Both remedies were proven unavailable, not deferred: `2.R13` proved a retrieval-scoped gate unimplementable against ORT 1.22 as bound, and `2C.3` proved full-application calibration unproducible on this host. The mismatch errs fail-safe and semantic retrieval has no query surface in Sprint 2, so no user can reach the defect. Sprint 3 is the first build where a real loaded application runs a semantic query, making it a better calibration site than any synthetic harness. Recorded in `architecture.md` "Close-out acceptance and its Sprint 3 obligation". | Build a CI calibration rig (a cloud runner is not a user machine and yields weaker evidence); wait for an upstream ORT memory API (no timeline); snapshots-only accounting (omits the dominant term); a fixed conservative session bound (a guess that can undercount). | User |
+| 2026-08-28 | Require activation-refusal observability before the release that first exposes semantic retrieval; add it as `2C.6`. | The refusal reason is stored in `pending_blockers` and read by nothing. Without it, the Sprint 3 calibration obligation is unmeasurable and a permanently-refusing gate is indistinguishable from a working one. | Ship the accepted gate with no observability and rely on Sprint 3 dogfooding to notice. | User |
+| 2026-08-28 | Retain the `retrieval_documents(meeting_id, generation_id)` index; revisit at Sprint 3 close. | Measured on SQLite 3.49.1, the release deletion decrement is a covering-index search on the pre-existing index with or without the new one, so release builds carry it unused. Removal costs a third forward-only migration where two of three prior migration incidents broke startup, and restores the scan `2C.1` removed. Bounded waste beats an unbounded migration risk. | Drop the index via a new migration and re-index only the test fixture. | User |
+| 2026-08-28 | Accept the `2C.R1` review remediation and require `2C.4` to be re-dispatched against the resulting head. | `2C.R1` changed the MSI and NSIS smoke steps, so the run `41` evidence no longer covers the shipped workflow. The sprint's own rule forbids claiming installer coverage without a real run of the current source. | Accept run `41` as still-valid evidence for changed workflow logic. | User |
+
+## Remaining Task Specs
+
+### 2C.6 - Activation refusal observability [S]
+
+**Outcome.** When the activation gate refuses to switch on a semantic
+generation, the reason reaches the application log. A refused activation and a
+normal run stop being indistinguishable.
+
+**Why this is required.** The user accepted a knowingly conservative activation
+gate for Sprint 2 (see the decision log and `architecture.md` "Close-out
+acceptance and its Sprint 3 obligation"). That acceptance is conditional on
+being able to observe the gate in the field: Sprint 3 owes a real refusal rate,
+and a gate that never admits is a defect even though nothing crashes. Today
+`retrieval/index.rs:1630` stores every blocker in `pending_blockers` and
+`pending_activation_blockers()` at `:748` is called by nothing - not a Tauri
+command, not a log line, not a test outside the module. Successful activation
+already logs at `retrieval/index.rs:1622`; only the failure path is silent.
+
+**Likely touchpoints.**
+- `frontend/src-tauri/src/retrieval/index.rs` - the activation loop that ends
+  at `set_pending_blockers`, around `:1474`-`:1631`.
+
+**Required implementation.**
+- Emit exactly one `log::warn!` when the activation pass ends with a non-empty
+  blocker set, naming every blocker it collected. Do not log per iteration: the
+  loop can reject several candidate generations in one pass and a per-candidate
+  line would be noise.
+- Emit nothing when `reported_blockers` is empty. Successful activation is
+  already logged at `:1622` and must not gain a second line.
+- Cover every blocker source, not only the RAM gate: coverage blockers
+  (`:1503`, `:1596`), model mismatch (`:1483`, `:1545`), the RAM gate
+  (`:1571`), and the derived-disk gate (`:1607`) all reach the same set and all
+  produce a silently non-activating index.
+- Do not change `ram_gate_blocker`, `ACTIVATION_RAM_CEILING_BYTES`,
+  `ACTIVATION_RAM_SCOPE`, the measurement, the gate's admit/refuse decision, or
+  any blocker string. This task is read-only with respect to behaviour.
+- Do not add a Tauri command or any UI surface. Sprint 3 owns query surfaces.
+
+**Acceptance criteria.**
+- A refused activation produces one warn-level line carrying the scope, the
+  measured byte value, and the ceiling for a RAM refusal, and the equivalent
+  detail for the other blocker kinds.
+- An admitted activation produces no new line.
+- The blocker strings already contain only generation ids, model ids, byte
+  counts, and revision numbers. Confirm no meeting text, token, or vector can
+  reach the line, and state how you confirmed it.
+
+**Required verification.**
+- A test asserting the refusal path populates the blockers it logs, and a test
+  asserting the admitted path leaves the set empty. Prefer extending the
+  existing `ram_gate_admits_below_and_blocks_at_above_or_unavailable` coverage
+  over inventing a new fixture.
+- Full `cargo test --lib`, `cargo fmt --check`, `git diff --check`.
+
+**Worker report additions.**
+- Quote the exact log line produced for a RAM refusal.
+- State whether `pending_activation_blockers()` remains uncalled, and if you
+  removed it, say so.
+
+**Rollback.** Revert the logging call. The gate behaves identically either way.
 
 ## Task Execution Log
 
@@ -281,6 +356,152 @@ source change creates the final closure head.
 - Any future R13 source change must repeat this same installed-package evidence
   before `2C.5` can seek Sprint closure.
 
+### 2C.R1 - Final Code Review (R15) remediation
+
+**Status:** Complete
+**Owner:** Main agent, under user delegation (session `e762b0ec-7ac3-454d-a05c-49ad443b817d`)
+**Completed:** 2026-08-28
+**Implemented:**
+- Closed ten of the eleven Final Code Review (R15) findings below; the
+  eleventh is recorded as a user decision, not an omission.
+- Stopped the packaged smoke teardown from overwriting a diagnostic verdict. A
+  teardown problem now downgrades only a passing run to harness code `1`; a
+  verdict the diagnostic already returned survives. Exit `2` - the one
+  condition this smoke exists to detect - can no longer be relabelled as a
+  flaky installer.
+- Extended the MSI residue check to every root the executable search covers, so
+  a Program Files install that fails to uninstall is no longer masked by the
+  empty temporary directory the step creates for itself.
+- Bounded the diagnostic invocation with an explicit 120-second wait and kill
+  path, replacing an unbounded wait that could hold a runner until the job
+  timeout.
+- Reduced the caught-exception log line to the exception class, removing the
+  absolute paths PowerShell embeds in exception messages.
+- Preserved the underlying `sqlx::Error` behind `#[cfg(debug_assertions)]`
+  instead of discarding it at the point of failure, so a local run still names
+  what broke while the packaged verdict stays a bare stage code.
+- Replaced a tautological assertion over two constants with a loop that
+  actually proves `unavailable` never collapses into any pre-verdict stage.
+- Narrowed the query-plan regression to the index name, dropping a match on
+  `EXPLAIN QUERY PLAN` prose that SQLite does not treat as a stable interface.
+- Brought three normative documents back in line with the shipped contract:
+  the exit-code table in `architecture.md`, the self-contradicting task table
+  in this file, and the eight-commit-stale work order in the agent brief.
+**Implementation:**
+- Files: `.github/workflows/build-windows.yml`,
+  `frontend/src-tauri/src/lib.rs`,
+  `frontend/src-tauri/src/database/migration_tests.rs`,
+  `docs/hybrid-rag/architecture.md`,
+  `docs/hybrid-rag/sprint2agentbrief-V1.0.md`, this file.
+- Approach: hoist the installer search roots to step scope so teardown can
+  re-scan the same roots it searched; gate every teardown downgrade behind an
+  exit code of zero; a generic stage mapper that logs in debug builds and
+  returns the bounded enum in all builds.
+**Not implemented:**
+- Finding 5, the `retrieval_documents(meeting_id, generation_id)` index. The
+  finding is correct and was verified by running both query plans through
+  SQLite 3.49.1: the release-path decrement is a covering-index search on the
+  pre-existing index either way, so release builds carry the new index unused.
+- No change to `ACTIVATION_RAM_CEILING_BYTES`, the gate, the approved
+  model/chunk/encoding/backend contracts, or any migration.
+**Why not implemented:**
+- Removing the index needs a third forward-only migration in a codebase where
+  two of three migration incidents broke application startup, and it restores
+  the write-lock scan `2C.1` was commissioned to remove. The user accepted the
+  bounded cost and deferred the question to Sprint 3 close, when the added
+  query surfaces make it decidable on evidence. Recorded in the decision log
+  above and in `architecture.md`.
+**Verification:**
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib` - pass:
+  584 passed, 0 failed, 2 ignored; identical to the pre-change baseline.
+- `cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check` - pass.
+- `git diff --check` - pass; the pre-existing workflow CRLF notice remains.
+- `cargo run --manifest-path "frontend/src-tauri/Cargo.toml" -- --smoke-dbstat`
+  - pass: `smoke-dbstat: status=exact bytes=69632`.
+- Workflow YAML parses; both smoke steps parse under the PowerShell language
+  parser; smoke steps still precede the upload steps. The final gate's residual
+  parse errors are its GitHub Actions expression placeholders, which Actions
+  substitutes before PowerShell runs.
+- Teardown verdict precedence simulated across six cases, including the
+  finding-1 scenario (dbstat unavailable plus failed uninstall), which now
+  persists `2` rather than collapsing to `1`.
+**Rollback:**
+- Revert the `2C.R1` commit. The prior behaviour returns together with all
+  eleven findings; no persisted data, schema, or model contract is involved.
+**Decisions and follow-ups:**
+- The MSI and NSIS smoke steps changed, so run `41` no longer covers the
+  shipped workflow. `2C.4` MUST be re-dispatched against this head before
+  `2C.5`; the root workflow does not auto-run on this branch and needs a manual
+  `workflow_dispatch`.
+- `2C.6` is now dependency-ready and is the last implementation task before
+  sprint close.
+
 ## Sprint Reviews
 
 <!-- Append fresh code and architecture review results after task verification. -->
+
+### Final Code Review (R15)
+
+**Reviewer:** `claude-opus-5` (session `e762b0ec-7ac3-454d-a05c-49ad443b817d`), 2026-08-28
+**Scope:** `0fe0442..6f0fd43` - the Sprint 2C range: the packaged smoke workflow
+steps and their verdict gate, the `--smoke-dbstat` stage enum, the
+`(meeting_id, generation_id)` migration and its query-plan regression, the
+manifest-path correction, and both close-out documents.
+**Verdict:** Changes requested - ten findings resolved in `2C.R1` above, one
+resolved by user decision.
+
+**Findings (severity order):**
+1. **Blocker - the packaged smoke teardown overwrites the diagnostic verdict.**
+   Setting the harness code on any uninstall or cleanup problem discards a
+   verdict the try-block already captured, so exit `2` - dbstat unavailable,
+   the one condition the smoke exists to detect - is reported as a flaky
+   installer. `.github/workflows/build-windows.yml:344`, and `:421`/`:424` for
+   NSIS.
+2. **Blocker - `architecture.md` documents only exit codes `0`/`2`/`3`.**
+   `2C.2` split `3` into five stage codes and the workflow maps `1`, so the
+   source of truth contradicts both the shipped binary and its gate.
+   `docs/hybrid-rag/architecture.md:1971`.
+3. **Blocker - the agent brief is eight commits stale and re-orders shipped
+   work.** It reports the branch unpushed, omits eight commits, and presents
+   `5.1` and `5.2` as open when both shipped; a fresh session would
+   re-implement the lazy reranker and re-open a resolved envelope blocker.
+   `docs/hybrid-rag/sprint2agentbrief-V1.0.md:59`.
+4. **Should-fix - the MSI cleanup check ignores the Program Files fallback.**
+   The residue test covers only the temporary directory the step created for
+   itself, so a failed uninstall from the fallback location reports PASS.
+   `.github/workflows/build-windows.yml:315`.
+5. **Should-fix - the new index serves only a `debug_assertions` query.**
+   Verified against SQLite 3.49.1: the release decrement is a covering-index
+   search on the pre-existing index either way, so release builds maintain a
+   second B-tree nothing reads.
+   `migrations/20260827030000_add_retrieval_documents_meeting_lookup_index.sql:1`.
+6. **Should-fix - the underlying error is discarded at its source.** The unit
+   mapping destroys the `sqlx::Error` before any build can print it, including
+   debug runs that have a console. `frontend/src-tauri/src/lib.rs:159`.
+7. **Should-fix - a test is named for a separation it never exercises.** Its
+   second assertion compares two integer literals and calls no function under
+   test. `frontend/src-tauri/src/lib.rs:1126`.
+8. **Should-fix - the task table contradicts the execution log.** Owner cells
+   read "Pending" for tasks the log records Complete, in a document that is the
+   normal work order for a fresh worker.
+   `docs/hybrid-rag/sprint-2c-close-out.md:91`.
+9. Correctness (minor) - the query-plan regression matches
+   `EXPLAIN QUERY PLAN` prose, which SQLite does not treat as a stable
+   interface. `frontend/src-tauri/src/database/migration_tests.rs:68`.
+10. Conventions - the catch handler prints the raw exception message,
+    reintroducing the absolute paths the same commit removed and that this
+    document's risk register forbids.
+    `.github/workflows/build-windows.yml:338`.
+11. Correctness (minor) - the diagnostic wait cannot be bounded, so a hung
+    diagnostic holds the runner until the job timeout rather than returning a
+    verdict. `.github/workflows/build-windows.yml:327`.
+
+**Verification:** `cargo test --lib` (584 passed, 2 ignored), `cargo fmt
+--check`, and `git diff --check` all passed on the reviewed tree before any
+change, so every finding is a latent defect rather than a broken build. The
+250k production benchmark and the frontend suites were not re-run for this
+review; they belong to `2C.5`.
+
+**Required follow-ups:** all addressed in `2C.R1`, except finding 5, which the
+user resolved by decision (retain the index, revisit at Sprint 3 close) and
+which is recorded in the decision log above and in `architecture.md`.

@@ -1,7 +1,12 @@
 # Meetily Hybrid RAG — Sprint 2 agent brief
 
-Complete context and work order as of 2026-08-27. Paste everything below the
+Complete context and work order as of 2026-08-28. Paste everything below the
 rule into a fresh orchestrator session.
+
+**Superseded for close-out work.** Sprint 2's remaining work is tracked in
+`sprint-2c-close-out.md`, which is authoritative for task state. This brief
+covers program rules and settled decisions only; take the work order from the
+2C PRD, not from section 5 below.
 
 ---
 
@@ -49,6 +54,16 @@ $env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA "meetily-cargo-target"
 ## Committed
 
 ```
+6f0fd43  Docs: record successful installed package evidence
+7f11887  CI: capture GUI smoke process exit codes
+08611e3  CI: persist packaged smoke verdicts
+60e763f  CI: preserve packaged dbstat verdicts
+1bbfcbb  CI: locate packaged installers in Tauri target
+fbdaa63  CI: retain packaged smoke failure details
+fc18ff8  Fix: compile retrieval contract from checked-in manifest
+456b794  Sprint 2C: index lookup and dbstat verdicts
+0fe0442  Sprint 2: dbstat smoke contract, document-count integrity, R14 fixes
+1130ad5  Sprint 2: update CI audit and knowledge graph
 bc5a11c  Docs: Sprint 2 remediation log, envelope blocker, and 2.R12 spec
 dc7e003  Sprint 2 remediation: tasks 2.R1-2.R11
 c972107  Docs: Sprint 2 reviews, remediation spec, architecture amendments
@@ -56,18 +71,18 @@ c972107  Docs: Sprint 2 reviews, remediation spec, architecture amendments
 c3e89c1  Docs: close Sprint 1
 ```
 
-Branch: `sprint-2/durable-local-index`, off `main`. Not pushed.
+Branch: `sprint-2/durable-local-index`, off `main`. Pushed; HEAD equals
+`origin/sprint-2/durable-local-index`.
 
 ## Uncommitted
 
-Nothing of yours. `cargo check --lib` and
-`cargo test --lib database::migration_tests` (6 tests) pass on `bc5a11c`.
+Nothing of yours. On `6f0fd43` the full suite passes: 584 Rust tests (2
+ignored), `cargo fmt --check`, and `git diff --check`.
 
 Working-tree changes that are **not yours** and must be preserved untouched:
-`upstream/.github/workflows/build-windows.yml`,
-`upstream/docs/notes-chat-improvement-execution.md`,
-`upstream/docs/hybrid-rag/sprint2handoffprompt.md`, and the three
-`graphify-out/` directories (tool output; never commit them).
+`upstream/docs/notes-chat-improvement-execution.md` and the three
+`graphify-out/` directories (tool output; never commit them). Re-check
+`git status` yourself; this list drifts.
 
 Commit your own work per task. The earlier remediation round was lost because
 it was never committed, and the recovery search found nothing to restore.
@@ -85,10 +100,18 @@ it was never committed, and the recovery search found nothing to restore.
 
 ## Blocked
 
-`2.R9` measured the production activation envelope at **1,482.7 MiB** against
-the approved 1.30 GiB ceiling (1,395,864,371 bytes) — 151.5 MiB over. The RAM
-gate correctly refused activation. `2.R12` is the approved remedy and is
-specified but not implemented.
+**Resolved, do not re-open.** `2.R9` measured the activation envelope at
+1,482.7 MiB against the 1.30 GiB ceiling (1,395,864,371 bytes). `2.R12` stage 1
+(lazy reranker) shipped, and `2.R13`'s recorded benchmark now measures the peak
+at **1,170,399,232 bytes (1116.2 MiB)** — 215.0 MiB of margin, passing.
+
+What remains blocked is only the *scope* question: the gate samples
+whole-process RSS while the ceiling derives from retrieval-only arithmetic.
+`2.R13` proved a retrieval-scoped gate is not implementable (ORT 1.22 as bound
+exposes no per-session memory query), and `2C.3` then found the approved
+full-application calibration unachievable on the current host. See
+`sprint-2c-close-out.md`; this needs a user decision, not an implementation
+attempt.
 
 # 4. Settled decisions — do not re-open
 
@@ -117,9 +140,10 @@ Sprint 1's package hardening exists to prevent. See `architecture.md`
 
 Do these in order. Commit after each numbered item.
 
-## 5.1 Close three review findings
+## 5.1 Close three review findings — DONE, do not redo
 
-From the 2026-08-27 analysis of the remediation delta:
+All three shipped: (a) as `2.R16`, (b) recorded in `architecture.md` and the
+2C task log, (c) as `2.R17` and `2C.2`. Retained below for context only.
 
 **a. Detect `document_count` drift instead of clamping it.**
 `database/repositories/meeting.rs` uses `MAX(document_count - N, 0)` in the
@@ -146,7 +170,11 @@ already distinguishes "unavailable" from "too large". Extend the assertion to
 the packaged smoke test (`architecture.md` "Packaged Smoke Tests"), because the
 symptom of a packaging change would be silent permanent non-activation.
 
-## 5.2 Implement 2.R12
+## 5.2 Implement 2.R12 — DONE, do not redo
+
+Stage 1 shipped as `2.R14`; stage 2 was correctly skipped because stage 1
+passed with margin; stage 3 became `2.R13`/`2C.D1`/`2C.3` and is the open
+decision described under "Blocked" above. Retained below for context only.
 
 Full spec: `sprint-2-durable-local-index.md`, section `### 2.R12 - Activation
 envelope remedy: session residency and gate scope [M]`. Follow it as written.
@@ -172,7 +200,7 @@ Summary of its three stages:
    ceiling as an explicit whole-process budget naming what else may be
    resident. Record the choice in `architecture.md` beside the ceiling.
 
-## 5.3 Sprint close
+## 5.3 Sprint close — tracked as `2C.5`
 
 1. Full verification from `upstream/frontend/src-tauri/`:
 

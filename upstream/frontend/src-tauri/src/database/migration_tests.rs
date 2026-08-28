@@ -63,10 +63,13 @@ async fn assert_meeting_lookup_index(pool: &SqlitePool) {
     .into_iter()
     .map(|(_, _, _, detail)| detail)
     .collect();
+    // The invariant is that the lookup is index-driven, asserted by rejecting a
+    // scan. Do not match the rest of EXPLAIN QUERY PLAN's prose: SQLite states
+    // that output is not a stable interface, so a libsqlite3-sys bump that
+    // reworded it would fail here as if the schema had regressed.
     assert!(
-        plan.iter().any(|detail| detail.contains(
-            "SEARCH retrieval_documents USING COVERING INDEX retrieval_documents_by_meeting_lookup (meeting_id=?)"
-        )),
+        plan.iter()
+            .any(|detail| detail.contains(RETRIEVAL_DOCUMENTS_MEETING_LOOKUP_INDEX)),
         "affected-generation lookup must use the meeting lookup index: {plan:?}"
     );
     assert!(

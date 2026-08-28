@@ -1079,6 +1079,55 @@ application can consume part of the fixed budget before retrieval activation.
 The status payload names the scope next to the measured resident value and
 ceiling.
 
+#### Close-out acceptance and its Sprint 3 obligation (2026-08-28)
+
+The whole-process scope above is **accepted as-is for Sprint 2**, with the
+ceiling unchanged at `1,395,864,371` bytes. It is knowingly mismatched: the
+gate samples whole-process RSS while the ceiling derives from retrieval-only
+arithmetic, so it refuses in states where retrieval alone would have fit. The
+error direction is fail-safe — activation is withheld, the built generation
+stays on disk, and every surface falls back to lexical retrieval.
+
+The mismatch is accepted rather than corrected because both corrections were
+proven unavailable, not merely deferred:
+
+- A retrieval-scoped gate cannot be built. `2.R13` established that ORT
+  1.22 as bound exposes no per-session memory query, that native session
+  allocations never traverse the Rust global allocator, and that every
+  whole-process delta substitute can undercount.
+- Full-application calibration cannot be produced on the development host.
+  `2C.3` established that the approved Whisper artifact is absent, that
+  loading the real audio stack requires contending with live WASAPI streams,
+  and that no production-path facility proves WebView residency.
+
+**Sprint 3 obligation.** Sprint 3 is the first build in which a real, fully
+loaded application runs a semantic query on a user machine — the measurement
+`2C.3` could not manufacture. Sprint 3 MUST therefore, before its own close:
+
+1. Record whole-process RSS at activation from a real application session
+   with Whisper, audio, and the WebView resident.
+2. Re-derive `ACTIVATION_RAM_CEILING_BYTES` from that measurement, or record
+   that the existing value is confirmed correct.
+3. Report the observed refusal rate. A gate that never admits is a defect
+   even though it never crashes.
+
+Until (1)-(3) land, no code may relax, widen, or bypass this gate.
+
+#### Activation refusals must be observable
+
+The gate stores its refusal reason in `IndexService::pending_blockers` and
+exposes `pending_activation_blockers()`. Neither is read by any caller, logged,
+or surfaced. A refusal is therefore indistinguishable from a normal run.
+
+This is admissible only while no query surface exists, because nothing yet
+depends on activation having happened. It MUST NOT ship in the release that
+first exposes semantic retrieval: from that build onward the reason a
+generation was refused MUST reach the application log, so that "semantic
+retrieval is working" and "semantic retrieval has never once activated" are
+distinguishable without a debugger. The refusal reason names the scope,
+measured bytes, and ceiling, and carries no meeting text, tokens, or vectors,
+so it is safe to log verbatim.
+
 Sprint 2 MUST implement one immutable contiguous base snapshot, an exact
 upsert delta, and tombstones. It MUST preserve canonical SQLite plus the
 publication journal, serve the active snapshot while a shadow builds, replay a
@@ -1961,18 +2010,41 @@ Rollback principles, ordered from cheapest to most disruptive:
 - Installed application model loading and inference on Windows x64, the only
   supported target this release.
 - Every claimed Windows installer (currently MSI and NSIS) is installed silently
-  into an isolated runner-temporary directory, and its installed `meetily.exe`
-  is run with `--smoke-dbstat` before artifact upload. The diagnostic uses an
-  in-memory migrated SQLite database, registers one fixed model and generation,
-  and calls `RetrievalRepository::derived_disk_usage`. The asserted invariant is
-  that the shipped SQLite exposes `dbstat` and returns an exact allocated-page
+  and its installed `meetily.exe` is run with `--smoke-dbstat` before artifact
+  upload. NSIS installs into an isolated runner-temporary directory. MSI is
+  directed there too, but `INSTALLDIR` binds only if the generated WiX exposes
+  that property as its root directory; when it does not, msiexec still succeeds
+  into the default location, so the MSI smoke also searches
+  `%ProgramFiles%\meetily` and `%ProgramFiles(x86)%\meetily` and checks the same
+  roots for residue after uninstalling. The diagnostic uses an in-memory
+  migrated SQLite database, registers one fixed model and generation, and calls
+  `RetrievalRepository::derived_disk_usage`. The asserted invariant is that the
+  shipped SQLite exposes `dbstat` and returns an exact allocated-page
   measurement; the byte total is reported, never asserted, because it tracks the
   derived schema's page layout and legitimately moves with every migration.
-  Outcomes are distinguished by exit code — `0` exact, `2` dbstat unavailable,
-  `3` probe failed before a verdict — because release builds are
-  `windows_subsystem = "windows"` and their printed output reaches no console.
-  The installer is uninstalled and the temporary directory is removed after
-  each run.
+- The verdict crosses the process boundary as an exit code and nothing else,
+  because release builds are `windows_subsystem = "windows"` and their printed
+  output reaches no console. The codes are a contract between
+  `run_dbstat_smoke` and the root workflow's gate:
+
+  | Code | Meaning | Emitted by |
+  |---|---|---|
+  | `0` | Exact `dbstat` measurement — the smoke passes | diagnostic |
+  | `1` | Packaged smoke harness failed: installer, executable discovery, diagnostic timeout, or teardown | workflow step |
+  | `2` | `dbstat` unavailable — the shipped SQLite lacks `ENABLE_DBSTAT_VTAB` | diagnostic |
+  | `3` | Async runtime construction failed before a verdict | diagnostic |
+  | `4` | SQLite connection failed before a verdict | diagnostic |
+  | `5` | Migration failed before a verdict | diagnostic |
+  | `6` | Deterministic model/generation setup failed before a verdict | diagnostic |
+  | `7` | Measurement failed before a verdict | diagnostic |
+
+  Codes `3`-`7` name the stage only; the underlying error is printed where a
+  console exists and never crosses the boundary, so no SQL, path, or user
+  content reaches a public log. A teardown problem downgrades a passing run to
+  `1` but never overwrites a verdict the diagnostic already returned, because
+  `2` is the condition this smoke exists to detect. Any other code is reported
+  as unrecognized rather than mapped. The installer is uninstalled and the
+  temporary directory removed after each run.
 - Windows CUDA/Vulkan Whisper variants do not change ORT correctness.
 - Missing resource and corrupt sidecar fallback.
 - Forced lexical-only setting produces lexical behavior on every surface.
@@ -2126,3 +2198,6 @@ Any failure to resolve one of these gates blocks Sprint 2 approval.
 | 2026-08-24 | Clarify two-snapshot rebuild accounting and approve a 1.30 GiB transient rebuild ceiling for the selected e5-base int8 bundle; select exact vector search and do not evaluate ANN. | A reader's `Arc` to the active snapshot does not allocate a third vector copy, so rebuild accounting is active plus shadow snapshots. The measured two-snapshot peak is 1296.5 MiB, inside the explicit 1.30 GiB transient ceiling; steady state remains 1113.4 MiB inside the existing approved 1-1.25 GiB band. Exact search passes p95 48.2 ms at 250k with recall@150 1.0000, while ANN would add memory and its only trigger (latency miss with passing RAM) did not occur. Any true third allocation or peak above 1.30 GiB remains blocking. | User |
 | 2026-08-26 | Preserve a prior bundled embedding model across an upgrading restart by packaging at most one prior bundle in the transition release, retaining only the embedding engine, and making FTS-only the required fallback when it is absent or inadmissible. | A vector generation is queryable only with the model that produced it, and the single packaged bundle is replaced in place on upgrade — so the prior active generation becomes unqueryable at the next restart (`retrieval/index.rs:564`, `:795` set and consume `model_mismatch`), while "Generation Activation" requires it to stay queryable while the shadow builds. Copying the prior bundle to app data would create an unsigned mutable model store outside package authority and outside the pinned provenance chain. The reranker needs no retention: it scores text pairs and is generation-independent, so retention is one embedding session, not two. Version-skipping installs make a lexical fallback unavoidable regardless, so it is specified rather than left implicit. No bundled-model upgrade has shipped yet, so this is forward-looking with no migration burden today. Enabling retention additionally requires a measured active + shadow snapshot plus current + prior embedding session peak, and the identity derivation fix; this decision approves neither by implication. | User |
 | 2026-08-26 | Amend the garbage-collection gate with a transitional clause: while no semantic query surface exists, the successful-Fast-hybrid-query condition is satisfied by one clean application restart with the new generation active and publication lag zero. The clause expires at Sprint 3 close. | The Fast hybrid surface is Sprint 3 work, so the condition as written is unsatisfiable in Sprint 2 — `retrieval/index.rs:1630` gates cleanup on a counter that only a Sprint 3 consumer increments. Against the two-generation retention ceiling that makes `retrieval_rebuild_index` succeed exactly once per install and eventually dead-ends the corrupt-active recovery path, which depends on registering a replacement generation. The restart condition is not relaxed and no other cleanup guard changes; only the query condition is substituted, and only while no query surface exists to satisfy it. | User |
+| 2026-08-28 | Accept the whole-process activation RAM gate as-is for Sprint 2 with the ceiling unchanged, and move full-application calibration into Sprint 3 as a close obligation. | Both corrections were proven unavailable rather than deferred: `2.R13` showed a retrieval-scoped gate is not implementable against ORT 1.22 as bound, and `2C.3` showed full-application calibration is not producible on the development host (Whisper artifact absent, audio stack requires live WASAPI contention, no WebView residency proof). The mismatch errs fail-safe — activation is withheld and lexical retrieval serves every surface — and semantic retrieval has no query surface in Sprint 2, so the defect is unreachable by users today. Sprint 3 is the first build where a real fully loaded application runs a semantic query, which is exactly the measurement `2C.3` could not manufacture; calibrating there uses better evidence than any synthetic harness could produce, at no cost to a sprint with no deadline. | User |
+| 2026-08-28 | Require activation-refusal observability before the release that first exposes semantic retrieval. | The gate's refusal reason is written to `pending_blockers` and read by nothing — not logged, not surfaced. Accepting a knowingly conservative gate without this makes "working" and "never once activated" indistinguishable in the field, which would leave the Sprint 3 calibration obligation unmeasurable. Harmless while no query surface exists; unacceptable from the build that adds one. | User |
+| 2026-08-28 | Retain the `retrieval_documents(meeting_id, generation_id)` index despite it serving only a `debug_assertions`-gated query, and revisit at Sprint 3 close. | Measured against SQLite 3.49.1, the release-path deletion decrement is a covering-index search on the pre-existing `retrieval_documents_by_meeting` with or without the new index, so release builds carry it unused. Removing it costs a third forward-only migration in a codebase where two of three migration incidents broke application startup, and restores the write-lock scan `2C.1` was commissioned to remove. Trading a bounded cost (order 10-20 MB and a small write-throughput margin on a 250k-document corpus) for a high-risk operation is a poor exchange; Sprint 3 adds query surfaces that may make the index load-bearing, at which point the question is decidable on evidence. | User |

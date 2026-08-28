@@ -288,6 +288,17 @@ jobs:
           $installer = $null
           $installDir = Join-Path $env:RUNNER_TEMP "meetily-smoke-msi"
           $resultPath = Join-Path $env:RUNNER_TEMP "meetily-smoke-msi-exit-code.txt"
+          # INSTALLDIR is honoured only if the generated WiX exposes that
+          # property as its root directory. When it does not, msiexec still
+          # succeeds and installs to the default location, so search there too
+          # rather than reporting a dbstat failure for a layout mismatch. The
+          # teardown re-scans these same roots, so the residue check cannot be
+          # satisfied by the empty temporary directory this step creates.
+          $searchRoots = @(
+            $installDir
+            (Join-Path $env:ProgramFiles "meetily")
+            (Join-Path ${env:ProgramFiles(x86)} "meetily")
+          )
           $bundleDir = Join-Path $env:GITHUB_WORKSPACE "$env:ARTIFACT_DIR\bundle\msi"
 
           try {
@@ -306,15 +317,6 @@ jobs:
               throw "MSI installation failed"
             }
             $installed = $true
-            # INSTALLDIR is honoured only if the generated WiX exposes that
-            # property as its root directory. When it does not, msiexec still
-            # succeeds and installs to the default location, so search there
-            # too rather than reporting a dbstat failure for a layout mismatch.
-            $searchRoots = @(
-              $installDir
-              (Join-Path $env:ProgramFiles "meetily")
-              (Join-Path ${env:ProgramFiles(x86)} "meetily")
-            )
             $executables = @(
               $searchRoots |
                 Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
@@ -324,7 +326,14 @@ jobs:
               throw "installed executable was not found"
             }
             Write-Host "MSI packaged smoke: running installed executable"
-            $diagnosticProcess = Start-Process -FilePath $executables[0].FullName -ArgumentList "--smoke-dbstat" -Wait -PassThru
+            # -Wait cannot be bounded, so wait explicitly: a diagnostic that
+            # hangs has to fail this step in minutes rather than hold the
+            # runner until the job timeout.
+            $diagnosticProcess = Start-Process -FilePath $executables[0].FullName -ArgumentList "--smoke-dbstat" -PassThru
+            if (-not $diagnosticProcess.WaitForExit(120000)) {
+              try { $diagnosticProcess.Kill() } catch { }
+              throw "MSI diagnostic timed out"
+            }
             $diagnosticExitCode = $diagnosticProcess.ExitCode
             if ($diagnosticExitCode -ne 0) {
               # Carry the diagnostic's own code so the gate can name the cause;
@@ -335,19 +344,38 @@ jobs:
             $exitCode = 0
           }
           catch {
-            Write-Host "MSI packaged smoke: failed: $($_.Exception.Message)"
+            # Only the exception class is printed. PowerShell exception
+            # messages embed absolute paths and this log is public.
+            Write-Host "MSI packaged smoke: failed ($($_.Exception.GetType().Name))"
           }
           finally {
+            # A teardown problem downgrades a passing run to the harness code,
+            # but must never overwrite a verdict the diagnostic already
+            # returned: code 2 is the one condition this smoke exists to
+            # detect, and relabelling it as a harness failure hides it.
+            $teardownFailed = $false
             if ($installed -and $null -ne $installer) {
               $uninstallProcess = Start-Process -FilePath "msiexec.exe" -ArgumentList "/x `"$installer`" /qn /norestart" -Wait -PassThru
               if ($uninstallProcess.ExitCode -ne 0) {
-                $exitCode = 1
+                $teardownFailed = $true
               }
             }
             if (Test-Path -LiteralPath $installDir) {
               Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
             }
-            if (Test-Path -LiteralPath $installDir) {
+            # Check every root the executable search covers, not just the
+            # temporary directory this step created: when INSTALLDIR is not
+            # honoured the residue is in Program Files, and testing an empty
+            # directory we made ourselves would pass regardless.
+            $residue = @(
+              $searchRoots |
+                Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
+                ForEach-Object { Get-ChildItem -LiteralPath $_ -Filter "meetily.exe" -File -Recurse -ErrorAction SilentlyContinue }
+            )
+            if ((Test-Path -LiteralPath $installDir) -or $residue.Count -gt 0) {
+              $teardownFailed = $true
+            }
+            if ($teardownFailed -and $exitCode -eq 0) {
               $exitCode = 1
             }
             # Continued steps do not expose GITHUB_OUTPUT reliably; persist the
@@ -399,7 +427,14 @@ jobs:
               throw "installed executable was not found"
             }
             Write-Host "NSIS packaged smoke: running installed executable"
-            $diagnosticProcess = Start-Process -FilePath $executables[0].FullName -ArgumentList "--smoke-dbstat" -Wait -PassThru
+            # -Wait cannot be bounded, so wait explicitly: a diagnostic that
+            # hangs has to fail this step in minutes rather than hold the
+            # runner until the job timeout.
+            $diagnosticProcess = Start-Process -FilePath $executables[0].FullName -ArgumentList "--smoke-dbstat" -PassThru
+            if (-not $diagnosticProcess.WaitForExit(120000)) {
+              try { $diagnosticProcess.Kill() } catch { }
+              throw "NSIS diagnostic timed out"
+            }
             $diagnosticExitCode = $diagnosticProcess.ExitCode
             if ($diagnosticExitCode -ne 0) {
               # Carry the diagnostic's own code so the gate can name the cause;
@@ -410,24 +445,34 @@ jobs:
             $exitCode = 0
           }
           catch {
-            Write-Host "NSIS packaged smoke: failed: $($_.Exception.Message)"
+            # Only the exception class is printed. PowerShell exception
+            # messages embed absolute paths and this log is public.
+            Write-Host "NSIS packaged smoke: failed ($($_.Exception.GetType().Name))"
           }
           finally {
+            # A teardown problem downgrades a passing run to the harness code,
+            # but must never overwrite a verdict the diagnostic already
+            # returned: code 2 is the one condition this smoke exists to
+            # detect, and relabelling it as a harness failure hides it.
+            $teardownFailed = $false
             if ($installed) {
               $uninstaller = Join-Path $installDir "uninstall.exe"
               if (Test-Path -LiteralPath $uninstaller) {
                 $uninstallProcess = Start-Process -FilePath $uninstaller -ArgumentList "/S" -Wait -PassThru
                 if ($uninstallProcess.ExitCode -ne 0) {
-                  $exitCode = 1
+                  $teardownFailed = $true
                 }
               } else {
-                $exitCode = 1
+                $teardownFailed = $true
               }
             }
             if (Test-Path -LiteralPath $installDir) {
               Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
             }
             if (Test-Path -LiteralPath $installDir) {
+              $teardownFailed = $true
+            }
+            if ($teardownFailed -and $exitCode -eq 0) {
               $exitCode = 1
             }
             # Continued steps do not expose GITHUB_OUTPUT reliably; persist the
