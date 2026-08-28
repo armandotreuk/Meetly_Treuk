@@ -662,7 +662,7 @@ mod tests {
             max_sequence_length: u32,
         }
         let manifest: ManifestProbe = serde_json::from_str(include_str!(
-            "../../resources/retrieval/bundle/model-bundle.manifest.json"
+            "../../resources/retrieval/model-bundle.manifest.json"
         ))
         .expect("packaged manifest must parse");
         assert_eq!(APPROVED_MODEL_ID, manifest.embedding_model.model_id);

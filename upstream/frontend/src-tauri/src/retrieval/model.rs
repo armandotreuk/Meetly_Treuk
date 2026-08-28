@@ -925,7 +925,7 @@ mod tests {
     use std::sync::Barrier;
 
     const PACKAGED_MANIFEST_JSON: &str =
-        include_str!("../../resources/retrieval/bundle/model-bundle.manifest.json");
+        include_str!("../../resources/retrieval/model-bundle.manifest.json");
     const REFERENCE_FIXTURE_JSON: &str =
         include_str!("../../tests/fixtures/model_bundle_manifest.json");
 
