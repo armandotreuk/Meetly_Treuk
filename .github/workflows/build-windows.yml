@@ -277,6 +277,192 @@ jobs:
           fi
           echo "ARTIFACT_DIR=$ARTIFACT_DIR" >> $GITHUB_ENV
 
+      - name: Install and run MSI dbstat smoke
+        id: smoke-msi
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exitCode = 1
+          $installed = $false
+          $installer = $null
+          $installDir = Join-Path $env:RUNNER_TEMP "meetily-smoke-msi"
+          $bundleDir = Join-Path $env:GITHUB_WORKSPACE "$env:ARTIFACT_DIR\bundle\msi"
+
+          try {
+            if (Test-Path -LiteralPath $installDir) {
+              Remove-Item -LiteralPath $installDir -Recurse -Force
+            }
+            $installers = @(Get-ChildItem -LiteralPath $bundleDir -Filter "*.msi" -File)
+            if ($installers.Count -ne 1) {
+              throw "expected exactly one MSI installer"
+            }
+            $installer = $installers[0].FullName
+            New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+            $installArguments = "/i `"$installer`" /qn /norestart INSTALLDIR=`"$installDir`""
+            $installProcess = Start-Process -FilePath "msiexec.exe" -ArgumentList $installArguments -Wait -PassThru
+            if ($installProcess.ExitCode -ne 0) {
+              throw "MSI installation failed"
+            }
+            $installed = $true
+            # INSTALLDIR is honoured only if the generated WiX exposes that
+            # property as its root directory. When it does not, msiexec still
+            # succeeds and installs to the default location, so search there
+            # too rather than reporting a dbstat failure for a layout mismatch.
+            $searchRoots = @(
+              $installDir
+              (Join-Path $env:ProgramFiles "meetily")
+              (Join-Path ${env:ProgramFiles(x86)} "meetily")
+            )
+            $executables = @(
+              $searchRoots |
+                Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
+                ForEach-Object { Get-ChildItem -LiteralPath $_ -Filter "meetily.exe" -File -Recurse }
+            )
+            if ($executables.Count -lt 1) {
+              throw "installed executable was not found"
+            }
+            Write-Host "MSI packaged smoke: running $($executables[0].FullName)"
+            $diagnosticOutput = & $executables[0].FullName --smoke-dbstat 2>&1
+            $diagnosticExitCode = $LASTEXITCODE
+            $diagnosticOutput | ForEach-Object { Write-Host $_ }
+            if ($diagnosticExitCode -ne 0) {
+              # Carry the diagnostic's own code so the gate can name the cause;
+              # the packaged binary is GUI-subsystem and prints to no console.
+              $exitCode = $diagnosticExitCode
+              throw "MSI diagnostic failed"
+            }
+            $exitCode = 0
+          }
+          catch {
+            Write-Host "MSI packaged smoke: failed"
+          }
+          finally {
+            if ($installed -and $null -ne $installer) {
+              $uninstallProcess = Start-Process -FilePath "msiexec.exe" -ArgumentList "/x `"$installer`" /qn /norestart" -Wait -PassThru
+              if ($uninstallProcess.ExitCode -ne 0) {
+                $exitCode = 1
+              }
+            }
+            if (Test-Path -LiteralPath $installDir) {
+              Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            if (Test-Path -LiteralPath $installDir) {
+              $exitCode = 1
+            }
+            "exit_code=$exitCode" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            if ($exitCode -eq 0) {
+              "- MSI packaged dbstat smoke: PASS" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            } else {
+              "- MSI packaged dbstat smoke: FAIL" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            }
+          }
+          exit $exitCode
+
+      - name: Install and run NSIS dbstat smoke
+        id: smoke-nsis
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exitCode = 1
+          $installed = $false
+          $installer = $null
+          $installDir = Join-Path $env:RUNNER_TEMP "meetily-smoke-nsis"
+          $bundleDir = Join-Path $env:GITHUB_WORKSPACE "$env:ARTIFACT_DIR\bundle\nsis"
+
+          try {
+            if (Test-Path -LiteralPath $installDir) {
+              Remove-Item -LiteralPath $installDir -Recurse -Force
+            }
+            $installers = @(Get-ChildItem -LiteralPath $bundleDir -Filter "*.exe" -File)
+            if ($installers.Count -ne 1) {
+              throw "expected exactly one NSIS installer"
+            }
+            $installer = $installers[0].FullName
+            New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+            # NSIS requires /D last, unquoted, and to the end of the line. An
+            # -ArgumentList array lets PowerShell quote any element containing
+            # a space, which NSIS rejects, so pass one raw argument string.
+            $installProcess = Start-Process -FilePath $installer -ArgumentList "/S /D=$installDir" -Wait -PassThru
+            if ($installProcess.ExitCode -ne 0) {
+              throw "NSIS installation failed"
+            }
+            $installed = $true
+            $executables = @(Get-ChildItem -LiteralPath $installDir -Filter "meetily.exe" -File -Recurse)
+            if ($executables.Count -lt 1) {
+              throw "installed executable was not found"
+            }
+            Write-Host "NSIS packaged smoke: running $($executables[0].FullName)"
+            $diagnosticOutput = & $executables[0].FullName --smoke-dbstat 2>&1
+            $diagnosticExitCode = $LASTEXITCODE
+            $diagnosticOutput | ForEach-Object { Write-Host $_ }
+            if ($diagnosticExitCode -ne 0) {
+              # Carry the diagnostic's own code so the gate can name the cause;
+              # the packaged binary is GUI-subsystem and prints to no console.
+              $exitCode = $diagnosticExitCode
+              throw "NSIS diagnostic failed"
+            }
+            $exitCode = 0
+          }
+          catch {
+            Write-Host "NSIS packaged smoke: failed"
+          }
+          finally {
+            if ($installed) {
+              $uninstaller = Join-Path $installDir "uninstall.exe"
+              if (Test-Path -LiteralPath $uninstaller) {
+                $uninstallProcess = Start-Process -FilePath $uninstaller -ArgumentList "/S" -Wait -PassThru
+                if ($uninstallProcess.ExitCode -ne 0) {
+                  $exitCode = 1
+                }
+              } else {
+                $exitCode = 1
+              }
+            }
+            if (Test-Path -LiteralPath $installDir) {
+              Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            if (Test-Path -LiteralPath $installDir) {
+              $exitCode = 1
+            }
+            "exit_code=$exitCode" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            if ($exitCode -eq 0) {
+              "- NSIS packaged dbstat smoke: PASS" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            } else {
+              "- NSIS packaged dbstat smoke: FAIL" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            }
+          }
+          exit $exitCode
+
+      - name: Fail if packaged dbstat smoke failed
+        if: always()
+        shell: pwsh
+        run: |
+          # Skipped smokes mean an earlier step already failed the job; blaming
+          # them here would bury the real cause. Only a smoke that actually ran
+          # can fail this gate, and its exit code names why.
+          $checks = @(
+            @{ Name = "MSI"; Outcome = "${{ steps.smoke-msi.outcome }}"; ExitCode = "${{ steps.smoke-msi.outputs.exit_code }}" }
+            @{ Name = "NSIS"; Outcome = "${{ steps.smoke-nsis.outcome }}"; ExitCode = "${{ steps.smoke-nsis.outputs.exit_code }}" }
+          )
+          $failures = @()
+          foreach ($check in $checks) {
+            if ($check.Outcome -eq "skipped") {
+              Write-Host "$($check.Name) packaged dbstat smoke: skipped (an earlier step failed)"
+              continue
+            }
+            switch ($check.ExitCode) {
+              "0" { Write-Host "$($check.Name) packaged dbstat smoke: PASS" }
+              "2" { $failures += "$($check.Name): dbstat unavailable - the shipped SQLite lacks ENABLE_DBSTAT_VTAB" }
+              "3" { $failures += "$($check.Name): the dbstat probe failed before reaching a verdict (setup, migration, or runtime error)" }
+              default { $failures += "$($check.Name): smoke reported no verdict (exit '$($check.ExitCode)')" }
+            }
+          }
+          if ($failures.Count -gt 0) {
+            throw ($failures -join "; ")
+          }
+
       # --- Upload ---
       - name: Upload MSI installer
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'

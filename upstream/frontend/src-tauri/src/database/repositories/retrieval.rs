@@ -258,9 +258,64 @@ pub enum ReplacementOutcome {
     RevisionConflict { current_revision: Option<i64> },
 }
 
+#[cfg(any(debug_assertions, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DocumentCountDivergence {
+    pub generation_id: String,
+    pub tracked_count: i64,
+    pub actual_count: i64,
+}
+
 pub struct RetrievalRepository;
 
 impl RetrievalRepository {
+    #[cfg(any(debug_assertions, test))]
+    pub(crate) async fn reconcile_document_counts(
+        pool: &SqlitePool,
+        generation_ids: &[&str],
+    ) -> Result<Vec<DocumentCountDivergence>, SqlxError> {
+        if generation_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders = std::iter::repeat("?")
+            .take(generation_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT g.generation_id, g.document_count,
+                    (SELECT COUNT(*) FROM retrieval_documents d
+                     WHERE d.generation_id = g.generation_id)
+             FROM retrieval_generations g
+             WHERE g.generation_id IN ({placeholders})
+             ORDER BY g.generation_id"
+        );
+        let mut query = sqlx::query_as::<_, (String, i64, i64)>(&sql);
+        for generation_id in generation_ids {
+            query = query.bind(*generation_id);
+        }
+        let rows = query.fetch_all(pool).await?;
+        let divergences = rows
+            .into_iter()
+            .filter_map(|(generation_id, tracked_count, actual_count)| {
+                (tracked_count != actual_count).then(|| DocumentCountDivergence {
+                    generation_id,
+                    tracked_count,
+                    actual_count,
+                })
+            })
+            .collect::<Vec<_>>();
+        for divergence in &divergences {
+            log::warn!(
+                "retrieval document count divergence for generation {}: tracked {}, actual {}",
+                divergence.generation_id,
+                divergence.tracked_count,
+                divergence.actual_count
+            );
+        }
+        Ok(divergences)
+    }
+
     // -- Registration and lifecycle --------------------------------------
 
     pub async fn register_model(pool: &SqlitePool, spec: &ModelSpec) -> Result<(), SqlxError> {
@@ -1234,6 +1289,12 @@ impl RetrievalRepository {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        // Deliberately no reconciliation here. Publication is the hot path: a
+        // per-replacement check would run one full-generation COUNT(*) per
+        // indexed meeting, re-introducing the O(corpus) recount that 2.R3
+        // removed from this path. Drift detection rides the deletion path
+        // instead, which is the rare event and the one whose decrement is
+        // applied outside this incremental accounting.
         Ok(ReplacementOutcome::Published { change_id })
     }
 
@@ -2774,7 +2835,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn document_count_moves_by_exact_deltas_and_survives_meeting_deletes() {
+    async fn document_count_reconciliation_detects_drift_after_exact_replacement_and_delete() {
         let pool = migrated_pool().await;
         RetrievalRepository::register_model(&pool, &f32_spec("model", 2))
             .await
@@ -2888,6 +2949,31 @@ mod tests {
             .unwrap());
         assert_eq!(stored("gen-dc", &pool).await, 1);
         assert_eq!(stored("gen-dc", &pool).await, live_rows(&pool).await);
+        assert!(
+            RetrievalRepository::reconcile_document_counts(&pool, &["gen-dc"])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        sqlx::query(
+            "UPDATE retrieval_generations
+             SET document_count = document_count + 4
+             WHERE generation_id = 'gen-dc'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            RetrievalRepository::reconcile_document_counts(&pool, &["gen-dc"])
+                .await
+                .unwrap(),
+            vec![DocumentCountDivergence {
+                generation_id: "gen-dc".to_string(),
+                tracked_count: 5,
+                actual_count: 1,
+            }]
+        );
     }
 
     #[tokio::test]

@@ -1,6 +1,8 @@
 use crate::api::{MeetingDetails, MeetingTranscript};
 use crate::database::models::{MeetingModel, Transcript};
 use crate::database::repositories::chat::ChatRepository;
+#[cfg(debug_assertions)]
+use crate::database::repositories::retrieval::RetrievalRepository;
 use chrono::Utc;
 use sqlx::{Acquire, Error as SqlxError, SqliteConnection, SqlitePool};
 use tracing::{error, info};
@@ -32,9 +34,26 @@ impl MeetingsRepository {
         let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
 
         match delete_meeting_with_transaction(&mut transaction, meeting_id).await {
-            Ok(success) => {
+            Ok((success, _affected_generations)) => {
                 if success {
                     transaction.commit().await?;
+                    #[cfg(debug_assertions)]
+                    if !_affected_generations.is_empty() {
+                        let generation_ids = _affected_generations
+                            .iter()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>();
+                        if let Err(error) =
+                            RetrievalRepository::reconcile_document_counts(pool, &generation_ids)
+                                .await
+                        {
+                            log::warn!(
+                                "retrieval document count reconciliation failed after meeting deletion {}: {}",
+                                meeting_id,
+                                error
+                            );
+                        }
+                    }
                     info!(
                         "Successfully deleted meeting {} and all associated data",
                         meeting_id
@@ -240,7 +259,7 @@ impl MeetingsRepository {
 async fn delete_meeting_with_transaction(
     transaction: &mut SqliteConnection,
     meeting_id: &str,
-) -> Result<bool, SqlxError> {
+) -> Result<(bool, Vec<String>), SqlxError> {
     // Check if meeting exists
     let meeting_exists: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM meetings WHERE id = ?")
         .bind(meeting_id)
@@ -249,8 +268,21 @@ async fn delete_meeting_with_transaction(
 
     if meeting_exists.is_none() {
         error!("Meeting {} not found for deletion", meeting_id);
-        return Ok(false);
+        return Ok((false, Vec::new()));
     }
+
+    #[cfg(debug_assertions)]
+    let affected_generations: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT generation_id
+         FROM retrieval_documents
+         WHERE meeting_id = ?
+         ORDER BY generation_id",
+    )
+    .bind(meeting_id)
+    .fetch_all(&mut *transaction)
+    .await?;
+    #[cfg(not(debug_assertions))]
+    let affected_generations = Vec::new();
 
     // Delete from related tables in proper order
     // 1. Delete from FTS index
@@ -315,7 +347,7 @@ async fn delete_meeting_with_transaction(
         .execute(&mut *transaction)
         .await?;
 
-    Ok(result.rows_affected() > 0)
+    Ok((result.rows_affected() > 0, affected_generations))
 }
 
 #[cfg(test)]
@@ -493,6 +525,90 @@ mod tests {
             .await
             .unwrap(),
             None
+        );
+    }
+
+    /// Covers the deletion path end to end: the DISTINCT generation lookup must
+    /// pick up exactly the generations that held the deleted meeting's rows, the
+    /// decrement must leave those counters matching the true row count, and
+    /// generations that held nothing must be left untouched (pre-existing drift
+    /// on them is still reported, proving the lookup did not over-collect).
+    #[tokio::test]
+    async fn deletion_reconciles_document_counts_for_affected_generations_only() {
+        use crate::database::repositories::retrieval::RetrievalRepository;
+
+        let pool = deletion_test_pool().await;
+        for (id, title) in [("delete-me", "Deleted"), ("keep-me", "Survivor")] {
+            sqlx::query("INSERT INTO meetings (id, title) VALUES ($1, $2)")
+                .bind(id)
+                .bind(title)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        // `holds-docs` owns two rows for the deleted meeting and one for the
+        // survivor; `no-docs` owns nothing and carries deliberate drift.
+        for (generation_id, document_count) in [("holds-docs", 3), ("no-docs", 9)] {
+            sqlx::query(
+                "INSERT INTO retrieval_generations (generation_id, document_count) VALUES ($1, $2)",
+            )
+            .bind(generation_id)
+            .bind(document_count)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for (document_id, meeting_id) in [
+            ("d-1", "delete-me"),
+            ("d-2", "delete-me"),
+            ("d-3", "keep-me"),
+        ] {
+            sqlx::query(
+                "INSERT INTO retrieval_documents (generation_id, document_id, meeting_id)
+                 VALUES ('holds-docs', $1, $2)",
+            )
+            .bind(document_id)
+            .bind(meeting_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        assert!(MeetingsRepository::delete_meeting(&pool, "delete-me")
+            .await
+            .unwrap());
+
+        // The affected generation's counter tracked the cascade exactly, so
+        // reconciliation reports nothing for it.
+        let tracked: i64 = sqlx::query_scalar(
+            "SELECT document_count FROM retrieval_generations WHERE generation_id = 'holds-docs'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tracked, 1);
+        assert!(
+            RetrievalRepository::reconcile_document_counts(&pool, &["holds-docs"])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // The generation that held no rows for this meeting was not decremented,
+        // so its pre-existing drift survives and is still detected.
+        let untouched: i64 = sqlx::query_scalar(
+            "SELECT document_count FROM retrieval_generations WHERE generation_id = 'no-docs'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(untouched, 9);
+        assert_eq!(
+            RetrievalRepository::reconcile_document_counts(&pool, &["no-docs"])
+                .await
+                .unwrap()
+                .len(),
+            1
         );
     }
 }

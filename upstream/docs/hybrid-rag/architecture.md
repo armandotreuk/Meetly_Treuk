@@ -887,6 +887,15 @@ tombstone survives the cascade so a running or restarted publisher can remove
 deleted vectors from memory/sidecar; semantic queries pause while canonical is
 ahead of published.
 
+The same primary delete transaction decrements each affected generation's derived
+`document_count` by the rows for that meeting using the indexed
+`(generation_id, meeting_id)` lookup. The correlated count is bounded by one
+meeting's rows across the at-most-two retained generations and uses
+`MAX(document_count - N, 0)` to preserve the existing non-negative clamp; it is
+not a full-generation recount. Debug-time reconciliation compares affected
+counter values with the authoritative `retrieval_documents` row counts and
+reports divergence without changing either value.
+
 Folder metadata does not require re-embedding, but FTS stores folder ID/name.
 Triggers or repository mutations therefore advance only
 `fts_projection_revision` for `meetings.folder_id` changes and affected
@@ -1951,9 +1960,26 @@ Rollback principles, ordered from cheapest to most disruptive:
 
 - Installed application model loading and inference on Windows x64, the only
   supported target this release.
+- Every claimed Windows installer (currently MSI and NSIS) is installed silently
+  into an isolated runner-temporary directory, and its installed `meetily.exe`
+  is run with `--smoke-dbstat` before artifact upload. The diagnostic uses an
+  in-memory migrated SQLite database, registers one fixed model and generation,
+  and calls `RetrievalRepository::derived_disk_usage`. The asserted invariant is
+  that the shipped SQLite exposes `dbstat` and returns an exact allocated-page
+  measurement; the byte total is reported, never asserted, because it tracks the
+  derived schema's page layout and legitimately moves with every migration.
+  Outcomes are distinguished by exit code — `0` exact, `2` dbstat unavailable,
+  `3` probe failed before a verdict — because release builds are
+  `windows_subsystem = "windows"` and their printed output reaches no console.
+  The installer is uninstalled and the temporary directory is removed after
+  each run.
 - Windows CUDA/Vulkan Whisper variants do not change ORT correctness.
 - Missing resource and corrupt sidecar fallback.
 - Forced lexical-only setting produces lexical behavior on every surface.
+
+This installed-package `dbstat` contract remains unverified until the root
+Windows workflow completes an actual MSI and NSIS run; local unit coverage and
+package construction do not count as a passing installed-package smoke.
 
 ## Subagent Guardrails
 

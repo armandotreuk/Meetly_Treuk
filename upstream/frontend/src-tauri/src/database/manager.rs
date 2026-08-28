@@ -14,6 +14,14 @@ pub struct DatabaseManager {
     pool: SqlitePool,
 }
 
+/// The one place SQLite connection options are configured. Diagnostics that
+/// need a throwaway database (the packaged `--smoke-dbstat` probe) open it
+/// through here so they exercise the same connection contract the application
+/// does, instead of drifting from it.
+pub(crate) fn sqlite_connect_options(path: &str) -> Result<SqliteConnectOptions> {
+    Ok(SqliteConnectOptions::from_str(path)?.foreign_keys(true))
+}
+
 impl DatabaseManager {
     pub async fn new(tauri_db_path: &str, backend_db_path: &str) -> Result<Self> {
         if let Some(parent_dir) = Path::new(tauri_db_path).parent() {
@@ -37,7 +45,7 @@ impl DatabaseManager {
         }
 
         let pool = SqlitePoolOptions::new()
-            .connect_with(SqliteConnectOptions::from_str(tauri_db_path)?.foreign_keys(true))
+            .connect_with(sqlite_connect_options(tauri_db_path)?)
             .await?;
 
         sqlx::migrate!("./migrations").run(&pool).await?;

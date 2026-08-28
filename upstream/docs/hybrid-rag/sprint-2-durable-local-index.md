@@ -631,6 +631,8 @@ cache/sidecar format, corruption behavior, and memory/latency results.
 | 2026-08-27 | Remedy the measured 1,482.7 MiB activation peak by cutting session residency and fixing the gate's measurement scope, rather than raising the 1.30 GiB transient ceiling. | The peak is 63% warm ONNX sessions and only 25% snapshot overlap, yet the ceiling's approving decision reasons about snapshot overlap; `2.R6` measured 573.3 MiB for the same activation with no sessions resident. Sprint 2 has no production rerank consumer, so a warm cross-encoder is residency nothing in this sprint uses. Raising the ceiling would also calibrate a retrieval-scoped budget against a whole-process RSS sample that moves with Whisper and webview state - `2.R9` recorded that its benchmark excludes exactly those - so the limit would need raising again for reasons unrelated to retrieval. | Raise the ceiling to 1.60 GiB; redesign activation to avoid two coexisting snapshots; leave Sprint 2 blocked at the gate. | User |
 | 2026-08-26 | Record prior-embedding-model retention across an upgrading restart as an architecture amendment; implementation deferred to the sprint that ships a bundled-model upgrade. | Sprint 2B built the activation path this constrains, and the post-remediation reviews found the prior active generation is unqueryable after an upgrading restart. Sprint 2 ships one bundle and never upgrades one, so the defect is latent here and the fix belongs where the upgrade ships. See `architecture.md` "Prior-Model Retention Across Upgrade". | Copy the prior bundle into app data on upgrade; accept FTS-only for the entire rebuild window as the contract; implement retention inside Sprint 2. | User |
 | 2026-08-26 | Keep Task `2.R3`'s one revision-fenced transaction; paging bounds memory, not writer-lock duration. Replace the lock-scaling criterion with a corpus-scale before/after lock measurement around the `document_count` recompute fix. | SQLite cannot release the writer lock between pages while preserving all-or-nothing replacement, canonical advance, and journal append under the current schema. Atomicity and bounded memory are the demonstrated requirements. | Add versioned document sets now; allow partial page publication. | User |
+| 2026-08-27 | Leave `2.R13` blocked and hold the proposed `2.R16` document-count reconciliation follow-up. | The current ONNX Runtime binding cannot attribute native session residency without undercounting. The user did not approve full-application calibration, runtime attribution infrastructure, snapshot-only accounting, or a fixed session bound; no independent remediation task may proceed while work is held. | Calibrate a whole-process budget; add runtime attribution; approve an incomplete snapshot-only gate; start `2.R16` independently. | User |
+| 2026-08-27 | Resume the independent agent-brief follow-ups as `2.R16` and `2.R17`; keep `2.R13` blocked. | The user directed the remediation brief to proceed. Counter-drift detection and the packaged `dbstat` smoke contract improve correctness evidence without selecting an unapproved R13 RAM-gate alternative. | Continue holding all work; resolve R13 before independent follow-ups. | User |
 
 ## Task Execution Log
 
@@ -1269,6 +1271,139 @@ activation gate had passed.
 **Decisions and follow-ups:**
 - Cleanup errors remain bounded and opaque: logs contain error context and identifiers only, never meeting text, tokens, or vectors.
 
+### 2.R16 - Derived document-count integrity
+
+**Status:** Complete
+**Owner:** `worker-m` (`ses_fbaa0e35dffe316ZQQ2GdcCzzU`)
+**Completed:** 2026-08-27
+**Implemented:**
+- Added debug/test-only reconciliation for affected retrieval generations after successful replacement and meeting deletion. It compares the incremental counter to the authoritative `retrieval_documents` count, logs only generation IDs and numeric counts, and never mutates either value.
+- Added a regression that verifies exact replacement/deletion deltas, then deliberately corrupts the counter and detects the resulting divergence.
+- Documented the primary delete transaction's bounded, indexed per-meeting decrement in `architecture.md`.
+**Implementation:**
+- Files: `frontend/src-tauri/src/database/repositories/retrieval.rs`, `frontend/src-tauri/src/database/repositories/meeting.rs`, `docs/hybrid-rag/architecture.md`, this file.
+- Approach: retain `MAX(document_count - N, 0)` and the existing incremental accounting. In debug builds, collect the affected generation IDs before a deletion's cascade, reconcile after its successful commit, and use the replacement generation after a successful publish.
+**Not implemented:**
+- No periodic scheduler, migration, dependency, public API, or counter-repair mutation.
+**Why not implemented:**
+- The brief permits debug-time reconciliation; a scheduler would add unapproved lifecycle scope, while silent repair would conceal the very drift this task must expose.
+**Verification:**
+- `$env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA "meetily-cargo-target"; cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib database::repositories::retrieval::tests::document_count_reconciliation_detects_drift_after_exact_replacement_and_delete -- --nocapture` - pass: 1 passed.
+- `cargo check --manifest-path "frontend/src-tauri/Cargo.toml"` - pass; existing `retrieval/model.rs` unnecessary-parentheses warning remains.
+- `cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check` - pass.
+- `git diff --check` - pass.
+**Rollback:**
+- Revert the reconciliation helper, debug-only call sites, regression, and documentation; existing incremental counters and the non-negative clamp remain intact.
+**Decisions and follow-ups:**
+- `2.R13` remains blocked. `2.R17` is the next agent-brief follow-up and must establish an installed-package `dbstat` smoke without claiming packaged support before the test runs.
+
+### 2.R17 - Packaged `dbstat` smoke contract [M]
+
+**Outcome:** The installed Windows application verifies the same exact
+derived-disk measurement path that semantic activation requires, so a package
+that lacks `ENABLE_DBSTAT_VTAB` fails its release smoke rather than silently
+shipping permanent semantic non-activation.
+
+**Likely touchpoints:**
+
+- Root `.github/workflows/build-windows.yml` (the only active workflow)
+- `frontend/src-tauri/src/main.rs`
+- `frontend/src-tauri/src/lib.rs`
+- `frontend/src-tauri/src/database/repositories/retrieval.rs` and focused tests
+- `docs/hybrid-rag/architecture.md`, this file
+
+**Required implementation:**
+
+1. Add a narrowly scoped, non-GUI `--smoke-dbstat` diagnostic before normal
+   Tauri startup. It creates a disposable migrated SQLite database and calls
+   the existing `RetrievalRepository::derived_disk_usage` path; checking only
+   the compile option is insufficient.
+2. Succeed only when that path returns the exact `dbstat` measurement with an
+   exact byte value. Otherwise emit a bounded status-only failure and exit
+   non-zero. Do not add a Tauri IPC command, frontend automation, dependency,
+   model change, or duplicate disk-measurement implementation.
+3. In the root Windows workflow, install and run each packaged installer whose
+   support is claimed (currently MSI and NSIS) after package build and before
+   artifact upload. Record the diagnostic result in the job summary and remove
+   the test installation afterward.
+4. Extend the packaged-smoke contract in `architecture.md`. Do not claim a
+   passing installed-package test until an actual workflow run completes.
+
+**Acceptance checks:**
+
+- Focused test proves exact measurement succeeds and unavailable measurement
+  exits non-zero through the diagnostic path.
+- Build/package verification confirms the installed executable accepts the
+  diagnostic without initializing the GUI, tray, engines, or persisted user DB.
+- The root workflow contains ordered MSI and NSIS installation/diagnostic/
+  cleanup steps before artifact upload; its actual installed-package result
+  remains pending until CI executes.
+
+**Rollback:** Revert the diagnostic, workflow smoke, focused test, and
+documentation. Semantic activation continues to fail closed when `dbstat` is
+unavailable; no user data or retrieval rows require migration.
+
+### 2.R17 - Packaged `dbstat` smoke contract
+
+**Status:** Implementation complete; installed-package CI pending
+**Owner:** `worker-m`
+**Completed:** 2026-08-27
+**Implemented:**
+- Added the non-GUI `--smoke-dbstat` process path before Tauri startup. It migrates a disposable in-memory SQLite database, registers one fixed model and generation, and accepts only the exact `65,536` byte `dbstat` measurement.
+- Added focused exact, unavailable, and migrated-database-path tests. The diagnostic emits bounded status-only output and exits non-zero for unavailable or failed measurements.
+- Added root-workflow MSI and NSIS silent install, installed-executable smoke, uninstall, temporary-directory cleanup, job-summary, and pre-upload failure-gate steps.
+- Documented the installed-package contract and its CI-pending status in `architecture.md`.
+**Implementation:**
+- Files: `.github/workflows/build-windows.yml`, `frontend/src-tauri/src/main.rs`, `frontend/src-tauri/src/lib.rs`, `docs/hybrid-rag/architecture.md`, this file.
+- Approach: reuse `RetrievalRepository::derived_disk_usage` rather than checking a compile option or duplicating SQLite measurement logic. Both installers run independently so their cleanup and results cannot conceal each other.
+**Not implemented:**
+- No Tauri IPC command, frontend automation, dependency, migration, model change, or persisted user database access.
+**Why not implemented:**
+- The smoke is a package-build assertion, not application functionality; reusing the existing repository path keeps its acceptance behavior identical to semantic activation.
+**Verification:**
+- `$env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA "meetily-cargo-target"; cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib dbstat_smoke -- --nocapture` - pass: 3 passed.
+- `$env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA "meetily-cargo-target"; cargo run --manifest-path "frontend/src-tauri/Cargo.toml" -- --smoke-dbstat` - pass: `smoke-dbstat: status=exact bytes=65536`.
+- `py -c "import yaml; ... yaml.safe_load(...)"` - pass: root workflow parses and its MSI/NSIS smoke and failure gate precede installer uploads.
+- `pnpm run typecheck` and `npx vitest run` - pass: 95 tests passed.
+- Actual MSI and NSIS installed-package results remain pending until the root Windows workflow runs; this entry does not claim those checks passed.
+**Rollback:**
+- Revert the diagnostic, focused tests, workflow smoke/failure gate, and documentation. Semantic activation remains fail-closed when `dbstat` is unavailable.
+**Decisions and follow-ups:**
+- Append the actual CI result rather than changing this record. `2.R13` remains blocked and independent of this package-contract verification.
+
+### 2.R18 - Packaged smoke verdict channel and gate scoping
+
+**Status:** Complete
+**Owner:** `claude-sonnet-5` (session `e762b0ec-7ac3-454d-a05c-49ad443b817d`)
+**Completed:** 2026-08-27
+**Implemented:**
+- Closed all 14 findings of the Final Code Review (R14) below, against the `2.R16`/`2.R17` working tree.
+- Replaced the packaged smoke's exact-byte pass condition with the invariant it was meant to assert: `dbstat` is linked in and returns an exact allocated-page measurement. The byte total is now reported, never asserted, so a derived-schema migration can no longer read as a packaging failure.
+- Gave the smoke three distinct exit codes (`0` exact, `2` dbstat unavailable, `3` probe failed before a verdict) and made the workflow gate map each to a sentence. Release builds are `windows_subsystem = "windows"`, so printed output reaches no console and the exit code is the only verdict channel that survives packaging.
+- Carried the failing stage through `DbstatSmokeStatus::Failed { reason }` instead of collapsing every `sqlx::Error` to the unit type, so a broken migration is no longer indistinguishable from a missing compile option.
+- Removed the per-replacement reconciliation call. Publication is the hot path; a check there runs one full-generation `COUNT(*)` per indexed meeting, reinstating the O(corpus) recount that `2.R3` removed. Drift detection now rides the deletion path only, which is the rare event and the one whose decrement is applied outside the incremental accounting.
+- Made the CI gate distinguish a skipped smoke from a failing one via `steps.<id>.outcome`, so an earlier build failure is no longer reported as a dbstat failure.
+- Gave the MSI smoke a fallback search across the default install locations when `INSTALLDIR` is not honoured by the generated WiX, passed the NSIS `/D=` switch as one raw argument string so PowerShell cannot quote it, and aligned the MSI teardown guard with the NSIS one.
+- Added an end-to-end deletion test asserting the affected-generation lookup collects exactly the generations that held the deleted meeting's rows and leaves others untouched.
+**Implementation:**
+- Files: `frontend/src-tauri/src/lib.rs`, `frontend/src-tauri/src/main.rs`, `frontend/src-tauri/src/database/manager.rs`, `frontend/src-tauri/src/database/repositories/retrieval.rs`, `frontend/src-tauri/src/database/repositories/meeting.rs`, `.github/workflows/build-windows.yml`, `docs/hybrid-rag/architecture.md`, this file.
+- Approach: `DbstatSmokeStatus` became a data-carrying enum so the verdict, its byte total, and its failure reason travel together; `dbstat_smoke_exit_code` now maps an already-computed status instead of recomputing it. The diagnostic opens its throwaway database through a new shared `database::manager::sqlite_connect_options`, which `DatabaseManager::new` also uses, so the probe cannot drift from the application's connection contract. `main` matches `--smoke-dbstat` only as the first argument, since Tauri forwards argv for single-instance activation and deep links.
+**Not implemented:**
+- Console attachment for the packaged GUI-subsystem binary. `AttachConsole` needs a `windows`/`winapi` crate that is not a direct dependency, and a new dependency requires user approval.
+- Any change to `ACTIVATION_RAM_CEILING_BYTES`, the approved model/chunk/encoding/backend contracts, or the `MAX(document_count - N, 0)` clamp.
+**Why not implemented:**
+- Exit codes plus the workflow's code-to-text mapping give an operator the cause without a new dependency; the printed reason still works in debug builds, where a console exists.
+**Verification:**
+- `$env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA "meetily-cargo-target"; cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib -- database::repositories::meeting tests::dbstat database::repositories::retrieval::tests::document_count` - pass, 9 passed, 0 failed, 576 filtered out.
+- Workflow YAML parses and retains all three ordered smoke steps.
+- The full `cargo test --lib`, `cargo fmt --check`, and `git diff --check` sweep was NOT re-run in this task; it belongs to the sprint-close sequence.
+**Rollback:**
+- Revert the smoke status/exit-code change, the shared connect-options helper, the deletion test, the workflow edits, and the `architecture.md` wording. The removed per-replacement reconciliation restores by re-adding the call after `tx.commit()`; deletion-path detection is unaffected.
+**Decisions and follow-ups:**
+- The installed-package `dbstat` contract stays unverified until the root Windows workflow completes a real MSI and NSIS run, exactly as `2.R17` recorded. These fixes remove known false-failure modes; they do not constitute a passing packaged smoke.
+- `2.R12`/`2.R13` remain the open envelope work. The R13 blocker on whole-application calibration is untouched by this task.
+- Two files reported as modified on disk between read and edit during this task, so another worker may have been active in the same tree; the diff was inspected and applied cleanly, but the working tree should be reconciled before commit.
+
 ### Task Entry Template
 
 ```markdown
@@ -1463,6 +1598,32 @@ Remediation has not started. The architecture review above additionally requires
 
 **Required follow-ups:** use a like-for-like retrieval-scoped gate or a full-app calibrated budget; release the reranker initialization lock before inference; fail/repair the work item when all divergent-staging cleanup attempts fail.
 
+### Final Code Review (R14)
+
+**Reviewer:** `claude-sonnet-5` (session `e762b0ec-7ac3-454d-a05c-49ad443b817d`), 2026-08-27
+**Scope:** the `2.R16`/`2.R17` working tree (526 lines: debug reconciliation, the `--smoke-dbstat` diagnostic, 150 lines added to the **active root** `.github/workflows/build-windows.yml`, and the `architecture.md` records). The range diff against `origin/sprint-2/durable-local-index` was empty.
+**Verdict:** Changes requested — all 14 findings resolved in `2.R18` above.
+
+**Findings (severity order):**
+1. **Blocker - the packaged smoke asserts an exact 65,536-byte `dbstat` total.** Any derived-schema migration shifts the page count, the binary exits non-zero, and the gate blocks every Windows release build — reported identically to `ENABLE_DBSTAT_VTAB` actually being absent, the one condition the smoke exists to detect. `frontend/src-tauri/src/lib.rs:78`.
+2. **Blocker - the release binary is `windows_subsystem = "windows"`, so the smoke's diagnostic output reaches no console.** `$diagnosticOutput` is empty in CI and a failure shows exit 1 with no reason, defeating the unavailable-versus-failed distinction the task was built for. `frontend/src-tauri/src/main.rs:10`.
+3. **Blocker - every `sqlx::Error` collapses to the unit type.** A broken migration, a connect failure, and a genuine `dbstat` absence are indistinguishable at every observable output. `frontend/src-tauri/src/lib.rs:149`.
+4. **Should-fix - reconciliation runs on every successful replacement in debug builds.** One full-generation `COUNT(*)` per published meeting reinstates the O(corpus) recount `2.R3` removed from that path, only now outside the write lock. `frontend/src-tauri/src/database/repositories/retrieval.rs:1293`.
+5. **Should-fix - the `if: always()` gate blames skipped smokes for earlier failures.** When a prior step fails the smokes are skipped, their outputs are empty, and the gate throws "one or more packaged dbstat smokes failed", burying the real cause. `.github/workflows/build-windows.yml:418`.
+6. **Should-fix - `INSTALLDIR` may not be honoured by the generated WiX**, leaving the executable in Program Files, unfindable under the temp directory, and the smoke permanently failing regardless of `dbstat`. `.github/workflows/build-windows.yml:304`.
+7. **Should-fix - NSIS `/D=` passed through an `-ArgumentList` array** can be quoted by PowerShell; NSIS requires it last and unquoted. `.github/workflows/build-windows.yml:371`.
+8. **Should-fix - no test covers the deletion path that triggers reconciliation**; the only new assertion manufactures drift with a direct `UPDATE`. `frontend/src-tauri/src/database/repositories/meeting.rs:275`.
+9. **Should-fix - `architecture.md` promotes the 65,536-byte page total to a normative contract**, so any legitimate schema change puts the source of truth in conflict with the code. `docs/hybrid-rag/architecture.md:1968`.
+10. Simplification - `run_dbstat_smoke` computes the status twice, letting the printed status and the exit code drift. `frontend/src-tauri/src/lib.rs:138`.
+11. Simplification - MSI and NSIS teardown guards diverge for the same pattern. `.github/workflows/build-windows.yml:330`.
+12. Correctness (minor) - the pass condition requires `estimate_bytes.is_none()`, coupling it to an internal representation detail. `frontend/src-tauri/src/lib.rs:92`.
+13. Reuse - the smoke re-implements `DatabaseManager::new`'s connect-and-migrate setup, which can drift from it. `frontend/src-tauri/src/lib.rs:110`.
+14. Correctness (minor) - `--smoke-dbstat` is matched anywhere in argv, so a forwarded single-instance or deep-link payload could exit the app instead of opening content. `frontend/src-tauri/src/main.rs:10`.
+
+**Verification:** `cargo check --lib --tests` passed on the reviewed tree (the pre-existing `retrieval/model.rs` unnecessary-parentheses warning remains). The full library suite, rustfmt, and the release-envelope benchmark were not re-run for this review.
+
+**Required follow-ups:** assert the `dbstat` invariant rather than a byte total; carry the verdict on a channel that survives a GUI-subsystem binary; keep the failing stage in the error; move drift detection off the publication hot path; make the CI gate distinguish skipped from failed. All addressed in `2.R18`.
+
 ## Sprint 2 Remediation
 
 Drafted 2026-08-26 from the two post-remediation reviews above. Task IDs
@@ -1504,6 +1665,8 @@ branch; no further approval is outstanding for this task.
 | 2.R12 | Activation envelope | Cut session residency during the activation window and align the RAM gate's measurement scope with its ceiling. Closes the 2.R9 blocker without changing the 1.30 GiB ceiling. | M | `worker-l` | Complete | The 2.R9 benchmark passes against the unchanged ceiling with recorded margin; the reranker still passes load-time validation and Sprint 1 reference parity; gate and ceiling measure the same quantity. | Restore eager reranker loading and the prior gate; activation returns to blocked-only and never deletes data. |
 | 2.R13 | Activation envelope | Implement the retrieval-scoped activation RAM gate the Final Code Review (R13) blocker requires: the gate measures only approved retrieval sessions plus active+shadow snapshots and their metadata/overlays, cannot undercount, never blocks on unrelated process RSS, and keeps the unchanged 1.30 GiB ceiling. | M | `worker-l` | 2.R12 | Blocked with proof: no existing public/runtime facility can measure the session term without undercounting (see the 2.R13 execution entry). The R12 whole-process gate remains in force and still passes the release benchmark. | None needed - no production or benchmark diff exists; the R12 gate ships unchanged. |
 | 2.R15 | Staging cleanup fail-closed boundary | Abort semantic work and record bounded retry/backoff when divergent-staging pruning plus discard, or unreadable-staging recovery plus discard, both fail. | S | `implementation subagent` | Complete | Cleanup failure leaves prior canonical documents and publication bounds unchanged, performs no embedding or replacement, and schedules retry. | Revert the worker guard and regression; staging remains durable and recoverable. |
+| 2.R16 | Derived document-count integrity | Detect `retrieval_generations.document_count` drift without removing the legacy deletion clamp, and document the bounded derived-count work inside the primary delete transaction. | M | `worker-m` (`ses_fbaa0e35dffe316ZQQ2GdcCzzU`) | 2.R3 complete | A deliberately corrupted counter is detected by a debug-time reconciliation; normal replacement/deletion deltas remain exact; no raw meeting content reaches logs. | Revert the reconciliation and its focused regression; the existing clamp and durable rows are unchanged. |
+| 2.R17 | Packaged `dbstat` smoke contract | Extend the Windows installed-package smoke contract to prove the linked SQLite exposes `dbstat` before semantic activation is claimed. | M | `worker-m` | 2.R8 complete | Local diagnostic coverage verifies exact and unavailable outcomes; MSI and NSIS installed-package smoke results remain pending until the root workflow runs. | Revert the smoke assertion and documentation; runtime activation remains fail-closed without `dbstat`. |
 
 ### Dependency Order
 

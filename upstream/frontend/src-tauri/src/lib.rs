@@ -62,13 +62,116 @@ pub mod utils;
 pub mod whisper_engine;
 
 use audio::{list_audio_devices, trigger_audio_permission, AudioDevice};
+use database::repositories::retrieval::{
+    DerivedDiskMeasurementStatus, DerivedDiskUsage, ModelSpec, RetrievalRepository, VectorEncoding,
+};
 use log::{error as log_error, info as log_info};
 use notifications::commands::NotificationManagerState;
+use sqlx::sqlite::SqlitePoolOptions;
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, Runtime};
 use tokio::sync::RwLock;
 
 static RECORDING_FLAG: AtomicBool = AtomicBool::new(false);
+
+/// Exit codes are the only diagnostic channel that survives the packaged
+/// binary: release builds are `windows_subsystem = "windows"`, so stdout and
+/// stderr are unattached and the printed status never reaches a CI log. Each
+/// outcome therefore gets its own code and the workflow maps it back to text.
+const SMOKE_EXIT_EXACT: i32 = 0;
+const SMOKE_EXIT_UNAVAILABLE: i32 = 2;
+const SMOKE_EXIT_FAILED: i32 = 3;
+
+#[derive(Debug, PartialEq, Eq)]
+enum DbstatSmokeStatus {
+    /// `dbstat` is linked in and returned an exact allocated-page measurement.
+    /// The byte total is reported, never asserted: it tracks the derived
+    /// schema's page layout and changes with any migration, while the property
+    /// under test is only that an exact measurement was possible at all.
+    Exact { bytes: u64 },
+    /// The linked SQLite lacks `ENABLE_DBSTAT_VTAB`, which is the one condition
+    /// this smoke exists to detect.
+    Unavailable,
+    /// The probe could not run to a verdict; `reason` names the failing stage
+    /// so a broken migration is never mistaken for a missing compile option.
+    Failed { reason: String },
+}
+
+fn dbstat_smoke_status(measurement: Result<DerivedDiskUsage, String>) -> DbstatSmokeStatus {
+    match measurement {
+        Ok(usage) => match (usage.status, usage.bytes) {
+            (DerivedDiskMeasurementStatus::Exact, Some(bytes)) => {
+                DbstatSmokeStatus::Exact { bytes }
+            }
+            (DerivedDiskMeasurementStatus::Exact, None) => DbstatSmokeStatus::Failed {
+                reason: "exact measurement status carried no byte total".to_string(),
+            },
+            (DerivedDiskMeasurementStatus::Unavailable, _) => DbstatSmokeStatus::Unavailable,
+        },
+        Err(reason) => DbstatSmokeStatus::Failed { reason },
+    }
+}
+
+fn dbstat_smoke_exit_code(status: &DbstatSmokeStatus) -> i32 {
+    match status {
+        DbstatSmokeStatus::Exact { .. } => SMOKE_EXIT_EXACT,
+        DbstatSmokeStatus::Unavailable => SMOKE_EXIT_UNAVAILABLE,
+        DbstatSmokeStatus::Failed { .. } => SMOKE_EXIT_FAILED,
+    }
+}
+
+async fn smoke_dbstat_measurement() -> Result<DerivedDiskUsage, sqlx::Error> {
+    let options = database::manager::sqlite_connect_options("sqlite::memory:")?;
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await?;
+    sqlx::query("PRAGMA page_size = 4096")
+        .execute(&pool)
+        .await?;
+    sqlx::migrate!("./migrations").run(&pool).await?;
+    RetrievalRepository::register_model(
+        &pool,
+        &ModelSpec {
+            model_id: "smoke-model".to_string(),
+            dimensions: 1,
+            vector_encoding: VectorEncoding::F32,
+            chunker_version: 1,
+            dequantization_scale: None,
+            dequantization_zero_point: None,
+        },
+    )
+    .await?;
+    RetrievalRepository::register_generation(&pool, "smoke-generation", "smoke-model").await?;
+    let measurement = RetrievalRepository::derived_disk_usage(&pool).await?;
+    pool.close().await;
+    Ok(measurement)
+}
+
+pub fn run_dbstat_smoke() -> i32 {
+    let measurement = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime
+            .block_on(smoke_dbstat_measurement())
+            .map_err(|error| format!("probe failed: {error}")),
+        Err(error) => Err(format!("runtime build failed: {error}")),
+    };
+    let status = dbstat_smoke_status(measurement);
+    match &status {
+        DbstatSmokeStatus::Exact { bytes } => {
+            println!("smoke-dbstat: status=exact bytes={bytes}");
+        }
+        DbstatSmokeStatus::Unavailable => {
+            eprintln!("smoke-dbstat: status=unavailable");
+        }
+        DbstatSmokeStatus::Failed { reason } => {
+            eprintln!("smoke-dbstat: status=failed reason={reason}");
+        }
+    }
+    dbstat_smoke_exit_code(&status)
+}
 
 // Global language preference storage (default to "auto-translate" for automatic translation to English)
 static LANGUAGE_PREFERENCE: std::sync::LazyLock<StdMutex<String>> =
@@ -944,7 +1047,11 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::build_whisper_prompt_from_vocabulary;
+    use super::{
+        build_whisper_prompt_from_vocabulary, dbstat_smoke_exit_code, dbstat_smoke_status,
+        smoke_dbstat_measurement, DerivedDiskMeasurementStatus, DerivedDiskUsage,
+        SMOKE_EXIT_EXACT, SMOKE_EXIT_FAILED, SMOKE_EXIT_UNAVAILABLE,
+    };
 
     #[test]
     fn flattens_newline_separated_words() {
@@ -969,5 +1076,40 @@ mod tests {
             .join("\n");
         let prompt = build_whisper_prompt_from_vocabulary(&long);
         assert!(prompt.len() <= 220); // cap + small slack for the trailing period
+    }
+
+    /// Any exact measurement passes: the byte total tracks the derived
+    /// schema's page layout, so pinning it would turn the next migration into
+    /// a release-blocking "packaged dbstat smoke failed".
+    #[test]
+    fn dbstat_smoke_accepts_any_exact_measurement() {
+        for bytes in [4_096, 65_536, 1_048_576] {
+            assert_eq!(
+                dbstat_smoke_exit_code(&dbstat_smoke_status(Ok(DerivedDiskUsage::exact(bytes)))),
+                SMOKE_EXIT_EXACT
+            );
+        }
+    }
+
+    /// The three outcomes get distinct exit codes because the packaged
+    /// GUI-subsystem binary has no console to print a reason to.
+    #[test]
+    fn dbstat_smoke_separates_unavailable_from_failed() {
+        assert_eq!(
+            dbstat_smoke_exit_code(&dbstat_smoke_status(Ok(DerivedDiskUsage::unavailable(1)))),
+            SMOKE_EXIT_UNAVAILABLE
+        );
+        assert_eq!(
+            dbstat_smoke_exit_code(&dbstat_smoke_status(Err("migration failed".to_string()))),
+            SMOKE_EXIT_FAILED
+        );
+        assert_ne!(SMOKE_EXIT_UNAVAILABLE, SMOKE_EXIT_FAILED);
+    }
+
+    #[tokio::test]
+    async fn dbstat_smoke_uses_the_migrated_database_path() {
+        let measurement = smoke_dbstat_measurement().await.unwrap();
+        assert_eq!(measurement.status, DerivedDiskMeasurementStatus::Exact);
+        assert!(measurement.bytes.is_some_and(|bytes| bytes > 0));
     }
 }
