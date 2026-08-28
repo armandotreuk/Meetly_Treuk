@@ -2,9 +2,9 @@
 
 ## Status
 
-Blocked. Tasks `2C.1` and `2C.2` are complete, but `2C.3` cannot safely
-produce qualifying full-application calibration evidence on this host. Its
-dependent package and closure tasks wait for that evidence.
+Blocked. Tasks `2C.1`, `2C.2`, and `2C.4` are complete, but `2C.3` cannot
+safely produce qualifying full-application calibration evidence on this host.
+Sprint closure remains blocked on that evidence and its dependent reviews.
 
 ## Goal
 
@@ -38,24 +38,21 @@ and independent reviews are approved.
 
 ## Current State And Evidence
 
-- `frontend/src-tauri/src/database/repositories/meeting.rs:274-283` obtains
-  affected generation IDs with `WHERE meeting_id = ?` under `BEGIN IMMEDIATE`.
-  The available index is ordered `(generation_id, meeting_id)` at
-  `migrations/20260825000000_add_semantic_retrieval.sql:72-73`; independent
-  `EXPLAIN QUERY PLAN` evidence reports a full covering-index scan.
-- `frontend/src-tauri/src/lib.rs:151-173` retains a probe reason in memory, but
-  the Windows GUI-subsystem process cannot expose stderr to the installed
-  package workflow. `.github/workflows/build-windows.yml:455-459` receives only
-  generic exit code `3` text.
-- `cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check` fails on
-  the R18 import wrapping in `frontend/src-tauri/src/lib.rs:1049-1054`.
+- `migrations/20260827030000_add_retrieval_documents_meeting_lookup_index.sql`
+  adds `retrieval_documents(meeting_id, generation_id)`. Fresh- and
+  upgrade-migration query-plan regressions reject `SCAN retrieval_documents`.
+- `frontend/src-tauri/src/lib.rs` emits bounded exact, unavailable, runtime,
+  SQLite-connection, migration, deterministic-setup, and measurement verdicts;
+  the Windows workflow preserves them through the GUI-subsystem package path.
+- `cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check` passes.
 - `sprint-2-durable-local-index.md:1177-1218` records R13 as blocked: current
   ONNX Runtime bindings cannot measure native session residency in a
   retrieval-scoped, non-undercounting way.
 - The root workflow only auto-runs on `main` and `dev`
-  (`.github/workflows/build-windows.yml:3-8`). GitHub reports no workflow run
-  for pushed commit `0fe0442`, so R17's MSI/NSIS result remains unverified.
-- Current verification is otherwise green: 583 Rust tests passed (2 ignored),
+  (`.github/workflows/build-windows.yml:3-8`), so release evidence was manually
+  dispatched. Run `41` passed its checked-in contract, staged bundle, reference
+  inference, release build, installed MSI and NSIS smokes, and package uploads.
+- Current verification is green: 584 Rust tests passed (2 ignored),
   `cargo check --lib --tests`, frontend typecheck, 95 Vitest tests, workflow
   YAML parsing, range `git diff --check`, and debug `--smoke-dbstat` all pass.
 
@@ -133,6 +130,7 @@ source change creates the final closure head.
 | 2026-08-28 | Reject the first `2C.3` calibration implementation; retain the existing ceiling as authoritative until remediation passes fresh code and architecture review. | Independent reviews found incomplete runs could set a ceiling, nonzero calibration exits became success, the harness omitted claimed production state, and a regular environment variable could bypass the gate. | Accept unreviewable one-host evidence; relabel the retrieval benchmark as full application. | Main agent under user delegation |
 | 2026-08-28 | Mark `2C.3` blocked and remove its incomplete implementation. | A safe isolated full-app run cannot make the audio stack resident without contending on live WASAPI/CPAL streams; the required Whisper artifact is absent on this host; no existing API proves WebView residency through its production path. The partial code was uncompilable and could not yield valid evidence. | Retain an environment-controlled gate bypass; accept a retrieval-only or partial-component measurement; raise the ceiling from unverifiable evidence. | Main agent under user delegation |
 | 2026-08-28 | Run `2C.4` ahead of blocked `2C.3`. | Installed-package `dbstat` coverage does not depend on the RAM gate and can be tested on the accepted 2C.1/2C.2 head. It is explicitly repeated if R13 later changes packaged source. | Delay all independent evidence until external calibration prerequisites exist. | Main agent under user delegation |
+| 2026-08-28 | Repair fresh-checkout package evidence before accepting `2C.4`. | CI proved the compile-time manifest probe used an unstaged path, the smoke looked in the wrong Tauri target directory, and GUI-process exit handling lost the bounded verdict. The workflow now uses the checked-in manifest, actual bundle directory, persisted runner verdicts, and explicit process exit codes. | Accept local staged artifacts as package evidence; weaken or remove the installed-package gate. | Main agent under user delegation |
 
 ## Task Execution Log
 
@@ -240,6 +238,48 @@ source change creates the final closure head.
 **Decisions and follow-ups:**
 - Qualifying external evidence requires a release build with the approved staged retrieval bundle and explicit Whisper loadout, no production instance, a hermetic temporary app-data/model/database root, actual component-residency checks, atomic report persistence, and a current-RSS sample at active+shadow coexistence. It must not bypass the production gate or derive a ceiling until the evidence is independently reviewed.
 - `2C.5` remains blocked by this task. `2C.4` may establish independent installed-`dbstat` evidence now and must rerun after any future R13 source change.
+
+### 2C.4 - Installed package evidence
+
+**Status:** Complete
+**Owner:** Main agent, under user delegation
+**Completed:** 2026-08-28
+**Implemented:**
+- Repaired the fresh-checkout compile-time manifest probe to use the checked-in
+  production manifest rather than the later-staged bundle directory.
+- Corrected Windows package discovery to use Tauri's actual
+  `upstream/frontend/target/<profile>` output directory.
+- Made installer smoke verdict handoff reliable for GUI-subsystem binaries by
+  collecting explicit `Start-Process -Wait -PassThru` exit codes and persisting
+  bounded results for the final workflow gate.
+**Implementation:**
+- Files: `.github/workflows/build-windows.yml`,
+  `frontend/src-tauri/src/retrieval/chunking.rs`,
+  `frontend/src-tauri/src/retrieval/model.rs`, this file.
+- Approach: package the release first, silently install each real installer,
+  invoke the installed executable's non-GUI diagnostic, silently uninstall and
+  clean up, then let one final gate map only its bounded exit code.
+**Not implemented:**
+- No R13 calibration, RAM-ceiling change, model/chunk/encoding/backend change,
+  package success bypass, or user-database diagnostic output.
+**Why not implemented:**
+- Installed-package `dbstat` evidence is independent of the unavailable R13
+  calibration environment and must not alter that activation-gate authority.
+**Verification:**
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib dbstat_smoke`
+  - pass: 4 passed.
+- Root Windows workflow run `41` on commit `7f11887f730f9480b78254d33e2847d27b08f2c4`
+  - pass: [Build Windows (CI)](https://github.com/armandotreuk/Meetly_Treuk/actions/runs/33171251338).
+- The successful run completed the checked-in manifest contract, staged-bundle
+  verification, reference inference, release build, installed MSI smoke,
+  installed NSIS smoke, final bounded-verdict gate, MSI upload, NSIS upload,
+  executable upload, and Cargo Check (Windows), with no smoke skipped.
+**Rollback:**
+- Revert the package-evidence workflow and manifest-path changes together. The
+  semantic activation gate remains fail-closed when `dbstat` evidence is absent.
+**Decisions and follow-ups:**
+- Any future R13 source change must repeat this same installed-package evidence
+  before `2C.5` can seek Sprint closure.
 
 ## Sprint Reviews
 
