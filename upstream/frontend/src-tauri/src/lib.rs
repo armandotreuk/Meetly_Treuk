@@ -80,7 +80,20 @@ static RECORDING_FLAG: AtomicBool = AtomicBool::new(false);
 /// outcome therefore gets its own code and the workflow maps it back to text.
 const SMOKE_EXIT_EXACT: i32 = 0;
 const SMOKE_EXIT_UNAVAILABLE: i32 = 2;
-const SMOKE_EXIT_FAILED: i32 = 3;
+const SMOKE_EXIT_RUNTIME: i32 = 3;
+const SMOKE_EXIT_CONNECTION: i32 = 4;
+const SMOKE_EXIT_MIGRATION: i32 = 5;
+const SMOKE_EXIT_SETUP: i32 = 6;
+const SMOKE_EXIT_MEASUREMENT: i32 = 7;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DbstatSmokeFailureStage {
+    Runtime,
+    Connection,
+    Migration,
+    Setup,
+    Measurement,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum DbstatSmokeStatus {
@@ -92,23 +105,25 @@ enum DbstatSmokeStatus {
     /// The linked SQLite lacks `ENABLE_DBSTAT_VTAB`, which is the one condition
     /// this smoke exists to detect.
     Unavailable,
-    /// The probe could not run to a verdict; `reason` names the failing stage
-    /// so a broken migration is never mistaken for a missing compile option.
-    Failed { reason: String },
+    /// The probe could not run to a verdict; the bounded stage is carried
+    /// without exposing the underlying error.
+    Failed { stage: DbstatSmokeFailureStage },
 }
 
-fn dbstat_smoke_status(measurement: Result<DerivedDiskUsage, String>) -> DbstatSmokeStatus {
+fn dbstat_smoke_status(
+    measurement: Result<DerivedDiskUsage, DbstatSmokeFailureStage>,
+) -> DbstatSmokeStatus {
     match measurement {
         Ok(usage) => match (usage.status, usage.bytes) {
             (DerivedDiskMeasurementStatus::Exact, Some(bytes)) => {
                 DbstatSmokeStatus::Exact { bytes }
             }
             (DerivedDiskMeasurementStatus::Exact, None) => DbstatSmokeStatus::Failed {
-                reason: "exact measurement status carried no byte total".to_string(),
+                stage: DbstatSmokeFailureStage::Measurement,
             },
             (DerivedDiskMeasurementStatus::Unavailable, _) => DbstatSmokeStatus::Unavailable,
         },
-        Err(reason) => DbstatSmokeStatus::Failed { reason },
+        Err(stage) => DbstatSmokeStatus::Failed { stage },
     }
 }
 
@@ -116,20 +131,32 @@ fn dbstat_smoke_exit_code(status: &DbstatSmokeStatus) -> i32 {
     match status {
         DbstatSmokeStatus::Exact { .. } => SMOKE_EXIT_EXACT,
         DbstatSmokeStatus::Unavailable => SMOKE_EXIT_UNAVAILABLE,
-        DbstatSmokeStatus::Failed { .. } => SMOKE_EXIT_FAILED,
+        DbstatSmokeStatus::Failed { stage } => match stage {
+            DbstatSmokeFailureStage::Runtime => SMOKE_EXIT_RUNTIME,
+            DbstatSmokeFailureStage::Connection => SMOKE_EXIT_CONNECTION,
+            DbstatSmokeFailureStage::Migration => SMOKE_EXIT_MIGRATION,
+            DbstatSmokeFailureStage::Setup => SMOKE_EXIT_SETUP,
+            DbstatSmokeFailureStage::Measurement => SMOKE_EXIT_MEASUREMENT,
+        },
     }
 }
 
-async fn smoke_dbstat_measurement() -> Result<DerivedDiskUsage, sqlx::Error> {
-    let options = database::manager::sqlite_connect_options("sqlite::memory:")?;
+async fn smoke_dbstat_measurement() -> Result<DerivedDiskUsage, DbstatSmokeFailureStage> {
+    let options = database::manager::sqlite_connect_options("sqlite::memory:")
+        .map_err(|_| DbstatSmokeFailureStage::Connection)?;
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(options)
-        .await?;
+        .await
+        .map_err(|_| DbstatSmokeFailureStage::Connection)?;
     sqlx::query("PRAGMA page_size = 4096")
         .execute(&pool)
-        .await?;
-    sqlx::migrate!("./migrations").run(&pool).await?;
+        .await
+        .map_err(|_| DbstatSmokeFailureStage::Setup)?;
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .map_err(|_| DbstatSmokeFailureStage::Migration)?;
     RetrievalRepository::register_model(
         &pool,
         &ModelSpec {
@@ -141,9 +168,14 @@ async fn smoke_dbstat_measurement() -> Result<DerivedDiskUsage, sqlx::Error> {
             dequantization_zero_point: None,
         },
     )
-    .await?;
-    RetrievalRepository::register_generation(&pool, "smoke-generation", "smoke-model").await?;
-    let measurement = RetrievalRepository::derived_disk_usage(&pool).await?;
+    .await
+    .map_err(|_| DbstatSmokeFailureStage::Setup)?;
+    RetrievalRepository::register_generation(&pool, "smoke-generation", "smoke-model")
+        .await
+        .map_err(|_| DbstatSmokeFailureStage::Setup)?;
+    let measurement = RetrievalRepository::derived_disk_usage(&pool)
+        .await
+        .map_err(|_| DbstatSmokeFailureStage::Measurement)?;
     pool.close().await;
     Ok(measurement)
 }
@@ -153,10 +185,8 @@ pub fn run_dbstat_smoke() -> i32 {
         .enable_all()
         .build()
     {
-        Ok(runtime) => runtime
-            .block_on(smoke_dbstat_measurement())
-            .map_err(|error| format!("probe failed: {error}")),
-        Err(error) => Err(format!("runtime build failed: {error}")),
+        Ok(runtime) => runtime.block_on(smoke_dbstat_measurement()),
+        Err(_) => Err(DbstatSmokeFailureStage::Runtime),
     };
     let status = dbstat_smoke_status(measurement);
     match &status {
@@ -166,8 +196,8 @@ pub fn run_dbstat_smoke() -> i32 {
         DbstatSmokeStatus::Unavailable => {
             eprintln!("smoke-dbstat: status=unavailable");
         }
-        DbstatSmokeStatus::Failed { reason } => {
-            eprintln!("smoke-dbstat: status=failed reason={reason}");
+        DbstatSmokeStatus::Failed { stage } => {
+            eprintln!("smoke-dbstat: status=failed stage={stage:?}");
         }
     }
     dbstat_smoke_exit_code(&status)
@@ -1049,8 +1079,9 @@ pub fn run() {
 mod tests {
     use super::{
         build_whisper_prompt_from_vocabulary, dbstat_smoke_exit_code, dbstat_smoke_status,
-        smoke_dbstat_measurement, DerivedDiskMeasurementStatus, DerivedDiskUsage,
-        SMOKE_EXIT_EXACT, SMOKE_EXIT_FAILED, SMOKE_EXIT_UNAVAILABLE,
+        smoke_dbstat_measurement, DbstatSmokeFailureStage, DerivedDiskMeasurementStatus,
+        DerivedDiskUsage, SMOKE_EXIT_CONNECTION, SMOKE_EXIT_EXACT, SMOKE_EXIT_MEASUREMENT,
+        SMOKE_EXIT_MIGRATION, SMOKE_EXIT_RUNTIME, SMOKE_EXIT_SETUP, SMOKE_EXIT_UNAVAILABLE,
     };
 
     #[test]
@@ -1091,19 +1122,33 @@ mod tests {
         }
     }
 
-    /// The three outcomes get distinct exit codes because the packaged
-    /// GUI-subsystem binary has no console to print a reason to.
     #[test]
-    fn dbstat_smoke_separates_unavailable_from_failed() {
+    fn dbstat_smoke_separates_unavailable_from_pre_verdict_failures() {
         assert_eq!(
             dbstat_smoke_exit_code(&dbstat_smoke_status(Ok(DerivedDiskUsage::unavailable(1)))),
             SMOKE_EXIT_UNAVAILABLE
         );
-        assert_eq!(
-            dbstat_smoke_exit_code(&dbstat_smoke_status(Err("migration failed".to_string()))),
-            SMOKE_EXIT_FAILED
-        );
-        assert_ne!(SMOKE_EXIT_UNAVAILABLE, SMOKE_EXIT_FAILED);
+        assert_ne!(SMOKE_EXIT_EXACT, SMOKE_EXIT_UNAVAILABLE);
+    }
+
+    #[test]
+    fn dbstat_smoke_maps_every_pre_verdict_stage_to_a_distinct_code() {
+        let mappings = [
+            (DbstatSmokeFailureStage::Runtime, SMOKE_EXIT_RUNTIME),
+            (DbstatSmokeFailureStage::Connection, SMOKE_EXIT_CONNECTION),
+            (DbstatSmokeFailureStage::Migration, SMOKE_EXIT_MIGRATION),
+            (DbstatSmokeFailureStage::Setup, SMOKE_EXIT_SETUP),
+            (DbstatSmokeFailureStage::Measurement, SMOKE_EXIT_MEASUREMENT),
+        ];
+        let mut seen = Vec::new();
+        for (stage, expected_code) in mappings {
+            let code = dbstat_smoke_exit_code(&dbstat_smoke_status(Err(stage)));
+            assert_eq!(code, expected_code);
+            assert_ne!(code, SMOKE_EXIT_EXACT);
+            assert_ne!(code, SMOKE_EXIT_UNAVAILABLE);
+            assert!(!seen.contains(&code));
+            seen.push(code);
+        }
     }
 
     #[tokio::test]

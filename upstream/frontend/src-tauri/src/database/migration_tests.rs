@@ -35,6 +35,47 @@ async fn table_sql(pool: &SqlitePool, name: &str) -> Option<String> {
     .map(|(sql,)| sql)
 }
 
+const RETRIEVAL_DOCUMENTS_MEETING_LOOKUP_INDEX: &str = "retrieval_documents_by_meeting_lookup";
+
+async fn assert_meeting_lookup_index(pool: &SqlitePool) {
+    let columns: Vec<(i64, String)> = sqlx::query_as(&format!(
+        "SELECT seqno, name FROM pragma_index_info('{RETRIEVAL_DOCUMENTS_MEETING_LOOKUP_INDEX}') ORDER BY seqno"
+    ))
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        columns,
+        vec![(0, "meeting_id".into()), (1, "generation_id".into())]
+    );
+
+    let plan: Vec<String> = sqlx::query_as::<_, (i64, i64, i64, String)>(
+        "EXPLAIN QUERY PLAN
+         SELECT DISTINCT generation_id
+         FROM retrieval_documents
+         WHERE meeting_id = ?
+         ORDER BY generation_id",
+    )
+    .bind("deleted-meeting")
+    .fetch_all(pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|(_, _, _, detail)| detail)
+    .collect();
+    assert!(
+        plan.iter().any(|detail| detail.contains(
+            "SEARCH retrieval_documents USING COVERING INDEX retrieval_documents_by_meeting_lookup (meeting_id=?)"
+        )),
+        "affected-generation lookup must use the meeting lookup index: {plan:?}"
+    );
+    assert!(
+        plan.iter()
+            .all(|detail| !detail.contains("SCAN retrieval_documents")),
+        "affected-generation lookup must not scan retrieval_documents: {plan:?}"
+    );
+}
+
 #[tokio::test]
 async fn fresh_migration_installs_semantic_schema_without_active_state() {
     let pool = connect().await;
@@ -91,6 +132,7 @@ async fn fresh_migration_installs_semantic_schema_without_active_state() {
     for index in [
         "search_source_state_fts_due",
         "retrieval_documents_by_meeting",
+        RETRIEVAL_DOCUMENTS_MEETING_LOOKUP_INDEX,
         "retrieval_document_staging_by_generation",
         "retrieval_meeting_state_due",
         "retrieval_index_changes_replay",
@@ -106,6 +148,8 @@ async fn fresh_migration_installs_semantic_schema_without_active_state() {
             "index {index} must exist"
         );
     }
+
+    assert_meeting_lookup_index(&pool).await;
 
     // Document tables stay rowid; meeting state stays WITHOUT ROWID.
     let documents_sql = table_sql(&pool, "retrieval_documents").await.unwrap();
@@ -222,6 +266,8 @@ async fn legacy_backfill_seeds_existing_meetings_without_inference() {
         }
     }
     drop(conn);
+
+    assert_meeting_lookup_index(&pool).await;
 
     // Every legacy meeting is seeded with pending FTS repair work.
     let seeded: Vec<(String, i64, i64, i64)> =

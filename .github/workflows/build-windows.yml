@@ -322,10 +322,9 @@ jobs:
             if ($executables.Count -lt 1) {
               throw "installed executable was not found"
             }
-            Write-Host "MSI packaged smoke: running $($executables[0].FullName)"
-            $diagnosticOutput = & $executables[0].FullName --smoke-dbstat 2>&1
+            Write-Host "MSI packaged smoke: running installed executable"
+            $null = & $executables[0].FullName --smoke-dbstat 2>&1
             $diagnosticExitCode = $LASTEXITCODE
-            $diagnosticOutput | ForEach-Object { Write-Host $_ }
             if ($diagnosticExitCode -ne 0) {
               # Carry the diagnostic's own code so the gate can name the cause;
               # the packaged binary is GUI-subsystem and prints to no console.
@@ -393,10 +392,9 @@ jobs:
             if ($executables.Count -lt 1) {
               throw "installed executable was not found"
             }
-            Write-Host "NSIS packaged smoke: running $($executables[0].FullName)"
-            $diagnosticOutput = & $executables[0].FullName --smoke-dbstat 2>&1
+            Write-Host "NSIS packaged smoke: running installed executable"
+            $null = & $executables[0].FullName --smoke-dbstat 2>&1
             $diagnosticExitCode = $LASTEXITCODE
-            $diagnosticOutput | ForEach-Object { Write-Host $_ }
             if ($diagnosticExitCode -ne 0) {
               # Carry the diagnostic's own code so the gate can name the cause;
               # the packaged binary is GUI-subsystem and prints to no console.
@@ -455,8 +453,13 @@ jobs:
             switch ($check.ExitCode) {
               "0" { Write-Host "$($check.Name) packaged dbstat smoke: PASS" }
               "2" { $failures += "$($check.Name): dbstat unavailable - the shipped SQLite lacks ENABLE_DBSTAT_VTAB" }
-              "3" { $failures += "$($check.Name): the dbstat probe failed before reaching a verdict (setup, migration, or runtime error)" }
-              default { $failures += "$($check.Name): smoke reported no verdict (exit '$($check.ExitCode)')" }
+              "1" { $failures += "$($check.Name): packaged smoke harness failed (installer, executable discovery, or teardown)" }
+              "3" { $failures += "$($check.Name): dbstat diagnostic runtime construction failed before a verdict" }
+              "4" { $failures += "$($check.Name): dbstat diagnostic SQLite connection failed before a verdict" }
+              "5" { $failures += "$($check.Name): dbstat diagnostic migration failed before a verdict" }
+              "6" { $failures += "$($check.Name): dbstat diagnostic deterministic setup failed before a verdict" }
+              "7" { $failures += "$($check.Name): dbstat diagnostic measurement failed before a verdict" }
+              default { $failures += "$($check.Name): packaged smoke returned an unrecognized diagnostic or harness exit code ('$($check.ExitCode)')" }
             }
           }
           if ($failures.Count -gt 0) {
