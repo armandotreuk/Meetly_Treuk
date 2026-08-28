@@ -334,7 +334,7 @@ jobs:
             $exitCode = 0
           }
           catch {
-            Write-Host "MSI packaged smoke: failed"
+            Write-Host "MSI packaged smoke: failed: $($_.Exception.Message)"
           }
           finally {
             if ($installed -and $null -ne $installer) {
@@ -404,7 +404,7 @@ jobs:
             $exitCode = 0
           }
           catch {
-            Write-Host "NSIS packaged smoke: failed"
+            Write-Host "NSIS packaged smoke: failed: $($_.Exception.Message)"
           }
           finally {
             if ($installed) {
