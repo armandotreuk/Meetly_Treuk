@@ -1995,11 +1995,48 @@ mod tests {
     use std::collections::VecDeque;
     use std::str::FromStr;
     use std::sync::atomic::{AtomicU64, AtomicUsize};
+    use std::sync::{Mutex, Once, OnceLock};
     use std::time::{Duration, Instant};
 
     const DIMS: usize = 4;
     const MODEL_ID: &str = "test-e5-int8";
     const SCALE: f64 = 1.0 / 127.0;
+
+    struct ActivationTestLogger;
+
+    static ACTIVATION_TEST_LOGGER: ActivationTestLogger = ActivationTestLogger;
+    static ACTIVATION_TEST_LOGGER_INSTALLED: Once = Once::new();
+    static ACTIVATION_TEST_LOGS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+    impl log::Log for ActivationTestLogger {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::Level::Warn
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if self.enabled(record.metadata()) {
+                let message = record.args().to_string();
+                if message
+                    .starts_with("Semantic generation activation refused: generation gen-ram:")
+                {
+                    activation_test_logs().lock().unwrap().push(message);
+                }
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    fn activation_test_logs() -> &'static Mutex<Vec<String>> {
+        ACTIVATION_TEST_LOGS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    fn install_activation_test_logger() {
+        ACTIVATION_TEST_LOGGER_INSTALLED.call_once(|| {
+            log::set_logger(&ACTIVATION_TEST_LOGGER).unwrap();
+            log::set_max_level(log::LevelFilter::Trace);
+        });
+    }
 
     // -- Harness -------------------------------------------------------------
 
@@ -4289,6 +4326,8 @@ mod tests {
 
     #[tokio::test]
     async fn measured_ram_gate_blocks_activation_until_measurement_admits() {
+        install_activation_test_logger();
+        activation_test_logs().lock().unwrap().clear();
         let pool = migrated_pool().await;
         insert_meeting(&pool, "ram", "Ram").await;
         register_test_model(&pool).await;
@@ -4309,8 +4348,10 @@ mod tests {
         let blockers = service.pending_activation_blockers();
         assert_eq!(blockers.len(), 1);
         assert!(blockers[0].contains("unavailable"));
+        assert_eq!(activation_test_logs().lock().unwrap().len(), 1);
 
         // At the approved ceiling: still blocked.
+        activation_test_logs().lock().unwrap().clear();
         let at_limit: RamProbe = Arc::new(|| Some(ACTIVATION_RAM_CEILING_BYTES));
         service.set_ram_probe(at_limit);
         publish_tick(&pool, &service).await.unwrap();
@@ -4323,8 +4364,15 @@ mod tests {
         assert!(blockers[0].contains("activation ceiling"));
         assert!(blockers[0].contains(ACTIVATION_RAM_SCOPE));
         assert!(blockers[0].contains(&ACTIVATION_RAM_CEILING_BYTES.to_string()));
+        assert_eq!(
+            activation_test_logs().lock().unwrap().as_slice(),
+            [format!(
+                "Semantic generation activation refused: generation gen-ram: measured {ACTIVATION_RAM_SCOPE} {ACTIVATION_RAM_CEILING_BYTES} bytes meets or exceeds the {ACTIVATION_RAM_CEILING_BYTES} byte activation ceiling"
+            )]
+        );
 
         // Below the ceiling: activation proceeds through pointer + memory swap.
+        activation_test_logs().lock().unwrap().clear();
         let below: RamProbe = Arc::new(|| Some(ACTIVATION_RAM_CEILING_BYTES - 1));
         service.set_ram_probe(below);
         publish_tick(&pool, &service).await.unwrap();
@@ -4335,6 +4383,7 @@ mod tests {
             Some("gen-ram".to_string())
         );
         assert!(service.pending_activation_blockers().is_empty());
+        assert!(activation_test_logs().lock().unwrap().is_empty());
         let hits = search_all(&service, "gate").await.unwrap();
         assert!(hits.iter().any(|hit| hit.meeting_id == "ram"));
     }

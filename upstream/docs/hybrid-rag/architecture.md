@@ -1115,18 +1115,13 @@ Until (1)-(3) land, no code may relax, widen, or bypass this gate.
 
 #### Activation refusals must be observable
 
-The gate stores its refusal reason in `IndexService::pending_blockers` and
-exposes `pending_activation_blockers()`. Neither is read by any caller, logged,
-or surfaced. A refusal is therefore indistinguishable from a normal run.
-
-This is admissible only while no query surface exists, because nothing yet
-depends on activation having happened. It MUST NOT ship in the release that
-first exposes semantic retrieval: from that build onward the reason a
-generation was refused MUST reach the application log, so that "semantic
-retrieval is working" and "semantic retrieval has never once activated" are
-distinguishable without a debugger. The refusal reason names the scope,
-measured bytes, and ceiling, and carries no meeting text, tokens, or vectors,
-so it is safe to log verbatim.
+The gate stores its refusal reason in `IndexService::pending_blockers`, exposes
+`pending_activation_blockers()` through the retrieval status report, and emits
+one warn-level line for each activation pass that refuses one or more
+generations. A refusal is therefore distinguishable from a normal run without
+a debugger, even though no UI surface exists yet. The refusal reason names the
+scope, measured bytes, and ceiling, and carries no meeting text, tokens, or
+vectors, so it is safe to log verbatim.
 
 Sprint 2 MUST implement one immutable contiguous base snapshot, an exact
 upsert delta, and tombstones. It MUST preserve canonical SQLite plus the

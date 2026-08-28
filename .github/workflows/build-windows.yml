@@ -355,9 +355,14 @@ jobs:
             # detect, and relabelling it as a harness failure hides it.
             $teardownFailed = $false
             if ($installed -and $null -ne $installer) {
-              $uninstallProcess = Start-Process -FilePath "msiexec.exe" -ArgumentList "/x `"$installer`" /qn /norestart" -Wait -PassThru
-              if ($uninstallProcess.ExitCode -ne 0) {
+              try {
+                $uninstallProcess = Start-Process -FilePath "msiexec.exe" -ArgumentList "/x `"$installer`" /qn /norestart" -Wait -PassThru
+                if ($uninstallProcess.ExitCode -ne 0) {
+                  $teardownFailed = $true
+                }
+              } catch {
                 $teardownFailed = $true
+                Write-Host "MSI packaged smoke teardown failed ($($_.Exception.GetType().Name))"
               }
             }
             if (Test-Path -LiteralPath $installDir) {
@@ -458,9 +463,14 @@ jobs:
             if ($installed) {
               $uninstaller = Join-Path $installDir "uninstall.exe"
               if (Test-Path -LiteralPath $uninstaller) {
-                $uninstallProcess = Start-Process -FilePath $uninstaller -ArgumentList "/S" -Wait -PassThru
-                if ($uninstallProcess.ExitCode -ne 0) {
+                try {
+                  $uninstallProcess = Start-Process -FilePath $uninstaller -ArgumentList "/S" -Wait -PassThru
+                  if ($uninstallProcess.ExitCode -ne 0) {
+                    $teardownFailed = $true
+                  }
+                } catch {
                   $teardownFailed = $true
+                  Write-Host "NSIS packaged smoke teardown failed ($($_.Exception.GetType().Name))"
                 }
               } else {
                 $teardownFailed = $true
