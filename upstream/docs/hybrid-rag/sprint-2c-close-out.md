@@ -2,13 +2,12 @@
 
 ## Status
 
-Unblocked by decision, 2026-08-28. Tasks `2C.1`, `2C.2`, `2C.4` and `2C.R1`
-are complete. `2C.3` is **closed as accepted-with-obligation**, not delivered:
-the user accepted the existing whole-process gate for Sprint 2 with the ceiling
-unchanged, and moved full-application calibration into Sprint 3 as a close
-obligation recorded in `architecture.md`. Sprint closure now depends on `2C.6`
-(activation-refusal observability), a re-dispatched `2C.4` covering the current
-head, and `2C.5`.
+Unblocked by decision, 2026-08-28. Tasks `2C.1`, `2C.2`, `2C.4`, `2C.R1`, and
+`2C.6` are complete. `2C.3` is **closed as accepted-with-obligation**, not
+delivered: the user accepted the existing whole-process gate for Sprint 2 with
+the ceiling unchanged, and moved full-application calibration into Sprint 3 as
+a close obligation recorded in `architecture.md`. Sprint closure now depends on
+a re-dispatched `2C.4` covering the current head and `2C.5`.
 
 ## Goal
 
@@ -101,8 +100,8 @@ must be updated whenever a log entry is appended.
 | 2C.3 | Activation envelope | Calibrate the existing whole-process gate against the production application and revise its ceiling only from recorded full-application evidence. | L, high risk | `worker-l` (closed: accepted with Sprint 3 obligation) | 2C.D1 complete | The gate measures the documented full-application quantity, fails closed on unavailable terms, passes its agreed benchmark, and does not alter model/chunk/encoding/backend contracts without separate approval. | Revert the R13 implementation and architecture amendment; retain the current R12 fail-closed gate. |
 | 2C.4 | Installed package evidence | Dispatch the root Windows workflow for the accepted 2C.1/2C.2 branch head and record actual MSI and NSIS silent-install, diagnostic, uninstall, cleanup, and pre-upload-gate outcomes. Rerun after any later R13 source change. | M | Main agent (complete) | 2C.2 complete | Both installed `meetily.exe --smoke-dbstat` runs pass; job summary records them; no smoke is skipped; CI URL and immutable addendum are recorded. | Revert only the diagnostic CI assertion if it prevents emergency packaging; semantic activation remains fail-closed without `dbstat`. |
 | 2C.R1 | Review remediation | Apply the Final Code Review (R15) findings across the packaged smoke workflow, the diagnostic, the migration regression, and the three normative documents. | M | Main agent (complete) | 2C.4 complete | Full Rust suite, rustfmt, diff check, workflow YAML and PowerShell parse all pass; no finding left unaddressed or undocumented. | Revert the R15 commit; the prior behaviour returns along with its eleven findings. |
-| 2C.6 | Activation observability | Surface the activation-refusal reason through the application log so a refused activation is distinguishable from a normal run. Read-only: no gate, ceiling, or measurement change. | S | Pending `worker-s` | 2C.R1 complete | A refused activation emits one warn-level log line naming scope, measured bytes and ceiling; an admitted activation emits none; a test covers both; no meeting text, token, or vector appears in the line. | Revert the logging call; the gate is unchanged either way. |
-| 2C.5 | Sprint closure | Run final verification, append fresh code and architecture reviews, record deferrals, and request user Sprint 2 close approval. | M | Main agent and reviewers (pending) | 2C.4 complete | Full Rust suite, `cargo check`, rustfmt, diff check, typecheck, Vitest, and 250k benchmark pass; both reviews approve; user approves close. | Do not close Sprint 2; preserve the accepted tasks and keep the remaining finding open. |
+| 2C.6 | Activation observability | Surface the activation-refusal reason through the application log so a refused activation is distinguishable from a normal run. Read-only: no gate, ceiling, or measurement change. | S | Main agent (complete) | 2C.R1 complete | A refused activation emits one warn-level log line naming scope, measured bytes and ceiling; an admitted activation emits none; a test covers both; no meeting text, token, or vector appears in the line. | Revert the logging call; the gate is unchanged either way. |
+| 2C.5 | Sprint closure | Run final verification, append fresh code and architecture reviews, record deferrals, and request user Sprint 2 close approval. | M | Main agent and reviewers (pending) | 2C.6 complete; 2C.4 re-dispatch complete | Full Rust suite, `cargo check`, rustfmt, diff check, typecheck, Vitest, and 250k benchmark pass; both reviews approve; user approves close. | Do not close Sprint 2; preserve the accepted tasks and keep the remaining finding open. |
 
 ## Dependency Order
 
@@ -435,6 +434,50 @@ already logs at `retrieval/index.rs:1622`; only the failure path is silent.
   `workflow_dispatch`.
 - `2C.6` is now dependency-ready and is the last implementation task before
   sprint close.
+
+### 2C.6 - Activation refusal observability
+
+**Status:** Complete
+**Owner:** Main agent, under user delegation
+**Completed:** 2026-08-28
+**Implemented:**
+- Added one `warn`-level line after an activation pass collects one or more
+  blockers. It reports the complete safe blocker set once, rather than one line
+  per rejected candidate.
+- Extended the measured RAM-gate integration test to assert the refusal payload
+  contains the scope, ceiling, and measured value, and that a later admitted
+  activation leaves no blockers.
+**Implementation:**
+- Files: `frontend/src-tauri/src/retrieval/index.rs`, this file.
+- Approach: log the existing `reported_blockers` collection immediately before
+  persisting it to `pending_blockers`; all coverage, model, RAM, and disk
+  blockers already enter this same collection.
+**Not implemented:**
+- No gate, ceiling, measurement, blocker string, Tauri command, status-API, or
+  UI change.
+**Why not implemented:**
+- This task makes the accepted fail-closed state observable only. Sprint 3 owns
+  the full-application calibration and refusal-rate obligation.
+**Verification:**
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib measured_ram_gate_blocks_activation_until_measurement_admits -- --nocapture`
+  - pass: 1 passed.
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib`
+  - pass: 584 passed, 2 ignored.
+- `cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check` and
+  `git diff --check`
+  - pass.
+- The exact RAM-refusal line at the approved ceiling is
+  `Semantic generation activation refused: generation gen-ram: measured whole-process RSS 1395864371 bytes meets or exceeds the 1395864371 byte activation ceiling`.
+- Existing blocker construction carries only generation/model IDs, counts,
+  revisions, measurements, and fixed gate text; no meeting text, token, or
+  vector enters `reported_blockers`. `pending_activation_blockers()` already
+  remains used by `index_status`; this task did not add a new consumer.
+**Rollback:**
+- Revert the logging call. Activation admission and refusal behavior remain
+  unchanged.
+**Decisions and follow-ups:**
+- Re-dispatch `2C.4` against the head containing this task before `2C.5`; the
+  root workflow is manually dispatched for this branch.
 
 ## Sprint Reviews
 

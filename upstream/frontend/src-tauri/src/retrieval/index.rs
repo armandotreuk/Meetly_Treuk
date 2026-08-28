@@ -1627,6 +1627,12 @@ async fn try_activate_shadow_generation(
         reported_blockers.clear();
         break;
     }
+    if !reported_blockers.is_empty() {
+        log::warn!(
+            "Semantic generation activation refused: {}",
+            reported_blockers.join("; ")
+        );
+    }
     service.set_pending_blockers(reported_blockers);
     Ok(())
 }
@@ -4300,10 +4306,9 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-        assert!(service
-            .pending_activation_blockers()
-            .iter()
-            .any(|blocker| blocker.contains("unavailable")));
+        let blockers = service.pending_activation_blockers();
+        assert_eq!(blockers.len(), 1);
+        assert!(blockers[0].contains("unavailable"));
 
         // At the approved ceiling: still blocked.
         let at_limit: RamProbe = Arc::new(|| Some(ACTIVATION_RAM_CEILING_BYTES));
@@ -4313,10 +4318,11 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-        assert!(service
-            .pending_activation_blockers()
-            .iter()
-            .any(|blocker| blocker.contains("activation ceiling")));
+        let blockers = service.pending_activation_blockers();
+        assert_eq!(blockers.len(), 1);
+        assert!(blockers[0].contains("activation ceiling"));
+        assert!(blockers[0].contains(ACTIVATION_RAM_SCOPE));
+        assert!(blockers[0].contains(&ACTIVATION_RAM_CEILING_BYTES.to_string()));
 
         // Below the ceiling: activation proceeds through pointer + memory swap.
         let below: RamProbe = Arc::new(|| Some(ACTIVATION_RAM_CEILING_BYTES - 1));
@@ -4328,6 +4334,7 @@ mod tests {
                 .unwrap(),
             Some("gen-ram".to_string())
         );
+        assert!(service.pending_activation_blockers().is_empty());
         let hits = search_all(&service, "gate").await.unwrap();
         assert!(hits.iter().any(|hit| hit.meeting_id == "ram"));
     }
