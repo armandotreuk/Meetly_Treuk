@@ -287,6 +287,7 @@ jobs:
           $installed = $false
           $installer = $null
           $installDir = Join-Path $env:RUNNER_TEMP "meetily-smoke-msi"
+          $resultPath = Join-Path $env:RUNNER_TEMP "meetily-smoke-msi-exit-code.txt"
           $bundleDir = Join-Path $env:GITHUB_WORKSPACE "$env:ARTIFACT_DIR\bundle\msi"
 
           try {
@@ -349,14 +350,17 @@ jobs:
             if (Test-Path -LiteralPath $installDir) {
               $exitCode = 1
             }
-            "exit_code=$exitCode" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            # Continued steps do not expose GITHUB_OUTPUT reliably; persist the
+            # diagnostic verdict for the final gate on this runner instead.
+            [System.IO.File]::WriteAllText($resultPath, [string]$exitCode)
+            Write-Host "MSI packaged smoke exit code: $exitCode"
             if ($exitCode -eq 0) {
               "- MSI packaged dbstat smoke: PASS" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
             } else {
               "- MSI packaged dbstat smoke: FAIL" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
             }
           }
-          # The final verdict gate reads this output and owns the job failure.
+          # The final verdict gate reads the persisted verdict and owns failure.
           exit 0
 
       - name: Install and run NSIS dbstat smoke
@@ -369,6 +373,7 @@ jobs:
           $installed = $false
           $installer = $null
           $installDir = Join-Path $env:RUNNER_TEMP "meetily-smoke-nsis"
+          $resultPath = Join-Path $env:RUNNER_TEMP "meetily-smoke-nsis-exit-code.txt"
           $bundleDir = Join-Path $env:GITHUB_WORKSPACE "$env:ARTIFACT_DIR\bundle\nsis"
 
           try {
@@ -425,14 +430,17 @@ jobs:
             if (Test-Path -LiteralPath $installDir) {
               $exitCode = 1
             }
-            "exit_code=$exitCode" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            # Continued steps do not expose GITHUB_OUTPUT reliably; persist the
+            # diagnostic verdict for the final gate on this runner instead.
+            [System.IO.File]::WriteAllText($resultPath, [string]$exitCode)
+            Write-Host "NSIS packaged smoke exit code: $exitCode"
             if ($exitCode -eq 0) {
               "- NSIS packaged dbstat smoke: PASS" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
             } else {
               "- NSIS packaged dbstat smoke: FAIL" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
             }
           }
-          # The final verdict gate reads this output and owns the job failure.
+          # The final verdict gate reads the persisted verdict and owns failure.
           exit 0
 
       - name: Fail if packaged dbstat smoke failed
@@ -442,9 +450,13 @@ jobs:
           # Skipped smokes mean an earlier step already failed the job; blaming
           # them here would bury the real cause. Only a smoke that actually ran
           # can fail this gate, and its exit code names why.
+          $msiResultPath = Join-Path $env:RUNNER_TEMP "meetily-smoke-msi-exit-code.txt"
+          $nsisResultPath = Join-Path $env:RUNNER_TEMP "meetily-smoke-nsis-exit-code.txt"
+          $msiExitCode = if (Test-Path -LiteralPath $msiResultPath) { (Get-Content -LiteralPath $msiResultPath -Raw).Trim() } else { "" }
+          $nsisExitCode = if (Test-Path -LiteralPath $nsisResultPath) { (Get-Content -LiteralPath $nsisResultPath -Raw).Trim() } else { "" }
           $checks = @(
-            @{ Name = "MSI"; Outcome = "${{ steps.smoke-msi.outcome }}"; ExitCode = "${{ steps.smoke-msi.outputs.exit_code }}" }
-            @{ Name = "NSIS"; Outcome = "${{ steps.smoke-nsis.outcome }}"; ExitCode = "${{ steps.smoke-nsis.outputs.exit_code }}" }
+            @{ Name = "MSI"; Outcome = "${{ steps.smoke-msi.outcome }}"; ExitCode = $msiExitCode }
+            @{ Name = "NSIS"; Outcome = "${{ steps.smoke-nsis.outcome }}"; ExitCode = $nsisExitCode }
           )
           $failures = @()
           foreach ($check in $checks) {
