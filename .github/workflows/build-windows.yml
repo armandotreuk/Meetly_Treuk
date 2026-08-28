@@ -356,7 +356,8 @@ jobs:
               "- MSI packaged dbstat smoke: FAIL" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
             }
           }
-          exit $exitCode
+          # The final verdict gate reads this output and owns the job failure.
+          exit 0
 
       - name: Install and run NSIS dbstat smoke
         id: smoke-nsis
@@ -431,7 +432,8 @@ jobs:
               "- NSIS packaged dbstat smoke: FAIL" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
             }
           }
-          exit $exitCode
+          # The final verdict gate reads this output and owns the job failure.
+          exit 0
 
       - name: Fail if packaged dbstat smoke failed
         if: always()
