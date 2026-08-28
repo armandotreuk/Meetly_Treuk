@@ -324,8 +324,8 @@ jobs:
               throw "installed executable was not found"
             }
             Write-Host "MSI packaged smoke: running installed executable"
-            $null = & $executables[0].FullName --smoke-dbstat 2>&1
-            $diagnosticExitCode = $LASTEXITCODE
+            $diagnosticProcess = Start-Process -FilePath $executables[0].FullName -ArgumentList "--smoke-dbstat" -Wait -PassThru
+            $diagnosticExitCode = $diagnosticProcess.ExitCode
             if ($diagnosticExitCode -ne 0) {
               # Carry the diagnostic's own code so the gate can name the cause;
               # the packaged binary is GUI-subsystem and prints to no console.
@@ -399,8 +399,8 @@ jobs:
               throw "installed executable was not found"
             }
             Write-Host "NSIS packaged smoke: running installed executable"
-            $null = & $executables[0].FullName --smoke-dbstat 2>&1
-            $diagnosticExitCode = $LASTEXITCODE
+            $diagnosticProcess = Start-Process -FilePath $executables[0].FullName -ArgumentList "--smoke-dbstat" -Wait -PassThru
+            $diagnosticExitCode = $diagnosticProcess.ExitCode
             if ($diagnosticExitCode -ne 0) {
               # Carry the diagnostic's own code so the gate can name the cause;
               # the packaged binary is GUI-subsystem and prints to no console.
