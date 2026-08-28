@@ -271,9 +271,9 @@ jobs:
         shell: bash
         run: |
           if [[ "${{ steps.build-profile.outputs.profile }}" == "debug" ]]; then
-            ARTIFACT_DIR="upstream/target/debug"
+            ARTIFACT_DIR="upstream/frontend/target/debug"
           else
-            ARTIFACT_DIR="upstream/target/release"
+            ARTIFACT_DIR="upstream/frontend/target/release"
           fi
           echo "ARTIFACT_DIR=$ARTIFACT_DIR" >> $GITHUB_ENV
 
