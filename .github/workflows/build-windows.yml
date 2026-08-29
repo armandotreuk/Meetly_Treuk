@@ -609,6 +609,16 @@ jobs:
           cargo fetch
           node frontend/scripts/restore-whisper-bindings.mjs
 
+      - name: Build llama-helper sidecar for workspace check
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: target
+        run: |
+          cd upstream
+          cargo build -p llama-helper
+          mkdir -p frontend/src-tauri/binaries
+          cp target/debug/llama-helper.exe frontend/src-tauri/binaries/llama-helper-x86_64-pc-windows-msvc.exe
+
       - name: Cargo check workspace
         id: cargo-check
         shell: bash
