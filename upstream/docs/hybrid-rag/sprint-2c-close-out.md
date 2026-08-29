@@ -10,8 +10,8 @@ full-application calibration into Sprint 3 as a close obligation recorded in
 `architecture.md`. Run `43` establishes package evidence, but its Cargo Check
 result was not persisted for the final gate. Current-head `2C.4` evidence is
 complete through run `45`, including the correctly gated Cargo Check. Fresh
-code review approves; Sprint closure now depends on fresh architecture approval
-and user Sprint-close approval through `2C.5`.
+code and architecture reviews approve; Sprint closure now depends only on user
+Sprint-close approval through `2C.5`.
 
 ## Goal
 
@@ -109,7 +109,7 @@ must be updated whenever a log entry is appended.
 | 2C.R3 | Review remediation | Correct normative activation-observability text and capture warn emission in the refusal/admission regression. | S | Main agent (complete) | Final Code Review R11 | Architecture matches the status/log path; the test observes one exact RAM refusal line and no admitted line. | Revert the documentation correction and test logger; production activation behavior is unchanged. |
 | 2C.R4 | CI evidence remediation | Persist a nonzero Cargo Check result despite GitHub Bash's default `errexit`, then fail the job through the existing final gate. | S | Main agent (complete) | Closure Architecture Review | A failed workspace check writes its output and exit code; the final gate fails rather than skips. | Revert the `errexit` guard; Cargo Check may again report false green. |
 | 2C.R5 | Workspace-check sidecar staging | Build and stage the Tauri-required `llama-helper` sidecar before workspace Cargo Check. | S | Main agent (complete) | 2C.R4 evidence | The Cargo Check job reaches the workspace check with the target-qualified helper present and remains fail-closed on a helper-build failure. | Revert the staging step; Cargo Check again fails before Rust analysis begins. |
-| 2C.5 | Sprint closure | Run final verification, append fresh code and architecture reviews, record deferrals, and request user Sprint 2 close approval. | M | Main agent and reviewers (pending) | 2C.R2/R3/R4/R5 complete; 2C.4 re-dispatch complete; fresh code review approves; fresh architecture review approves | Full Rust suite, `cargo check`, rustfmt, diff check, typecheck, Vitest, and 250k benchmark pass; both reviews approve; user approves close. | Do not close Sprint 2; preserve the accepted tasks and keep the remaining finding open. |
+| 2C.5 | Sprint closure | Run final verification, append fresh code and architecture reviews, record deferrals, and request user Sprint 2 close approval. | M | Main agent (pending user approval) | 2C.R2/R3/R4/R5 complete; 2C.4 re-dispatch complete; fresh code and architecture reviews approve | Full Rust suite, `cargo check`, rustfmt, diff check, typecheck, Vitest, and 250k benchmark pass; both reviews approve; user approves close. | Do not close Sprint 2; preserve the accepted tasks and keep the remaining finding open. |
 
 ## Dependency Order
 
@@ -860,3 +860,28 @@ passed the helper stage, workspace Cargo Check, and output upload, with the
 final Cargo Check failure step skipped only on exit `0`. YAML lint and targeted
 diff validation passed. The subsequent run-45 package job also passed, as
 recorded in the current-head evidence addendum above.
+
+### Final Architecture Review (R14)
+
+**Reviewer:** `openai/gpt-5.6-sol`, 2026-08-29
+**Scope:** `25f64c0..2d6f8a4` - final Cargo Check remediations and complete
+Sprint 2C closure record.
+**Verdict:** Approve.
+
+**Findings:** None. The remediation is confined to the active root Windows
+workflow and its close-out record. R13 remains accepted with its Sprint 3
+calibration obligation, and the fixed whole-process ceiling, fail-closed gate,
+approved backend, model, chunking, and vector-encoding contracts are unchanged.
+The workspace check retains all packages, stages Tauri's required helper, and
+persists nonzero results for its authoritative final gate.
+
+**Verification:** Run `45` accurately covers tested workflow head
+`d02f4c834ddf2c0511ef683af51a35ee7325dab7`: Cargo Check passed helper staging,
+the workspace check, and output upload; its failure step skipped only at exit
+`0`. The package job passed both installed smokes, the final gate, and all
+three uploads. Documentation-only head `2d6f8a4` introduces no untested
+workflow or product delta.
+
+**Residual evidence note:** Raw Actions logs require authenticated access;
+immutable run/job/step results and artifact metadata remain retained and match
+the recorded evidence. No architecture or product-contract gap remains.
