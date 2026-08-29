@@ -2,7 +2,7 @@
 
 ## Status
 
-Unblocked by decision, 2026-08-28. Tasks `2C.1`, `2C.2`, `2C.R1`, `2C.6`,
+Closed with user approval, 2026-08-29. Tasks `2C.1`, `2C.2`, `2C.R1`, `2C.6`,
 `2C.R2`, `2C.R3`, `2C.R4`, and `2C.R5` are complete. `2C.3` is **closed as
 accepted-with-obligation**, not delivered: the user accepted the existing
 whole-process gate for Sprint 2 with the ceiling unchanged, and moved
@@ -10,8 +10,8 @@ full-application calibration into Sprint 3 as a close obligation recorded in
 `architecture.md`. Run `43` establishes package evidence, but its Cargo Check
 result was not persisted for the final gate. Current-head `2C.4` evidence is
 complete through run `45`, including the correctly gated Cargo Check. Fresh
-code and architecture reviews approve; Sprint closure now depends only on user
-Sprint-close approval through `2C.5`.
+code and architecture reviews approve, and the user approved Sprint closure
+through `2C.5`.
 
 ## Goal
 
@@ -109,7 +109,7 @@ must be updated whenever a log entry is appended.
 | 2C.R3 | Review remediation | Correct normative activation-observability text and capture warn emission in the refusal/admission regression. | S | Main agent (complete) | Final Code Review R11 | Architecture matches the status/log path; the test observes one exact RAM refusal line and no admitted line. | Revert the documentation correction and test logger; production activation behavior is unchanged. |
 | 2C.R4 | CI evidence remediation | Persist a nonzero Cargo Check result despite GitHub Bash's default `errexit`, then fail the job through the existing final gate. | S | Main agent (complete) | Closure Architecture Review | A failed workspace check writes its output and exit code; the final gate fails rather than skips. | Revert the `errexit` guard; Cargo Check may again report false green. |
 | 2C.R5 | Workspace-check sidecar staging | Build and stage the Tauri-required `llama-helper` sidecar before workspace Cargo Check. | S | Main agent (complete) | 2C.R4 evidence | The Cargo Check job reaches the workspace check with the target-qualified helper present and remains fail-closed on a helper-build failure. | Revert the staging step; Cargo Check again fails before Rust analysis begins. |
-| 2C.5 | Sprint closure | Run final verification, append fresh code and architecture reviews, record deferrals, and request user Sprint 2 close approval. | M | Main agent (pending user approval) | 2C.R2/R3/R4/R5 complete; 2C.4 re-dispatch complete; fresh code and architecture reviews approve | Full Rust suite, `cargo check`, rustfmt, diff check, typecheck, Vitest, and 250k benchmark pass; both reviews approve; user approves close. | Do not close Sprint 2; preserve the accepted tasks and keep the remaining finding open. |
+| 2C.5 | Sprint closure | Run final verification, append fresh code and architecture reviews, record deferrals, and request user Sprint 2 close approval. | M | Main agent (complete; user approved) | 2C.R2/R3/R4/R5 complete; 2C.4 re-dispatch complete; fresh code and architecture reviews approve | Full Rust suite, `cargo check`, rustfmt, diff check, typecheck, Vitest, and 250k benchmark pass; both reviews approve; user approved close. | Reopen only for a new post-close defect; preserve the accepted R13 Sprint 3 obligation. |
 
 ## Dependency Order
 
@@ -700,6 +700,41 @@ already logs at `retrieval/index.rs:1622`; only the failure path is silent.
 **Decisions and follow-ups:**
 - `2C.4` is no longer a Sprint closure dependency. Fresh architecture approval
   and user Sprint-close approval remain required by `2C.5`.
+
+### 2C.5 - Sprint closure
+
+**Status:** Complete
+**Owner:** Main agent, under user delegation
+**Completed:** 2026-08-29
+**Implemented:**
+- Recorded the completed verification, current-head package evidence, fresh
+  code and architecture approvals, and explicit user Sprint-close approval.
+**Implementation:**
+- Files: this file.
+- Approach: close only after all task acceptance checks, run-45 evidence, and
+  independent reviews were recorded; do not reinterpret the accepted R13
+  obligation as delivered calibration.
+**Not implemented:**
+- No R13 calibration, activation-gate or ceiling change, model, chunking,
+  vector, backend, package, schema, or product-source change.
+**Why not implemented:**
+- Sprint 2 closure accepts the existing fail-closed envelope contract and
+  carries full-application calibration into Sprint 3 rather than changing it
+  without new authority.
+**Verification:**
+- Run `45` passed both Windows package and Cargo Check jobs, including installed
+  MSI/NSIS `--smoke-dbstat` diagnostics, final gates, and uploads.
+- Full Rust suite, local workspace Cargo Check, rustfmt, YAML lint, targeted
+  diff check, frontend typecheck, Vitest, and the 250k benchmark passed as
+  recorded in this close-out record.
+- Final code review R13 and architecture review R14 approved with no findings.
+- User explicitly approved Sprint 2 closure on 2026-08-29.
+**Rollback:**
+- Reopen only for a new post-close defect. Retain the accepted R13 Sprint 3
+  calibration/refusal-rate close obligation.
+**Decisions and follow-ups:**
+- Sprint 2 is closed. Sprint 3 remains responsible for full-application R13
+  calibration and refusal-rate evidence.
 
 ## Sprint Reviews
 
