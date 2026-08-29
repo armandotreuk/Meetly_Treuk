@@ -1,17 +1,406 @@
-//! DOCX export (placeholder).
+//! DOCX export for meeting summaries (F3).
 //!
-//! F2 currently ships PDF export only. The DOCX module is reserved
-//! for a future iteration so the export menu has a stable shape and
-//! `mod.rs` can expose both entry points without churn.
+//! Renders the same `MeetingExportData` / `SectionContent` input that
+//! `pdf.rs` consumes (see [`crate::export::commands`] for how it's
+//! assembled), but targets a real Word document via the `docx-rs`
+//! crate instead of manually laying out PDF pages.
 //!
-//! The intent is to render the same `MeetingExportData` consumed by
-//! `pdf.rs` using the `docx-rs` crate, reusing the template-driven
-//! section layout (title, metadata, sections, action-item table).
+//! Word/LibreOffice handle pagination, text wrapping, and paragraph
+//! justification natively, so this renderer only needs to describe
+//! structure (headings, paragraphs, bullet lists, tables) — none of
+//! `pdf.rs`'s manual cursor/page-break/font-metrics machinery applies
+//! here.
+//!
+//! Section content that looks like a markdown pipe table or a
+//! `- [ ] task [[Owner]] Due: date` checkbox list is rendered as a
+//! real Word table, matching `pdf.rs`'s table rendering; the checkbox
+//! detection and Task/Owner/Due extraction is shared with `pdf.rs`
+//! (`looks_like_checkbox_list` / `checkbox_list_to_pipe_table`) so the
+//! two exports agree on what counts as an action-item list.
 
-use super::pdf::MeetingExportData;
+use docx_rs::{
+    AbstractNumbering, Docx, IndentLevel, Level, LevelJc, LevelText, NumberFormat, Numbering,
+    NumberingId, Paragraph, Run, SpecialIndentType, Start, Table, TableCell, TableRow, WidthType,
+};
+use std::io::Cursor;
 
-/// Render the meeting data as a DOCX file. Currently unimplemented;
-/// the function is kept to make the export surface stable.
-pub fn export_meeting_to_docx(_data: &MeetingExportData) -> Result<Vec<u8>, String> {
-    Err("DOCX export is not implemented yet. Please use the PDF export option.".to_string())
+use super::pdf::{
+    checkbox_list_to_pipe_table, format_date_human, looks_like_checkbox_list, MeetingExportData,
+    SectionContent,
+};
+
+// `docx-rs` always injects its own default numbering at abstract/numbering
+// ID 1 (a 9-level decimal list, see `docx_core::documents::numberings`'s
+// `create_default_numbering`) regardless of whether numbering is
+// requested. Reusing ID 1 here silently shadows our bullet definition
+// with that default, so every "bullet" item renders as "1. 2. 3.". Any
+// ID other than 1 avoids the collision.
+const BULLET_ABSTRACT_NUM_ID: usize = 100;
+const BULLET_NUMBERING_ID: usize = 100;
+
+const TITLE_SIZE_HALF_PT: usize = 36; // 18pt, matches pdf.rs::TITLE_SIZE_PT
+const META_SIZE_HALF_PT: usize = 20; // 10pt
+const SECTION_HEADING_SIZE_HALF_PT: usize = 26; // 13pt
+const BODY_SIZE_HALF_PT: usize = 21; // 10.5pt
+
+/// Approximate printable width for an A4 page with 20mm margins (matches
+/// `pdf.rs::CONTENT_WIDTH_MM`), in twentieths of a point (dxa).
+const CONTENT_WIDTH_DXA: usize = 9638;
+
+/// Render the supplied meeting data as a DOCX file and return the bytes.
+///
+/// Like `export_meeting_to_pdf`, this does not touch the filesystem;
+/// callers write the bytes to disk (see `commands::save_meeting_docx`).
+pub fn export_meeting_to_docx(data: &MeetingExportData) -> Result<Vec<u8>, String> {
+    let docx = Docx::new()
+        .add_abstract_numbering(bullet_abstract_numbering())
+        .add_numbering(Numbering::new(BULLET_NUMBERING_ID, BULLET_ABSTRACT_NUM_ID));
+
+    let docx = render_header(docx, data);
+    let docx = render_metadata(docx, data);
+    let docx = render_sections(docx, data);
+
+    let mut bytes = Vec::new();
+    {
+        let mut cursor = Cursor::new(&mut bytes);
+        docx.pack(&mut cursor)
+            .map_err(|e| format!("Failed to serialize DOCX: {}", e))?;
+    }
+    Ok(bytes)
+}
+
+// ---------- Numbering (bullet lists) ----------
+
+fn bullet_abstract_numbering() -> AbstractNumbering {
+    AbstractNumbering::new(BULLET_ABSTRACT_NUM_ID).add_level(
+        Level::new(
+            0,
+            Start::new(1),
+            NumberFormat::new("bullet"),
+            LevelText::new("•"),
+            LevelJc::new("left"),
+        )
+        .indent(Some(720), Some(SpecialIndentType::Hanging(360)), None, None),
+    )
+}
+
+fn bullet_paragraph(text: &str) -> Paragraph {
+    Paragraph::new()
+        .add_run(Run::new().add_text(text).size(BODY_SIZE_HALF_PT))
+        .numbering(NumberingId::new(BULLET_NUMBERING_ID), IndentLevel::new(0))
+}
+
+fn body_paragraph(text: &str) -> Paragraph {
+    Paragraph::new().add_run(Run::new().add_text(text).size(BODY_SIZE_HALF_PT))
+}
+
+// ---------- Header / metadata / sections ----------
+
+fn render_header(docx: Docx, data: &MeetingExportData) -> Docx {
+    let title = if data.meeting_title.is_empty() {
+        "Untitled meeting"
+    } else {
+        &data.meeting_title
+    };
+    let docx = docx.add_paragraph(
+        Paragraph::new().add_run(Run::new().add_text(title).bold().size(TITLE_SIZE_HALF_PT)),
+    );
+    docx.add_paragraph(
+        Paragraph::new().add_run(
+            Run::new()
+                .add_text(format!(
+                    "Generated by Personal Meetly • Template: {}",
+                    data.template_name
+                ))
+                .size(META_SIZE_HALF_PT),
+        ),
+    )
+}
+
+fn render_metadata(mut docx: Docx, data: &MeetingExportData) -> Docx {
+    let mut lines = vec![
+        format!("Meeting ID: {}", data.meeting_id),
+        format!("Date: {}", format_date_human(&data.created_at)),
+    ];
+    if let Some(duration) = data.duration.as_deref().filter(|d| !d.is_empty()) {
+        lines.push(format!("Duration: {duration}"));
+    }
+    if let Some(attendees) = data
+        .attendees
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+    {
+        lines.push(format!("Attendees: {attendees}"));
+    }
+    for line in lines {
+        docx = docx.add_paragraph(
+            Paragraph::new().add_run(Run::new().add_text(line).size(META_SIZE_HALF_PT)),
+        );
+    }
+    docx
+}
+
+fn render_sections(mut docx: Docx, data: &MeetingExportData) -> Docx {
+    for section in &data.sections {
+        docx = docx.add_paragraph(
+            Paragraph::new().add_run(
+                Run::new()
+                    .add_text(section.title.clone())
+                    .bold()
+                    .size(SECTION_HEADING_SIZE_HALF_PT),
+            ),
+        );
+        docx = render_section_body(docx, section);
+    }
+    docx
+}
+
+fn render_section_body(docx: Docx, section: &SectionContent) -> Docx {
+    match section.format.as_str() {
+        "list" => render_list(docx, &section.content),
+        // "string" and any unknown future format fall back to plain
+        // paragraphs, same default pdf.rs uses.
+        _ => render_paragraphs(docx, &section.content),
+    }
+}
+
+fn render_paragraphs(mut docx: Docx, content: &str) -> Docx {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return docx.add_paragraph(body_paragraph("(no content)"));
+    }
+    for paragraph in trimmed.lines().map(str::trim).filter(|p| !p.is_empty()) {
+        docx = docx.add_paragraph(body_paragraph(paragraph));
+    }
+    docx
+}
+
+fn render_list(mut docx: Docx, content: &str) -> Docx {
+    let lines: Vec<&str> = content
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return docx.add_paragraph(body_paragraph("(no content)"));
+    }
+
+    let any_pipe = lines.iter().any(|l| l.starts_with('|'));
+    if any_pipe {
+        if let Some(table) = parse_pipe_table(content) {
+            return docx.add_table(render_docx_table(table));
+        }
+    } else if looks_like_checkbox_list(content) {
+        let synthesized = checkbox_list_to_pipe_table(content);
+        if let Some(table) = parse_pipe_table(&synthesized) {
+            return docx.add_table(render_docx_table(table));
+        }
+    }
+
+    for line in lines {
+        let text = line.trim_start_matches(['-', '•', '*']).trim();
+        docx = docx.add_paragraph(bullet_paragraph(text));
+    }
+    docx
+}
+
+// ---------- Pipe-table parsing + rendering ----------
+
+struct PipeTable {
+    header: Vec<String>,
+    rows: Vec<Vec<String>>,
+}
+
+/// Parse markdown pipe-table lines (`| a | b |`) into a header + data
+/// rows. Mirrors `pdf.rs::render_table_grid`'s header-detection rule:
+/// a separator line (`|---|---|`) after at least one row marks that
+/// preceding row as an explicit header; otherwise synthetic `Col N`
+/// headers are used. Returns `None` when the content isn't a
+/// well-formed table (fewer than 2 columns, or a ragged row count),
+/// so the caller can fall back to a plain bullet list.
+fn parse_pipe_table(content: &str) -> Option<PipeTable> {
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut has_explicit_header = false;
+    for line in content.lines() {
+        let line = line.trim();
+        if !line.starts_with('|') || !line.ends_with('|') {
+            continue;
+        }
+        let inner = &line[1..line.len() - 1];
+        let cells: Vec<&str> = inner.split('|').collect();
+        let is_separator = !cells.is_empty()
+            && cells
+                .iter()
+                .all(|c| !c.trim().is_empty() && c.trim().chars().all(|ch| ch == '-' || ch == ':'));
+        if is_separator {
+            if !rows.is_empty() {
+                has_explicit_header = true;
+            }
+            continue;
+        }
+        rows.push(
+            cells
+                .iter()
+                .map(|c| c.trim().trim_matches('*').trim().to_string())
+                .collect(),
+        );
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    let num_cols = rows[0].len();
+    if num_cols < 2 || rows.iter().any(|r| r.len() != num_cols) {
+        return None;
+    }
+    let header = if has_explicit_header {
+        rows.remove(0)
+    } else {
+        (1..=num_cols).map(|i| format!("Col {i}")).collect()
+    };
+    Some(PipeTable { header, rows })
+}
+
+fn render_docx_table(table: PipeTable) -> Table {
+    let num_cols = table.header.len().max(1);
+    let col_width = CONTENT_WIDTH_DXA / num_cols;
+
+    let header_row = TableRow::new(
+        table
+            .header
+            .into_iter()
+            .map(|cell| {
+                TableCell::new()
+                    .width(col_width, WidthType::Dxa)
+                    .add_paragraph(
+                        Paragraph::new()
+                            .add_run(Run::new().add_text(cell).bold().size(BODY_SIZE_HALF_PT)),
+                    )
+            })
+            .collect(),
+    );
+
+    let mut rows = vec![header_row];
+    rows.extend(table.rows.into_iter().map(|row| {
+        TableRow::new(
+            row.into_iter()
+                .map(|cell| {
+                    TableCell::new()
+                        .width(col_width, WidthType::Dxa)
+                        .add_paragraph(
+                            Paragraph::new()
+                                .add_run(Run::new().add_text(cell).size(BODY_SIZE_HALF_PT)),
+                        )
+                })
+                .collect(),
+        )
+    }));
+
+    Table::new(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression lock: `docx-rs` always injects its own default
+    /// numbering at abstract/numbering ID 1 (see the comment on
+    /// `BULLET_ABSTRACT_NUM_ID`). Reusing ID 1 silently shadows our
+    /// bullet definition, and every "bullet" list renders as "1. 2. 3."
+    /// instead — a bug caught only by rendering a real DOCX and opening
+    /// it (LibreOffice headless conversion), not by any type or unit
+    /// check, since both IDs are structurally valid `usize`s.
+    #[test]
+    fn bullet_numbering_ids_do_not_collide_with_docx_rs_default() {
+        assert_ne!(BULLET_ABSTRACT_NUM_ID, 1);
+        assert_ne!(BULLET_NUMBERING_ID, 1);
+    }
+
+    fn sample_data(sections: Vec<SectionContent>) -> MeetingExportData {
+        MeetingExportData {
+            meeting_id: "m-1".into(),
+            meeting_title: "Weekly Planning".into(),
+            created_at: "2026-06-29T14:00:00Z".into(),
+            duration: Some("00:42:13".into()),
+            attendees: Some("Ana, Bruno".into()),
+            template_name: "Standard".into(),
+            sections,
+        }
+    }
+
+    #[test]
+    fn export_produces_a_nonempty_zip_package() {
+        let data = sample_data(vec![
+            SectionContent {
+                title: "Summary".into(),
+                format: "paragraph".into(),
+                content: "Discussed the roadmap.\nAgreed on next steps.".into(),
+                item_format: None,
+            },
+            SectionContent {
+                title: "Action Items".into(),
+                format: "list".into(),
+                content: "- [ ] Ship export [[Ana]] Due: 2026-07-01\n- [x] Draft doc [[Bruno]]"
+                    .into(),
+                item_format: None,
+            },
+        ]);
+
+        let bytes = export_meeting_to_docx(&data).expect("docx export succeeds");
+        // A DOCX file is a zip package; every zip starts with the local
+        // file header signature `PK\x03\x04`.
+        assert!(bytes.len() > 100);
+        assert_eq!(&bytes[0..4], b"PK\x03\x04");
+    }
+
+    #[test]
+    fn empty_sections_do_not_panic() {
+        let data = sample_data(vec![SectionContent {
+            title: "Summary".into(),
+            format: "paragraph".into(),
+            content: "".into(),
+            item_format: None,
+        }]);
+        let bytes = export_meeting_to_docx(&data).expect("docx export succeeds");
+        assert_eq!(&bytes[0..4], b"PK\x03\x04");
+    }
+
+    #[test]
+    fn parse_pipe_table_detects_explicit_header() {
+        let content = "| Task | Owner |\n| --- | --- |\n| Ship it | Ana |";
+        let table = parse_pipe_table(content).expect("parses as a table");
+        assert_eq!(table.header, vec!["Task", "Owner"]);
+        assert_eq!(
+            table.rows,
+            vec![vec!["Ship it".to_string(), "Ana".to_string()]]
+        );
+    }
+
+    #[test]
+    fn parse_pipe_table_synthesizes_header_without_separator() {
+        let content = "| Ship it | Ana |\n| Draft doc | Bruno |";
+        let table = parse_pipe_table(content).expect("parses as a table");
+        assert_eq!(table.header, vec!["Col 1", "Col 2"]);
+        assert_eq!(table.rows.len(), 2);
+    }
+
+    #[test]
+    fn parse_pipe_table_rejects_ragged_rows() {
+        let content = "| a | b |\n| --- | --- |\n| c |";
+        assert!(parse_pipe_table(content).is_none());
+    }
+
+    #[test]
+    fn checkbox_list_becomes_a_table_not_bullets() {
+        let data = sample_data(vec![SectionContent {
+            title: "Action Items".into(),
+            format: "list".into(),
+            content: "- [ ] Ship export [[Ana]] Due: 2026-07-01\n- [ ] Draft doc [[Bruno]] Due: 2026-07-05".into(),
+            item_format: None,
+        }]);
+        // Just confirms the checkbox → table path renders without error;
+        // the extraction itself is covered by pdf.rs's own tests.
+        let bytes = export_meeting_to_docx(&data).expect("docx export succeeds");
+        assert_eq!(&bytes[0..4], b"PK\x03\x04");
+    }
 }

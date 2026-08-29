@@ -45,12 +45,20 @@ interface ExportPdfResponse {
     page_count: number;
 }
 
+interface ExportDocxResponse {
+    bytes: number[];
+    suggested_filename: string;
+}
+
+interface ExportMarkdownResponse {
+    content: string;
+    suggested_filename: string;
+}
+
+type ExportFormat = "pdf" | "docx" | "markdown";
+
 /**
- * Export menu for the meeting summary.
- *
- * Currently offers a single "Export as PDF" entry, but the dropdown
- * is in place to grow into DOCX, Markdown, etc. without further UI
- * changes.
+ * Export menu for the meeting summary. Offers PDF, DOCX, and Markdown.
  */
 export function ExportMenu({
     meetingId,
@@ -67,53 +75,72 @@ export function ExportMenu({
 
     const templateSource = availableTemplates?.find((t) => t.id === templateId)?.source;
 
-    const handleExportPdf = useCallback(async () => {
-        if (isExporting) return;
-        // ponytail: trust-boundary guard. The trigger is `disabled` when
-        // `exportDisabled` is true (no active row), but the dropdown menu
-        // item can still be activated via keyboard or a stale DOM event.
-        // Refuse loudly rather than pass an empty template id to the backend
-        // (which would either throw or, worse, export the wrong row).
-        if (!templateId) {
-            logger.warn("Skipping PDF export: no active template selected");
-            toast.error("Select a template before exporting");
-            return;
-        }
-        setIsExporting(true);
-        try {
-            Analytics.trackButtonClick("export_pdf", "meeting_details");
-
-            const response = await invoke<ExportPdfResponse>("export_meeting_pdf", {
-                request: buildExportPdfRequest(meetingId, templateId, templateSource),
-            });
-
-            // The backend returns the PDF as a `Vec<u8>` which Tauri's IPC
-            // serialises to a JS `number[]`. Reassemble it into a Uint8Array
-            // for the save call.
-            const bytes = new Uint8Array(response.bytes);
-
-            const savedPath = await invoke<string | null>("save_meeting_pdf", {
-                bytes: Array.from(bytes),
-                suggestedFilename: response.suggested_filename,
-            });
-
-            if (savedPath) {
-                toast.success("PDF exported", {
-                    description: savedPath,
-                });
-            } else {
-                // User cancelled the dialog – stay silent.
+    const handleExport = useCallback(
+        async (format: ExportFormat) => {
+            if (isExporting) return;
+            // ponytail: trust-boundary guard. The trigger is `disabled` when
+            // `exportDisabled` is true (no active row), but the dropdown menu
+            // item can still be activated via keyboard or a stale DOM event.
+            // Refuse loudly rather than pass an empty template id to the backend
+            // (which would either throw or, worse, export the wrong row).
+            if (!templateId) {
+                logger.warn(`Skipping ${format} export: no active template selected`);
+                toast.error("Select a template before exporting");
+                return;
             }
-        } catch (err) {
-            const message = err instanceof Error ? err.message : String(err);
-            toast.error("Failed to export PDF", {
-                description: message,
-            });
-            logger.error("PDF export failed:", err);
-        } finally {
-            setIsExporting(false);
-        }
-    }, [meetingId, templateId, templateSource, isExporting]);
+            setIsExporting(true);
+            try {
+                const request = buildExportPdfRequest(meetingId, templateId, templateSource);
+                let savedPath: string | null;
+                let label: string;
+
+                if (format === "pdf") {
+                    Analytics.trackButtonClick("export_pdf", "meeting_details");
+                    const response = await invoke<ExportPdfResponse>("export_meeting_pdf", { request });
+                    savedPath = await invoke<string | null>("save_meeting_pdf", {
+                        bytes: response.bytes,
+                        suggestedFilename: response.suggested_filename,
+                    });
+                    label = "PDF";
+                } else if (format === "docx") {
+                    Analytics.trackButtonClick("export_docx", "meeting_details");
+                    const response = await invoke<ExportDocxResponse>("export_meeting_docx", { request });
+                    savedPath = await invoke<string | null>("save_meeting_docx", {
+                        bytes: response.bytes,
+                        suggestedFilename: response.suggested_filename,
+                    });
+                    label = "DOCX";
+                } else {
+                    Analytics.trackButtonClick("export_markdown", "meeting_details");
+                    const response = await invoke<ExportMarkdownResponse>("export_meeting_markdown", {
+                        request,
+                    });
+                    savedPath = await invoke<string | null>("save_meeting_markdown", {
+                        content: response.content,
+                        suggestedFilename: response.suggested_filename,
+                    });
+                    label = "Markdown";
+                }
+
+                if (savedPath) {
+                    toast.success(`${label} exported`, {
+                        description: savedPath,
+                    });
+                } else {
+                    // User cancelled the dialog – stay silent.
+                }
+            } catch (err) {
+                const message = err instanceof Error ? err.message : String(err);
+                toast.error(`Failed to export ${format.toUpperCase()}`, {
+                    description: message,
+                });
+                logger.error(`${format} export failed:`, err);
+            } finally {
+                setIsExporting(false);
+            }
+        },
+        [meetingId, templateId, templateSource, isExporting]
+    );
 
     return (
         <DropdownMenu>
@@ -150,16 +177,32 @@ export function ExportMenu({
                 <DropdownMenuItem
                     onSelect={(event) => {
                         event.preventDefault();
-                        void handleExportPdf();
+                        void handleExport("pdf");
                     }}
                     disabled={isExporting}
                 >
                     <FileDown className="mr-2 h-4 w-4" />
                     <span>Export as PDF</span>
                 </DropdownMenuItem>
-                <DropdownMenuItem disabled>
-                    <span className="mr-2 h-4 w-4 inline-block text-center text-gray-400">↻</span>
-                    <span className="text-gray-400">Export as DOCX (coming soon)</span>
+                <DropdownMenuItem
+                    onSelect={(event) => {
+                        event.preventDefault();
+                        void handleExport("docx");
+                    }}
+                    disabled={isExporting}
+                >
+                    <FileDown className="mr-2 h-4 w-4" />
+                    <span>Export as DOCX</span>
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                    onSelect={(event) => {
+                        event.preventDefault();
+                        void handleExport("markdown");
+                    }}
+                    disabled={isExporting}
+                >
+                    <FileDown className="mr-2 h-4 w-4" />
+                    <span>Export as Markdown</span>
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 {meetingTitle ? (

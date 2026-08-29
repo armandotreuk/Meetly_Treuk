@@ -58,12 +58,13 @@ _Goal: the productivity features most users actually want from Pro._
   - [x] Template-driven layout: title, metadata, sections, lists, and action-item tables
   - [x] `ExportMenu.tsx` with save dialog
   - [x] PT-BR/Unicode font coverage and export tests
-- [ ] **1.3 F3 — DOCX export**
-  - [ ] Add `docx-rs` to `Cargo.toml`
-  - [ ] `frontend/src-tauri/src/export/docx.rs`
-  - [ ] Map template `format` types → Word elements (Paragraph / BulletList / Table)
-  - [ ] Extend `ExportMenu.tsx` with "Export DOCX"
-  - [ ] Verify: opens cleanly in Word + LibreOffice
+- [x] **1.3 F3 — DOCX export**
+  - [x] Add `docx-rs` to `Cargo.toml`
+  - [x] `frontend/src-tauri/src/export/docx.rs`
+  - [x] Map template `format` types → Word elements (Paragraph / BulletList / Table); checkbox action-item lists and markdown pipe tables render as real Word tables (shares detection with `pdf.rs`'s `looks_like_checkbox_list`/`checkbox_list_to_pipe_table`)
+  - [x] Extend `ExportMenu.tsx` with "Export DOCX"
+  - [x] Verify: opens cleanly in Word + LibreOffice (headless `soffice --convert-to pdf` round-trip on a sample with PT-BR diacritics, paragraphs, bullets, a checkbox action-item list, and a pipe table — confirmed correct rendering; caught and fixed a bullet-numbering-ID collision with `docx-rs`'s built-in default numbering, which silently turned bullets into "1. 2. 3." lists)
+  - [x] Bonus, not originally scoped here: Markdown export (`frontend/src-tauri/src/export/markdown.rs`, `export_meeting_markdown`/`save_meeting_markdown` commands, "Export as Markdown" in `ExportMenu.tsx`) — brought forward from Sprint 6.6 since the summary content is already GFM markdown and the command plumbing is shared with DOCX via a new `build_meeting_export_data` helper in `commands.rs`
 - [ ] **1.4 F4 — Call detection, start prompt, and auto-stop** — delivery sequenced in Phase 5.5
   - [ ] `frontend/src-tauri/src/audio/detector.rs` — window-title polling (`EnumWindows` on Windows) + audio-session state cross-check
   - [ ] Platform signatures in `config.rs` (Zoom, Teams, Meet, Webex, Discord)
@@ -71,7 +72,7 @@ _Goal: the productivity features most users actually want from Pro._
   - [ ] `frontend/src/components/settings/AutoDetectSettings.tsx` — per-platform toggles
   - [ ] **Privacy safeguard:** one-click start by default; auto-start requires explicit opt-in + persistent notification
 
-**Phase 1 exit criteria:** user can author templates, export to PDF + DOCX, and have calls detected with the configured privacy-first start/stop workflow.
+**Phase 1 exit criteria:** user can author templates, export to PDF + DOCX ✅, and have calls detected with the configured privacy-first start/stop workflow.
 
 ---
 
@@ -191,7 +192,7 @@ This is the canonical gap list for features that fit Meetily's local-first direc
 | Note/summary claim → transcript provenance | Partial: chat citations exist; notes and summaries have no source links | Sprint 6.4 |
 | Copy/delete individual transcript chunks and refresh dependent search | Missing | Sprint 6.4 |
 | Meeting playbooks combining agenda, output template, and prompts | Partial: custom summary templates exist; pre-meeting note scaffolds/recipes do not | Sprint 6.5 |
-| Complete meeting export | Partial: PDF summary ships; manual notes are excluded and DOCX is a placeholder | Sprint 6.6 + F3 |
+| Complete meeting export | Partial: PDF, DOCX, and Markdown summary export all ship (F3); manual notes and the raw transcript are still excluded | Sprint 6.6 |
 | Trash, restore, and safe permanent purge | Missing; current deletion is permanent | Sprint 6.7 |
 | Calendar sync, upcoming meetings, attendees, and recurring-event links | Missing; F6 is already scoped | Phase 5.1 |
 | Call-detected prompt, meeting reminders, and reliable auto-stop | Missing; F4 is already scoped | Phase 5.5 |
@@ -211,7 +212,7 @@ This is the canonical gap list for features that fit Meetily's local-first direc
 | Actions on chat answers | Keep and expand | 6.2 adds safe note editing and artifact actions |
 | Note↔transcript timestamp links | Keep and expand | 6.4 adds provenance, quote insertion, seeking, and transcript redaction |
 | Note templates | Merge | 6.5 delivers meeting playbooks rather than generic Cornell-only templates |
-| Notes export | Keep | 6.6 ships complete PDF/Markdown first; DOCX follows F3 |
+| Notes export | Keep | 6.6 adds manual notes and the optional transcript on top of the PDF/DOCX/Markdown summary export F3 already ships |
 | More chat entry points | Promote to first | 6.1 covers home, folder, live, and selected-meeting contexts |
 | Standalone notes / quick-capture library | Defer | Ad-hoc meeting capture already exists; do not turn Meetily into a general notes app without demand |
 | Semantic/hybrid search | Defer and benchmark-gate | Current FTS5 retrieval is mature; add embeddings only after measured recall failures on real corpora |
@@ -228,7 +229,7 @@ Deliver as two independently reviewed increments. Do not begin 6B until 6A is re
 - [ ] **Sprint 6B — Trust and complete artifacts**
   - [ ] 6.4 `[L]` **Transcript provenance and privacy controls** — timestamp links in notes, add transcript quote to notes, jump/seek from a note, delete a transcript chunk, refresh FTS, and prompt to regenerate affected summaries. Automatic per-bullet AI provenance is a later extension.
   - [ ] 6.5 `[M]` **Meeting playbooks** — bundle a raw-note/agenda scaffold, an existing summary template, and suggested Recipes for stand-ups, 1:1s, interviews, sales calls, retros, and project syncs.
-  - [ ] 6.6 `[M]` **Complete meeting export** — PDF and Markdown containing metadata, active summary, manual notes, and optional transcript. Add DOCX when F3 is implemented; do not block PDF/Markdown parity on F3.
+  - [ ] 6.6 `[M]` **Complete meeting export** — extend F3's PDF/DOCX/Markdown summary export (metadata + active summary, already shipped) with manual notes and an optional transcript.
   - [ ] 6.7 `[M]` **Trash and restore** — soft-delete meetings/notes, restore, permanent purge, and a default 30-day trash window. Transcript retention policy is separate follow-up work.
   - _Review: per-task review for 6.4, then a Sprint 6 end-to-end review._
 
@@ -335,7 +336,7 @@ Roughly **45–65 working days** total. These are planning figures, not commitme
 |---|---|---|
 | Scoping | README, SCOPE, ARCHITECTURE, ROADMAP, diarization research | ✅ complete |
 | Phase 0 | Fork, build verify, F10, F11 | ⏳ implementation complete; packaged-app/PT-BR smoke verification remains |
-| Phase 1 | F1, F2, F3, F4 | partial — custom templates and PDF export ship; DOCX and auto-detect remain |
+| Phase 1 | F1, F2, F3, F4 | partial — custom templates, PDF export, and DOCX export (F3, plus a Markdown export bonus) ship; call auto-detect (F4) remains |
 | Phase 2 | F8, F7 | pending |
 | Phase 3 | F5, F6, F9 | partial — Chat shipped and was hardened in Phase 4; diarization/calendar remain |
 | Phase 4 | F12 Notes & Chat | Sprints 1–5 ✅ approved/shippable; revised Sprint 6 pending |

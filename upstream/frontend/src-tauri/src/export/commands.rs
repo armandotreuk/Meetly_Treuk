@@ -18,6 +18,8 @@ use crate::database::repositories::meeting::MeetingsRepository;
 use crate::database::repositories::summary::{
     resolve_summary_storage_template_id, SummaryProcessesRepository,
 };
+use crate::export::docx::export_meeting_to_docx;
+use crate::export::markdown::export_meeting_to_markdown;
 use crate::export::pdf::{export_meeting_to_pdf, MeetingExportData, SectionContent};
 use crate::state::AppState;
 use crate::summary::templates::{self, Template, TemplateSection};
@@ -53,6 +55,85 @@ pub struct ExportPdfResponse {
 /// Returns the raw PDF bytes and a suggested filename. The frontend is
 /// responsible for showing a save dialog and writing the bytes to
 /// disk.
+/// Assemble the meeting + summary + template data shared by every export
+/// format (PDF, DOCX, Markdown). Each format's command calls this and
+/// then hands the result to its own renderer.
+async fn build_meeting_export_data(
+    pool: &sqlx::SqlitePool,
+    meeting_id: &str,
+    template_id: &str,
+    template_source: Option<&str>,
+) -> Result<MeetingExportData, String> {
+    // 1) Look up the meeting record (title, created_at, folder_path).
+    let meeting = MeetingsRepository::get_meeting(pool, meeting_id)
+        .await
+        .map_err(|e| format!("Failed to load meeting: {}", e))?
+        .ok_or_else(|| format!("Meeting '{}' not found", meeting_id))?;
+
+    // 2) Look up the completed summary, if any. Scoped to the requested
+    //    template — only the active template's summary is exported per
+    //    decision #11 (plan).
+    let summary = load_export_summary(pool, meeting_id, template_id).await?;
+    let template_reference =
+        resolve_export_template_reference(pool, meeting_id, template_id).await?;
+
+    // 3) Resolve the template (DB-stored or built-in). A deleted template
+    // reference must not make the stored summary disappear from export.
+    let summary_result = summary.as_ref().and_then(|s| s.result.as_deref());
+    let resolved_template_source =
+        if templates::parse_database_template_id(&template_reference).is_some() {
+            Some("database")
+        } else if template_reference
+            .parse::<i64>()
+            .ok()
+            .filter(|id| *id > 0)
+            .is_some()
+        {
+            // Raw numeric references are ambiguous legacy values. The resolver
+            // checks DB first and then the numeric file namespace.
+            None
+        } else {
+            template_source
+        };
+    let template = match templates::resolve_template_with_source(
+        pool,
+        &template_reference,
+        resolved_template_source,
+    )
+    .await
+    {
+        Ok(template) => template,
+        Err(error) => {
+            info!(
+                "Using archived-summary export fallback for template {}: {}",
+                template_reference, error
+            );
+            fallback_template(&template_reference, summary_result)
+        }
+    };
+
+    // 4) Merge template sections with the stored summary content.
+    let sections = merge_sections(&template, summary_result);
+
+    // 5) Build the export payload.
+    let duration = compute_duration(summary.as_ref());
+    let attendees = derive_attendees(summary.as_ref());
+
+    Ok(MeetingExportData {
+        meeting_id: meeting.id.clone(),
+        meeting_title: if meeting.title.is_empty() {
+            "Untitled meeting".to_string()
+        } else {
+            meeting.title.clone()
+        },
+        created_at: meeting.created_at.clone(),
+        duration,
+        attendees,
+        template_name: template.name.clone(),
+        sections,
+    })
+}
+
 #[tauri::command]
 pub async fn export_meeting_pdf<R: Runtime>(
     _app: AppHandle<R>,
@@ -65,77 +146,17 @@ pub async fn export_meeting_pdf<R: Runtime>(
     );
 
     let pool = state.db_manager.pool();
+    let export_data = build_meeting_export_data(
+        pool,
+        &request.meeting_id,
+        &request.template_id,
+        request.template_source.as_deref(),
+    )
+    .await?;
 
-    // 1) Look up the meeting record (title, created_at, folder_path).
-    let meeting = MeetingsRepository::get_meeting(pool, &request.meeting_id)
-        .await
-        .map_err(|e| format!("Failed to load meeting: {}", e))?
-        .ok_or_else(|| format!("Meeting '{}' not found", request.meeting_id))?;
-
-    // 2) Look up the completed summary, if any. Scoped to the requested
-    //    template — only the active template's summary is exported per
-    //    decision #11 (plan).
-    let summary = load_export_summary(pool, &request.meeting_id, &request.template_id).await?;
-    let template_reference =
-        resolve_export_template_reference(pool, &request.meeting_id, &request.template_id).await?;
-
-    // 3) Resolve the template (DB-stored or built-in). A deleted template
-    // reference must not make the stored summary disappear from export.
-    let summary_result = summary.as_ref().and_then(|s| s.result.as_deref());
-    let template_source = if templates::parse_database_template_id(&template_reference).is_some() {
-        Some("database")
-    } else if template_reference
-        .parse::<i64>()
-        .ok()
-        .filter(|id| *id > 0)
-        .is_some()
-    {
-        // Raw numeric references are ambiguous legacy values. The resolver
-        // checks DB first and then the numeric file namespace.
-        None
-    } else {
-        request.template_source.as_deref()
-    };
-    let template =
-        match templates::resolve_template_with_source(pool, &template_reference, template_source)
-            .await
-        {
-            Ok(template) => template,
-            Err(error) => {
-                info!(
-                    "Using archived-summary PDF fallback for template {}: {}",
-                    template_reference, error
-                );
-                fallback_template(&template_reference, summary_result)
-            }
-        };
-
-    // 4) Merge template sections with the stored summary content.
-    let sections = merge_sections(&template, summary_result);
-
-    // 5) Build the export payload.
-    let duration = compute_duration(summary.as_ref());
-    let attendees = derive_attendees(summary.as_ref());
-
-    let created_at = meeting.created_at.clone();
-
-    let export_data = MeetingExportData {
-        meeting_id: meeting.id.clone(),
-        meeting_title: if meeting.title.is_empty() {
-            "Untitled meeting".to_string()
-        } else {
-            meeting.title.clone()
-        },
-        created_at,
-        duration,
-        attendees,
-        template_name: template.name.clone(),
-        sections,
-    };
-
-    // 6) Render PDF. We render in a blocking task because printpdf
-    // is synchronous; offloading it to `spawn_blocking` keeps the
-    // Tauri async runtime responsive.
+    // Render PDF in a blocking task because printpdf is synchronous;
+    // offloading it to `spawn_blocking` keeps the Tauri async runtime
+    // responsive.
     let data_for_render = export_data.clone();
     let (bytes, page_count) =
         tokio::task::spawn_blocking(move || export_meeting_to_pdf(&data_for_render))
@@ -148,6 +169,105 @@ pub async fn export_meeting_pdf<R: Runtime>(
         bytes,
         suggested_filename,
         page_count,
+    })
+}
+
+/// Request payload for the `export_meeting_docx` command. Same shape as
+/// [`ExportPdfRequest`]; kept as a separate type so each format's wire
+/// contract can evolve independently.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExportDocxRequest {
+    pub meeting_id: String,
+    pub template_id: String,
+    #[serde(default)]
+    pub template_source: Option<String>,
+}
+
+/// Response payload: the rendered DOCX bytes plus a suggested file name.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExportDocxResponse {
+    pub bytes: Vec<u8>,
+    pub suggested_filename: String,
+}
+
+/// Render a meeting summary as a DOCX file.
+#[tauri::command]
+pub async fn export_meeting_docx<R: Runtime>(
+    _app: AppHandle<R>,
+    state: State<'_, AppState>,
+    request: ExportDocxRequest,
+) -> Result<ExportDocxResponse, String> {
+    info!(
+        "export_meeting_docx called for meeting={} template={}",
+        request.meeting_id, request.template_id
+    );
+
+    let pool = state.db_manager.pool();
+    let export_data = build_meeting_export_data(
+        pool,
+        &request.meeting_id,
+        &request.template_id,
+        request.template_source.as_deref(),
+    )
+    .await?;
+
+    let data_for_render = export_data.clone();
+    let bytes = tokio::task::spawn_blocking(move || export_meeting_to_docx(&data_for_render))
+        .await
+        .map_err(|e| format!("DOCX render task failed: {}", e))??;
+
+    let suggested_filename = build_filename_with_extension(&export_data, "docx");
+
+    Ok(ExportDocxResponse {
+        bytes,
+        suggested_filename,
+    })
+}
+
+/// Request payload for the `export_meeting_markdown` command. Same shape
+/// as [`ExportPdfRequest`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExportMarkdownRequest {
+    pub meeting_id: String,
+    pub template_id: String,
+    #[serde(default)]
+    pub template_source: Option<String>,
+}
+
+/// Response payload: the rendered Markdown text plus a suggested file name.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExportMarkdownResponse {
+    pub content: String,
+    pub suggested_filename: String,
+}
+
+/// Render a meeting summary as a Markdown document.
+#[tauri::command]
+pub async fn export_meeting_markdown<R: Runtime>(
+    _app: AppHandle<R>,
+    state: State<'_, AppState>,
+    request: ExportMarkdownRequest,
+) -> Result<ExportMarkdownResponse, String> {
+    info!(
+        "export_meeting_markdown called for meeting={} template={}",
+        request.meeting_id, request.template_id
+    );
+
+    let pool = state.db_manager.pool();
+    let export_data = build_meeting_export_data(
+        pool,
+        &request.meeting_id,
+        &request.template_id,
+        request.template_source.as_deref(),
+    )
+    .await?;
+
+    let content = export_meeting_to_markdown(&export_data);
+    let suggested_filename = build_filename_with_extension(&export_data, "md");
+
+    Ok(ExportMarkdownResponse {
+        content,
+        suggested_filename,
     })
 }
 
@@ -200,6 +320,94 @@ pub async fn save_meeting_pdf<R: Runtime>(
         .map_err(|e| format!("Failed to write PDF: {}", e))?;
 
     info!("Saved PDF export to {}", path.display());
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+/// Show a native save dialog and write the supplied DOCX bytes to the
+/// chosen path. Mirrors `save_meeting_pdf`.
+#[tauri::command]
+pub async fn save_meeting_docx<R: Runtime>(
+    app: AppHandle<R>,
+    bytes: Vec<u8>,
+    suggested_filename: String,
+) -> Result<Option<String>, String> {
+    use std::path::PathBuf;
+
+    let default_name = sanitize_filename(&suggested_filename);
+
+    let picked = app
+        .dialog()
+        .file()
+        .add_filter("Word document", &["docx"])
+        .set_file_name(&default_name)
+        .set_title("Save meeting summary as DOCX")
+        .blocking_save_file();
+
+    let path: PathBuf = match picked {
+        Some(fp) => fp
+            .into_path()
+            .map_err(|e| format!("Invalid save path: {}", e))?,
+        None => return Ok(None),
+    };
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Could not create destination directory: {}", e))?;
+        }
+    }
+
+    let write_path = path.clone();
+    tokio::task::spawn_blocking(move || std::fs::write(&write_path, &bytes))
+        .await
+        .map_err(|e| format!("File write task failed: {}", e))?
+        .map_err(|e| format!("Failed to write DOCX: {}", e))?;
+
+    info!("Saved DOCX export to {}", path.display());
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+/// Show a native save dialog and write the supplied Markdown text to
+/// the chosen path. Mirrors `save_meeting_pdf`.
+#[tauri::command]
+pub async fn save_meeting_markdown<R: Runtime>(
+    app: AppHandle<R>,
+    content: String,
+    suggested_filename: String,
+) -> Result<Option<String>, String> {
+    use std::path::PathBuf;
+
+    let default_name = sanitize_filename(&suggested_filename);
+
+    let picked = app
+        .dialog()
+        .file()
+        .add_filter("Markdown document", &["md"])
+        .set_file_name(&default_name)
+        .set_title("Save meeting summary as Markdown")
+        .blocking_save_file();
+
+    let path: PathBuf = match picked {
+        Some(fp) => fp
+            .into_path()
+            .map_err(|e| format!("Invalid save path: {}", e))?,
+        None => return Ok(None),
+    };
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Could not create destination directory: {}", e))?;
+        }
+    }
+
+    let write_path = path.clone();
+    tokio::task::spawn_blocking(move || std::fs::write(&write_path, content.as_bytes()))
+        .await
+        .map_err(|e| format!("File write task failed: {}", e))?
+        .map_err(|e| format!("Failed to write Markdown: {}", e))?;
+
+    info!("Saved Markdown export to {}", path.display());
     Ok(Some(path.to_string_lossy().into_owned()))
 }
 
@@ -625,6 +833,10 @@ fn derive_attendees(_summary: Option<&crate::database::models::SummaryProcess>) 
 }
 
 fn build_filename(data: &MeetingExportData) -> String {
+    build_filename_with_extension(data, "pdf")
+}
+
+fn build_filename_with_extension(data: &MeetingExportData, extension: &str) -> String {
     let date_part = data
         .created_at
         .get(..10)
@@ -655,7 +867,7 @@ fn build_filename(data: &MeetingExportData) -> String {
     } else {
         title_slug
     };
-    format!("{}_{}.pdf", date_part, title_slug)
+    format!("{}_{}.{}", date_part, title_slug, extension)
 }
 
 // ---------- Tests ----------
@@ -792,6 +1004,25 @@ mod tests {
         assert!(name.ends_with(".pdf"));
         assert!(!name.contains('/'));
         assert!(!name.contains('#'));
+    }
+
+    #[test]
+    fn build_filename_with_extension_swaps_only_the_extension() {
+        let data = MeetingExportData {
+            meeting_id: "id".into(),
+            meeting_title: "Weekly Planning".into(),
+            created_at: "2026-06-29T14:00:00Z".into(),
+            duration: None,
+            attendees: None,
+            template_name: "Standard".into(),
+            sections: vec![],
+        };
+        assert!(build_filename_with_extension(&data, "docx").ends_with(".docx"));
+        assert!(build_filename_with_extension(&data, "md").ends_with(".md"));
+        assert_eq!(
+            build_filename_with_extension(&data, "pdf"),
+            build_filename(&data)
+        );
     }
 
     #[test]

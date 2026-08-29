@@ -771,7 +771,11 @@ fn render_structured_list_as_table(ctx: &mut RenderContext, lines: &[&str]) {
 /// Requires a strict majority of non-empty lines to start with `- [ ]`
 /// or `- [x]` so a stray checkbox in a long bullet list does not
 /// trigger table mode.
-fn looks_like_checkbox_list(content: &str) -> bool {
+///
+/// `pub(crate)` so `docx.rs` can reuse the same detection instead of
+/// re-deriving it, keeping checkbox → Task/Owner/Due synthesis
+/// consistent between the PDF and DOCX renderers.
+pub(crate) fn looks_like_checkbox_list(content: &str) -> bool {
     let non_empty: Vec<&str> = content
         .lines()
         .map(|l| l.trim())
@@ -794,7 +798,9 @@ fn looks_like_checkbox_list(content: &str) -> bool {
 /// 3-col pipe table (`Task | Owner | Due`). Tolerant of missing
 /// `[[Owner]]` or `Due:` tokens (empty cell). Lines that don't start
 /// with a checkbox marker are skipped.
-fn checkbox_list_to_pipe_table(content: &str) -> String {
+///
+/// `pub(crate)`: see [`looks_like_checkbox_list`].
+pub(crate) fn checkbox_list_to_pipe_table(content: &str) -> String {
     let mut out = String::from("| Task | Owner | Due |\n| --- | --- | --- |\n");
     for line in content.lines() {
         let t = line.trim();
@@ -2033,9 +2039,10 @@ fn approx_chars_per_line(size_pt: f64, width_mm: f64) -> usize {
     chars.max(10)
 }
 
-fn format_date_human(iso: &str) -> String {
-    // Best-effort human-friendly date; we deliberately don't pull in
-    // `chrono` parsing here to keep this module self-contained.
+/// `pub(crate)` so `docx.rs` and `markdown.rs` render the same
+/// human-readable date as the PDF export instead of reimplementing
+/// RFC 3339 parsing.
+pub(crate) fn format_date_human(iso: &str) -> String {
     if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(iso) {
         return parsed
             .with_timezone(&chrono::Utc)

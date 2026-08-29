@@ -1020,6 +1020,12 @@ pub fn run() {
             // F2: PDF export
             export::commands::export_meeting_pdf,
             export::commands::save_meeting_pdf,
+            // F3: DOCX export
+            export::commands::export_meeting_docx,
+            export::commands::save_meeting_docx,
+            // Markdown export
+            export::commands::export_meeting_markdown,
+            export::commands::save_meeting_markdown,
             whisper_engine::commands::open_models_folder,
             // Onboarding commands
             onboarding::get_onboarding_status,
