@@ -7,8 +7,9 @@ Unblocked by decision, 2026-08-28. Tasks `2C.1`, `2C.2`, `2C.4`, `2C.R1`,
 accepted-with-obligation**, not delivered: the user accepted the existing
 whole-process gate for Sprint 2 with the ceiling unchanged, and moved
 full-application calibration into Sprint 3 as a close obligation recorded in
-`architecture.md`. Sprint closure now depends on a re-dispatched `2C.4`
-covering the current head and `2C.5`.
+`architecture.md`. Current-head `2C.4` evidence is complete; Sprint closure now
+depends on fresh approving reviews and user Sprint-close approval through
+`2C.5`.
 
 ## Goal
 
@@ -99,12 +100,12 @@ must be updated whenever a log entry is appended.
 | 2C.2 | Packaged smoke diagnostics | Give every safe probe failure stage a bounded verdict that survives the GUI-subsystem executable; map it in the active root workflow; apply rustfmt. | M | `worker-m` (complete) | 2C.1 complete | Focused status/exit-code tests cover exact, unavailable, and every failure stage; release diagnostic exits correctly; workflow YAML/order checks and `cargo fmt --check` pass. | Revert the exit-code/workflow mapping and tests; `dbstat` activation remains fail-closed. |
 | 2C.D1 | Envelope decision | Select one R13 resolution contract: full-application calibrated whole-process ceiling, runtime attribution infrastructure, upstream ORT API wait, sessions-excluded accounting, or an explicitly accepted conservative bound. | Decision | Main agent (complete) | None | Full-application calibrated whole-process scope is recorded with its ceiling consequences and rejected alternatives. | Keep R13 blocked; do not implement an unapproved approximation. |
 | 2C.3 | Activation envelope | Calibrate the existing whole-process gate against the production application and revise its ceiling only from recorded full-application evidence. | L, high risk | `worker-l` (closed: accepted with Sprint 3 obligation) | 2C.D1 complete | The gate measures the documented full-application quantity, fails closed on unavailable terms, passes its agreed benchmark, and does not alter model/chunk/encoding/backend contracts without separate approval. | Revert the R13 implementation and architecture amendment; retain the current R12 fail-closed gate. |
-| 2C.4 | Installed package evidence | Dispatch the root Windows workflow for the accepted 2C.1/2C.2 branch head and record actual MSI and NSIS silent-install, diagnostic, uninstall, cleanup, and pre-upload-gate outcomes. Rerun after any later R13 source change. | M | Main agent (complete) | 2C.2 complete | Both installed `meetily.exe --smoke-dbstat` runs pass; job summary records them; no smoke is skipped; CI URL and immutable addendum are recorded. | Revert only the diagnostic CI assertion if it prevents emergency packaging; semantic activation remains fail-closed without `dbstat`. |
+| 2C.4 | Installed package evidence | Dispatch the root Windows workflow for the accepted 2C.1/2C.2 branch head and record actual MSI and NSIS silent-install, diagnostic, uninstall, cleanup, and pre-upload-gate outcomes. Rerun after any later R13 source change. | M | Main agent (complete; current-head re-dispatch complete) | 2C.2 complete | Both installed `meetily.exe --smoke-dbstat` runs pass; job summary records them; no smoke is skipped; CI URL and immutable addendum are recorded. | Revert only the diagnostic CI assertion if it prevents emergency packaging; semantic activation remains fail-closed without `dbstat`. |
 | 2C.R1 | Review remediation | Apply the Final Code Review (R15) findings across the packaged smoke workflow, the diagnostic, the migration regression, and the three normative documents. | M | Main agent (complete) | 2C.4 complete | Full Rust suite, rustfmt, diff check, workflow YAML and PowerShell parse all pass; no finding left unaddressed or undocumented. | Revert the R15 commit; the prior behaviour returns along with its eleven findings. |
 | 2C.6 | Activation observability | Surface the activation-refusal reason through the application log so a refused activation is distinguishable from a normal run. Read-only: no gate, ceiling, or measurement change. | S | Main agent (complete) | 2C.R1 complete | A refused activation emits one warn-level log line naming scope, measured bytes and ceiling; an admitted activation emits none; a test covers both; no meeting text, token, or vector appears in the line. | Revert the logging call; the gate is unchanged either way. |
 | 2C.R2 | Review remediation | Make MSI/NSIS teardown exception-safe so every smoke persists its captured diagnostic verdict after an uninstall-launch failure. | S | Main agent (complete) | Final Code Review R11 | A teardown exception does not bypass residue checks or result persistence; nonzero diagnostic verdicts remain unchanged; a passing verdict downgrades to harness `1`. | Revert the nested teardown catches; installer diagnostics remain fail-closed. |
 | 2C.R3 | Review remediation | Correct normative activation-observability text and capture warn emission in the refusal/admission regression. | S | Main agent (complete) | Final Code Review R11 | Architecture matches the status/log path; the test observes one exact RAM refusal line and no admitted line. | Revert the documentation correction and test logger; production activation behavior is unchanged. |
-| 2C.5 | Sprint closure | Run final verification, append fresh code and architecture reviews, record deferrals, and request user Sprint 2 close approval. | M | Main agent and reviewers (pending) | 2C.R2/R3 complete; 2C.4 re-dispatch complete | Full Rust suite, `cargo check`, rustfmt, diff check, typecheck, Vitest, and 250k benchmark pass; both reviews approve; user approves close. | Do not close Sprint 2; preserve the accepted tasks and keep the remaining finding open. |
+| 2C.5 | Sprint closure | Run final verification, append fresh code and architecture reviews, record deferrals, and request user Sprint 2 close approval. | M | Main agent and reviewers (pending) | 2C.R2/R3 complete; 2C.4 re-dispatch complete; fresh reviews approve | Full Rust suite, `cargo check`, rustfmt, diff check, typecheck, Vitest, and 250k benchmark pass; both reviews approve; user approves close. | Do not close Sprint 2; preserve the accepted tasks and keep the remaining finding open. |
 
 ## Dependency Order
 
@@ -357,6 +358,38 @@ already logs at `retrieval/index.rs:1622`; only the failure path is silent.
 **Decisions and follow-ups:**
 - Any future R13 source change must repeat this same installed-package evidence
   before `2C.5` can seek Sprint closure.
+
+### 2C.4 - Current-head package evidence addendum
+
+**Status:** Complete
+**Owner:** Main agent, under user delegation
+**Completed:** 2026-08-28
+**Implemented:**
+- Re-dispatched the root Windows workflow after `2C.R1`, `2C.6`, `2C.R2`, and
+  `2C.R3` changed package smoke and close-out source.
+**Implementation:**
+- Files: no source change; this file.
+- Approach: dispatch the active root workflow with its release input against the
+  pushed final package source rather than treating the prior successful run as
+  coverage for changed scripts.
+**Not implemented:**
+- No package, diagnostic, gate, ceiling, model, or migration change.
+**Why not implemented:**
+- Run `42` covers the prior head only. Current workflow evidence is an execution
+  requirement, not a reason to change product behavior.
+**Verification:**
+- Root Windows workflow run `43` on commit
+  `25f64c012a0268a6e7aea525d8cdc85fe35bcbc1`
+  - pass: [Build Windows (CI)](https://github.com/armandotreuk/Meetly_Treuk/actions/runs/33215212797).
+- The completed run passed Cargo Check (Windows), the checked-in manifest and
+  staged-bundle contracts, reference inference, release build, installed MSI
+  smoke, installed NSIS smoke, final bounded-verdict gate, and package uploads.
+**Rollback:**
+- No source rollback applies. A later package-source change requires a new
+  dispatch before release evidence can be claimed.
+**Decisions and follow-ups:**
+- `2C.4` is no longer a Sprint closure dependency. Fresh approving reviews and
+  user Sprint-close approval remain required by `2C.5`.
 
 ### 2C.R1 - Final Code Review (R15) remediation
 
@@ -641,3 +674,31 @@ change was found.
 
 **Required follow-ups:** `2C.R2`, `2C.R3`, then re-dispatch `2C.4` for the
 current workflow head before fresh closure reviews.
+
+### Post-remediation Code Review
+
+**Reviewer:** `openai/gpt-5.6-sol`, 2026-08-28
+**Scope:** `51e9c7c..25f64c0` - R11 remediation.
+**Verdict:** Approve.
+
+**Findings:** None. The review confirmed uninstall-launch exceptions preserve
+an existing diagnostic code and continue cleanup/residue checks; the refusal
+line remains safe and gate-read-only; and the test logger is one-time,
+mutex-protected, and filtered to the unique test generation.
+
+**Verification:** Run `43` passed on `25f64c012a0268a6e7aea525d8cdc85fe35bcbc1`.
+Focused activation coverage, full Rust tests, and diff validation passed.
+
+### Closure Architecture Review
+
+**Reviewer:** `openai/gpt-5.6-sol`, 2026-08-28
+**Scope:** Sprint 2C authority and final remediation head `25f64c0`.
+**Verdict:** Changes requested - documentation-only finding.
+
+**Findings:** The authoritative close-out record still treated `2C.4`
+re-dispatch as outstanding and recorded only obsolete run `41`, despite current
+head run `43` having passed MSI/NSIS smoke, final verdict gate, package uploads,
+and Cargo Check. No architecture or source-code finding was identified.
+
+**Required follow-ups:** This immutable run-43 addendum and task-summary update,
+then a fresh architecture review.
