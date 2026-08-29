@@ -2,14 +2,15 @@
 
 ## Status
 
-Unblocked by decision, 2026-08-28. Tasks `2C.1`, `2C.2`, `2C.4`, `2C.R1`,
-`2C.6`, `2C.R2`, and `2C.R3` are complete. `2C.3` is **closed as
+Unblocked by decision, 2026-08-28. Tasks `2C.1`, `2C.2`, `2C.R1`, `2C.6`,
+`2C.R2`, `2C.R3`, and `2C.R4` are complete. `2C.3` is **closed as
 accepted-with-obligation**, not delivered: the user accepted the existing
 whole-process gate for Sprint 2 with the ceiling unchanged, and moved
 full-application calibration into Sprint 3 as a close obligation recorded in
-`architecture.md`. Current-head `2C.4` evidence is complete; Sprint closure now
-depends on fresh approving reviews and user Sprint-close approval through
-`2C.5`.
+`architecture.md`. Run `43` establishes package evidence, but its Cargo Check
+result was not persisted for the final gate. Current-head `2C.4` must be
+re-dispatched after `2C.R4`; Sprint closure then depends on fresh approving
+reviews and user Sprint-close approval through `2C.5`.
 
 ## Goal
 
@@ -100,16 +101,17 @@ must be updated whenever a log entry is appended.
 | 2C.2 | Packaged smoke diagnostics | Give every safe probe failure stage a bounded verdict that survives the GUI-subsystem executable; map it in the active root workflow; apply rustfmt. | M | `worker-m` (complete) | 2C.1 complete | Focused status/exit-code tests cover exact, unavailable, and every failure stage; release diagnostic exits correctly; workflow YAML/order checks and `cargo fmt --check` pass. | Revert the exit-code/workflow mapping and tests; `dbstat` activation remains fail-closed. |
 | 2C.D1 | Envelope decision | Select one R13 resolution contract: full-application calibrated whole-process ceiling, runtime attribution infrastructure, upstream ORT API wait, sessions-excluded accounting, or an explicitly accepted conservative bound. | Decision | Main agent (complete) | None | Full-application calibrated whole-process scope is recorded with its ceiling consequences and rejected alternatives. | Keep R13 blocked; do not implement an unapproved approximation. |
 | 2C.3 | Activation envelope | Calibrate the existing whole-process gate against the production application and revise its ceiling only from recorded full-application evidence. | L, high risk | `worker-l` (closed: accepted with Sprint 3 obligation) | 2C.D1 complete | The gate measures the documented full-application quantity, fails closed on unavailable terms, passes its agreed benchmark, and does not alter model/chunk/encoding/backend contracts without separate approval. | Revert the R13 implementation and architecture amendment; retain the current R12 fail-closed gate. |
-| 2C.4 | Installed package evidence | Dispatch the root Windows workflow for the accepted 2C.1/2C.2 branch head and record actual MSI and NSIS silent-install, diagnostic, uninstall, cleanup, and pre-upload-gate outcomes. Rerun after any later R13 source change. | M | Main agent (complete; current-head re-dispatch complete) | 2C.2 complete | Both installed `meetily.exe --smoke-dbstat` runs pass; job summary records them; no smoke is skipped; CI URL and immutable addendum are recorded. | Revert only the diagnostic CI assertion if it prevents emergency packaging; semantic activation remains fail-closed without `dbstat`. |
+| 2C.4 | Installed package evidence | Dispatch the root Windows workflow for the accepted 2C.1/2C.2 branch head and record actual MSI and NSIS silent-install, diagnostic, uninstall, cleanup, and pre-upload-gate outcomes. Rerun after any later R13 source change. | M | Main agent (rerun required after 2C.R4) | 2C.2 complete | Both installed `meetily.exe --smoke-dbstat` runs pass; job summary records them; no smoke is skipped; CI URL and immutable addendum are recorded. | Revert only the diagnostic CI assertion if it prevents emergency packaging; semantic activation remains fail-closed without `dbstat`. |
 | 2C.R1 | Review remediation | Apply the Final Code Review (R15) findings across the packaged smoke workflow, the diagnostic, the migration regression, and the three normative documents. | M | Main agent (complete) | 2C.4 complete | Full Rust suite, rustfmt, diff check, workflow YAML and PowerShell parse all pass; no finding left unaddressed or undocumented. | Revert the R15 commit; the prior behaviour returns along with its eleven findings. |
 | 2C.6 | Activation observability | Surface the activation-refusal reason through the application log so a refused activation is distinguishable from a normal run. Read-only: no gate, ceiling, or measurement change. | S | Main agent (complete) | 2C.R1 complete | A refused activation emits one warn-level log line naming scope, measured bytes and ceiling; an admitted activation emits none; a test covers both; no meeting text, token, or vector appears in the line. | Revert the logging call; the gate is unchanged either way. |
 | 2C.R2 | Review remediation | Make MSI/NSIS teardown exception-safe so every smoke persists its captured diagnostic verdict after an uninstall-launch failure. | S | Main agent (complete) | Final Code Review R11 | A teardown exception does not bypass residue checks or result persistence; nonzero diagnostic verdicts remain unchanged; a passing verdict downgrades to harness `1`. | Revert the nested teardown catches; installer diagnostics remain fail-closed. |
 | 2C.R3 | Review remediation | Correct normative activation-observability text and capture warn emission in the refusal/admission regression. | S | Main agent (complete) | Final Code Review R11 | Architecture matches the status/log path; the test observes one exact RAM refusal line and no admitted line. | Revert the documentation correction and test logger; production activation behavior is unchanged. |
-| 2C.5 | Sprint closure | Run final verification, append fresh code and architecture reviews, record deferrals, and request user Sprint 2 close approval. | M | Main agent and reviewers (pending) | 2C.R2/R3 complete; 2C.4 re-dispatch complete; fresh reviews approve | Full Rust suite, `cargo check`, rustfmt, diff check, typecheck, Vitest, and 250k benchmark pass; both reviews approve; user approves close. | Do not close Sprint 2; preserve the accepted tasks and keep the remaining finding open. |
+| 2C.R4 | CI evidence remediation | Persist a nonzero Cargo Check result despite GitHub Bash's default `errexit`, then fail the job through the existing final gate. | S | Main agent (complete) | Closure Architecture Review | A failed workspace check writes its output and exit code; the final gate fails rather than skips. | Revert the `errexit` guard; Cargo Check may again report false green. |
+| 2C.5 | Sprint closure | Run final verification, append fresh code and architecture reviews, record deferrals, and request user Sprint 2 close approval. | M | Main agent and reviewers (pending) | 2C.R2/R3/R4 complete; 2C.4 re-dispatch complete; fresh reviews approve | Full Rust suite, `cargo check`, rustfmt, diff check, typecheck, Vitest, and 250k benchmark pass; both reviews approve; user approves close. | Do not close Sprint 2; preserve the accepted tasks and keep the remaining finding open. |
 
 ## Dependency Order
 
-`2C.1 -> 2C.2 -> 2C.4 -> 2C.R1 -> 2C.6 -> 2C.R2/R3 -> 2C.4(re-dispatched)`;
+`2C.1 -> 2C.2 -> 2C.4 -> 2C.R1 -> 2C.6 -> 2C.R2/R3 -> 2C.R4 -> 2C.4(re-dispatched)`;
 `2C.D1 -> 2C.3` (closed by decision); `2C.4(re-dispatched) -> 2C.5`
 
 Task `2C.1` runs alone because it adds a migration. Task `2C.3` runs alone
@@ -381,15 +383,19 @@ already logs at `retrieval/index.rs:1622`; only the failure path is silent.
 - Root Windows workflow run `43` on commit
   `25f64c012a0268a6e7aea525d8cdc85fe35bcbc1`
   - pass: [Build Windows (CI)](https://github.com/armandotreuk/Meetly_Treuk/actions/runs/33215212797).
-- The completed run passed Cargo Check (Windows), the checked-in manifest and
-  staged-bundle contracts, reference inference, release build, installed MSI
-  smoke, installed NSIS smoke, final bounded-verdict gate, and package uploads.
+- The completed run passed the checked-in manifest and staged-bundle contracts,
+  reference inference, release build, installed MSI smoke, installed NSIS smoke,
+  final bounded-verdict gate, and package uploads. Its workspace Cargo Check
+  exited nonzero, but Bash `errexit` prevented the step from exporting that
+  result; the final Cargo Check gate skipped and the green job does not certify
+  that check.
 **Rollback:**
 - No source rollback applies. A later package-source change requires a new
   dispatch before release evidence can be claimed.
 **Decisions and follow-ups:**
-- `2C.4` is no longer a Sprint closure dependency. Fresh approving reviews and
-  user Sprint-close approval remain required by `2C.5`.
+- `2C.4` must be re-dispatched after `2C.R4` before it can be considered a
+  Sprint closure dependency. Fresh approving reviews and user Sprint-close
+  approval then remain required by `2C.5`.
 
 ### 2C.R1 - Final Code Review (R15) remediation
 
@@ -580,6 +586,42 @@ already logs at `retrieval/index.rs:1622`; only the failure path is silent.
 **Decisions and follow-ups:**
 - Fresh code and architecture reviews follow the re-dispatched `2C.4` evidence.
 
+### 2C.R4 - Cargo Check verdict persistence
+
+**Status:** Complete
+**Owner:** Main agent, under user delegation
+**Completed:** 2026-08-28
+**Implemented:**
+- Disabled Bash `errexit` only while workspace Cargo Check runs, then restored
+  it after capturing and exporting Cargo's exit code.
+**Implementation:**
+- Files: `.github/workflows/build-windows.yml`, this file.
+- Approach: retain the existing output artifact and final failure gate; prevent
+  the intermediate script from exiting before either receives Cargo's verdict.
+**Not implemented:**
+- No Cargo command, dependency, Rust toolchain, package diagnostic, installer
+  smoke, gate, ceiling, model, schema, or source-code change.
+**Why not implemented:**
+- In run `43`, workspace Cargo Check exited nonzero, but GitHub Bash's default
+  `-e` stopped the script before it wrote `cargo_check_exit_code`. The final
+  gate therefore skipped. Package-smoke evidence remains valid, but its green
+  job conclusion cannot certify Cargo Check.
+**Verification:**
+- `cargo check --workspace --message-format=short`
+  - pass locally.
+- `npx --yes yaml-lint ".github/workflows/build-windows.yml"`
+  - pass.
+- `git diff --check -- .github/workflows/build-windows.yml upstream/docs/hybrid-rag/sprint-2c-close-out.md`
+  - pass.
+- The root workflow must be re-dispatched after this workflow-source change;
+  its final gate is the CI proof that a remote check failure is surfaced.
+**Rollback:**
+- Revert the `set +e` / `set -e` pair. Cargo Check would again report false
+  green when the check fails before its result is exported.
+**Decisions and follow-ups:**
+- `2C.4` is pending re-dispatch. Do not claim Cargo Check evidence from run
+  `43`.
+
 ## Sprint Reviews
 
 <!-- Append fresh code and architecture review results after task verification. -->
@@ -702,3 +744,20 @@ and Cargo Check. No architecture or source-code finding was identified.
 
 **Required follow-ups:** This immutable run-43 addendum and task-summary update,
 then a fresh architecture review.
+
+### Closure Architecture Re-Review
+
+**Reviewer:** `openai/gpt-5.6-sol`, 2026-08-28
+**Scope:** Current close-out head after the run-43 addendum.
+**Verdict:** Changes requested - resolved by `2C.R4` above; fresh approval
+remains pending CI evidence.
+
+**Findings:** Run `43`'s workspace Cargo Check exited `101`, but GitHub Bash
+ran with `-e` and stopped the script before `cargo_check_exit_code` was
+exported. The final failure gate skipped, so the workflow's green conclusion
+cannot be used as Cargo Check evidence. The run-43 addendum also incorrectly
+claimed that check passed.
+
+**Required follow-ups:** Re-dispatch `2C.4` after `2C.R4`; record the actual
+Cargo Check result and obtain fresh code and architecture approvals before
+requesting Sprint-close approval.

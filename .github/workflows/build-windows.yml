@@ -620,8 +620,11 @@ jobs:
           cd upstream
           # Capture all cargo output (no color codes for clean parsing)
           LOG="$CARGO_DEBUG_LOG"
+          # GitHub invokes Bash with -e. Persist cargo's result before its gate.
+          set +e
           CARGO_TERM_COLOR=never cargo check --workspace --message-format=short > "$LOG" 2>&1
           RC=$?
+          set -e
           echo "cargo_check_exit_code=$RC" >> "$GITHUB_OUTPUT"
           echo "=== CARGO CHECK EXIT CODE: $RC ==="
           echo "--- CARGO OUTPUT START ---"
