@@ -2,9 +2,9 @@
 
 ## Status
 
-Planned. Sprint 2 closed with user approval on 2026-08-29. This PRD received
-mandatory pre-start amendments on 2026-08-29; no Sprint 3 implementation task
-has started.
+Approved for planning, 2026-08-29. Sprint 2 closed with user approval. This PRD
+received mandatory pre-start amendments and user approval; no Sprint 3 TODO or
+implementation task has started.
 
 Revised 2026-08-21 after pre-implementation critique: reranking sub-budget and
 a mandatory runtime kill switch added. Revised 2026-08-29 after architecture
@@ -673,6 +673,7 @@ budget; and the failure/fallback behavior actually exercised.
 | 2026-08-24 | Leave the expansion approach undecided and block Task `3.6` dispatch on an explicit user choice. | The three candidates differ materially in architecture: a hand-authored lexicon promotes the non-production `CONCEPT_LEXICON` pattern into the product, LLM expansion places a provider round-trip inside the retrieval path of a local-first product against a 2 s budget, and pseudo-relevance feedback would likely drift toward the very distractors that own the surface vocabulary. Choosing among them is a product decision, not an implementation detail. | Pre-select an approach in the task specification. | User |
 | 2026-08-29 | Apply mandatory pre-start architecture amendments. | Carry Sprint 2 R13 calibration/refusal evidence, exact-head Windows evidence, scheduler reuse, hydration consistency, settings migration, and Sprint 3 closure dependencies into executable acceptance criteria. | Add a new runtime, telemetry subsystem, Search implementation, or relax the activation gate. | User |
 | 2026-08-29 | Defer the Task `3.6` expansion approach. | None of the three approaches can be selected by implementation inference; retain the 3.4 rollout path while making 3.6 and the inherited 5/5 gate explicit Sprint-close dependencies. | Pre-select a lexicon, provider expansion, or pseudo-relevance feedback. | User |
+| 2026-08-29 | Approve this amended Sprint 3 PRD only. | The user approved planning authority but did not authorize Sprint 3 TODO creation or Task 3.1 dispatch. | Approve and dispatch Task 3.1 in the same decision. | User |
 
 ## Task Execution Log
 
@@ -719,10 +720,10 @@ hydration TOCTOU/source compatibility, explicit Chat-only purpose scope, and
 Task 3.6's Sprint-close dependency were absent or underspecified. The review
 found no authority to relax the R13 gate or select an expansion approach.
 
-**Required follow-ups:** Obtain user approval of this amended PRD before Sprint
-3 TODO creation. Do not dispatch Task 3.6 until the user selects an approach;
-do not close Sprint 3 before its 5/5 critical Recall@1 evidence and all R13
-evidence are recorded.
+**Required follow-ups:** PRD approval is recorded in the decision log. Obtain
+separate batch approval before Sprint 3 TODO creation or Task 3.1 dispatch. Do
+not dispatch Task 3.6 until the user selects an approach; do not close Sprint 3
+before its 5/5 critical Recall@1 evidence and all R13 evidence are recorded.
 
 ### Code Review
 
@@ -744,7 +745,8 @@ streaming integration.
 ## Approval Gates
 
 - Sprint 2 close is approved.
-- User approval of this PRD is required before Sprint 3 TODO creation.
+- User approval of this PRD is recorded. Separate batch approval is required
+  before Sprint 3 TODO creation or Task 3.1 dispatch.
 - Tasks 3.1-3.3 are L and require individual batch approval.
 - Task 3.6 remains blocked by the deferred user architecture decision and its
   inherited 5/5 Recall@1 gate blocks Sprint close.
