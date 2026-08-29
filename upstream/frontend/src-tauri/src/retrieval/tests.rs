@@ -342,6 +342,97 @@ async fn all_scope_returns_current_persisted_meetings_only() {
 }
 
 #[tokio::test]
+async fn meeting_scope_excludes_every_other_meeting() {
+    let pool = migrated_pool().await;
+    insert_meeting(&pool, "m-target", "Target").await;
+    insert_meeting(&pool, "m-other", "Other").await;
+    add_transcript(
+        &pool,
+        "t-target",
+        "m-target",
+        "shared retention topic target",
+    )
+    .await;
+    add_transcript(&pool, "t-other", "m-other", "shared retention topic other").await;
+    for meeting in ["m-target", "m-other"] {
+        crate::database::repositories::fts::FtsRepository::refresh_meeting(&pool, meeting)
+            .await
+            .unwrap();
+    }
+    register_test_model(&pool).await;
+    RetrievalRepository::ensure_generation(&pool, "gen-meeting", MODEL_ID)
+        .await
+        .unwrap();
+    publish_meeting(
+        &pool,
+        "gen-meeting",
+        "m-target",
+        &["shared retention target"],
+    )
+    .await;
+    publish_meeting(&pool, "gen-meeting", "m-other", &["shared retention other"]).await;
+    let embedder = ServiceEmbedder::new();
+    let lifecycle = query_lifecycle(&embedder);
+    install_snapshot(&pool, &lifecycle, MODEL_ID).await;
+
+    let service = RetrievalService::new(lifecycle);
+    let result = service
+        .retrieve(
+            &pool,
+            request(
+                "retention",
+                PersistedRetrievalScope::Meeting("m-target".to_string()),
+                RetrievalLimits::default(),
+                CoreTermLanguage::English,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(result.semantic_fallback.is_none());
+    assert!(!result.candidates.is_empty());
+    let meetings: BTreeSet<String> = result
+        .candidates
+        .iter()
+        .map(|candidate| candidate.meeting_id.clone())
+        .collect();
+    assert_eq!(meetings, BTreeSet::from(["m-target".to_string()]));
+    // Both channels are scope-safe: neither ever produced a hit for m-other.
+    assert!(result.candidates.iter().any(|candidate| candidate
+        .provenance
+        .iter()
+        .any(|provenance| provenance.channel == RetrievalChannel::Semantic)));
+    assert!(result.candidates.iter().any(|candidate| candidate
+        .provenance
+        .iter()
+        .any(|provenance| provenance.channel == RetrievalChannel::Lexical)));
+}
+
+/// A regression that dropped the `meeting_id` bind on the single-meeting FTS
+/// path would turn this into a corpus-wide search instead of failing; naming
+/// a meeting that does not currently exist must fail closed rather than
+/// silently widen to an unscoped search.
+#[tokio::test]
+async fn meeting_scope_naming_no_current_meeting_fails_closed() {
+    let pool = migrated_pool().await;
+    let service = RetrievalService::new(query_lifecycle(&ServiceEmbedder::new()));
+    let error = service
+        .retrieve(
+            &pool,
+            request(
+                "needle",
+                PersistedRetrievalScope::Meeting("m-missing".to_string()),
+                RetrievalLimits::default(),
+                CoreTermLanguage::English,
+                None,
+            ),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, RetrievalError::InvalidScope(_)));
+}
+
+#[tokio::test]
 async fn folder_scope_includes_descendants_and_excludes_outside_subtree() {
     let pool = migrated_pool().await;
     insert_folder(&pool, "f-parent", "Parent", None).await;
@@ -1496,6 +1587,17 @@ fn core_terms_fold_listed_portuguese_diacritics() {
     assert_eq!(terms, ["comunicacao", "nao"]);
 }
 
+/// Title Case and all-caps titles carry uppercase accented letters
+/// (`to_ascii_lowercase` leaves non-ASCII characters untouched), so folding
+/// must match the uppercase forms directly rather than relying on ASCII
+/// lowercasing to expose them first.
+#[test]
+fn core_terms_fold_uppercase_portuguese_diacritics() {
+    assert_eq!(normalize_core_token("Água"), "agua");
+    assert_eq!(normalize_core_token("REUNIÃO"), "reuniao");
+    assert_eq!(normalize_core_token("Órgão"), "orgao");
+}
+
 /// All-stopword fallback: when every token would be removed, the untouched
 /// normalized tokens are kept instead of an empty variant.
 #[test]
@@ -1522,6 +1624,38 @@ fn core_terms_preserve_names_numbers_and_unknown_languages() {
     assert_eq!(
         core_terms("kafka 250 mil", CoreTermLanguage::Unknown),
         ["kafka", "250", "mil"]
+    );
+}
+
+/// The production stopword lists are hand-copied from
+/// `tests/fixtures/evaluation_policy.json`, the document the evaluation
+/// harness treats as authoritative for the lexical policy. Nothing else ties
+/// the two together, so a policy edit that is not mirrored here would let
+/// the evaluation gates measure a lexical policy production does not run.
+#[test]
+fn core_terms_stopword_lists_match_the_evaluation_policy_fixture() {
+    let policy: serde_json::Value =
+        serde_json::from_str(include_str!("../../tests/fixtures/evaluation_policy.json"))
+            .expect("evaluation_policy.json must parse as JSON");
+    let fixture_list = |field: &str| -> Vec<&str> {
+        policy["lexicalPolicy"][field]
+            .as_array()
+            .unwrap_or_else(|| panic!("lexicalPolicy.{field} must be an array"))
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .unwrap_or_else(|| panic!("lexicalPolicy.{field} entries must be strings"))
+            })
+            .collect()
+    };
+    assert_eq!(
+        fixture_list("portugueseHighFrequency"),
+        super::service::PORTUGUESE_HIGH_FREQUENCY.to_vec()
+    );
+    assert_eq!(
+        fixture_list("englishHighFrequency"),
+        super::service::ENGLISH_HIGH_FREQUENCY.to_vec()
     );
 }
 
@@ -1651,7 +1785,7 @@ async fn activation_swap_during_embedding_cannot_score_the_new_generation() {
     let result = outcome.unwrap();
     assert_eq!(
         result.semantic_fallback,
-        Some(SemanticFallbackReason::ModelMismatch)
+        Some(SemanticFallbackReason::GenerationChanged)
     );
     assert!(result.candidates.iter().all(|candidate| candidate
         .provenance
@@ -2037,7 +2171,7 @@ async fn generation_change_after_a_scan_cannot_retain_semantic_hits() {
     let result = result.unwrap();
     assert_eq!(
         result.semantic_fallback,
-        Some(SemanticFallbackReason::ModelMismatch)
+        Some(SemanticFallbackReason::GenerationChanged)
     );
     assert!(result.candidates.iter().all(|candidate| candidate
         .provenance

@@ -910,12 +910,12 @@ fn normalize_core_token(token: &str) -> String {
     token
         .chars()
         .map(|character| match character.to_ascii_lowercase() {
-            'á' | 'à' | 'â' | 'ã' => 'a',
-            'é' | 'ê' => 'e',
-            'í' => 'i',
-            'ó' | 'ô' | 'õ' => 'o',
-            'ú' | 'ü' => 'u',
-            'ç' => 'c',
+            'á' | 'à' | 'â' | 'ã' | 'Á' | 'À' | 'Â' | 'Ã' => 'a',
+            'é' | 'ê' | 'É' | 'Ê' => 'e',
+            'í' | 'Í' => 'i',
+            'ó' | 'ô' | 'õ' | 'Ó' | 'Ô' | 'Õ' => 'o',
+            'ú' | 'ü' | 'Ú' | 'Ü' => 'u',
+            'ç' | 'Ç' => 'c',
             other => other,
         })
         .collect()

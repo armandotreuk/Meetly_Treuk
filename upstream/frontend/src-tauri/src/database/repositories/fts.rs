@@ -46,55 +46,55 @@ struct ParsedQuery {
 /// Extract `folder:"..."` from the raw query, resolve it to a folder_id,
 /// and return the cleaned FTS query + optional folder_id filter.
 ///
-/// ponytail: naive parse — finds the last `folder:"` pair. If the user
-/// writes multiple folder operators, only the last one takes effect.
+/// ponytail: naive parse — finds the first `folder:"` pair. If the user
+/// writes multiple folder operators, only the first one takes effect.
 /// FTS5 column filters (`folder_name:"..."`) would be more natural but
 /// require the column to be indexed (it is), so this is a convenience
 /// alias that also resolves the folder name to its id for a WHERE filter.
 async fn parse_query(pool: &SqlitePool, raw: &str) -> ParsedQuery {
-    if let Some(caps) = FOLDER_RE.captures(raw) {
-        let folder_name = caps.get(1).unwrap().as_str();
-        let match_end = caps.get(0).unwrap().end();
-        let fts_query = raw[match_end..].trim().to_string();
-        // Resolve folder name to id
-        match FolderRepository::get_all(pool).await {
-            Ok(folders) => {
-                if let Some(folder) = folders
-                    .iter()
-                    .find(|f| f.name.eq_ignore_ascii_case(folder_name))
-                {
-                    return ParsedQuery {
-                        fts_query,
-                        folder_id: Some(folder.id.clone()),
-                    };
-                }
-                // Folder name not found — return query without folder filter
-                ParsedQuery {
-                    fts_query,
-                    folder_id: None,
-                }
-            }
-            Err(_) => ParsedQuery {
-                fts_query,
-                folder_id: None,
-            },
-        }
-    } else {
-        ParsedQuery {
-            fts_query: raw.trim().to_string(),
+    let (fts_query, folder_name) = split_folder_operator(raw);
+    let Some(folder_name) = folder_name else {
+        return ParsedQuery {
+            fts_query,
             folder_id: None,
+        };
+    };
+    // Resolve folder name to id
+    match FolderRepository::get_all(pool).await {
+        Ok(folders) => {
+            let folder_id = folders
+                .iter()
+                .find(|f| f.name.eq_ignore_ascii_case(&folder_name))
+                .map(|f| f.id.clone());
+            // Folder name not found — return query without folder filter
+            ParsedQuery {
+                fts_query,
+                folder_id,
+            }
         }
+        Err(_) => ParsedQuery {
+            fts_query,
+            folder_id: None,
+        },
     }
 }
 
 /// Splits the first `folder:"..."` operator out of a raw query, returning the
-/// remaining query text and the operator's folder name. Direct FTS search
-/// methods keep parsing the operator themselves; this helper exists for
-/// scope normalization in the retrieval service.
+/// remaining query text (text before and after the operator, joined) and the
+/// operator's folder name. Direct FTS search methods keep parsing the
+/// operator themselves; this helper exists for scope normalization in the
+/// retrieval service.
 pub(crate) fn split_folder_operator(raw: &str) -> (String, Option<String>) {
     if let Some(caps) = FOLDER_RE.captures(raw) {
+        let whole = caps.get(0).unwrap();
         let name = caps.get(1).unwrap().as_str().to_string();
-        let rest = raw[caps.get(0).unwrap().end()..].trim().to_string();
+        let before = raw[..whole.start()].trim();
+        let after = raw[whole.end()..].trim();
+        let rest = match (before.is_empty(), after.is_empty()) {
+            (true, _) => after.to_string(),
+            (false, true) => before.to_string(),
+            (false, false) => format!("{before} {after}"),
+        };
         (rest, Some(name))
     } else {
         (raw.trim().to_string(), None)
@@ -776,6 +776,17 @@ mod tests {
         let (rest, name) = split_folder_operator("  plain query  ");
         assert_eq!(rest, "plain query");
         assert!(name.is_none());
+    }
+
+    #[test]
+    fn split_folder_operator_preserves_text_before_the_operator() {
+        let (rest, name) = split_folder_operator(r#"migration risks folder:"Sales""#);
+        assert_eq!(rest, "migration risks");
+        assert_eq!(name.as_deref(), Some("Sales"));
+
+        let (rest, name) = split_folder_operator(r#"before folder:"Sales" after"#);
+        assert_eq!(rest, "before after");
+        assert_eq!(name.as_deref(), Some("Sales"));
     }
 
     #[tokio::test]

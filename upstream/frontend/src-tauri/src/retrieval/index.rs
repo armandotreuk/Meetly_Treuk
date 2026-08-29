@@ -932,7 +932,7 @@ impl QueryIndexService {
             return Err(SearchFailure::CatchUpPending { behind: lag.max(1) });
         }
         if stale || lag > 0 {
-            return Err(SearchFailure::CatchUpPending { behind: lag });
+            return Err(SearchFailure::CatchUpPending { behind: lag.max(1) });
         }
         let query_i8 = prepare_query(query)?;
         // Shape must match the index exactly: `zip` in the dot product would

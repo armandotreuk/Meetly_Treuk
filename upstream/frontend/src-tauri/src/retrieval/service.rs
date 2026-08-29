@@ -169,6 +169,15 @@ pub struct EvidenceProvenance {
 /// One stable-identity evidence candidate. Field names follow the
 /// architecture's conceptual `RetrievedEvidence`; per-channel ranks live in
 /// `provenance` and fused rank/reranker score are added by Task 3.2.
+///
+/// `evidence_id` is stable only within the channel that produced it (each
+/// channel mints its own namespace: `fts:{chunk_type}:{chunk_id}`,
+/// `title:{meeting_id}`, or the semantic `document_id`). A lexical chunk and
+/// a semantic chunk covering the same source text are therefore two distinct
+/// candidates at this stage; the same source range can also legitimately
+/// back several overlapping semantic documents (384-token sliding windows).
+/// Recognizing that overlap and fusing it into one ranked identity is
+/// Task 3.2's job, not this task's.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RetrievedEvidence {
     pub evidence_id: String,
@@ -202,9 +211,15 @@ pub struct ResolvedScope {
 pub enum SemanticFallbackReason {
     NoActiveGeneration,
     ModelMismatch,
+    /// The pinned generation was superseded by an activation/snapshot swap
+    /// mid-request (a routine, self-healing rotation) - distinct from
+    /// [`Self::ModelMismatch`], a genuine embedder/index model divergence.
+    GenerationChanged,
     EmbeddingUnavailable,
     SchedulerRejected,
-    CatchUpTimeout { behind: i64 },
+    CatchUpTimeout {
+        behind: i64,
+    },
     SemanticScanFailed,
 }
 
@@ -234,6 +249,20 @@ fn ensure_not_cancelled(cancel: &CancellationToken) -> Result<(), RetrievalError
     }
 }
 
+/// Strips every remaining `folder:"..."` operator from lexical text after
+/// the first has already been consumed for scope. A second occurrence names
+/// no additional scope and must not become literal FTS MATCH terms in
+/// channels that never re-parse the operator.
+fn strip_residual_folder_operators(mut text: String) -> String {
+    loop {
+        let (stripped, name) = split_folder_operator(&text);
+        if name.is_none() {
+            return stripped;
+        }
+        text = stripped;
+    }
+}
+
 /// One retrieval outcome.
 #[derive(Debug, Clone)]
 pub struct RetrievalResult {
@@ -254,6 +283,7 @@ struct NormalizedRequest {
     lexical_original: String,
     lexical_rewritten: Option<String>,
     core_terms: Vec<String>,
+    core_language: CoreTermLanguage,
 }
 
 /// The one shared retrieval service. Holds a clone of the process-wide
@@ -371,10 +401,15 @@ impl RetrievalService {
             return Err(RetrievalError::InvalidQuery("original query is empty"));
         }
         let (lexical_original, folder_operator) = split_folder_operator(original);
+        // Only the first `folder:"..."` operator determines scope; any
+        // further occurrence in the remaining text must not leak into the
+        // FTS MATCH as literal search terms (`search_with_folder_ids` and
+        // `search_with_meeting_ids` never re-parse the operator).
+        let lexical_original = strip_residual_folder_operators(lexical_original);
         let lexical_rewritten = request
             .rewritten_query
             .as_deref()
-            .map(|rewritten| split_folder_operator(rewritten).0)
+            .map(|rewritten| strip_residual_folder_operators(split_folder_operator(rewritten).0))
             .filter(|rewritten| !rewritten.is_empty() && rewritten != &lexical_original);
 
         let scope = match (&request.scope, folder_operator.as_deref()) {
@@ -414,6 +449,7 @@ impl RetrievalService {
             lexical_original,
             lexical_rewritten,
             core_terms,
+            core_language: request.core_language,
         })
     }
 
@@ -575,15 +611,22 @@ impl RetrievalService {
                 )
                 .await?;
             ensure_not_cancelled(cancel)?;
-            let or_results = self
-                .fts_for_scope(
+            // The AND pass alone can already fill the per-variant bound; the
+            // OR pass exists only to fill what AND left short, so skip the
+            // extra FTS round-trip (and its snippet-expansion cost) when
+            // there is nothing left to fill.
+            let or_results = if and_results.len() >= limits.lexical_per_variant {
+                Vec::new()
+            } else {
+                self.fts_for_scope(
                     pool,
                     &text,
                     limits.lexical_per_variant,
                     normalized,
                     MatchMode::Or,
                 )
-                .await?;
+                .await?
+            };
             ensure_not_cancelled(cancel)?;
             // AND ranks first, OR fills the remainder of the per-variant
             // bound; a chunk already claimed keeps its first (mode, rank).
@@ -673,6 +716,13 @@ impl RetrievalService {
     /// ever held, so a large corpus is never fetched, stored, or sorted whole
     /// before truncation. Scope safety, the overlap score, and the
     /// (overlap desc, meeting id asc) ordering are identical to a full sort.
+    ///
+    /// Requires a known [`CoreTermLanguage`]: overlap scoring has no
+    /// content-word signal without a stopword list, so for
+    /// [`CoreTermLanguage::Unknown`] every function word in the query would
+    /// score equally with real content words and the channel outranks
+    /// Semantic in [`best_provenance`] - noise that would sit ahead of every
+    /// semantic hit rather than being skipped.
     async fn title_channel(
         &self,
         pool: &SqlitePool,
@@ -681,53 +731,63 @@ impl RetrievalService {
         cancel: &CancellationToken,
         candidates: &mut HashMap<String, RetrievedEvidence>,
     ) -> Result<(), RetrievalError> {
-        if normalized.core_terms.is_empty() || limits.lexical_per_variant == 0 {
+        if normalized.core_terms.is_empty()
+            || limits.lexical_per_variant == 0
+            || normalized.core_language == CoreTermLanguage::Unknown
+        {
             return Ok(());
         }
         let mut top: std::collections::BinaryHeap<std::cmp::Reverse<TitleCandidate>> =
             std::collections::BinaryHeap::with_capacity(limits.lexical_per_variant + 1);
-        let mut cursor = String::new();
-        loop {
-            // A cancelled request must not continue to later SQL pages.
-            ensure_not_cancelled(cancel)?;
-            let mut query =
-                QueryBuilder::<Sqlite>::new("SELECT id, title FROM meetings WHERE id > ");
-            query.push_bind(&cursor);
-            query.push(" ORDER BY id LIMIT ");
-            query.push_bind(TITLE_SCAN_PAGE as i64);
-            let rows: Vec<(String, String)> = query
-                .build_query_as()
-                .fetch_all(pool)
-                .await
-                .map_err(db_error)?;
-            ensure_not_cancelled(cancel)?;
-            let next_cursor = rows.last().map(|(id, _)| id.clone());
-            let complete_page = rows.len() == TITLE_SCAN_PAGE;
-            for (meeting_id, title) in rows {
-                if !normalized.membership.allows(&meeting_id) {
-                    continue;
+        match &normalized.membership {
+            // A bounded scope (meeting/folder/allowed-IDs) can only ever
+            // match rows inside its own allow-list, so read exactly those
+            // rows instead of paging the entire `meetings` table.
+            ScopeFilter::Meetings(ids) => {
+                if ids.is_empty() {
+                    return Ok(());
                 }
-                let overlap = title_term_overlap(&normalized.core_terms, &title);
-                if overlap == 0 {
-                    continue;
+                ensure_not_cancelled(cancel)?;
+                let mut query =
+                    QueryBuilder::<Sqlite>::new("SELECT id, title FROM meetings WHERE id IN (");
+                let mut binds = query.separated(", ");
+                for id in ids {
+                    binds.push_bind(id);
                 }
-                let candidate = TitleCandidate {
-                    overlap,
-                    meeting_id,
-                    title,
-                };
-                if top.len() < limits.lexical_per_variant {
-                    top.push(std::cmp::Reverse(candidate));
-                } else if let Some(worst) = top.peek().map(|entry| &entry.0) {
-                    if candidate.cmp(worst) == std::cmp::Ordering::Greater {
-                        top.pop();
-                        top.push(std::cmp::Reverse(candidate));
+                drop(binds);
+                query.push(")");
+                let rows: Vec<(String, String)> = query
+                    .build_query_as()
+                    .fetch_all(pool)
+                    .await
+                    .map_err(db_error)?;
+                ensure_not_cancelled(cancel)?;
+                push_title_candidates(&mut top, rows, normalized, limits.lexical_per_variant);
+            }
+            ScopeFilter::All => {
+                let mut cursor = String::new();
+                loop {
+                    // A cancelled request must not continue to later SQL pages.
+                    ensure_not_cancelled(cancel)?;
+                    let mut query =
+                        QueryBuilder::<Sqlite>::new("SELECT id, title FROM meetings WHERE id > ");
+                    query.push_bind(&cursor);
+                    query.push(" ORDER BY id LIMIT ");
+                    query.push_bind(TITLE_SCAN_PAGE as i64);
+                    let rows: Vec<(String, String)> = query
+                        .build_query_as()
+                        .fetch_all(pool)
+                        .await
+                        .map_err(db_error)?;
+                    ensure_not_cancelled(cancel)?;
+                    let next_cursor = rows.last().map(|(id, _)| id.clone());
+                    let complete_page = rows.len() == TITLE_SCAN_PAGE;
+                    push_title_candidates(&mut top, rows, normalized, limits.lexical_per_variant);
+                    match next_cursor {
+                        Some(id) if complete_page => cursor = id,
+                        _ => break,
                     }
                 }
-            }
-            match next_cursor {
-                Some(id) if complete_page => cursor = id,
-                _ => break,
             }
         }
         let mut ranked: Vec<(usize, String, String)> = top
@@ -877,14 +937,15 @@ impl RetrievalService {
                     Err(SearchFailure::NoActiveGeneration) => {
                         return Ok(Some(SemanticFallbackReason::NoActiveGeneration));
                     }
-                    Err(
-                        SearchFailure::ModelMismatch
-                        | SearchFailure::GenerationChanged
-                        | SearchFailure::InvalidQuery(_),
-                    ) => {
+                    Err(SearchFailure::ModelMismatch | SearchFailure::InvalidQuery(_)) => {
                         // Any identity/shape failure invalidates the whole
                         // semantic stage: no partial hits survive.
                         return Ok(Some(SemanticFallbackReason::ModelMismatch));
+                    }
+                    Err(SearchFailure::GenerationChanged) => {
+                        // A benign mid-request activation swap, not a model
+                        // divergence: no partial hits survive either way.
+                        return Ok(Some(SemanticFallbackReason::GenerationChanged));
                     }
                     Err(SearchFailure::ScanFailed(_)) => {
                         return Ok(Some(SemanticFallbackReason::SemanticScanFailed));
@@ -904,7 +965,7 @@ impl RetrievalService {
         // used: an activation between variant scans cannot publish partial
         // semantic candidates.
         if index.active_generation().as_deref() != Some(generation_id.as_str()) {
-            return Ok(Some(SemanticFallbackReason::ModelMismatch));
+            return Ok(Some(SemanticFallbackReason::GenerationChanged));
         }
 
         // Current-membership re-filter (defense in depth on top of the scan
@@ -945,7 +1006,7 @@ impl RetrievalService {
         // Re-fence after the awaited candidate-gate SQL read: an activation
         // during validation cannot publish partial semantic candidates.
         if index.active_generation().as_deref() != Some(generation_id.as_str()) {
-            return Ok(Some(SemanticFallbackReason::ModelMismatch));
+            return Ok(Some(SemanticFallbackReason::GenerationChanged));
         }
         let document_ids: Vec<String> = filtered
             .iter()
@@ -964,7 +1025,7 @@ impl RetrievalService {
         // A swap while canonical content was read invalidates the whole
         // semantic stage before any stale-generation evidence is published.
         if index.active_generation().as_deref() != Some(generation_id.as_str()) {
-            return Ok(Some(SemanticFallbackReason::ModelMismatch));
+            return Ok(Some(SemanticFallbackReason::GenerationChanged));
         }
         for (variant, rank, hit) in filtered {
             let Some(title) = verified.get(&hit.meeting_id) else {
@@ -1017,8 +1078,12 @@ impl NormalizedRequest {
     }
 }
 
-/// Deduplicates candidates by stable evidence identity while accumulating
-/// per-channel provenance.
+/// Deduplicates repeat matches within one channel's evidence-ID namespace
+/// (e.g. the same FTS chunk hit by two query variants) while accumulating
+/// their provenance. Different channels never share an evidence-ID
+/// namespace (see [`RetrievedEvidence`]), so this cannot and does not unify
+/// a lexical and a semantic candidate covering the same source text - that
+/// cross-channel fusion is Task 3.2's job.
 fn record_candidate(
     candidates: &mut HashMap<String, RetrievedEvidence>,
     evidence: RetrievedEvidence,
@@ -1055,11 +1120,19 @@ fn lexical_evidence(result: FtsSearchResult) -> RetrievedEvidence {
         source_template_id,
         heading: None,
         ordinal: 0,
-        text: result.snippet,
+        // FTS5 `snippet()` wraps matches in `<mark>`/`</mark>`; evidence text
+        // must read as plain prose like the semantic channel's canonical
+        // content, since reranking and hydration read this field uniformly
+        // across channels.
+        text: strip_snippet_markup(&result.snippet),
         speaker: result.speaker,
         timestamp_label: result.timestamp_label,
         provenance: Vec::new(),
     }
+}
+
+fn strip_snippet_markup(snippet: &str) -> String {
+    snippet.replace("<mark>", "").replace("</mark>", "")
 }
 
 fn title_evidence(meeting_id: String, title: String) -> RetrievedEvidence {
@@ -1158,12 +1231,12 @@ fn mode_order(mode: Option<LexicalMode>) -> u8 {
 /// never per-corpus inference, never an all-language union as a language
 /// substitute. Names and numeric tokens survive unless they exactly equal a
 /// listed function word.
-const PORTUGUESE_HIGH_FREQUENCY: &[&str] = &[
+pub(crate) const PORTUGUESE_HIGH_FREQUENCY: &[&str] = &[
     "a", "as", "o", "os", "de", "da", "das", "do", "dos", "e", "em", "no", "na", "nos", "nas",
     "para", "por", "que", "qual", "quais", "como", "foi",
 ];
 
-const ENGLISH_HIGH_FREQUENCY: &[&str] = &[
+pub(crate) const ENGLISH_HIGH_FREQUENCY: &[&str] = &[
     "a", "an", "the", "of", "to", "and", "in", "on", "for", "by", "that", "what", "which", "how",
     "was", "were", "is", "are",
 ];
@@ -1175,12 +1248,12 @@ pub(crate) fn normalize_core_token(token: &str) -> String {
     token
         .chars()
         .map(|character| match character.to_ascii_lowercase() {
-            'á' | 'à' | 'â' | 'ã' => 'a',
-            'é' | 'ê' => 'e',
-            'í' => 'i',
-            'ó' | 'ô' | 'õ' => 'o',
-            'ú' | 'ü' => 'u',
-            'ç' => 'c',
+            'á' | 'à' | 'â' | 'ã' | 'Á' | 'À' | 'Â' | 'Ã' => 'a',
+            'é' | 'ê' | 'É' | 'Ê' => 'e',
+            'í' | 'Í' => 'i',
+            'ó' | 'ô' | 'õ' | 'Ó' | 'Ô' | 'Õ' => 'o',
+            'ú' | 'ü' | 'Ú' | 'Ü' => 'u',
+            'ç' | 'Ç' => 'c',
             other => other,
         })
         .collect()
@@ -1217,6 +1290,39 @@ pub(crate) fn core_terms(query: &str, language: CoreTermLanguage) -> Vec<String>
     }
 }
 
+/// Scores one page/batch of `(id, title)` rows against the bounded top-k
+/// heap. Shared by the full-corpus streamed scan and the bounded-scope
+/// direct read so both apply identical scope, overlap, and eviction rules.
+fn push_title_candidates(
+    top: &mut std::collections::BinaryHeap<std::cmp::Reverse<TitleCandidate>>,
+    rows: Vec<(String, String)>,
+    normalized: &NormalizedRequest,
+    cap: usize,
+) {
+    for (meeting_id, title) in rows {
+        if !normalized.membership.allows(&meeting_id) {
+            continue;
+        }
+        let overlap = title_term_overlap(&normalized.core_terms, &title);
+        if overlap == 0 {
+            continue;
+        }
+        let candidate = TitleCandidate {
+            overlap,
+            meeting_id,
+            title,
+        };
+        if top.len() < cap {
+            top.push(std::cmp::Reverse(candidate));
+        } else if let Some(worst) = top.peek().map(|entry| &entry.0) {
+            if candidate.cmp(worst) == std::cmp::Ordering::Greater {
+                top.pop();
+                top.push(std::cmp::Reverse(candidate));
+            }
+        }
+    }
+}
+
 fn title_term_overlap(terms: &[String], title: &str) -> usize {
     let title_terms: HashSet<String> = title
         .split(|character: char| !character.is_alphanumeric())
@@ -1233,12 +1339,26 @@ fn title_term_overlap(terms: &[String], title: &str) -> usize {
 /// `Reverse`): lower overlap first, and among equal overlaps the
 /// lexicographically LARGER meeting id is worse, so bounded eviction keeps
 /// the smaller id and the final order is overlap desc, meeting id asc.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq`/`Ord` are both keyed on `(overlap, meeting_id)` only, matching each
+/// other exactly (`meetings.id` is a primary key, so `title` never varies
+/// for a fixed `meeting_id` and dropping it from equality changes nothing
+/// observable today - but it keeps the `BinaryHeap` invariant that equal
+/// `Ord` implies equal `Eq` true by construction rather than by coincidence).
+#[derive(Debug, Clone)]
 struct TitleCandidate {
     overlap: usize,
     meeting_id: String,
     title: String,
 }
+
+impl PartialEq for TitleCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.overlap == other.overlap && self.meeting_id == other.meeting_id
+    }
+}
+
+impl Eq for TitleCandidate {}
 
 impl Ord for TitleCandidate {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
@@ -1278,6 +1398,7 @@ impl SemanticFallbackReason {
         match self {
             Self::NoActiveGeneration => "no_active_generation",
             Self::ModelMismatch => "model_mismatch",
+            Self::GenerationChanged => "generation_changed",
             Self::EmbeddingUnavailable => "embedding_unavailable",
             Self::SchedulerRejected => "scheduler_rejected",
             Self::CatchUpTimeout { .. } => "catch_up_timeout",

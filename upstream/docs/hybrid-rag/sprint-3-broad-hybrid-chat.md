@@ -675,6 +675,7 @@ budget; and the failure/fallback behavior actually exercised.
 | 2026-08-29 | Defer the Task `3.6` expansion approach. | None of the three approaches can be selected by implementation inference; retain the 3.4 rollout path while making 3.6 and the inherited 5/5 gate explicit Sprint-close dependencies. | Pre-select a lexicon, provider expansion, or pseudo-relevance feedback. | User |
 | 2026-08-29 | Approve this amended Sprint 3 PRD only. | The user approved planning authority but did not authorize Sprint 3 TODO creation or Task 3.1 dispatch. | Approve and dispatch Task 3.1 in the same decision. | User |
 | 2026-08-29 | Approve Sprint 3 start and the first batch, Task 3.1 only. | Task 3.1 is the sole dependency-ready L task; ranking, hydration, rollout, calibration, and expansion remain sequenced or separately gated. | Start multiple tasks, or defer the foundation. | User |
+| 2026-08-29 | Task 3.1 code review (R16) finding 14 (incompatible cross-channel `evidence_id` namespaces) is not remediated in `3.1.R1`; the doc's overclaiming contract text is corrected instead. | Semantic documents are 384-token sliding windows that generally span multiple transcript segments, while FTS chunks are per-segment - there is no clean bijection to key shared identity on without the overlap-range fusion Task 3.2 already owns. Building partial fusion inside Task 3.1 would duplicate that work under a narrower, riskier scope. | Attempt a heuristic cross-channel identity match inside Task 3.1. | Main agent |
 
 ## Task Execution Log
 
@@ -795,6 +796,114 @@ budget; and the failure/fallback behavior actually exercised.
   must state the language deliberately per request.
 - Task 3.2 is now dependency-ready but requires its own L-task batch approval.
 
+### 3.1.R1 - Task 3.1 code review (R16) remediation
+
+**Status:** Complete
+**Owner:** Main agent (session `e762b0ec-7ac3-454d-a05c-49ad443b817d`)
+**Completed:** 2026-08-29
+**Implemented:**
+- Closed thirteen of the fourteen Task 3.1 code review (R16) findings below;
+  the fourteenth is recorded as a scope decision in the decision log, not an
+  omission.
+- Fixed `split_folder_operator` (`database/repositories/fts.rs`) to preserve
+  query text on both sides of the `folder:"..."` operator instead of
+  discarding everything before it, and refactored `parse_query` to call the
+  shared helper instead of duplicating the same extraction logic with a
+  stale "finds the last pair" comment.
+- Added a `strip_residual_folder_operators` pass so a second `folder:"..."`
+  occurrence in the remaining text cannot leak into an FTS `MATCH` clause as
+  literal search terms on scope branches that never re-parse the operator.
+- Fixed `normalize_core_token` to fold uppercase accented Portuguese letters
+  (`character.to_ascii_lowercase()` leaves non-ASCII characters untouched, so
+  `Água`/`REUNIÃO`-style titles never matched their lowercase query terms in
+  the title channel); mirrored the identical fix into the evaluation
+  harness's copy of the same function to keep the doc's parity claim true.
+- Stripped FTS5 `<mark>`/`</mark>` snippet markup out of lexical evidence
+  text so it reads as plain prose like the semantic channel's canonical
+  content, instead of leaking HTML tags into whatever later reads
+  `RetrievedEvidence.text` (Task 3.2's reranker, Task 3.3's hydration).
+- Split `SemanticFallbackReason::GenerationChanged` out of `ModelMismatch`:
+  a routine mid-request activation swap and a genuine embedder/index model
+  divergence were reported as the same typed reason at all four sites that
+  can observe a pinned-generation mismatch, which would have made Sprint
+  3.4's kill-switch/observability work unable to tell a benign snapshot
+  rotation from an operator-actionable fault.
+- Skipped the redundant OR-mode FTS pass when the AND pass already filled the
+  per-variant candidate bound, avoiding both the extra query and its
+  per-transcript-row snippet-expansion cost.
+- Replaced the title channel's unscoped full-`meetings`-table streamed scan
+  with a direct `WHERE id IN (...)` read for every bounded scope (meeting,
+  folder, allowed-IDs); the paginated streaming scan is now used only for the
+  genuinely unbounded `ScopeFilter::All` case.
+- Fixed a `CatchUpPending { behind: 0 }` inconsistency on the pre-scan
+  staleness check in `index.rs` (every other emission site in the same
+  function floors `behind` at 1).
+- Fixed `TitleCandidate`'s `PartialEq` to compare the same fields as its
+  manual `Ord` (`overlap`, `meeting_id`), closing a latent `BinaryHeap`
+  invariant gap that was unreachable today only because `meetings.id` is a
+  primary key.
+- Gated the title channel off for `CoreTermLanguage::Unknown`: without a
+  stopword list, function words scored equally with content words and could
+  occupy candidate slots ahead of every semantic hit in the deterministic
+  channel ordering.
+- Added a test asserting the production stopword consts
+  (`PORTUGUESE_HIGH_FREQUENCY`, `ENGLISH_HIGH_FREQUENCY`) match
+  `tests/fixtures/evaluation_policy.json` byte-for-byte, so a future policy
+  edit that is not mirrored into production fails loudly instead of silently
+  invalidating the evaluation gates.
+- Added `meeting_scope_excludes_every_other_meeting` and
+  `meeting_scope_naming_no_current_meeting_fails_closed`:
+  `PersistedRetrievalScope::Meeting` had zero positive coverage before this -
+  only one negative (conflicting-scope) assertion touched it anywhere in the
+  test file.
+**Implementation:**
+- Files: `frontend/src-tauri/src/retrieval/service.rs`,
+  `frontend/src-tauri/src/retrieval/tests.rs`,
+  `frontend/src-tauri/src/retrieval/index.rs`,
+  `frontend/src-tauri/src/database/repositories/fts.rs`,
+  `frontend/src-tauri/tests/retrieval_evaluation.rs`.
+- Approach: fix each finding at its narrowest correct scope; where a full fix
+  belonged to a later task (finding 14), correct the misleading contract text
+  instead of building partial cross-task logic.
+**Not implemented:**
+- Finding 14, cross-channel `evidence_id` unification (lexical/title/semantic
+  candidates covering the same source text stay separate identities at this
+  stage). Recorded as a decision below and in the decision log above.
+**Why not implemented:**
+- Semantic documents are 384-token sliding windows that generally span
+  multiple transcript segments while FTS chunks are per-segment, so there is
+  no clean bijection to key shared identity on without the overlap-range
+  fusion Task 3.2 already owns. Corrected `RetrievedEvidence` and
+  `record_candidate`'s doc comments, which previously implied cross-channel
+  dedup already happens.
+**Verification:**
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib retrieval::tests`
+  - pass: 75 passed (was 71; +4 new tests).
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib database::repositories::fts::tests`
+  - pass: 17 passed (was 16; +1 new test).
+- `cargo check --manifest-path "frontend/src-tauri/Cargo.toml"` (and `--tests`)
+  - pass.
+- `cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check` and
+  `git diff --check`
+  - pass.
+- Full `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib`
+  - pass: 630 passed, 0 failed, 2 ignored (was 625 passed, 0 failed).
+- Also cleaned a stale `tauri` build-cache directory (`cargo clean -p tauri`)
+  left over from an earlier OneDrive-to-`D:\` project relocation, which was
+  blocking `cargo check` with a permissions-file read error against the old
+  path; unrelated to this remediation but required to compile at all.
+**Rollback:**
+- Revert the `3.1.R1` commit. Task 3.1's original behavior returns, including
+  the fourteen findings; no persisted data, schema, or model contract is
+  involved.
+**Decisions and follow-ups:**
+- Finding 14 is not a Task 3.1 gap; it is recorded as Task 3.2's cross-channel
+  fusion responsibility in the decision log above.
+- The `GenerationChanged` vs `ModelMismatch` split is a new public
+  `SemanticFallbackReason` variant; any Task 3.4 diagnostics/observability
+  surface consuming this enum must handle it explicitly, not fall through a
+  wildcard arm.
+
 ## Sprint Reviews
 
 ### Pre-start Architecture Review (R15)
@@ -816,12 +925,92 @@ separate batch approval before Sprint 3 TODO creation or Task 3.1 dispatch. Do
 not dispatch Task 3.6 until the user selects an approach; do not close Sprint 3
 before its 5/5 critical Recall@1 evidence and all R13 evidence are recorded.
 
-### Code Review
+### Task 3.1 Code Review (R16)
 
-**Reviewer:** Pending
-**Verdict:** Pending
-**Findings:** Pending
-**Required follow-ups:** Pending
+**Reviewer:** `claude-sonnet-5` (session `e762b0ec-7ac3-454d-a05c-49ad443b817d`), 2026-08-29
+**Scope:** Task 3.1's implementation range only:
+`frontend/src-tauri/src/retrieval/service.rs`,
+`frontend/src-tauri/src/retrieval/tests.rs`,
+`frontend/src-tauri/src/retrieval/index.rs`,
+`frontend/src-tauri/src/database/repositories/fts.rs`. Not a full-sprint
+review; the pending "Architecture Review" below remains required once later
+tasks land.
+**Verdict:** Changes requested - thirteen findings resolved in `3.1.R1` above,
+one resolved by scope decision (deferred to Task 3.2).
+
+**Findings (severity order):**
+1. **Should-fix - a `folder:"..."` operator with query text before it
+   silently drops that text.** `split_folder_operator` returned only the text
+   after the match, so `migration risks folder:"Sales"` ran as an empty
+   query with a valid folder scope, and `retrieve` returned `Ok` with zero
+   candidates - indistinguishable from "no matches exist."
+   `database/repositories/fts.rs:97`.
+2. **Should-fix - the title channel silently disagrees with the lexical
+   channel on the corpus's primary language.** `normalize_core_token`
+   matched only lowercase accented characters after
+   `character.to_ascii_lowercase()`, which leaves non-ASCII characters
+   untouched, so ordinary Title Case (`Água`, `Ação`) and all-caps
+   (`REUNIÃO`) titles never folded and never scored a title-overlap match.
+   `retrieval/service.rs:1177`.
+3. **Should-fix - lexical evidence text carries FTS5 `<mark>` markup while
+   semantic evidence text is plain prose.** The same `RetrievedEvidence.text`
+   field meant different things per channel with nothing signaling it; Task
+   3.2's reranker would have scored HTML tags as tokens.
+   `retrieval/service.rs:1058`.
+4. **Should-fix - a second `folder:"..."` operator leaks into the FTS
+   `MATCH` clause as literal search terms.** Only the first operator is
+   consumed for scope; `search_with_folder_ids`/`search_with_meeting_ids`
+   never re-parse the operator, so a residual second occurrence became
+   required/optional search terms including the literal word `folder`.
+   `retrieval/service.rs:649`.
+5. **Should-fix - a benign mid-request activation swap is reported
+   identically to a genuine model mismatch.** `SearchFailure::GenerationChanged`
+   collapsed into `SemanticFallbackReason::ModelMismatch` at all four
+   observation sites, which would have made kill-switch/observability work
+   unable to tell a self-healing snapshot rotation from an
+   operator-actionable fault. `retrieval/service.rs:887`.
+6. Correctness (minor) - `TitleCandidate` derives `PartialEq`/`Eq` over all
+   three fields but its manual `Ord` compares only two, breaking the
+   `BinaryHeap` equal-ordering invariant (latent; unreachable while
+   `meetings.id` stays a primary key). `retrieval/service.rs:1243`.
+7. Correctness (minor) - `CoreTermLanguage::Unknown` has no stopword list, so
+   the title channel scored function words as real overlap and could rank
+   noise ahead of every semantic hit. `retrieval/service.rs:1220`.
+8. Correctness (minor) - one `CatchUpPending` emission site returned
+   `behind: 0` where the other three in the same function floor it at 1,
+   producing a self-contradictory "waited for zero changes" diagnostic.
+   `retrieval/index.rs:935`.
+9. Efficiency - the OR-mode FTS pass ran unconditionally even when the AND
+   pass already filled the per-variant bound, each call paying an extra
+   per-transcript-row snippet-expansion cost. `retrieval/service.rs:578`.
+10. Efficiency - the title channel streamed the entire `meetings` table for
+    every request regardless of scope, discarding out-of-scope rows in Rust
+    instead of binding the already-known allow-list into SQL.
+    `retrieval/service.rs:693`.
+11. Test coverage - `PersistedRetrievalScope::Meeting` had zero positive
+    coverage; only one negative (conflicting-scope) assertion touched it
+    anywhere in the 2,208-line test file. `retrieval/service.rs:454`.
+12. Reuse - the production stopword lists are hand-copied from
+    `tests/fixtures/evaluation_policy.json` with nothing asserting they stay
+    equal, so a future policy edit could silently decouple production from
+    the gates that are supposed to measure it. `retrieval/service.rs:1161`.
+13. Reuse - `split_folder_operator` duplicated `parse_query`'s extraction
+    logic verbatim, and the two copies' doc comments already disagreed about
+    whether the regex finds the first or last match.
+    `database/repositories/fts.rs:94`.
+14. Correctness (minor, not remediated) - lexical, title, and semantic
+    channels mint `evidence_id` in incompatible namespaces, so
+    `record_candidate`'s dedupe cannot unify the same source text hit by two
+    channels. `retrieval/service.rs:1085`.
+
+**Verification:** `cargo test --lib` was green before this review (625
+passed, 2 ignored) and stayed green after remediation (630 passed, 2 ignored,
++5 new tests), plus `cargo fmt --check` and `git diff --check`, so every
+finding was a latent defect rather than a broken build.
+
+**Required follow-ups:** all addressed in `3.1.R1`, except finding 14, which
+is correctly Task 3.2's cross-channel fusion responsibility and is recorded
+in the decision log rather than fixed here.
 
 ### Architecture Review
 
