@@ -307,7 +307,9 @@ impl ScopeFilter {
         ScopeFilter::Meetings(ids.into_iter().map(Into::into).collect())
     }
 
-    fn allows(&self, meeting_id: &str) -> bool {
+    /// True when `meeting_id` is inside the scope. Also the post-filter rule
+    /// the retrieval service re-applies to every candidate before return.
+    pub fn allows(&self, meeting_id: &str) -> bool {
         match self {
             ScopeFilter::All => true,
             ScopeFilter::Meetings(ids) => ids.contains(meeting_id),
@@ -327,6 +329,10 @@ pub enum SearchFailure {
         behind: i64,
     },
     ModelMismatch,
+    /// The generation the query was pinned to is no longer the active
+    /// snapshot (an activation/snapshot switch happened mid-request). The
+    /// pinned request must never be scored against the newer generation.
+    GenerationChanged,
     InvalidQuery(&'static str),
     ScanFailed(String),
 }
@@ -758,7 +764,9 @@ impl QueryIndexService {
             .unwrap_or(0)
     }
 
-    #[allow(dead_code)] // Invoked by the Sprint 3 Fast hybrid consumer.
+    /// Invoked by the Sprint 3 Fast hybrid consumer (retrieval service): one
+    /// successful hybrid query satisfies the garbage-collection eligibility
+    /// gate for retired generations.
     pub(crate) fn acknowledge_fast_hybrid_query(&self) {
         self.acknowledged_fast_hybrid_queries
             .fetch_add(1, Ordering::Relaxed);
@@ -767,6 +775,12 @@ impl QueryIndexService {
     fn acknowledged_fast_hybrid_queries(&self) -> u64 {
         self.acknowledged_fast_hybrid_queries
             .load(Ordering::Relaxed)
+    }
+
+    /// Test-only read of the existing Fast hybrid query counter.
+    #[cfg(test)]
+    pub(crate) fn fast_hybrid_query_count(&self) -> u64 {
+        self.acknowledged_fast_hybrid_queries()
     }
 
     /// Injects a deterministic RAM measurement for gate tests.
@@ -867,6 +881,30 @@ impl QueryIndexService {
         limit: usize,
         cancel: &CancellationToken,
     ) -> Result<Vec<VectorHit>, SearchFailure> {
+        let pinned = {
+            let state = self.lock_state();
+            match state.active.as_ref() {
+                Some(snapshot) => snapshot.generation_id().to_string(),
+                None => return Err(SearchFailure::NoActiveGeneration),
+            }
+        };
+        self.search_pinned(query, scope, limit, cancel, &pinned)
+            .await
+    }
+
+    /// The same search pinned to one generation: the query is only ever
+    /// scored against the snapshot whose generation was observed before query
+    /// embedding. An activation/snapshot switch that installs a newer active
+    /// snapshot refuses the request instead of selecting it, so a request can
+    /// never receive hits from a different generation/model.
+    pub(crate) async fn search_pinned(
+        &self,
+        query: &[f32],
+        scope: ScopeFilter,
+        limit: usize,
+        cancel: &CancellationToken,
+        pinned_generation: &str,
+    ) -> Result<Vec<VectorHit>, SearchFailure> {
         if cancel.is_cancelled() {
             return Err(SearchFailure::Cancelled);
         }
@@ -875,6 +913,9 @@ impl QueryIndexService {
             let Some(snapshot) = state.active.clone() else {
                 return Err(SearchFailure::NoActiveGeneration);
             };
+            if snapshot.generation_id() != pinned_generation {
+                return Err(SearchFailure::GenerationChanged);
+            }
             (
                 snapshot,
                 state.lag,
@@ -922,6 +963,13 @@ impl QueryIndexService {
             return Err(SearchFailure::Cancelled);
         }
         let state = self.lock_state();
+        if state
+            .active
+            .as_ref()
+            .is_none_or(|active| active.generation_id() != pinned_generation)
+        {
+            return Err(SearchFailure::GenerationChanged);
+        }
         if state.epoch != epoch || state.model_mismatch || state.activation_transition {
             return Err(if state.model_mismatch {
                 SearchFailure::ModelMismatch
@@ -4566,6 +4614,13 @@ mod tests {
                 text.split_whitespace().count()
             }
             fn embed_documents_blocking(
+                &self,
+                texts: &[String],
+                _cancel: &CancellationToken,
+            ) -> Result<Vec<Vec<f32>>, crate::retrieval::model::RetrievalModelError> {
+                Ok(texts.iter().map(|text| vector_for(text)).collect())
+            }
+            fn embed_queries_blocking(
                 &self,
                 texts: &[String],
                 _cancel: &CancellationToken,

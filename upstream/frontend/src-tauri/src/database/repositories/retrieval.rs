@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use sqlx::{Error as SqlxError, Sqlite, SqlitePool, Transaction};
+use sqlx::{Error as SqlxError, QueryBuilder, Sqlite, SqlitePool, Transaction};
 use tokio_util::sync::CancellationToken;
 
 pub const GENERATION_STATES: [&str; 4] = ["building", "ready", "failed", "retired"];
@@ -879,6 +879,65 @@ impl RetrievalRepository {
                 .fetch_optional(pool)
                 .await?;
         Ok(row.map(|(revision,)| revision))
+    }
+
+    /// Current title and semantic eligibility for candidate meetings from one
+    /// query-side generation. A meeting is eligible only when it exists, its
+    /// per-meeting state for the generation is exactly `'ready'`, and the
+    /// indexed source revision equals the current source revision; meetings
+    /// that are missing, never indexed, dirty, or in a non-ready state for
+    /// the generation are absent from the result (Task 3.1 candidate gate).
+    pub async fn verified_semantic_meetings(
+        pool: &SqlitePool,
+        generation_id: &str,
+        meeting_ids: &[String],
+    ) -> Result<Vec<(String, String)>, SqlxError> {
+        if meeting_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query = QueryBuilder::<Sqlite>::new(
+            r#"
+            SELECT m.id, m.title
+            FROM meetings m
+            JOIN search_source_state s ON s.meeting_id = m.id
+            JOIN retrieval_meeting_state r
+                   ON r.meeting_id = m.id AND r.generation_id = "#,
+        );
+        query.push_bind(generation_id);
+        query.push(" WHERE r.state = 'ready' AND r.indexed_source_revision = s.source_revision");
+        query.push(" AND m.id IN (");
+        let mut ids = query.separated(", ");
+        for meeting_id in meeting_ids {
+            ids.push_bind(meeting_id);
+        }
+        drop(ids);
+        query.push(")");
+        Ok(query.build_query_as().fetch_all(pool).await?)
+    }
+
+    /// Canonical chunk text for semantic candidate documents of one
+    /// generation. Documents absent from the generation are absent from the
+    /// result, so a vanished canonical row can never become evidence.
+    pub async fn document_contents(
+        pool: &SqlitePool,
+        generation_id: &str,
+        document_ids: &[String],
+    ) -> Result<Vec<(String, String)>, SqlxError> {
+        if document_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT document_id, content FROM retrieval_documents WHERE generation_id = ",
+        );
+        query.push_bind(generation_id);
+        query.push(" AND document_id IN (");
+        let mut ids = query.separated(", ");
+        for document_id in document_ids {
+            ids.push_bind(document_id);
+        }
+        drop(ids);
+        query.push(")");
+        Ok(query.build_query_as().fetch_all(pool).await?)
     }
 
     pub async fn load_meeting_source(

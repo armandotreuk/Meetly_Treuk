@@ -112,6 +112,14 @@ pub trait DocumentEmbedder: Send + Sync + 'static {
         texts: &[String],
         cancel: &CancellationToken,
     ) -> Result<Vec<Vec<f32>>, RetrievalModelError>;
+    /// Embeds query texts with the manifest query prefix (blocking; call from
+    /// `spawn_blocking`). The approved bundle uses distinct query and document
+    /// prefixes, so query work must never route through the document method.
+    fn embed_queries_blocking(
+        &self,
+        texts: &[String],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Vec<f32>>, RetrievalModelError>;
 }
 
 impl DocumentEmbedder for RetrievalModels {
@@ -138,6 +146,15 @@ impl DocumentEmbedder for RetrievalModels {
     ) -> Result<Vec<Vec<f32>>, RetrievalModelError> {
         let references: Vec<&str> = texts.iter().map(String::as_str).collect();
         self.embed_documents_sync(&references, cancel)
+    }
+
+    fn embed_queries_blocking(
+        &self,
+        texts: &[String],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Vec<f32>>, RetrievalModelError> {
+        let references: Vec<&str> = texts.iter().map(String::as_str).collect();
+        self.embed_queries_sync(&references, cancel)
     }
 }
 
@@ -260,7 +277,7 @@ impl RetrievalScheduler {
     }
 
     #[cfg(test)]
-    fn queued_interactive(&self) -> usize {
+    pub(crate) fn queued_interactive(&self) -> usize {
         locked(&self.0.queue).len()
     }
 
@@ -327,9 +344,25 @@ impl InteractiveTicket {
 
     /// Waits for the inference permit in FIFO order among interactives.
     pub async fn wait_for_permit(self) -> Result<InferenceLease, SchedulerRejection> {
+        self.wait_for_permit_with(&CancellationToken::new()).await
+    }
+
+    /// The same FIFO permit wait, also aborted by an external request token:
+    /// a request cancelled while queued is removed from the queue immediately
+    /// and returns [`SchedulerRejection::CancelledWhileQueued`] instead of
+    /// waiting for (or later consuming) the inference permit. Ticket-owned
+    /// cancellation semantics are unchanged.
+    pub async fn wait_for_permit_with(
+        self,
+        external: &CancellationToken,
+    ) -> Result<InferenceLease, SchedulerRejection> {
         tokio::select! {
             biased;
             _ = self.token.cancelled() => {
+                self.scheduler.remove_queued(self.id);
+                Err(SchedulerRejection::CancelledWhileQueued)
+            }
+            _ = external.cancelled() => {
                 self.scheduler.remove_queued(self.id);
                 Err(SchedulerRejection::CancelledWhileQueued)
             }
@@ -509,6 +542,16 @@ impl RetrievalLifecycle {
     /// The shared scheduler consumed by Task 2.5 query paths.
     pub fn scheduler(&self) -> RetrievalScheduler {
         self.0.scheduler.clone()
+    }
+
+    /// Loads the bundled embedding runtime for query-side work on a blocking
+    /// thread. This is the same loader the worker uses, so it resolves to the
+    /// process-wide cached session set - never a second model-session owner.
+    pub(crate) async fn load_embedder(&self) -> Result<Arc<dyn DocumentEmbedder>, String> {
+        let loader = self.0.config.loader();
+        tokio::task::spawn_blocking(move || loader())
+            .await
+            .map_err(|error| format!("embedder load task join failed: {error}"))?
     }
 
     /// The one process-wide query-index service (Task 2.5); MCP and Tauri
@@ -1629,6 +1672,15 @@ mod tests {
                 None => {}
             }
             Ok(vectors)
+        }
+
+        fn embed_queries_blocking(
+            &self,
+            texts: &[String],
+            cancel: &CancellationToken,
+        ) -> Result<Vec<Vec<f32>>, RetrievalModelError> {
+            // The fake has no prefix contract; query and document behavior match.
+            self.embed_documents_blocking(texts, cancel)
         }
     }
 

@@ -2,9 +2,9 @@
 
 ## Status
 
-Approved for planning, 2026-08-29. Sprint 2 closed with user approval. This PRD
-received mandatory pre-start amendments and user approval; no Sprint 3 TODO or
-implementation task has started.
+In progress, 2026-08-29. Sprint 2 closed with user approval. This PRD received
+mandatory pre-start amendments and user approval. Task 3.1 is complete; later
+tasks remain pending their individual batch approvals.
 
 Revised 2026-08-21 after pre-implementation critique: reranking sub-budget and
 a mandatory runtime kill switch added. Revised 2026-08-29 after architecture
@@ -135,7 +135,7 @@ encoding, or exact-backend contract.
 
 | ID | Feature | Task | Size | Owner | Dependencies | Acceptance check | Rollback |
 |---|---|---|---|---|---|---|---|
-| 3.1 | Hybrid candidates | Add concrete persisted-scope retrieval requests and scope-safe FTS/vector candidate generation. | L | Pending `worker-l` | Sprint 2 | Tests prove all/folder allow-lists, query variants, cancellation, semantic fallback, and no out-of-scope candidates. | Route broad Chat back to existing `resolve_scope_results`; index remains unused. |
+| 3.1 | Hybrid candidates | Add concrete persisted-scope retrieval requests and scope-safe FTS/vector candidate generation. | L | `worker-l` (complete) | Sprint 2 | Tests prove all/folder allow-lists, query variants, cancellation, semantic fallback, and no out-of-scope candidates. | Route broad Chat back to existing `resolve_scope_results`; index remains unused. |
 | 3.2 | Ranking | Add RRF, stable dedupe, meeting aggregation/diversity, and local cross-encoder reranking. **Owns the inherited critical Recall@1 debt for `pt-ref-sla-suporte` and `pt-ref-nps-detrator`**, whose targets the bi-encoder already ranks first. | L | Pending `worker-l` | 3.1 | Evaluation proves correct meeting ranking and reranker improvement without exact-term regression; both inherited cases reach rank 1; constants tuned with threshold semantics. | Disable reranking/fusion service and use ordered lexical candidates. |
 | 3.3 | Context | Add authoritative multi-meeting hydration, bounded allocation, coverage, and retained-source output. | L | Pending `worker-l` | 3.2 | Reference context contains complete schedule/MPV facts and all sources match retained evidence. | Keep old generic context builder and lexical path. |
 | 3.4 | Broad Chat rollout | Integrate Fast hybrid retrieval into all/folder streaming and non-streaming Chat through shared preparation, and ship the mandatory `force_lexical_retrieval` kill switch. | M | Pending `worker-m` | 3.1-3.3 | Product-path tests prove all/folder Fast behavior, lexical fallback, kill-switch behavior, cancellation, and source events. | Enable `force_lexical_retrieval` at runtime; no rebuild or reinstall required. |
@@ -674,6 +674,7 @@ budget; and the failure/fallback behavior actually exercised.
 | 2026-08-29 | Apply mandatory pre-start architecture amendments. | Carry Sprint 2 R13 calibration/refusal evidence, exact-head Windows evidence, scheduler reuse, hydration consistency, settings migration, and Sprint 3 closure dependencies into executable acceptance criteria. | Add a new runtime, telemetry subsystem, Search implementation, or relax the activation gate. | User |
 | 2026-08-29 | Defer the Task `3.6` expansion approach. | None of the three approaches can be selected by implementation inference; retain the 3.4 rollout path while making 3.6 and the inherited 5/5 gate explicit Sprint-close dependencies. | Pre-select a lexicon, provider expansion, or pseudo-relevance feedback. | User |
 | 2026-08-29 | Approve this amended Sprint 3 PRD only. | The user approved planning authority but did not authorize Sprint 3 TODO creation or Task 3.1 dispatch. | Approve and dispatch Task 3.1 in the same decision. | User |
+| 2026-08-29 | Approve Sprint 3 start and the first batch, Task 3.1 only. | Task 3.1 is the sole dependency-ready L task; ranking, hydration, rollout, calibration, and expansion remain sequenced or separately gated. | Start multiple tasks, or defer the foundation. | User |
 
 ## Task Execution Log
 
@@ -703,6 +704,96 @@ budget; and the failure/fallback behavior actually exercised.
 **Decisions and follow-ups:**
 - ...
 ```
+
+### 3.1 - Scope-safe hybrid candidate generation
+
+**Status:** Complete
+**Owner:** `worker-l` (`ses_fb20bd702ffeBpJKipm14HLKIL`)
+**Completed:** 2026-08-29
+**Implemented:**
+- Added a persisted-scope `RetrievalService` with concrete request, scope,
+  limits, candidate, provenance, and typed fallback contracts.
+- Added bounded original/rewritten/core-term FTS candidates, authoritative title
+  candidates, and pinned-generation semantic candidates, all post-filtered by
+  request-start current membership.
+- Reused the existing `RetrievalLifecycle` scheduler, interactive inference
+  permit, vector-scan permits, cancellation, queue, and model session loader;
+  added only the query-side embedder hook and scope/repository access needed to
+  use that shared lifecycle.
+- R16 corrections: replaced the provisional function-word list with the exact
+  evaluated core-term policy (`evaluation_policy.json`, fixed PT/EN lists,
+  diacritic folding, all-stopword fallback); connected the request cancellation
+  token to the queued interactive permit wait; pinned semantic search to the
+  pre-embedding generation/model via `QueryIndexService::search_pinned`
+  (typed `GenerationChanged` refusal, never scored against another
+  generation/model); degraded semantic-stage candidate-gate/content SQL
+  failures to a typed lexical fallback instead of a request error; required
+  `'ready'` state and exact revision equality in `verified_semantic_meetings`;
+  made the title channel a keyset-paged streaming scan with a bounded top-k
+  heap (identical scope safety, overlap score, and deterministic ordering).
+- R17 corrections: removed whatlang inference from the retrieval core-term
+  path entirely; `RetrievalRequest` now carries an explicit public
+  `CoreTermLanguage` (Portuguese/English/Unknown) discriminator mirroring the
+  evaluation corpus's explicit language field, and only it selects the closed
+  lists (no dependency or auto-detector added). Request cancellation now flows
+  into scope normalization and title scanning with checks before and after
+  every awaited scope/title SQL read/page and before each lexical FTS
+  boundary, while scope/FTS database failures stay request-fatal. Generation
+  and model fencing is request-atomic: the first fence failure discards all
+  accumulated semantic hits, skips the Fast hybrid query acknowledgement, and
+  returns the typed lexical fallback; the active generation is re-fenced
+  before accumulated hits are used and after the awaited candidate SQL reads.
+  All scope resolves to `ScopeFilter::All` directly (no per-meeting ID
+  materialization; current-meeting verification retained). The Fast hybrid
+  query counter now increments only at the end of successful semantic
+  candidate validation - zero-hit clean completions count under an explicit
+  tested rule, and catch-up, fence, and SQL failures never count.
+- R18 corrections: semantic candidate generation is all-or-nothing. Any typed
+  vector-stage failure discards accumulated hits and returns lexical fallback;
+  cancellation is checked before both candidate-validation reads, and the
+  active generation is re-fenced after canonical content loads before semantic
+  evidence can be recorded or the Fast hybrid counter can advance.
+**Implementation:**
+- Files: `frontend/src-tauri/src/retrieval/service.rs`,
+  `frontend/src-tauri/src/retrieval/tests.rs`,
+  `frontend/src-tauri/src/retrieval/mod.rs`,
+  `frontend/src-tauri/src/retrieval/index.rs`,
+  `frontend/src-tauri/src/retrieval/worker.rs`,
+  `frontend/src-tauri/src/database/repositories/fts.rs`, and
+  `frontend/src-tauri/src/database/repositories/retrieval.rs`.
+- Approach: resolve one authoritative persisted scope per request, preserve
+  channel/variant provenance without fusing ranks, and degrade semantic
+  preparation to bounded lexical candidates on typed non-cancellation failures.
+**Not implemented:**
+- No RRF, aggregation, reranking, hydration/source publication, Chat caller or
+  UI integration, kill switch/migration, R13 calibration, query expansion,
+  Search purpose wiring, live scope, MCP hybrid tool, dependency, schema, or
+  model/ceiling/gate change.
+**Why not implemented:**
+- Those behaviors belong to Tasks 3.2-3.6. This task supplies candidates only
+  and preserves the Sprint 2 whole-process fail-closed R13 authority.
+**Verification:**
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib retrieval::tests`
+  - pass: 71 passed.
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib database::repositories::fts::tests`
+  - pass: 16 passed.
+- `cargo check --manifest-path "frontend/src-tauri/Cargo.toml"` (and `--tests`)
+  - pass.
+- `cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check` and
+  `git diff --check`
+  - pass.
+- Full `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib`
+  - pass: 625 passed, 0 failed.
+**Rollback:**
+- Revert these Task 3.1 files. Existing broad Chat remains on
+  `resolve_scope_results` because this task adds no caller integration.
+**Decisions and follow-ups:**
+- `RetrievalPurpose::Search` and `Context` are rejected placeholders, not wired
+  surfaces; Sprint 3 invokes `Chat` only.
+- Core-term list selection uses only the explicit request language (the
+  evaluated harness's explicit language field); Task 3.4's caller integration
+  must state the language deliberately per request.
+- Task 3.2 is now dependency-ready but requires its own L-task batch approval.
 
 ## Sprint Reviews
 
@@ -747,7 +838,8 @@ streaming integration.
 - Sprint 2 close is approved.
 - User approval of this PRD is recorded. Separate batch approval is required
   before Sprint 3 TODO creation or Task 3.1 dispatch.
-- Tasks 3.1-3.3 are L and require individual batch approval.
+- Task 3.1's individual batch approval is recorded and complete. Tasks 3.2-3.3
+  remain L and require individual batch approval.
 - Task 3.6 remains blocked by the deferred user architecture decision and its
   inherited 5/5 Recall@1 gate blocks Sprint close.
 - Ranking constants or model limits that differ from Sprint 1 require a

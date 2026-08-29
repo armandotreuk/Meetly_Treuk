@@ -87,6 +87,20 @@ async fn parse_query(pool: &SqlitePool, raw: &str) -> ParsedQuery {
     }
 }
 
+/// Splits the first `folder:"..."` operator out of a raw query, returning the
+/// remaining query text and the operator's folder name. Direct FTS search
+/// methods keep parsing the operator themselves; this helper exists for
+/// scope normalization in the retrieval service.
+pub(crate) fn split_folder_operator(raw: &str) -> (String, Option<String>) {
+    if let Some(caps) = FOLDER_RE.captures(raw) {
+        let name = caps.get(1).unwrap().as_str().to_string();
+        let rest = raw[caps.get(0).unwrap().end()..].trim().to_string();
+        (rest, Some(name))
+    } else {
+        (raw.trim().to_string(), None)
+    }
+}
+
 pub struct FtsRepository;
 
 impl FtsRepository {
@@ -312,6 +326,50 @@ impl FtsRepository {
         let mut ids = query.separated(", ");
         for folder_id in folder_ids {
             ids.push_bind(folder_id);
+        }
+        drop(ids);
+        query.push(") ORDER BY 10 LIMIT ");
+        query.push_bind(limit);
+        let rows = query.build_query_as().fetch_all(pool).await?;
+        let mut results = rows_to_results(rows);
+        expand_transcript_segments(pool, &mut results, 200).await?;
+        Ok(results)
+    }
+
+    /// FTS search restricted to an explicit meeting-ID allow-list. Mirror of
+    /// [`Self::search_with_folder_ids`] for allowed-ID scopes (snapshots,
+    /// today, and the retrieval service's `AllowedMeetingIds` scope).
+    pub async fn search_with_meeting_ids(
+        pool: &SqlitePool,
+        raw_query: &str,
+        limit: u32,
+        meeting_ids: &[String],
+        match_mode: MatchMode,
+    ) -> Result<Vec<FtsSearchResult>, sqlx::Error> {
+        if raw_query.trim().is_empty() || meeting_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let safe_query = sanitize_fts_query(raw_query, match_mode);
+        if safe_query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut query = QueryBuilder::<Sqlite>::new(
+            r#"
+            SELECT fts.meeting_id, m.title, fts.chunk_type, fts.chunk_id,
+                   snippet(meeting_fts, 3, '<mark>', '</mark>', '...', 48),
+                   fts.speaker, fts.timestamp_label, fts.folder_id,
+                   COALESCE(fts.folder_name, ''),
+                   bm25(meeting_fts, 1.0, 1.0, 1.0, 1.0, 0.5, 1.0, 0.5, 0.5)
+            FROM meeting_fts fts
+            JOIN meetings m ON fts.meeting_id = m.id
+            WHERE meeting_fts MATCH "#,
+        );
+        query.push_bind(safe_query);
+        query.push(" AND fts.meeting_id IN (");
+        let mut ids = query.separated(", ");
+        for meeting_id in meeting_ids {
+            ids.push_bind(meeting_id);
         }
         drop(ids);
         query.push(") ORDER BY 10 LIMIT ");
@@ -707,6 +765,69 @@ mod tests {
             sanitize_fts_query("quick brown fox", MatchMode::Phrase),
             "\"quick brown fox\""
         );
+    }
+
+    #[test]
+    fn split_folder_operator_extracts_name_and_rest() {
+        let (rest, name) = split_folder_operator(r#"folder:"Sprint 14" migration"#);
+        assert_eq!(rest, "migration");
+        assert_eq!(name.as_deref(), Some("Sprint 14"));
+
+        let (rest, name) = split_folder_operator("  plain query  ");
+        assert_eq!(rest, "plain query");
+        assert!(name.is_none());
+    }
+
+    #[tokio::test]
+    async fn search_with_meeting_ids_scopes_to_allow_list() {
+        let pool = setup_fts_db().await;
+        sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES ('m-in', 'In', 'now', 'now'), ('m-out', 'Out', 'now', 'now')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp) VALUES (?, ?, ?, ?)",
+        )
+        .bind("t-in")
+        .bind("m-in")
+        .bind("allowlisted lexical needle")
+        .bind("10:00")
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp) VALUES (?, ?, ?, ?)",
+        )
+        .bind("t-out")
+        .bind("m-out")
+        .bind("allowlisted lexical needle")
+        .bind("10:00")
+        .execute(&pool)
+        .await
+        .unwrap();
+        FtsRepository::refresh_meeting(&pool, "m-in").await.unwrap();
+        FtsRepository::refresh_meeting(&pool, "m-out")
+            .await
+            .unwrap();
+
+        let results = FtsRepository::search_with_meeting_ids(
+            &pool,
+            "needle",
+            10,
+            &["m-in".to_string()],
+            MatchMode::Or,
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].meeting_id, "m-in");
+
+        // Empty allow-list stays empty without querying.
+        let results =
+            FtsRepository::search_with_meeting_ids(&pool, "needle", 10, &[], MatchMode::Or)
+                .await
+                .unwrap();
+        assert!(results.is_empty());
     }
 
     async fn setup_fts_db() -> SqlitePool {
