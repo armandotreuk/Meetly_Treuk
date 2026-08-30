@@ -32,6 +32,9 @@ desktop.ini
 *.log
 upstream/frontend/src-tauri/logs/
 
+# Knowledge-graph analysis artifacts
+graphify-out/
+
 # Models (downloaded at runtime, not committed)
 *.gguf
 *.onnx
