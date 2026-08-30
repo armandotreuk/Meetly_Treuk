@@ -676,6 +676,7 @@ budget; and the failure/fallback behavior actually exercised.
 | 2026-08-29 | Approve this amended Sprint 3 PRD only. | The user approved planning authority but did not authorize Sprint 3 TODO creation or Task 3.1 dispatch. | Approve and dispatch Task 3.1 in the same decision. | User |
 | 2026-08-29 | Approve Sprint 3 start and the first batch, Task 3.1 only. | Task 3.1 is the sole dependency-ready L task; ranking, hydration, rollout, calibration, and expansion remain sequenced or separately gated. | Start multiple tasks, or defer the foundation. | User |
 | 2026-08-29 | Task 3.1 code review (R16) finding 14 (incompatible cross-channel `evidence_id` namespaces) is not remediated in `3.1.R1`; the doc's overclaiming contract text is corrected instead. | Semantic documents are 384-token sliding windows that generally span multiple transcript segments, while FTS chunks are per-segment - there is no clean bijection to key shared identity on without the overlap-range fusion Task 3.2 already owns. Building partial fusion inside Task 3.1 would duplicate that work under a narrower, riskier scope. | Attempt a heuristic cross-channel identity match inside Task 3.1. | Main agent |
+| 2026-08-29 | Approve Task `3.1.R3`: folder semantic scans materialize at most 20,000 current meeting IDs behind `ScopeFilter::Meetings(Arc<BTreeSet<_>>)`, while `verified_semantic_meetings` applies the authoritative recursive root-folder SQL gate for every folder candidate. Folders above the cap scan a bounded global over-fetch and may return fewer semantic candidates than an exact folder-local top-k, but may never return an out-of-scope candidate. `ResolvedScope` retains only the persisted scope tag. | Review R21 found unbounded request membership allocation after R20's FTS/title fixes. The bounded scan accelerator avoids a migration and per-variant/result cloning; the root SQL gate, not the accelerator, establishes scope correctness. | A versioned folder-scope projection/migration for exact folder-local top-k; disable folder semantic retrieval and use lexical fallback; leave Task 3.1 blocked. | User |
 
 ## Task Execution Log
 
@@ -903,6 +904,85 @@ budget; and the failure/fallback behavior actually exercised.
   `SemanticFallbackReason` variant; any Task 3.4 diagnostics/observability
   surface consuming this enum must handle it explicitly, not fall through a
   wildcard arm.
+
+### 3.1.R2 - Bounded recursive-folder retrieval and FTS safeguards
+
+**Status:** Complete
+**Owner:** `worker-m` (`ses_fb0e46a8dffeQQ4OIXFMhzP2td`)
+**Completed:** 2026-08-29
+**Implemented:**
+- Replaced recursive folder bind lists in FTS, title, and Chat paths with
+  root-scoped recursive SQL; legacy explicit lists use deterministic 400-ID
+  chunks and global caps.
+- Made direct FTS folder parsing fail closed, preserved repeated-operator text,
+  added plain retrieval snippets that preserve literal `<mark>` content, and
+  covered title top-k eviction/ties/caps.
+- Restored folder allow-list result metadata to the current `meetings` and
+  `meeting_folders` values rather than stale FTS metadata.
+**Implementation:**
+- Files: `frontend/src-tauri/src/database/repositories/folder.rs`,
+  `frontend/src-tauri/src/database/repositories/fts.rs`,
+  `frontend/src-tauri/src/api/chat.rs`,
+  `frontend/src-tauri/src/retrieval/service.rs`, and
+  `frontend/src-tauri/src/retrieval/tests.rs`.
+- Approach: retain legacy highlighted FTS behavior while sending source-faithful
+  plain snippets only through the new retrieval candidate path.
+**Not implemented:**
+- Bounded semantic folder membership.
+**Why not implemented:**
+- Review R21 found the remaining unbounded semantic scan membership and it was
+  corrected by the approved R3 entry below.
+**Verification:**
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib` - pass:
+  655 passed, 2 ignored after R3.
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --test retrieval_evaluation`
+  - pass: 6 passed.
+**Rollback:**
+- Revert the focused Task 3.1 remediation commit.
+**Decisions and follow-ups:**
+- Cross-channel evidence identity remains Task 3.2 work; R3 was required before
+  Task 3.1 could be accepted.
+
+### 3.1.R3 - Capped folder semantic scan and root SQL gate
+
+**Status:** Complete
+**Owner:** `worker-l` (`ses_fb0294810ffeidltRM8z5bY5YT`)
+**Completed:** 2026-08-29
+**Implemented:**
+- Capped the internal folder scan accelerator at 20,000 current meeting IDs and
+  shared it as `ScopeFilter::Meetings(Arc<BTreeSet<_>>)`, removing public scope
+  membership from `ResolvedScope`.
+- Added the authoritative recursive root-folder SQL gate to semantic candidate
+  validation for both under-cap and over-cap folder requests.
+- Added a >20,000-meeting regression with a higher-ranked out-of-scope document
+  that proves root-gated, per-variant-capped semantic output.
+**Implementation:**
+- Files: `frontend/src-tauri/src/retrieval/index.rs`,
+  `frontend/src-tauri/src/retrieval/service.rs`,
+  `frontend/src-tauri/src/retrieval/tests.rs`, and
+  `frontend/src-tauri/src/database/repositories/retrieval.rs`.
+- Approach: over-cap folders scan the bounded global ceiling and retain only
+  root-gated candidates; under-cap folders retain the scan accelerator.
+**Not implemented:**
+- Exact folder-local semantic top-k above the 20,000-member cap.
+**Why not implemented:**
+- The user approved bounded global over-fetch for over-cap folders; it may
+  return fewer semantic candidates but cannot return an out-of-scope candidate.
+**Verification:**
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib retrieval::tests`
+  - pass: 78 passed.
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib` - pass:
+  655 passed, 2 ignored.
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --test retrieval_evaluation`
+  - pass: 6 passed.
+- `cargo check --manifest-path "frontend/src-tauri/Cargo.toml" --tests`,
+  `cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check`, and
+  `git diff --check` - pass.
+**Rollback:**
+- Revert the focused Task 3.1 remediation commit.
+**Decisions and follow-ups:**
+- Code Review R22 and Architecture Review R23 approved the capped accelerator
+  and root-gate trade-off. Task 3.2 still requires separate user approval.
 
 ## Sprint Reviews
 

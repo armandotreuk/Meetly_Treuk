@@ -64,6 +64,18 @@ impl FolderRepository {
         .await
     }
 
+    pub async fn get_by_name(
+        pool: &SqlitePool,
+        name: &str,
+    ) -> Result<Option<MeetingFolderModel>, SqlxError> {
+        sqlx::query_as::<_, MeetingFolderModel>(
+            "SELECT id, name, parent_id, created_at FROM meeting_folders WHERE name = ? COLLATE NOCASE ORDER BY name ASC, id ASC LIMIT 1",
+        )
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+    }
+
     pub async fn get_subtree_ids(pool: &SqlitePool, id: &str) -> Result<Vec<String>, SqlxError> {
         Ok(sqlx::query_scalar(
             r#"

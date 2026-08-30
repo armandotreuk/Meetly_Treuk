@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::database::repositories::folder::FolderRepository;
 use crate::database::repositories::fts::{
-    split_folder_operator, FtsRepository, FtsSearchResult, MatchMode,
+    folder_operator_names, strip_folder_operators, FtsRepository, FtsSearchResult, MatchMode,
 };
 use crate::database::repositories::retrieval::RetrievalRepository;
 use crate::retrieval::index::{ScopeFilter, SearchFailure, VectorHit, MAX_QUERY_LIMIT};
@@ -36,6 +36,12 @@ use crate::retrieval::worker::{RetrievalLifecycle, SchedulerRejection, PAUSE_QUA
 /// Approved bounded size for allowed-ID scopes, mirroring the approved
 /// 100-meeting snapshot ceiling (`MAX_SEARCH_SNAPSHOT_RESULTS`).
 const MAX_ALLOWED_MEETING_IDS: usize = 100;
+/// Approved ceiling on the folder membership accelerator: a folder subtree
+/// with at most this many current meetings materializes its ID set once to
+/// accelerate the vector scan; above it the scan runs as [`ScopeFilter::All`]
+/// and the repository's recursive root-folder gate is the sole semantic
+/// membership authority.
+pub(crate) const MAX_FOLDER_SCAN_MEMBERSHIP: usize = 20_000;
 /// Streaming page size of the bounded title scan; only one page plus the
 /// bounded top-k heap is ever resident.
 pub(crate) const TITLE_SCAN_PAGE: usize = 256;
@@ -195,14 +201,12 @@ pub struct RetrievedEvidence {
     pub provenance: Vec<EvidenceProvenance>,
 }
 
-/// The normalized scope: the tagged scope after `folder:"..."` normalization
-/// plus the request-start membership resolved once from current SQLite
-/// state. Downstream stages must revalidate current membership before
-/// publication (Task 3.3).
+/// The normalized scope: the tagged scope after `folder:"..."` normalization.
+/// The request-start membership stays internal to the service; downstream
+/// stages must revalidate current membership before publication (Task 3.3).
 #[derive(Debug, Clone)]
 pub struct ResolvedScope {
     pub scope: PersistedRetrievalScope,
-    pub membership: ScopeFilter,
 }
 
 /// Documented semantic-stage fallback: the request degrades to lexical
@@ -249,20 +253,6 @@ fn ensure_not_cancelled(cancel: &CancellationToken) -> Result<(), RetrievalError
     }
 }
 
-/// Strips every remaining `folder:"..."` operator from lexical text after
-/// the first has already been consumed for scope. A second occurrence names
-/// no additional scope and must not become literal FTS MATCH terms in
-/// channels that never re-parse the operator.
-fn strip_residual_folder_operators(mut text: String) -> String {
-    loop {
-        let (stripped, name) = split_folder_operator(&text);
-        if name.is_none() {
-            return stripped;
-        }
-        text = stripped;
-    }
-}
-
 /// One retrieval outcome.
 #[derive(Debug, Clone)]
 pub struct RetrievalResult {
@@ -273,13 +263,15 @@ pub struct RetrievalResult {
     pub semantic_fallback: Option<SemanticFallbackReason>,
 }
 
-/// Internal normalized request: lexical texts with the folder operator
-/// stripped, core terms, resolved membership, and the folder-ID list the
-/// existing FTS folder query needs.
+/// Internal normalized request: lexical texts with folder operators stripped,
+/// core terms, and request-start membership.
 struct NormalizedRequest {
     scope: PersistedRetrievalScope,
     membership: ScopeFilter,
-    folder_ids: Option<Vec<String>>,
+    /// Folder membership exceeded [`MAX_FOLDER_SCAN_MEMBERSHIP`]: the
+    /// semantic scan runs unscoped and the repository's recursive root-folder
+    /// gate is the sole semantic admission authority.
+    folder_over_cap: bool,
     lexical_original: String,
     lexical_rewritten: Option<String>,
     core_terms: Vec<String>,
@@ -400,30 +392,33 @@ impl RetrievalService {
         if original.is_empty() {
             return Err(RetrievalError::InvalidQuery("original query is empty"));
         }
-        let (lexical_original, folder_operator) = split_folder_operator(original);
+        let lexical_original = strip_folder_operators(original.to_string());
+        let operator_names = folder_operator_names(original);
+        let mut folder_operator = None;
+        for (index, name) in operator_names.into_iter().enumerate() {
+            let resolved = self.resolve_folder_name(pool, &name, cancel).await?;
+            ensure_not_cancelled(cancel)?;
+            if index == 0 {
+                folder_operator = Some(resolved);
+            }
+        }
         // Only the first `folder:"..."` operator determines scope; any
         // further occurrence in the remaining text must not leak into the
-        // FTS MATCH as literal search terms (`search_with_folder_ids` and
-        // `search_with_meeting_ids` never re-parse the operator).
-        let lexical_original = strip_residual_folder_operators(lexical_original);
+        // FTS MATCH as literal search terms.
         let lexical_rewritten = request
             .rewritten_query
             .as_deref()
-            .map(|rewritten| strip_residual_folder_operators(split_folder_operator(rewritten).0))
+            .map(|rewritten| strip_folder_operators(rewritten.to_string()))
             .filter(|rewritten| !rewritten.is_empty() && rewritten != &lexical_original);
 
-        let scope = match (&request.scope, folder_operator.as_deref()) {
+        let scope = match (&request.scope, folder_operator.as_ref()) {
             (PersistedRetrievalScope::All, None) => PersistedRetrievalScope::All,
             // Normalized into folder scope only from All.
-            (PersistedRetrievalScope::All, Some(name)) => {
-                let resolved = self.resolve_folder_name(pool, name, cancel).await?;
-                ensure_not_cancelled(cancel)?;
-                PersistedRetrievalScope::Folder(resolved)
+            (PersistedRetrievalScope::All, Some(resolved)) => {
+                PersistedRetrievalScope::Folder(resolved.clone())
             }
-            (PersistedRetrievalScope::Folder(id), Some(name)) => {
-                let resolved = self.resolve_folder_name(pool, name, cancel).await?;
-                ensure_not_cancelled(cancel)?;
-                if resolved != *id {
+            (PersistedRetrievalScope::Folder(id), Some(resolved)) => {
+                if resolved != id {
                     return Err(RetrievalError::InvalidScope(format!(
                         "folder operator resolves to folder {resolved}, conflicting with folder scope {id}"
                     )));
@@ -439,13 +434,13 @@ impl RetrievalService {
             (scope, None) => scope.clone(),
         };
 
-        let (membership, folder_ids) = self.resolve_membership(pool, &scope, cancel).await?;
+        let (membership, folder_over_cap) = self.resolve_membership(pool, &scope, cancel).await?;
         ensure_not_cancelled(cancel)?;
         let core_terms = core_terms(&lexical_original, request.core_language);
         Ok(NormalizedRequest {
             scope,
             membership,
-            folder_ids,
+            folder_over_cap,
             lexical_original,
             lexical_rewritten,
             core_terms,
@@ -463,30 +458,33 @@ impl RetrievalService {
         cancel: &CancellationToken,
     ) -> Result<String, RetrievalError> {
         ensure_not_cancelled(cancel)?;
-        let folders = FolderRepository::get_all(pool).await.map_err(db_error)?;
+        let folder = FolderRepository::get_by_name(pool, name)
+            .await
+            .map_err(db_error)?;
         ensure_not_cancelled(cancel)?;
-        folders
-            .iter()
-            .find(|folder| folder.name.eq_ignore_ascii_case(name))
-            .map(|folder| folder.id.clone())
-            .ok_or_else(|| {
-                RetrievalError::InvalidScope("folder operator names no current folder".to_string())
-            })
+        folder.map(|folder| folder.id).ok_or_else(|| {
+            RetrievalError::InvalidScope("folder operator names no current folder".to_string())
+        })
     }
 
     /// Authoritative request-start membership, resolved once per request from
-    /// current SQLite state. Folder scopes also return their subtree folder
-    /// IDs for the existing FTS folder query. `All` stays `All`: the FTS and
-    /// title queries already join current meetings, and semantic candidates
-    /// are verified against current existence per candidate.
+    /// current SQLite state, together with the folder over-cap flag. Folder
+    /// scopes use one recursive query capped at [`MAX_FOLDER_SCAN_MEMBERSHIP`]
+    /// plus one row: at or below the cap the IDs are a vector-scan
+    /// accelerator; above it the semantic scan runs as [`ScopeFilter::All`]
+    /// and the repository's recursive root-folder gate is the sole semantic
+    /// admission authority (lexical FTS and title scans stay root-scoped
+    /// SQL). `All` stays `All`: the FTS and title queries already join
+    /// current meetings, and semantic candidates are verified against
+    /// current existence per candidate.
     async fn resolve_membership(
         &self,
         pool: &SqlitePool,
         scope: &PersistedRetrievalScope,
         cancel: &CancellationToken,
-    ) -> Result<(ScopeFilter, Option<Vec<String>>), RetrievalError> {
+    ) -> Result<(ScopeFilter, bool), RetrievalError> {
         match scope {
-            PersistedRetrievalScope::All => Ok((ScopeFilter::All, None)),
+            PersistedRetrievalScope::All => Ok((ScopeFilter::All, false)),
             PersistedRetrievalScope::Meeting(meeting_id) => {
                 ensure_not_cancelled(cancel)?;
                 let exists: Option<(String,)> =
@@ -497,7 +495,7 @@ impl RetrievalService {
                         .map_err(db_error)?;
                 ensure_not_cancelled(cancel)?;
                 exists
-                    .map(|(id,)| (ScopeFilter::meetings([id]), None))
+                    .map(|(id,)| (ScopeFilter::meetings([id]), false))
                     .ok_or_else(|| {
                         RetrievalError::InvalidScope(
                             "meeting scope names no current meeting".to_string(),
@@ -515,27 +513,33 @@ impl RetrievalService {
                         "folder scope names no current folder".to_string(),
                     ));
                 }
-                let folder_ids = FolderRepository::get_subtree_ids(pool, folder_id)
-                    .await
-                    .map_err(db_error)?;
+                // At most cap + 1 rows decide whether the subtree fits the
+                // approved accelerator cap; the complete membership list is
+                // never materialized.
+                let meetings: Vec<(String,)> = sqlx::query_as(
+                    r#"
+                    WITH RECURSIVE folder_scope(id) AS (
+                        SELECT id FROM meeting_folders WHERE id = ?
+                        UNION ALL
+                        SELECT f.id FROM meeting_folders f JOIN folder_scope s ON f.parent_id = s.id
+                    )
+                    SELECT id FROM meetings
+                    WHERE folder_id IN (SELECT id FROM folder_scope)
+                    LIMIT ?
+                    "#,
+                )
+                .bind(folder_id)
+                .bind(MAX_FOLDER_SCAN_MEMBERSHIP as i64 + 1)
+                .fetch_all(pool)
+                .await
+                .map_err(db_error)?;
                 ensure_not_cancelled(cancel)?;
-                let mut query =
-                    QueryBuilder::<Sqlite>::new("SELECT id FROM meetings WHERE folder_id IN (");
-                let mut ids = query.separated(", ");
-                for id in &folder_ids {
-                    ids.push_bind(id);
+                if meetings.len() > MAX_FOLDER_SCAN_MEMBERSHIP {
+                    return Ok((ScopeFilter::All, true));
                 }
-                drop(ids);
-                query.push(")");
-                let meetings: Vec<(String,)> = query
-                    .build_query_as()
-                    .fetch_all(pool)
-                    .await
-                    .map_err(db_error)?;
-                ensure_not_cancelled(cancel)?;
                 Ok((
                     ScopeFilter::meetings(meetings.into_iter().map(|(id,)| id)),
-                    Some(folder_ids),
+                    false,
                 ))
             }
             PersistedRetrievalScope::AllowedMeetingIds(ids) => {
@@ -553,7 +557,7 @@ impl RetrievalService {
                     }
                 }
                 if deduped.is_empty() {
-                    return Ok((ScopeFilter::meetings(Vec::<String>::new()), None));
+                    return Ok((ScopeFilter::meetings(Vec::<String>::new()), false));
                 }
                 ensure_not_cancelled(cancel)?;
                 let mut query =
@@ -572,7 +576,7 @@ impl RetrievalService {
                 ensure_not_cancelled(cancel)?;
                 Ok((
                     ScopeFilter::meetings(meetings.into_iter().map(|(id,)| id)),
-                    None,
+                    false,
                 ))
             }
         }
@@ -682,21 +686,21 @@ impl RetrievalService {
         let limit = limit as u32;
         let results = match &normalized.scope {
             PersistedRetrievalScope::All => {
-                FtsRepository::search_with_mode(pool, text, limit, None, mode).await
+                FtsRepository::search_with_mode_plain(pool, text, limit, None, mode).await
             }
             PersistedRetrievalScope::Meeting(meeting_id) => {
-                FtsRepository::search_with_mode(pool, text, limit, Some(meeting_id), mode).await
+                FtsRepository::search_with_mode_plain(pool, text, limit, Some(meeting_id), mode)
+                    .await
             }
-            PersistedRetrievalScope::Folder(_) => {
-                let folder_ids = normalized.folder_ids.as_deref().unwrap_or_default();
-                FtsRepository::search_with_folder_ids(pool, text, limit, folder_ids, mode).await
+            PersistedRetrievalScope::Folder(folder_id) => {
+                FtsRepository::search_with_folder_id_plain(pool, text, limit, folder_id, mode).await
             }
             PersistedRetrievalScope::AllowedMeetingIds(_) => {
                 let ScopeFilter::Meetings(ids) = &normalized.membership else {
                     return Ok(Vec::new());
                 };
                 let ids: Vec<String> = ids.iter().cloned().collect();
-                FtsRepository::search_with_meeting_ids(pool, text, limit, &ids, mode).await
+                FtsRepository::search_with_meeting_ids_plain(pool, text, limit, &ids, mode).await
             }
         };
         let results = results.map_err(db_error)?;
@@ -739,11 +743,42 @@ impl RetrievalService {
         }
         let mut top: std::collections::BinaryHeap<std::cmp::Reverse<TitleCandidate>> =
             std::collections::BinaryHeap::with_capacity(limits.lexical_per_variant + 1);
-        match &normalized.membership {
-            // A bounded scope (meeting/folder/allowed-IDs) can only ever
-            // match rows inside its own allow-list, so read exactly those
-            // rows instead of paging the entire `meetings` table.
-            ScopeFilter::Meetings(ids) => {
+        match &normalized.scope {
+            PersistedRetrievalScope::Folder(folder_id) => {
+                let mut cursor = String::new();
+                loop {
+                    ensure_not_cancelled(cancel)?;
+                    let mut query = QueryBuilder::<Sqlite>::new(
+                        "WITH RECURSIVE folder_scope(id) AS (SELECT id FROM meeting_folders WHERE id = ",
+                    );
+                    query.push_bind(folder_id);
+                    query.push(
+                        " UNION ALL SELECT f.id FROM meeting_folders f JOIN folder_scope s ON f.parent_id = s.id) SELECT m.id, m.title FROM meetings m WHERE m.id > ",
+                    );
+                    query.push_bind(&cursor);
+                    query.push(
+                        " AND m.folder_id IN (SELECT id FROM folder_scope) ORDER BY m.id LIMIT ",
+                    );
+                    query.push_bind(TITLE_SCAN_PAGE as i64);
+                    let rows: Vec<(String, String)> = query
+                        .build_query_as()
+                        .fetch_all(pool)
+                        .await
+                        .map_err(db_error)?;
+                    ensure_not_cancelled(cancel)?;
+                    let next_cursor = rows.last().map(|(id, _)| id.clone());
+                    let complete_page = rows.len() == TITLE_SCAN_PAGE;
+                    push_title_candidates(&mut top, rows, normalized, limits.lexical_per_variant);
+                    match next_cursor {
+                        Some(id) if complete_page => cursor = id,
+                        _ => break,
+                    }
+                }
+            }
+            PersistedRetrievalScope::Meeting(_) | PersistedRetrievalScope::AllowedMeetingIds(_) => {
+                let ScopeFilter::Meetings(ids) = &normalized.membership else {
+                    return Ok(());
+                };
                 if ids.is_empty() {
                     return Ok(());
                 }
@@ -751,7 +786,7 @@ impl RetrievalService {
                 let mut query =
                     QueryBuilder::<Sqlite>::new("SELECT id, title FROM meetings WHERE id IN (");
                 let mut binds = query.separated(", ");
-                for id in ids {
+                for id in ids.iter() {
                     binds.push_bind(id);
                 }
                 drop(binds);
@@ -764,7 +799,7 @@ impl RetrievalService {
                 ensure_not_cancelled(cancel)?;
                 push_title_candidates(&mut top, rows, normalized, limits.lexical_per_variant);
             }
-            ScopeFilter::All => {
+            PersistedRetrievalScope::All => {
                 let mut cursor = String::new();
                 loop {
                     // A cancelled request must not continue to later SQL pages.
@@ -897,6 +932,15 @@ impl RetrievalService {
         }
 
         let scope_filter = normalized.membership.clone();
+        // An over-cap folder scans the bounded global over-fetch up to the
+        // approved ceiling; the root gate below then retains the in-scope
+        // per-variant top-k. Every other scope scans exactly its per-variant
+        // bound (the index clamps to the same ceiling).
+        let scan_limit = if normalized.folder_over_cap {
+            MAX_QUERY_LIMIT
+        } else {
+            limits.vector_per_variant
+        };
         let mut pending: Vec<(QueryVariantKind, Vec<f32>)> = variants
             .into_iter()
             .zip(vectors)
@@ -910,7 +954,7 @@ impl RetrievalService {
                     .search_pinned(
                         &vector,
                         scope_filter.clone(),
-                        limits.vector_per_variant,
+                        scan_limit,
                         cancel,
                         &generation_id,
                     )
@@ -981,6 +1025,13 @@ impl RetrievalService {
             index.acknowledge_fast_hybrid_query();
             return Ok(None);
         }
+        // Folder scopes verify inside the recursive root-folder gate of the
+        // same authoritative read: it is the definitive membership check for
+        // both under-cap and over-cap requests.
+        let folder_root = match &normalized.scope {
+            PersistedRetrievalScope::Folder(folder_id) => Some(folder_id.clone()),
+            _ => None,
+        };
         let meeting_ids: Vec<String> = filtered
             .iter()
             .map(|(_, _, hit)| hit.meeting_id.clone())
@@ -993,6 +1044,7 @@ impl RetrievalService {
                 pool,
                 &generation_id,
                 &meeting_ids,
+                folder_root.as_deref(),
             )
             .await
             {
@@ -1008,7 +1060,31 @@ impl RetrievalService {
         if index.active_generation().as_deref() != Some(generation_id.as_str()) {
             return Ok(Some(SemanticFallbackReason::GenerationChanged));
         }
-        let document_ids: Vec<String> = filtered
+        // The over-cap scan over-fetched globally, so nothing beyond the
+        // per-variant bound may be published: after the authoritative root
+        // gate, retain the first bound entries per variant in the scan's
+        // score order and rank 1..=n among the retained in-scope candidates.
+        let selected: Vec<(QueryVariantKind, usize, &VectorHit)> = if normalized.folder_over_cap {
+            let mut retained: HashMap<QueryVariantKind, usize> = HashMap::new();
+            filtered
+                .into_iter()
+                .filter(|(_, _, hit)| verified.contains_key(&hit.meeting_id))
+                .filter_map(|(variant, _, hit)| {
+                    let count = retained.entry(*variant).or_insert(0);
+                    if *count >= limits.vector_per_variant {
+                        return None;
+                    }
+                    *count += 1;
+                    Some((*variant, *count, hit))
+                })
+                .collect()
+        } else {
+            filtered
+                .into_iter()
+                .map(|(variant, rank, hit)| (*variant, *rank, hit))
+                .collect()
+        };
+        let document_ids: Vec<String> = selected
             .iter()
             .map(|(_, _, hit)| hit.document_id.clone())
             .collect::<BTreeSet<_>>()
@@ -1027,7 +1103,7 @@ impl RetrievalService {
         if index.active_generation().as_deref() != Some(generation_id.as_str()) {
             return Ok(Some(SemanticFallbackReason::GenerationChanged));
         }
-        for (variant, rank, hit) in filtered {
+        for (variant, rank, hit) in selected {
             let Some(title) = verified.get(&hit.meeting_id) else {
                 continue;
             };
@@ -1039,9 +1115,9 @@ impl RetrievalService {
                 semantic_evidence(hit, title.clone(), content.clone()),
                 EvidenceProvenance {
                     channel: RetrievalChannel::Semantic,
-                    variant: *variant,
+                    variant,
                     mode: None,
-                    rank: *rank,
+                    rank,
                 },
             );
         }
@@ -1073,7 +1149,6 @@ impl NormalizedRequest {
     fn resolved(&self) -> ResolvedScope {
         ResolvedScope {
             scope: self.scope.clone(),
-            membership: self.membership.clone(),
         }
     }
 }
@@ -1120,19 +1195,11 @@ fn lexical_evidence(result: FtsSearchResult) -> RetrievedEvidence {
         source_template_id,
         heading: None,
         ordinal: 0,
-        // FTS5 `snippet()` wraps matches in `<mark>`/`</mark>`; evidence text
-        // must read as plain prose like the semantic channel's canonical
-        // content, since reranking and hydration read this field uniformly
-        // across channels.
-        text: strip_snippet_markup(&result.snippet),
+        text: result.snippet,
         speaker: result.speaker,
         timestamp_label: result.timestamp_label,
         provenance: Vec::new(),
     }
-}
-
-fn strip_snippet_markup(snippet: &str) -> String {
-    snippet.replace("<mark>", "").replace("</mark>", "")
 }
 
 fn title_evidence(meeting_id: String, title: String) -> RetrievedEvidence {

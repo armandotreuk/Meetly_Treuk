@@ -498,17 +498,19 @@ async fn prepare_chat_inputs_for_scope(
         LLMProvider::Ollama | LLMProvider::BuiltInAI | LLMProvider::CustomOpenAI => (10, 64_000),
         _ => (30, 100_000),
     };
-    let today_meeting_ids = if requests_todays_meetings(query)
-        || requests_todays_meetings(&search_query)
-    {
-        Some(meeting_ids_for_local_date(pool, &retrieval_scope, Local::now().date_naive()).await?)
+    let today_date = if requests_todays_meetings(query) || requests_todays_meetings(&search_query) {
+        Some(Local::now().date_naive())
+    } else {
+        None
+    };
+    let today_meeting_ids = if let Some(local_date) = today_date {
+        Some(meeting_ids_for_local_date(pool, &retrieval_scope, local_date).await?)
     } else {
         None
     };
     let meeting_list_context = if requests_meeting_list(query) {
         Some(format_meeting_list_context(
-            &meeting_titles_for_scope(pool, &retrieval_scope, query, today_meeting_ids.as_deref())
-                .await?,
+            &meeting_titles_for_scope(pool, &retrieval_scope, query, today_date).await?,
         ))
     } else {
         None
@@ -632,10 +634,7 @@ async fn temporal_context_for_scope(
             .await
         }
         ChatRetrievalScope::Folder(folder_id) => {
-            let folder_ids = FolderRepository::get_subtree_ids(pool, folder_id)
-                .await
-                .map_err(|error| format!("Failed to resolve folder scope: {}", error))?;
-            latest_saved_meeting_in_ids(pool, "folder_id", &folder_ids).await
+            latest_saved_meeting_in_folder(pool, folder_id).await
         }
         ChatRetrievalScope::SearchSnapshot(meeting_ids) => {
             latest_saved_meeting_in_ids(pool, "id", meeting_ids).await
@@ -688,6 +687,29 @@ async fn latest_saved_meeting_in_ids(
     drop(values);
     query.push(") ORDER BY saved_at DESC, id DESC LIMIT 1");
     query.build_query_as().fetch_optional(pool).await
+}
+
+async fn latest_saved_meeting_in_folder(
+    pool: &SqlitePool,
+    folder_id: &str,
+) -> Result<Option<LatestSavedMeeting>, sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        WITH RECURSIVE folder_scope(id) AS (
+            SELECT id FROM meeting_folders WHERE id = ?
+            UNION ALL
+            SELECT f.id FROM meeting_folders f JOIN folder_scope s ON f.parent_id = s.id
+        )
+        SELECT m.title, m.saved_at
+        FROM meetings m
+        WHERE m.folder_id IN (SELECT id FROM folder_scope)
+        ORDER BY m.saved_at DESC, m.id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(folder_id)
+    .fetch_optional(pool)
+    .await
 }
 
 fn format_temporal_context(now: DateTime<Local>, latest: Option<&LatestSavedMeeting>) -> String {
@@ -766,13 +788,13 @@ async fn meeting_titles_for_scope(
     pool: &SqlitePool,
     scope: &ChatRetrievalScope,
     query_text: &str,
-    meeting_ids_override: Option<&[String]>,
+    local_date: Option<NaiveDate>,
 ) -> Result<Vec<String>, String> {
     if matches!(scope, ChatRetrievalScope::LiveRecording(_)) {
         return Ok(Vec::new());
     }
 
-    let named_folder_ids = if matches!(scope, ChatRetrievalScope::All) {
+    let named_folder_id = if matches!(scope, ChatRetrievalScope::All) {
         let normalized_query = query_text.to_lowercase();
         let folder = FolderRepository::get_all(pool)
             .await
@@ -780,50 +802,33 @@ async fn meeting_titles_for_scope(
             .into_iter()
             .filter(|folder| normalized_query.contains(&folder.name.to_lowercase()))
             .max_by_key(|folder| folder.name.len());
-        match folder {
-            Some(folder) => FolderRepository::get_subtree_ids(pool, &folder.id)
-                .await
-                .map_err(|error| format!("Failed to resolve named folder: {}", error))?,
-            None => Vec::new(),
-        }
+        folder.map(|folder| folder.id)
     } else {
-        Vec::new()
+        None
     };
 
-    let mut query = QueryBuilder::<Sqlite>::new("SELECT title FROM meetings");
-    let mut has_filter = false;
+    let folder_scope_id = named_folder_id.or_else(|| match scope {
+        ChatRetrievalScope::Folder(folder_id) => Some(folder_id.clone()),
+        _ => None,
+    });
+    let mut query = QueryBuilder::<Sqlite>::new("");
+    let mut has_filter = folder_scope_id.is_some();
+    if let Some(folder_id) = folder_scope_id {
+        query
+            .push("WITH RECURSIVE folder_scope(id) AS (SELECT id FROM meeting_folders WHERE id = ");
+        query.push_bind(folder_id);
+        query.push(
+            " UNION ALL SELECT f.id FROM meeting_folders f JOIN folder_scope s ON f.parent_id = s.id) SELECT title FROM meetings WHERE folder_id IN (SELECT id FROM folder_scope)",
+        );
+    } else {
+        query.push("SELECT title FROM meetings");
+    }
     match scope {
-        ChatRetrievalScope::All if named_folder_ids.is_empty() => {}
-        ChatRetrievalScope::All => {
-            query.push(" WHERE folder_id IN (");
-            has_filter = true;
-            let mut values = query.separated(", ");
-            for folder_id in named_folder_ids {
-                values.push_bind(folder_id);
-            }
-            drop(values);
-            query.push(")");
-        }
+        ChatRetrievalScope::All | ChatRetrievalScope::Folder(_) => {}
         ChatRetrievalScope::Meeting(meeting_id) => {
             query.push(" WHERE id = ");
             query.push_bind(meeting_id);
             has_filter = true;
-        }
-        ChatRetrievalScope::Folder(folder_id) => {
-            let folder_ids = FolderRepository::get_subtree_ids(pool, folder_id)
-                .await
-                .map_err(|error| format!("Failed to resolve folder scope: {}", error))?;
-            if folder_ids.is_empty() {
-                return Ok(Vec::new());
-            }
-            query.push(" WHERE folder_id IN (");
-            has_filter = true;
-            let mut values = query.separated(", ");
-            for folder_id in folder_ids {
-                values.push_bind(folder_id);
-            }
-            drop(values);
-            query.push(")");
         }
         ChatRetrievalScope::SearchSnapshot(meeting_ids) => {
             if meeting_ids.is_empty() {
@@ -840,21 +845,13 @@ async fn meeting_titles_for_scope(
         }
         ChatRetrievalScope::LiveRecording(_) => unreachable!(),
     }
-    if let Some(meeting_ids) = meeting_ids_override {
-        if meeting_ids.is_empty() {
-            return Ok(Vec::new());
-        }
+    if let Some(local_date) = local_date {
         query.push(if has_filter {
-            " AND id IN ("
+            " AND date(created_at, 'localtime') = "
         } else {
-            " WHERE id IN ("
+            " WHERE date(created_at, 'localtime') = "
         });
-        let mut values = query.separated(", ");
-        for meeting_id in meeting_ids {
-            values.push_bind(meeting_id);
-        }
-        drop(values);
-        query.push(")");
+        query.push_bind(local_date.format("%Y-%m-%d").to_string());
     }
     query.push(" ORDER BY datetime(created_at), id");
     query
@@ -897,19 +894,13 @@ async fn meeting_ids_for_local_date(
             query.push_bind(meeting_id.clone());
         }
         ChatRetrievalScope::Folder(folder_id) => {
-            let folder_ids = FolderRepository::get_subtree_ids(pool, folder_id)
-                .await
-                .map_err(|error| format!("Failed to resolve folder scope: {}", error))?;
-            if folder_ids.is_empty() {
-                return Ok(Vec::new());
-            }
-            query.push(" AND folder_id IN (");
-            let mut values = query.separated(", ");
-            for folder_id in folder_ids {
-                values.push_bind(folder_id);
-            }
-            drop(values);
-            query.push(")");
+            query.push(
+                " AND folder_id IN (WITH RECURSIVE folder_scope(id) AS (SELECT id FROM meeting_folders WHERE id = ",
+            );
+            query.push_bind(folder_id);
+            query.push(
+                " UNION ALL SELECT f.id FROM meeting_folders f JOIN folder_scope s ON f.parent_id = s.id) SELECT id FROM folder_scope)",
+            );
         }
         ChatRetrievalScope::SearchSnapshot(meeting_ids) => {
             if meeting_ids.is_empty() {
@@ -1214,20 +1205,7 @@ async fn search_scope(
             FtsRepository::search_with_mode(pool, query, chunk_limit, Some(meeting_id), mode).await
         }
         ChatRetrievalScope::Folder(folder_id) => {
-            let folder_ids = FolderRepository::get_subtree_ids(pool, folder_id).await;
-            match folder_ids {
-                Ok(folder_ids) => {
-                    FtsRepository::search_with_folder_ids(
-                        pool,
-                        query,
-                        chunk_limit,
-                        &folder_ids,
-                        mode,
-                    )
-                    .await
-                }
-                Err(error) => return Err(format!("Failed to resolve folder scope: {}", error)),
-            }
+            FtsRepository::search_with_folder_id(pool, query, chunk_limit, folder_id, mode).await
         }
         _ => unreachable!(),
     }
@@ -2589,7 +2567,7 @@ mod tests {
             &pool,
             &ChatRetrievalScope::All,
             "list today's meetings",
-            Some(&all_ids),
+            Some(Local::now().date_naive()),
         )
         .await
         .unwrap();
@@ -2597,7 +2575,7 @@ mod tests {
             &pool,
             &ChatRetrievalScope::Folder("root".to_string()),
             "list today's meetings",
-            Some(&folder_ids),
+            Some(Local::now().date_naive()),
         )
         .await
         .unwrap();
@@ -2605,7 +2583,7 @@ mod tests {
             &pool,
             &ChatRetrievalScope::SearchSnapshot(vec!["m2".to_string(), "m3".to_string()]),
             "list today's meetings",
-            Some(&snapshot_ids),
+            Some(Local::now().date_naive()),
         )
         .await
         .unwrap();

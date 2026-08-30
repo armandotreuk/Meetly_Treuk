@@ -89,6 +89,21 @@ async fn set_meeting_folder(pool: &SqlitePool, meeting_id: &str, folder_id: Opti
         .unwrap();
 }
 
+/// Bulk-inserts `count` title-only filler meetings directly inside `folder_id`
+/// with one recursive-CTE statement so the over-cap fixture stays fast.
+async fn bulk_insert_folder_meetings(pool: &SqlitePool, folder_id: &str, count: usize) {
+    sqlx::query(
+        "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < ?)
+         INSERT INTO meetings (id, title, folder_id, created_at, updated_at)
+         SELECT 'filler-' || n, 'Filler', ?, '2026-08-29T00:00:00Z', '2026-08-29T00:00:00Z' FROM seq",
+    )
+    .bind(count as i64)
+    .bind(folder_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 async fn register_test_model(pool: &SqlitePool) {
     assert!(RetrievalRepository::ensure_model(
         pool,
@@ -524,6 +539,96 @@ async fn folder_scope_includes_descendants_and_excludes_outside_subtree() {
         .any(|provenance| provenance.channel == RetrievalChannel::Lexical)));
 }
 
+/// A folder above [`MAX_FOLDER_SCAN_MEMBERSHIP`] current meetings must not
+/// materialize a membership allow-list: the semantic scan runs the bounded
+/// global over-fetch and the recursive root-folder gate alone decides
+/// admission. The higher-ranked out-of-scope document proves the gate, the
+/// retained rank proves the per-variant cap, and `ResolvedScope` carries only
+/// the `Folder` tag (no membership field exists to assert).
+#[tokio::test]
+async fn over_cap_folder_scan_is_root_scoped_capped_and_ranked_in_scope() {
+    let pool = migrated_pool().await;
+    insert_folder(&pool, "f-big", "Big", None).await;
+    insert_meeting(&pool, "y-inside", "Y Inside").await;
+    insert_meeting(&pool, "z-inside", "Z Inside").await;
+    insert_meeting(&pool, "a-outside", "A Outside").await;
+    set_meeting_folder(&pool, "y-inside", Some("f-big")).await;
+    set_meeting_folder(&pool, "z-inside", Some("f-big")).await;
+    register_test_model(&pool).await;
+    RetrievalRepository::ensure_generation(&pool, "gen-over-cap", MODEL_ID)
+        .await
+        .unwrap();
+    // Equal-score documents on the query axis; the scan's document-id
+    // tie-break ranks the out-of-scope document ahead of both in-scope ones.
+    publish_meeting(&pool, "gen-over-cap", "a-outside", &["zeta outside"]).await;
+    publish_meeting(&pool, "gen-over-cap", "y-inside", &["zeta inside"]).await;
+    publish_meeting(&pool, "gen-over-cap", "z-inside", &["zeta second"]).await;
+    let embedder = ServiceEmbedder::new();
+    let lifecycle = query_lifecycle(&embedder);
+    // Install before the fillers: pending filler work must never block
+    // activation coverage, and it carries no documents anyway.
+    install_snapshot(&pool, &lifecycle, MODEL_ID).await;
+    bulk_insert_folder_meetings(
+        &pool,
+        "f-big",
+        super::service::MAX_FOLDER_SCAN_MEMBERSHIP - 1,
+    )
+    .await;
+
+    let service = RetrievalService::new(lifecycle);
+    let result = service
+        .retrieve(
+            &pool,
+            request(
+                "zeta",
+                PersistedRetrievalScope::Folder("f-big".to_string()),
+                RetrievalLimits {
+                    lexical_per_variant: 5,
+                    vector_per_variant: 1,
+                },
+                CoreTermLanguage::English,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(result.semantic_fallback.is_none());
+    assert!(matches!(
+        result.scope.scope,
+        PersistedRetrievalScope::Folder(ref id) if id == "f-big"
+    ));
+    // Exactly one semantic candidate survives the root gate and the
+    // per-variant bound; the higher-ranked out-of-scope document never enters
+    // the result and the retained candidate is re-ranked to 1.
+    let semantic: Vec<&_> = result
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .provenance
+                .iter()
+                .any(|provenance| provenance.channel == RetrievalChannel::Semantic)
+        })
+        .collect();
+    assert_eq!(
+        semantic.len(),
+        1,
+        "over-cap semantic output must stay capped per variant"
+    );
+    assert_eq!(semantic[0].evidence_id, "doc-y-inside-0");
+    assert_eq!(semantic[0].meeting_id, "y-inside");
+    assert!(semantic[0].provenance.iter().any(|provenance| {
+        provenance.channel == RetrievalChannel::Semantic && provenance.rank == 1
+    }));
+    assert!(
+        result
+            .candidates
+            .iter()
+            .all(|candidate| candidate.meeting_id != "a-outside"),
+        "the recursive root gate must drop the out-of-scope document"
+    );
+}
+
 #[tokio::test]
 async fn stale_fts_folder_metadata_cannot_bypass_current_membership() {
     let pool = migrated_pool().await;
@@ -662,9 +767,6 @@ async fn allowed_ids_scope_deduplicates_and_intersects_current_meetings() {
         .map(|candidate| candidate.meeting_id.clone())
         .collect();
     assert_eq!(meetings, BTreeSet::from(["m-a".to_string()]));
-    assert!(result.scope.membership.allows("m-a"));
-    assert!(!result.scope.membership.allows("ghost"));
-    assert!(!result.scope.membership.allows("m-b"));
 }
 
 // -- Scope validation ----------------------------------------------------------
@@ -1478,6 +1580,7 @@ async fn verified_semantic_meetings_drops_missing_dirty_and_unindexed() {
             "m-dirty".to_string(),
             "missing".to_string(),
         ],
+        None,
     )
     .await
     .unwrap();
@@ -1494,6 +1597,7 @@ async fn verified_semantic_meetings_drops_missing_dirty_and_unindexed() {
         &pool,
         "gen-other",
         &["m-good".to_string(), "m-dirty".to_string()],
+        None,
     )
     .await
     .unwrap();
@@ -1513,6 +1617,7 @@ async fn verified_semantic_meetings_drops_missing_dirty_and_unindexed() {
         &pool,
         "gen-verify",
         &["m-good".to_string()],
+        None,
     )
     .await
     .unwrap();
@@ -1532,10 +1637,51 @@ async fn verified_semantic_meetings_drops_missing_dirty_and_unindexed() {
         &pool,
         "gen-verify",
         &["m-good".to_string()],
+        None,
     )
     .await
     .unwrap();
     assert!(verified.is_empty());
+
+    // The recursive root-folder gate: the same candidate list admits only
+    // current subtree members when a folder root is supplied.
+    insert_folder(&pool, "f-root", "Root", None).await;
+    insert_folder(&pool, "f-child", "Child", Some("f-root")).await;
+    insert_meeting(&pool, "m-in", "In").await;
+    insert_meeting(&pool, "m-descendant", "Descendant").await;
+    insert_meeting(&pool, "m-out", "Out").await;
+    set_meeting_folder(&pool, "m-in", Some("f-root")).await;
+    set_meeting_folder(&pool, "m-descendant", Some("f-child")).await;
+    publish_meeting(&pool, "gen-other", "m-in", &["content"]).await;
+    publish_meeting(&pool, "gen-other", "m-descendant", &["content"]).await;
+    publish_meeting(&pool, "gen-other", "m-out", &["content"]).await;
+    let candidates = [
+        "m-in".to_string(),
+        "m-descendant".to_string(),
+        "m-out".to_string(),
+    ];
+    let verified =
+        RetrievalRepository::verified_semantic_meetings(&pool, "gen-other", &candidates, None)
+            .await
+            .unwrap();
+    assert_eq!(
+        verified.len(),
+        3,
+        "without a root the gate is membership-free"
+    );
+    let verified = RetrievalRepository::verified_semantic_meetings(
+        &pool,
+        "gen-other",
+        &candidates,
+        Some("f-root"),
+    )
+    .await
+    .unwrap();
+    let verified_ids: BTreeSet<String> = verified.into_iter().map(|(id, _)| id).collect();
+    assert_eq!(
+        verified_ids,
+        BTreeSet::from(["m-in".to_string(), "m-descendant".to_string()])
+    );
 
     // Vanished canonical rows never become evidence.
     let contents = RetrievalRepository::document_contents(
@@ -1904,6 +2050,114 @@ async fn title_scan_finds_matches_across_streamed_pages() {
         .all(|candidate| candidate.meeting_id == "m-last"));
 }
 
+async fn bounded_folder_title_ids(reverse_insert: bool) -> Vec<String> {
+    let pool = migrated_pool().await;
+    insert_folder(&pool, "title-root", "Title Root", None).await;
+    let mut meetings: Vec<(String, String)> = (0..super::service::TITLE_SCAN_PAGE)
+        .map(|index| (format!("filler-{index:03}"), format!("Filler {index}")))
+        .collect();
+    meetings.extend([
+        ("match-best".to_string(), "Alpha Beta".to_string()),
+        ("match-a".to_string(), "Alpha".to_string()),
+        ("match-b".to_string(), "Alpha".to_string()),
+        ("match-c".to_string(), "Alpha".to_string()),
+        ("match-zero".to_string(), "Gamma".to_string()),
+    ]);
+    if reverse_insert {
+        meetings.reverse();
+    }
+    for (meeting_id, title) in meetings {
+        insert_meeting(&pool, &meeting_id, &title).await;
+        set_meeting_folder(&pool, &meeting_id, Some("title-root")).await;
+    }
+
+    let service = RetrievalService::new(query_lifecycle(&ServiceEmbedder::new()));
+    let result = service
+        .retrieve(
+            &pool,
+            request(
+                "alpha beta",
+                PersistedRetrievalScope::Folder("title-root".to_string()),
+                RetrievalLimits {
+                    lexical_per_variant: 3,
+                    vector_per_variant: 0,
+                },
+                CoreTermLanguage::English,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+    result
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.source_kind == "title")
+        .map(|candidate| candidate.meeting_id.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn folder_title_top_k_is_bounded_deterministic_and_page_order_independent() {
+    let mut oracle = vec![
+        ("match-best", 2),
+        ("match-a", 1),
+        ("match-b", 1),
+        ("match-c", 1),
+    ];
+    oracle.sort_by(|(left_id, left_overlap), (right_id, right_overlap)| {
+        right_overlap
+            .cmp(left_overlap)
+            .then_with(|| left_id.cmp(right_id))
+    });
+    let expected: Vec<String> = oracle
+        .into_iter()
+        .take(3)
+        .map(|(meeting_id, _)| meeting_id.to_string())
+        .collect();
+    assert_eq!(bounded_folder_title_ids(false).await, expected);
+    assert_eq!(bounded_folder_title_ids(true).await, expected);
+}
+
+#[tokio::test]
+async fn lexical_evidence_preserves_literal_mark_tags() {
+    let pool = migrated_pool().await;
+    insert_meeting(&pool, "m-mark", "Marked").await;
+    add_transcript(
+        &pool,
+        "t-mark",
+        "m-mark",
+        "literal <mark> needle </mark> text",
+    )
+    .await;
+    crate::database::repositories::fts::FtsRepository::refresh_meeting(&pool, "m-mark")
+        .await
+        .unwrap();
+    let service = RetrievalService::new(query_lifecycle(&ServiceEmbedder::new()));
+    let result = service
+        .retrieve(
+            &pool,
+            request(
+                "needle",
+                PersistedRetrievalScope::All,
+                RetrievalLimits {
+                    lexical_per_variant: 10,
+                    vector_per_variant: 0,
+                },
+                CoreTermLanguage::English,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+    let evidence = result
+        .candidates
+        .iter()
+        .find(|candidate| candidate.source_kind == "transcript")
+        .expect("literal-mark transcript should be retrieved");
+    assert!(evidence.text.contains("<mark>"));
+    assert!(evidence.text.contains("</mark>"));
+}
+
 // -- R17 finding 1: explicit request language drives the core variant ----------
 
 fn has_core_and_provenance(result: &super::service::RetrievalResult) -> bool {
@@ -2185,10 +2439,11 @@ async fn generation_change_after_a_scan_cannot_retain_semantic_hits() {
     assert_eq!(lifecycle.index_service().fast_hybrid_query_count(), 0);
 }
 
-// -- R17 findings 4+5: All membership and the Fast hybrid counter ----------------
+// -- R17 findings 4+5: All scope representation and the Fast hybrid counter ------
 
-/// All scope resolves to `ScopeFilter::All` (no per-meeting allow-list) while
-/// the returned candidates still exclude noncurrent data.
+/// All scope resolves without a materialized per-meeting allow-list (the
+/// request-start membership stays internal to the service) while the returned
+/// candidates still exclude noncurrent data.
 #[tokio::test]
 async fn all_scope_membership_stays_all_and_excludes_noncurrent_data() {
     let pool = migrated_pool().await;
@@ -2230,10 +2485,7 @@ async fn all_scope_membership_stays_all_and_excludes_noncurrent_data() {
         )
         .await
         .unwrap();
-    assert!(matches!(
-        result.scope.membership,
-        super::index::ScopeFilter::All
-    ));
+    assert!(matches!(result.scope.scope, PersistedRetrievalScope::All));
     let meetings: BTreeSet<String> = result
         .candidates
         .iter()

@@ -293,18 +293,19 @@ pub struct VectorHit {
 /// Authoritative allow-list scope resolved by the caller from current SQLite
 /// state. Narrow scopes filter during the scan AND again afterwards, so an
 /// out-of-scope meeting can never enter fusion, hydration, sources, or
-/// prompts.
+/// prompts. The allow-list is `Arc`-shared so per-variant scans and post-
+/// result re-filters clone only a pointer, never the ID set.
 #[derive(Debug, Clone)]
 pub enum ScopeFilter {
     All,
-    Meetings(BTreeSet<String>),
+    Meetings(Arc<BTreeSet<String>>),
 }
 
 impl ScopeFilter {
     /// Builds a meeting allow-list; duplicate IDs collapse and membership is
     /// order-free.
     pub fn meetings<I: IntoIterator<Item = S>, S: Into<String>>(ids: I) -> Self {
-        ScopeFilter::Meetings(ids.into_iter().map(Into::into).collect())
+        ScopeFilter::Meetings(Arc::new(ids.into_iter().map(Into::into).collect()))
     }
 
     /// True when `meeting_id` is inside the scope. Also the post-filter rule

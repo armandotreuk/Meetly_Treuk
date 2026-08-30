@@ -887,15 +887,33 @@ impl RetrievalRepository {
     /// indexed source revision equals the current source revision; meetings
     /// that are missing, never indexed, dirty, or in a non-ready state for
     /// the generation are absent from the result (Task 3.1 candidate gate).
+    /// `folder_root` additionally applies the authoritative recursive
+    /// root-folder membership gate against current `meetings.folder_id` in
+    /// this same query (Task 3.1.R3). The gate never receives or constructs a
+    /// membership list; the bounded candidate-ID `IN` list is safe because it
+    /// comes only from the capped vector hits.
     pub async fn verified_semantic_meetings(
         pool: &SqlitePool,
         generation_id: &str,
         meeting_ids: &[String],
+        folder_root: Option<&str>,
     ) -> Result<Vec<(String, String)>, SqlxError> {
         if meeting_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let mut query = QueryBuilder::<Sqlite>::new(
+        let mut query = QueryBuilder::<Sqlite>::new(match folder_root {
+            Some(_) => {
+                "WITH RECURSIVE folder_scope(id) AS (SELECT id FROM meeting_folders WHERE id = "
+            }
+            None => "",
+        });
+        if let Some(folder_root) = folder_root {
+            query.push_bind(folder_root);
+            query.push(
+                " UNION ALL SELECT f.id FROM meeting_folders f JOIN folder_scope s ON f.parent_id = s.id) ",
+            );
+        }
+        query.push(
             r#"
             SELECT m.id, m.title
             FROM meetings m
@@ -905,6 +923,9 @@ impl RetrievalRepository {
         );
         query.push_bind(generation_id);
         query.push(" WHERE r.state = 'ready' AND r.indexed_source_revision = s.source_revision");
+        if folder_root.is_some() {
+            query.push(" AND m.folder_id IN (SELECT id FROM folder_scope)");
+        }
         query.push(" AND m.id IN (");
         let mut ids = query.separated(", ");
         for meeting_id in meeting_ids {
