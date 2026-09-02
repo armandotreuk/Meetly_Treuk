@@ -116,7 +116,7 @@ no later Fast/Deep result may substitute for them.
 | ID | Feature | Task | Size | Owner | Dependencies | Acceptance check | Rollback |
 |---|---|---|---|---|---|---|---|
 | 4.1 | Quality mode | Add Fast/Deep request contract and accessible Chat selector with Deep default. | M | `worker-m` | R40 docs + current user approval; Sprint 3 implementation baseline | UI/backend tests prove explicit mode compatibility, shared ownership/cancellation, default, selection, request propagation, and no persistence/schema change. | Remove optional mode and default backend to Fast broad behavior. |
-| 4.2 | Deep retrieval | Implement bounded structured planner/search/open/expand loop with scope and cancellation enforcement. | L | Pending `worker-l` | 4.1 | Adversarial and functional tests prove iterative recall, max rounds, scope safety, fallback, and hidden planner output. | Disable Deep branch; Fast remains complete. |
+| 4.2 | Deep retrieval | Implement bounded structured planner/search/open/expand loop with scope and cancellation enforcement. | L | `worker-l` | 4.1 | Adversarial and functional tests prove iterative recall, max rounds, scope safety, fallback, and hidden planner output. | Disable Deep branch; Fast remains complete. |
 | 4.3 | Saved meeting | Replace saved-meeting transcript anchor selection with hybrid retrieval while preserving authoritative context and fallback. | M | Pending `worker-m` | Sprint 3 implementation baseline (release acceptance remains open) | Saved-meeting regressions prove summary/notes, neighborhoods, no-hit fallback, coverage, and source parity. | Restore lexical `search_meeting_transcripts`; no data change. |
 | 4.4 | Snapshot/today | Make snapshot and today membership query-aware through hybrid retrieval with deterministic Fast broad-summary coverage and bounded Deep actions. | M | Pending `worker-m` | 4.2; Sprint 3 implementation baseline | Tests prove frozen/date membership, query relevance, deleted-member tolerance, broad summarization coverage, and bounds. | Restore deterministic `get_by_meeting_ids`. |
 | 4.5 | Cross-scope hardening | Complete Fast/Deep integration, deleted-meeting source scrubbing/disclosure, provider/failure/cancellation/source tests, evaluation, and native smoke. | M | Pending `worker-m` | 4.2-4.4; inherited Sprint 3 release gates | Full evaluation/native/deletion checks pass with no scope leak, stale deleted source, or source mismatch, and every inherited Sprint 3 release gate has valid evidence. | Disable Deep/per-scope hybrid paths; source scrub rollback requires explicit privacy approval. |
@@ -630,6 +630,7 @@ no Fast/Deep result or task-local check may substitute for a missing gate.
 | 2026-09-02 | Make mode compatibility explicit and use one Rust ownership/cancellation mechanism for Chat/sidebar, with Chat-fenced Deep progress. | New interactive requests send `deep`, omissions are Fast, live is Fast/no-Deep, stale progress is fenced, and no parallel registries or agent-owned event bus are permitted. | Separate non-streaming/sidebar registries or agent-owned progress events. | User-authorized R40 |
 | 2026-09-02 | Bound planner generation inside the shared LLM client and enforce candidate/evidence action authority. | Provider capability/fallback handling, hard 512-token/8 KiB caps, deadline cancellation, and per-round supplied-ID bounds prevent cost, parser, and scope failures. | New planner client or broad-scope ID validation only. | User-authorized R40 |
 | 2026-09-02 | Carry the single persisted `force_lexical_retrieval` setting through every Deep round and hybrid surface. | Shared-boundary reads, typed `ForcedLexical`, and enable-next-request/restart/disable-restore tests preserve one reversible fallback without a second service. | Per-surface switches or diagnostics services. | User-authorized R40 |
+| 2026-09-02 | Record BuiltInAI as UNSUPPORTED for the Deep planner capability matrix so planner generation is refused fail-closed (current Fast evidence, no sidecar startup) and each additional planner search retrieves with the planner query as its actual original query. | BuiltInAI's sidecar cannot actually enforce the requested 8 KiB stream cap or a deadline-bounded startup/shutdown cleanup (byte cap checked only after the full response is read; startup races and graceful shutdown can outlive the deadline), and replaying the user's original query into a planner slot awarded un-earned planner RRF support to unrelated evidence. Ordinary non-planner BuiltInAI Chat is unchanged. | Keep declaring BuiltInAI fully capable, or implement a true 8 KiB stream cap, deadline-strict startup/cleanup, and a child-spawn-race fix before enabling it. | User-authorized R45 remediation |
 
 ## Task Execution Log
 
@@ -663,6 +664,44 @@ no Fast/Deep result or task-local check may substitute for a missing gate.
 - Remove the optional mode fields, selector/progress UI, and request-state extensions; retain the existing Fast broad path and stream cancellation behavior. No data rollback is needed because no schema or persisted conversation format changed.
 **Decisions and follow-ups:**
 - MCP remains Fast-only: omitted and explicit `fast` share Chat preparation, while explicit `deep` and unknown values are rejected. Sprint 3 release gates remain open; this task makes no release claim.
+
+### 4.2 - Bounded Deep retrieval loop
+
+**Status:** Complete
+**Owner:** `worker-l` (`z-ai/glm-5.3-flash`)
+**Completed:** 2026-09-02
+**Implemented:**
+- Bounded provider-independent Deep planner loop in `retrieval/agent.rs` with a strict versioned whole-payload JSON action schema, capability-token action authorization, per-round scope revalidation, typed cancellation, Fast-evidence fallback on every non-cancellation failure, stage-level Chat-fenced progress, and total provider round-trip accounting including the follow-up rewrite.
+- Planner-specific bounded generation inside the existing shared LLM client (`generate_bounded`): hard response-byte cap enforced mid-body, provider output limit sent for every provider (including the BuiltInAI sidecar's `Generate.max_tokens`), per-call deadline, and child-token cancellation. Tested provider capability/fallback matrix covering OpenAI, Claude, Groq, Ollama, OpenRouter, BuiltInAI, and Custom OpenAI.
+**Implementation:**
+- Files: `frontend/src-tauri/src/retrieval/agent.rs` + `agent/tests.rs` (new), `retrieval/mod.rs`, `retrieval/service.rs` (`revalidate_ids_in_scope`), `retrieval/tests.rs` (crate-visible test helpers), `summary/llm_client.rs`, `summary/summary_engine/client.rs`, `api/chat.rs`, `mcp/server.rs`, `frontend/src/types/index.ts`, `frontend/src/components/ChatPanel/index.tsx`, `frontend/src/lib/strings/en.ts`, `frontend/tests/components/chat-scope.test.tsx`, this doc, `docs/notes-chat-improvement-execution.md`.
+- Approach: the agent owns no Tauri events and no `AppHandle`. Chat preparation constructs one `SharedClientPlanner` (forwarding to the shared client's `generate_bounded`) and one privacy-safe progress sink that maps `DeepProgressEvent { stage, completed, total }` onto the existing `chat-preparation-progress` publication fence. Deep runs only for persisted All/Folder scopes with the managed lifecycle; today's derived allow-list, snapshot, saved-meeting, live, forced-lexical, and MCP requests resolve to the unchanged Fast single pass. Additional searches, meeting opens, and evidence expansions all run through `RetrievalService::retrieve` and merge into one candidate pool that is re-fused/re-ranked with the production `rank_with_mode` and hydrated by `hydrate_context`; no planner text ever enters context, sources, or answers.
+- Schema (version 1, whole payload, `deny_unknown_fields`): `{"schemaVersion":1,"status":"finish"|"search_more","queries":[≤3 strings],"openMeetingIds":[≤5],"expandEvidenceIds":[≤10]}`. Prefix/suffix prose, reasoning tags, trailing JSON, unknown fields, invalid types, unknown status, wrong version, any numeric over-bound, or output over 8 KiB is malformed and takes the Fast-evidence fallback. `openMeetingIds` must be a subset of the meeting-card IDs supplied to that round; `expandEvidenceIds` must be IDs retained by that round; duplicates and self-repeating queries are dropped and a no-op action stops the loop.
+- Limits: 2 planner calls/2 additional rounds; 3 queries/round; 256 Unicode chars/query; 5 opens/round, 8 total; 10 expands/round; 24,000 planner-input chars; 8 KiB/512 output tokens; 15 s per planner call; 30 s total planning budget enforced at operation boundaries (`DeepBounds::production()`).
+- Provider matrix: all seven providers record full support (native output limit + shared byte cap + child cancellation) after the sidecar output-limit extension; `planner_generation_capability` is the single seam where unsupported support would trigger the documented Fast-evidence fallback.
+- Cancellation/fallback: user/stream cancellation is the typed `DeepPreparationError::Cancelled` and aborts preparation with no answer/source publication (suppressed by the existing fence); timeout, malformed output, unsupported capability, provider error, refusal, and empty actions continue from current evidence. Scope is revalidated after every round and immediately before publication (deleted or moved meetings are dropped and the context re-hydrated).
+- Round-trip accounting: `ChatInputs.provider_round_trips` = follow-up rewrite (0-1) + planner calls (0-2); the final generation adds one, so the worst case is four and it is logged at stream/done time.
+**Not implemented:**
+- Task 4.3 saved-meeting hybrid anchors, Task 4.4 snapshot/today query-aware retrieval, Task 4.5 cross-scope hardening, and Deep for non-All/Folder scopes; MCP stays Fast-only.
+**Why not implemented:**
+- Explicitly outside Task 4.2 scope; Deep lifecycle stays scoped to supported persisted All/Folder paths until those tasks extend it.
+**Verification:**
+- `cargo test --manifest-path frontend/src-tauri/Cargo.toml --lib retrieval::agent::tests` - pass (20 tests).
+- `cargo test --manifest-path frontend/src-tauri/Cargo.toml --lib summary::llm_client::tests` - pass (18 tests).
+- `cargo test --manifest-path frontend/src-tauri/Cargo.toml --lib api::chat::tests` - pass (50 tests).
+- `cargo test --manifest-path frontend/src-tauri/Cargo.toml --lib mcp::server::tests` - pass (5 tests).
+- `cargo test --manifest-path frontend/src-tauri/Cargo.toml --lib` - pass (739 tests).
+- `cargo check --manifest-path frontend/src-tauri/Cargo.toml` - pass; one pre-existing non-failing `Sidebar` dead-code warning.
+- Touched-file `rustfmt --check` - pass. Repository `cargo fmt --check` - fails only on the pre-existing rejected V10 fixture trailing whitespace (`cases_pt_01.rs`, `cases_pt_02.rs`), untouched.
+- `pnpm --dir frontend run typecheck` - pass. `npx vitest run` - pass (20 files, 98 tests).
+- `git diff --check` - pass (pre-existing CRLF warning on `types/index.ts` only).
+- `cargo test --test retrieval_evaluation` - intentionally not run: the orchestrator prohibits `retrieval_evaluation*` for this task and the current worktree harness is contaminated by rejected-corpus changes; no corpus evaluation was executed.
+**Rollback:**
+- Gate `deep_preparation_eligible` to always return false (or revert `api/chat.rs`'s Deep branch) and remove `retrieval/agent.rs` plus the shared client's `generate_bounded`; Fast behavior, schemas, and commands are otherwise unchanged. No migration or persisted format changed.
+**Decisions and follow-ups:**
+- The 30-second Deep budget is enforced at operation boundaries (before each planner call and additional search); the initial retrieval and final hydration reuse the unmodified Fast boundary timing, so Deep adds at most the bounded planning cost on top of Fast's own stages. Deep p95 measurement remains Task 4.5's gate.
+- Open/expand actions are realized as additional `AllowedMeetingIds`-scoped retrievals through the same candidate/fusion/rerank/hydration contracts, differing in their capability-token source (round cards vs. retained evidence IDs); meeting opens get one dedicated retrieval each so every opened meeting receives the full per-variant candidate budget.
+- Sprint 3 release gates remain open; this task makes no release or corpus-quality claim.
 
 ### Task Entry Template
 

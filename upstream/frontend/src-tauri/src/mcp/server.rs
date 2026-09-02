@@ -246,6 +246,7 @@ async fn prepare_mcp_chat_inputs(
         retrieval,
         None,
         mode,
+        None,
     )
     .await?;
     let sources = serialize_chat_sources(&inputs.sources)?;
@@ -493,20 +494,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_preparation_uses_managed_forced_lexical_boundary() {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::query(r#"CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT NOT NULL, folder_id TEXT, created_at TEXT, saved_at TEXT);
-            CREATE TABLE meeting_folders (id TEXT PRIMARY KEY, name TEXT NOT NULL, parent_id TEXT, created_at TEXT NOT NULL);
-            CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, transcript TEXT NOT NULL, timestamp TEXT NOT NULL, speaker TEXT, audio_start_time REAL, audio_end_time REAL);
-            CREATE TABLE meeting_notes (meeting_id TEXT PRIMARY KEY, notes_markdown TEXT);
-            CREATE TABLE summary_processes (meeting_id TEXT NOT NULL, template_id TEXT NOT NULL, updated_at TEXT NOT NULL, result TEXT, PRIMARY KEY (meeting_id, template_id));
-            CREATE TABLE search_source_state (meeting_id TEXT PRIMARY KEY, source_revision INTEGER);
-            CREATE TABLE settings (id TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL, whisperModel TEXT NOT NULL, groqApiKey TEXT, openaiApiKey TEXT, anthropicApiKey TEXT, ollamaApiKey TEXT, openRouterApiKey TEXT, ollamaEndpoint TEXT, customOpenAIConfig TEXT, customVocabulary TEXT, chatProvider TEXT, chatModel TEXT, chatOllamaEndpoint TEXT, force_lexical_retrieval BOOLEAN NOT NULL DEFAULT FALSE);
-            CREATE VIRTUAL TABLE meeting_fts USING fts5(meeting_id UNINDEXED, chunk_type UNINDEXED, chunk_id UNINDEXED, text, speaker UNINDEXED, timestamp_label UNINDEXED, folder_id UNINDEXED, folder_name);
-            INSERT INTO meetings (id, title, created_at, saved_at) VALUES ('m1', 'Title', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z');
-            INSERT INTO settings (id, provider, model, whisperModel, chatProvider, chatModel, force_lexical_retrieval) VALUES ('1', 'ollama', 'local', 'whisper', 'ollama', 'local', TRUE);
-            INSERT INTO meeting_fts (meeting_id, chunk_type, chunk_id, text, folder_name) VALUES ('m1', 'note', 'n1', 'alpha', 'General');"#)
-            .execute(&pool).await.unwrap();
-
+        let pool = chat_pool(true).await;
         let lifecycle = crate::retrieval::worker::RetrievalLifecycle::new(
             crate::retrieval::worker::LifecycleConfig::production(None),
         );
@@ -555,5 +543,67 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("Invalid chat retrieval mode"));
+    }
+
+    #[tokio::test]
+    async fn omitted_mode_resolves_to_fast_without_the_forced_lexical_mask() {
+        let pool = chat_pool(false).await;
+        let lifecycle = crate::retrieval::worker::RetrievalLifecycle::new(
+            crate::retrieval::worker::LifecycleConfig::production(None),
+        );
+        // No mode field, and the kill switch is OFF: the ordinary default
+        // must still resolve to Fast through shared preparation, never Deep.
+        let (inputs, _sources) = prepare_mcp_chat_inputs(
+            &pool,
+            &json!({"query": "alpha"}),
+            &None,
+            &reqwest::Client::new(),
+            lifecycle.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(inputs.retrieval_mode, ChatRetrievalMode::Fast);
+        assert_ne!(
+            inputs.retrieval_diagnostic,
+            crate::api::chat::RetrievalPreparationDiagnostic::ForcedLexical
+        );
+        // Omitted mode makes no planner round trips.
+        assert_eq!(inputs.provider_round_trips, 0);
+        assert!(!inputs.sources.is_empty());
+
+        // An explicit fast request behaves identically.
+        let (inputs, _sources) = prepare_mcp_chat_inputs(
+            &pool,
+            &json!({"query": "alpha", "mode": "fast"}),
+            &None,
+            &reqwest::Client::new(),
+            lifecycle,
+        )
+        .await
+        .unwrap();
+        assert_eq!(inputs.retrieval_mode, ChatRetrievalMode::Fast);
+        assert_eq!(inputs.provider_round_trips, 0);
+    }
+
+    /// Minimal shared-preparation schema: one meeting with an indexed note
+    /// and transcript, and a configurable force-lexical switch.
+    async fn chat_pool(force_lexical: bool) -> SqlitePool {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::query(r#"CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT NOT NULL, folder_id TEXT, created_at TEXT, saved_at TEXT);
+            CREATE TABLE meeting_folders (id TEXT PRIMARY KEY, name TEXT NOT NULL, parent_id TEXT, created_at TEXT NOT NULL);
+            CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, transcript TEXT NOT NULL, timestamp TEXT NOT NULL, speaker TEXT, audio_start_time REAL, audio_end_time REAL);
+            CREATE TABLE meeting_notes (meeting_id TEXT PRIMARY KEY, notes_markdown TEXT);
+            CREATE TABLE summary_processes (meeting_id TEXT NOT NULL, template_id TEXT NOT NULL, updated_at TEXT NOT NULL, result TEXT, PRIMARY KEY (meeting_id, template_id));
+            CREATE TABLE search_source_state (meeting_id TEXT PRIMARY KEY, source_revision INTEGER);
+            CREATE TABLE settings (id TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL, whisperModel TEXT NOT NULL, groqApiKey TEXT, openaiApiKey TEXT, anthropicApiKey TEXT, ollamaApiKey TEXT, openRouterApiKey TEXT, ollamaEndpoint TEXT, customOpenAIConfig TEXT, customVocabulary TEXT, chatProvider TEXT, chatModel TEXT, chatOllamaEndpoint TEXT, force_lexical_retrieval BOOLEAN NOT NULL DEFAULT FALSE);
+            CREATE VIRTUAL TABLE meeting_fts USING fts5(meeting_id UNINDEXED, chunk_type UNINDEXED, chunk_id UNINDEXED, text, speaker UNINDEXED, timestamp_label UNINDEXED, folder_id UNINDEXED, folder_name);
+            INSERT INTO meetings (id, title, created_at, saved_at) VALUES ('m1', 'Title', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z');
+            INSERT INTO settings (id, provider, model, whisperModel, chatProvider, chatModel, force_lexical_retrieval) VALUES ('1', 'ollama', 'local', 'whisper', 'ollama', 'local', ?);
+            INSERT INTO transcripts (id, meeting_id, transcript, timestamp) VALUES ('t1', 'm1', 'alpha', '10:00');
+            INSERT INTO meeting_notes (meeting_id, notes_markdown) VALUES ('m1', 'alpha note text');
+            INSERT INTO meeting_fts (meeting_id, chunk_type, chunk_id, text, folder_name) VALUES ('m1', 'note', 'n1', 'alpha', 'General');"#)
+            .bind(force_lexical)
+            .execute(&pool).await.unwrap();
+        pool
     }
 }

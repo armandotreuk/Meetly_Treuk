@@ -30,7 +30,7 @@ const SCALE: f64 = 1.0 / 127.0;
 
 // -- Harness -----------------------------------------------------------------
 
-async fn migrated_pool() -> SqlitePool {
+pub(crate) async fn migrated_pool() -> SqlitePool {
     let options = sqlx::sqlite::SqliteConnectOptions::from_str("sqlite::memory:")
         .unwrap()
         .foreign_keys(true);
@@ -43,7 +43,7 @@ async fn migrated_pool() -> SqlitePool {
     pool
 }
 
-async fn insert_meeting(pool: &SqlitePool, id: &str, title: &str) {
+pub(crate) async fn insert_meeting(pool: &SqlitePool, id: &str, title: &str) {
     sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)")
         .bind(id)
         .bind(title)
@@ -54,7 +54,7 @@ async fn insert_meeting(pool: &SqlitePool, id: &str, title: &str) {
         .unwrap();
 }
 
-async fn add_transcript(pool: &SqlitePool, id: &str, meeting_id: &str, text: &str) {
+pub(crate) async fn add_transcript(pool: &SqlitePool, id: &str, meeting_id: &str, text: &str) {
     sqlx::query(
         "INSERT INTO transcripts (id, meeting_id, transcript, timestamp) VALUES (?, ?, ?, ?)",
     )
@@ -254,7 +254,7 @@ fn query_lifecycle(embedder: &Arc<ServiceEmbedder>) -> RetrievalLifecycle {
     ))
 }
 
-fn failing_lifecycle() -> RetrievalLifecycle {
+pub(crate) fn failing_lifecycle() -> RetrievalLifecycle {
     RetrievalLifecycle::new(LifecycleConfig::testing(
         Arc::new(|| false),
         Arc::new(|| Err("simulated bundle unavailability".to_string())),

@@ -12,8 +12,8 @@ use uuid::Uuid;
 
 use crate::retrieval::worker::RetrievalLifecycle;
 use crate::retrieval::{
-    hydrate_context, PersistedRetrievalScope, RetrievalLimits, RetrievalPurpose, RetrievalRequest,
-    RetrievalService,
+    agent::DeepProgressCallback, hydrate_context, PersistedRetrievalScope, RetrievalLimits,
+    RetrievalPurpose, RetrievalRequest, RetrievalService,
 };
 use crate::{
     database::repositories::{
@@ -247,6 +247,8 @@ impl Default for ChatRetrievalMode {
 #[serde(rename_all = "snake_case")]
 pub enum ChatPreparationStage {
     InitialRetrieval,
+    PlannerRound,
+    AdditionalSearch,
     AnswerGeneration,
 }
 
@@ -285,6 +287,9 @@ pub struct ChatInputs {
     pub user_prompt: String,
     pub retrieval_diagnostic: RetrievalPreparationDiagnostic,
     pub retrieval_mode: ChatRetrievalMode,
+    /// Provider round-trips made during preparation (follow-up query rewrite
+    /// plus Deep planner calls), excluding the final answer generation.
+    pub provider_round_trips: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -482,6 +487,7 @@ pub async fn prepare_chat_inputs_lexical_only(
         None,
         cancellation_token,
         Some(ChatRetrievalMode::Fast),
+        None,
     )
     .await
 }
@@ -496,6 +502,7 @@ pub async fn prepare_chat_inputs_with_lifecycle(
     lifecycle: RetrievalLifecycle,
     cancellation_token: Option<&CancellationToken>,
     retrieval_mode: Option<ChatRetrievalMode>,
+    deep_progress: Option<DeepProgressCallback<'_>>,
 ) -> Result<ChatInputs, String> {
     let retrieval_scope = meeting_id
         .map(ChatRetrievalScope::Meeting)
@@ -511,6 +518,7 @@ pub async fn prepare_chat_inputs_with_lifecycle(
         Some(lifecycle),
         cancellation_token,
         retrieval_mode,
+        deep_progress,
     )
     .await
 }
@@ -576,6 +584,7 @@ pub async fn prepare_scoped_chat_inputs(
         cancellation_token,
         None,
         Some(ChatRetrievalMode::Fast),
+        None,
     )
     .await
 }
@@ -591,6 +600,7 @@ async fn prepare_scoped_chat_inputs_with_authorization(
     cancellation_token: Option<&CancellationToken>,
     lifecycle: Option<RetrievalLifecycle>,
     retrieval_mode: Option<ChatRetrievalMode>,
+    deep_progress: Option<DeepProgressCallback<'_>>,
 ) -> Result<ChatInputs, String> {
     let conversation = ChatRepository::get_conversation(pool, conversation_id)
         .await
@@ -608,6 +618,7 @@ async fn prepare_scoped_chat_inputs_with_authorization(
         lifecycle,
         cancellation_token,
         retrieval_mode,
+        deep_progress,
     )
     .await
 }
@@ -623,6 +634,7 @@ async fn prepare_chat_inputs_for_scope(
     lifecycle: Option<RetrievalLifecycle>,
     cancellation_token: Option<&CancellationToken>,
     retrieval_mode: Option<ChatRetrievalMode>,
+    deep_progress: Option<DeepProgressCallback<'_>>,
 ) -> Result<ChatInputs, String> {
     let requested_retrieval_mode = retrieval_mode.unwrap_or_default();
     let model_config = SettingsRepository::get_chat_model_config(pool)
@@ -698,7 +710,9 @@ async fn prepare_chat_inputs_for_scope(
         None
     };
 
+    let mut provider_round_trips = 0usize;
     let search_query = if should_rewrite_query(history, query) {
+        provider_round_trips += 1;
         let rewrite_prompt = build_rewrite_prompt(history.unwrap(), query);
         // ponytail: 15s cap; retry with a shorter prompt or skip rewrite entirely on timeout.
         let rewritten = tokio::time::timeout(
@@ -824,6 +838,14 @@ async fn prepare_chat_inputs_for_scope(
                     ChatRetrievalScope::All | ChatRetrievalScope::Folder(_)
                 )
             {
+                let lifecycle =
+                    lifecycle.ok_or_else(|| "Retrieval lifecycle unavailable".to_string())?;
+                // Task 4.2 keeps the Deep lifecycle scoped to the supported
+                // persisted All/Folder paths; today's derived allow-list,
+                // snapshot, saved-meeting, and live scopes stay Fast until
+                // Tasks 4.3/4.4 extend them.
+                let deep_eligible =
+                    deep_preparation_eligible(retrieval_mode, today_meeting_ids.as_ref());
                 let persisted_scope = match &scope {
                     ChatRetrievalScope::All => PersistedRetrievalScope::All,
                     ChatRetrievalScope::Folder(folder_id) => {
@@ -831,43 +853,114 @@ async fn prepare_chat_inputs_for_scope(
                     }
                     _ => unreachable!(),
                 };
-                let persisted_scope = today_meeting_ids
-                    .as_ref()
-                    .map(|ids| PersistedRetrievalScope::AllowedMeetingIds(ids.clone()))
-                    .unwrap_or(persisted_scope);
-                let lifecycle =
-                    lifecycle.ok_or_else(|| "Retrieval lifecycle unavailable".to_string())?;
-                let ranked = RetrievalService::new(lifecycle)
-                    .retrieve_ranked(
-                        pool,
-                        RetrievalRequest {
-                            original_query: query.to_string(),
-                            rewritten_query: Some(search_query.clone()),
+                let persisted_scope = if deep_eligible {
+                    persisted_scope
+                } else {
+                    today_meeting_ids
+                        .as_ref()
+                        .map(|ids| PersistedRetrievalScope::AllowedMeetingIds(ids.clone()))
+                        .unwrap_or(persisted_scope)
+                };
+                if deep_eligible {
+                    let request_cancellation = cancellation_token.cloned().unwrap_or_default();
+                    let planner = crate::retrieval::agent::SharedClientPlanner {
+                        client: client.clone(),
+                        provider: provider.clone(),
+                        model_name: model_name.clone(),
+                        api_key: api_key.clone(),
+                        ollama_endpoint: ollama_endpoint.clone(),
+                        custom_openai_endpoint: custom_openai_endpoint.clone(),
+                        app_data_dir: app_data_dir.clone(),
+                    };
+                    let deep = crate::retrieval::agent::run_deep_preparation(
+                        crate::retrieval::agent::DeepPreparationInput {
+                            pool,
+                            lifecycle,
+                            original_query: query,
+                            effective_query: &search_query,
                             scope: persisted_scope,
-                            purpose: RetrievalPurpose::Chat,
                             limits: RetrievalLimits {
                                 lexical_per_variant: chunk_limit as usize,
                                 vector_per_variant: chunk_limit as usize,
                             },
                             core_language: crate::retrieval::service::CoreTermLanguage::Unknown,
-                            cancellation: cancellation_token.cloned(),
+                            context_budget: persisted_context_budget,
+                            cancellation: cancellation_token.unwrap_or(&request_cancellation),
+                            progress: deep_progress,
+                            planner: &planner,
+                            bounds: crate::retrieval::agent::DeepBounds::production(),
                         },
                     )
                     .await
-                    .map_err(|e| format!("Retrieval failed: {}", e))?;
-                if ranked.semantic_fallback.is_some() {
-                    retrieval_diagnostic = RetrievalPreparationDiagnostic::SemanticFallback;
-                }
-                let hydrated =
-                    hydrate_context(pool, &ranked, persisted_context_budget, cancellation_token)
+                    .map_err(|error| match error {
+                        crate::retrieval::agent::DeepPreparationError::Cancelled => {
+                            "Chat preparation was cancelled".to_string()
+                        }
+                        crate::retrieval::agent::DeepPreparationError::BudgetExhausted => format!(
+                            "Deep preparation exceeded the {} second budget",
+                            crate::retrieval::agent::DEEP_PREPARATION_BUDGET.as_secs()
+                        ),
+                        crate::retrieval::agent::DeepPreparationError::InitialRetrieval(error) => {
+                            format!("Retrieval failed: {}", error)
+                        }
+                        crate::retrieval::agent::DeepPreparationError::FinalValidation(error) => {
+                            format!("Deep final validation failed: {}", error)
+                        }
+                    })?;
+                    provider_round_trips += deep.planner_round_trips;
+                    log::info!(
+                        "Chat Deep preparation: additional_rounds={} planner_calls={} round_trips_before_generation={}",
+                        deep.additional_rounds,
+                        deep.planner_round_trips,
+                        provider_round_trips
+                    );
+                    if deep.semantic_fallback.is_some() {
+                        retrieval_diagnostic = RetrievalPreparationDiagnostic::SemanticFallback;
+                    }
+                    let sources = deep
+                        .hydrated
+                        .sources
+                        .iter()
+                        .map(chat_source_from_hydrated)
+                        .collect();
+                    (deep.hydrated.markdown, sources)
+                } else {
+                    let ranked = RetrievalService::new(lifecycle)
+                        .retrieve_ranked(
+                            pool,
+                            RetrievalRequest {
+                                original_query: query.to_string(),
+                                rewritten_query: Some(search_query.clone()),
+                                scope: persisted_scope,
+                                purpose: RetrievalPurpose::Chat,
+                                limits: RetrievalLimits {
+                                    lexical_per_variant: chunk_limit as usize,
+                                    vector_per_variant: chunk_limit as usize,
+                                },
+                                core_language: crate::retrieval::service::CoreTermLanguage::Unknown,
+                                cancellation: cancellation_token.cloned(),
+                            },
+                        )
                         .await
-                        .map_err(|e| format!("Retrieval hydration failed: {}", e))?;
-                let sources = hydrated
-                    .sources
-                    .iter()
-                    .map(chat_source_from_hydrated)
-                    .collect();
-                (hydrated.markdown, sources)
+                        .map_err(|e| format!("Retrieval failed: {}", e))?;
+                    if ranked.semantic_fallback.is_some() {
+                        retrieval_diagnostic = RetrievalPreparationDiagnostic::SemanticFallback;
+                    }
+                    let hydrated = hydrate_context(
+                        pool,
+                        &ranked,
+                        persisted_context_budget,
+                        cancellation_token,
+                    )
+                    .await
+                    .map_err(|e| format!("Retrieval hydration failed: {}", e))?;
+                    let sources = hydrated
+                        .sources
+                        .iter()
+                        .map(chat_source_from_hydrated)
+                        .collect();
+                    (hydrated.markdown, sources)
+                }
             } else {
                 log::info!("Chat retrieval preparation mode: {retrieval_diagnostic:?}");
                 let results = resolve_scope_results(
@@ -918,6 +1011,7 @@ async fn prepare_chat_inputs_for_scope(
         user_prompt,
         retrieval_diagnostic,
         retrieval_mode,
+        provider_round_trips,
     })
 }
 
@@ -1618,6 +1712,16 @@ async fn resolve_scope_results(
     Ok(results)
 }
 
+/// Deep runs only for the supported persisted All/Folder scopes in this
+/// release: a derived today allow-list (snapshot/today/saved-meeting members)
+/// keeps the request Fast until Tasks 4.3/4.4 extend the lifecycle.
+fn deep_preparation_eligible(
+    retrieval_mode: ChatRetrievalMode,
+    today_meeting_ids: Option<&Vec<String>>,
+) -> bool {
+    retrieval_mode == ChatRetrievalMode::Deep && today_meeting_ids.is_none()
+}
+
 fn should_rewrite_query(history: Option<&Vec<ChatMessage>>, query: &str) -> bool {
     history.is_some_and(|messages| messages.len() >= 2) && query.chars().count() < 100
 }
@@ -1765,6 +1869,7 @@ pub async fn api_chat_with_meetings<R: Runtime>(
             lifecycle,
             Some(token.as_ref()),
             mode,
+            None,
         )
         .await?;
         let answer = generate_summary(
@@ -1789,9 +1894,10 @@ pub async fn api_chat_with_meetings<R: Runtime>(
         })?;
 
         info!(
-            "Chat completed: {} sources, {} answer chars",
+            "Chat completed: {} sources, {} answer chars, {} provider round trips including final generation",
             inputs.sources.len(),
-            answer.len()
+            answer.len(),
+            inputs.provider_round_trips + 1
         );
 
         Ok(ChatResponse {
@@ -1849,6 +1955,7 @@ pub async fn api_chat_with_scoped_conversation<R: Runtime>(
             Some(token.as_ref()),
             Some(lifecycle),
             mode,
+            None,
         )
         .await?;
         let answer = generate_summary(
@@ -1897,6 +2004,7 @@ pub async fn api_chat_with_meetings_stream<R: Runtime>(
     let request_state = stream_state.inner().clone();
     let request_stream_id = stream_id.clone();
     let client = reqwest::Client::new();
+    let progress_sink = deep_progress_sink(&request_state, &app, &stream_id, &token);
     let result = tokio::time::timeout(CHAT_REQUEST_TIMEOUT, async {
         let inputs = match prepare_chat_inputs_with_lifecycle(
             state.db_manager.pool(),
@@ -1908,6 +2016,7 @@ pub async fn api_chat_with_meetings_stream<R: Runtime>(
             retrieval.inner().clone(),
             Some(token.as_ref()),
             mode,
+            Some(&progress_sink),
         )
         .await
         {
@@ -1959,6 +2068,7 @@ pub async fn api_chat_with_scoped_conversation_stream<R: Runtime>(
     let request_state = stream_state.inner().clone();
     let request_stream_id = stream_id.clone();
     let client = reqwest::Client::new();
+    let progress_sink = deep_progress_sink(&request_state, &app, &stream_id, &token);
     let result = tokio::time::timeout(CHAT_REQUEST_TIMEOUT, async {
         let inputs = match prepare_scoped_chat_inputs_with_authorization(
             state.db_manager.pool(),
@@ -1975,6 +2085,7 @@ pub async fn api_chat_with_scoped_conversation_stream<R: Runtime>(
             Some(token.as_ref()),
             Some(retrieval.inner().clone()),
             mode,
+            Some(&progress_sink),
         )
         .await
         {
@@ -2024,32 +2135,10 @@ async fn stream_chat<R: Runtime>(
     }
 
     if inputs.retrieval_mode == ChatRetrievalMode::Deep {
-        if !emit_chat_preparation_progress_if_owner(
-            &stream_state,
-            &app,
-            ChatPreparationProgressPayload {
-                stream_id: stream_id.clone(),
-                stage: ChatPreparationStage::InitialRetrieval,
-                completed: sources.len(),
-                total: sources.len(),
-            },
-            &token,
-        ) {
-            return Ok(());
-        }
-        if !emit_chat_preparation_progress_if_owner(
-            &stream_state,
-            &app,
-            ChatPreparationProgressPayload {
-                stream_id: stream_id.clone(),
-                stage: ChatPreparationStage::AnswerGeneration,
-                completed: 0,
-                total: 1,
-            },
-            &token,
-        ) {
-            return Ok(());
-        }
+        info!(
+            "Chat Deep stream handoff: {} provider round trips before generation (rewrite + planner calls)",
+            inputs.provider_round_trips
+        );
     }
 
     if !emit_chat_stream_event_if_owner(
@@ -2117,9 +2206,10 @@ async fn stream_chat<R: Runtime>(
                 return Ok(());
             };
             info!(
-                "Chat stream completed: {} sources, {} answer chars",
+                "Chat stream completed: {} sources, {} answer chars, {} provider round trips including final generation",
                 sources.len(),
-                answer.len()
+                answer.len(),
+                inputs.provider_round_trips + 1
             );
             emit_chat_stream_event_if_owner(
                 &stream_state,
@@ -2250,6 +2340,48 @@ fn emit_chat_preparation_progress_if_owner<R: Runtime>(
     )
 }
 
+/// The privacy-safe Deep progress sink handed to the retrieval agent: it maps
+/// stage identity and counts onto the established Chat publication fence.
+/// The agent itself never touches Tauri events or the app handle.
+fn deep_progress_sink<R: Runtime>(
+    request_state: &ChatRequestState,
+    app: &AppHandle<R>,
+    stream_id: &str,
+    token: &ChatRequestToken,
+) -> impl Fn(crate::retrieval::agent::DeepProgressEvent) + Send + Sync + 'static {
+    let request_state = request_state.clone();
+    let app = app.clone();
+    let stream_id = stream_id.to_string();
+    let token = token.clone();
+    move |event: crate::retrieval::agent::DeepProgressEvent| {
+        let stage = match event.stage {
+            crate::retrieval::agent::DeepProgressStage::InitialRetrieval => {
+                ChatPreparationStage::InitialRetrieval
+            }
+            crate::retrieval::agent::DeepProgressStage::PlannerRound => {
+                ChatPreparationStage::PlannerRound
+            }
+            crate::retrieval::agent::DeepProgressStage::AdditionalSearch => {
+                ChatPreparationStage::AdditionalSearch
+            }
+            crate::retrieval::agent::DeepProgressStage::AnswerGeneration => {
+                ChatPreparationStage::AnswerGeneration
+            }
+        };
+        emit_chat_preparation_progress_if_owner(
+            &request_state,
+            &app,
+            ChatPreparationProgressPayload {
+                stream_id: stream_id.clone(),
+                stage,
+                completed: event.completed,
+                total: event.total,
+            },
+            &token,
+        );
+    }
+}
+
 fn publish_chat_stream_event_if_owner<F: FnOnce(&str, serde_json::Value)>(
     state: &ChatRequestState,
     stream_id: &str,
@@ -2357,24 +2489,31 @@ mod tests {
 
     #[test]
     fn preparation_progress_payload_contains_only_stage_identity_and_counts() {
-        let value = serde_json::to_value(ChatPreparationProgressPayload {
-            stream_id: "stream".to_string(),
-            stage: ChatPreparationStage::InitialRetrieval,
-            completed: 2,
-            total: 3,
-        })
-        .unwrap();
-        assert_eq!(
-            value,
-            serde_json::json!({
-                "streamId": "stream",
-                "stage": "initial_retrieval",
-                "completed": 2,
-                "total": 3,
+        for (stage, name) in [
+            (ChatPreparationStage::InitialRetrieval, "initial_retrieval"),
+            (ChatPreparationStage::PlannerRound, "planner_round"),
+            (ChatPreparationStage::AdditionalSearch, "additional_search"),
+            (ChatPreparationStage::AnswerGeneration, "answer_generation"),
+        ] {
+            let value = serde_json::to_value(ChatPreparationProgressPayload {
+                stream_id: "stream".to_string(),
+                stage,
+                completed: 2,
+                total: 3,
             })
-        );
-        for forbidden in ["planner", "query", "evidence", "text"] {
-            assert!(value.get(forbidden).is_none());
+            .unwrap();
+            assert_eq!(
+                value,
+                serde_json::json!({
+                    "streamId": "stream",
+                    "stage": name,
+                    "completed": 2,
+                    "total": 3,
+                })
+            );
+            for forbidden in ["planner", "query", "evidence", "text"] {
+                assert!(value.get(forbidden).is_none());
+            }
         }
     }
 
@@ -2657,6 +2796,7 @@ mod tests {
             None,
             None,
             Some(ChatRetrievalMode::Deep),
+            None,
         )
         .await
         .unwrap();
@@ -3237,6 +3377,15 @@ mod tests {
             .await
             .unwrap();
 
+        let progress: Arc<Mutex<Vec<crate::retrieval::agent::DeepProgressEvent>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let sink_events = Arc::clone(&progress);
+            move |event: crate::retrieval::agent::DeepProgressEvent| {
+                sink_events.lock().unwrap().push(event);
+            }
+        };
+
         let inputs = prepare_chat_inputs_for_scope(
             &pool,
             None,
@@ -3248,6 +3397,7 @@ mod tests {
             None,
             None,
             Some(ChatRetrievalMode::Deep),
+            Some(&sink),
         )
         .await
         .unwrap();
@@ -3257,6 +3407,9 @@ mod tests {
             RetrievalPreparationDiagnostic::ForcedLexical
         );
         assert_eq!(inputs.retrieval_mode, ChatRetrievalMode::Fast);
+        // Forced lexical suppresses Deep: no planner runs, no progress emits.
+        assert!(progress.lock().unwrap().is_empty());
+        assert_eq!(inputs.provider_round_trips, 0);
         assert!(!inputs.sources.is_empty());
         assert!(inputs
             .sources
@@ -3271,6 +3424,67 @@ mod tests {
         assert!(serialized
             .iter()
             .all(|source| source.get("sourceKind").is_none()));
+    }
+
+    #[test]
+    fn deep_preparation_eligibility_requires_deep_mode_and_no_today_allow_list() {
+        assert!(deep_preparation_eligible(ChatRetrievalMode::Deep, None));
+        // A derived today allow-list (snapshot/today/saved-meeting members)
+        // stays Fast until Tasks 4.3/4.4 extend the Deep lifecycle.
+        assert!(!deep_preparation_eligible(
+            ChatRetrievalMode::Deep,
+            Some(&vec!["m1".to_string()])
+        ));
+        assert!(!deep_preparation_eligible(ChatRetrievalMode::Fast, None));
+        // Omitted mode resolves to Fast.
+        assert!(!deep_preparation_eligible(
+            ChatRetrievalMode::default(),
+            None
+        ));
+    }
+
+    #[tokio::test]
+    async fn fast_preparation_makes_no_deep_progress_and_counts_no_round_trips() {
+        let pool = scope_pool().await;
+        sqlx::query("CREATE TABLE settings (id TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL, whisperModel TEXT NOT NULL, groqApiKey TEXT, openaiApiKey TEXT, anthropicApiKey TEXT, ollamaApiKey TEXT, openRouterApiKey TEXT, ollamaEndpoint TEXT, customOpenAIConfig TEXT, customVocabulary TEXT, chatProvider TEXT, chatModel TEXT, chatOllamaEndpoint TEXT, force_lexical_retrieval BOOLEAN NOT NULL DEFAULT FALSE)")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO settings (id, provider, model, whisperModel, chatProvider, chatModel) VALUES ('1', 'ollama', 'local', 'whisper', 'ollama', 'local')")
+            .execute(&pool).await.unwrap();
+        sqlx::query("UPDATE meetings SET saved_at = '2026-08-22T00:00:00Z'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let progress: Arc<Mutex<Vec<crate::retrieval::agent::DeepProgressEvent>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let sink_events = Arc::clone(&progress);
+            move |event: crate::retrieval::agent::DeepProgressEvent| {
+                sink_events.lock().unwrap().push(event);
+            }
+        };
+
+        let inputs = prepare_chat_inputs_for_scope(
+            &pool,
+            None,
+            &reqwest::Client::new(),
+            "alpha",
+            None,
+            ChatRetrievalScope::All,
+            None,
+            None,
+            None,
+            None,
+            Some(&sink),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(inputs.retrieval_mode, ChatRetrievalMode::Fast);
+        // Fast never constructs the planner path or emits preparation progress.
+        assert!(progress.lock().unwrap().is_empty());
+        assert_eq!(inputs.provider_round_trips, 0);
+        assert!(!inputs.sources.is_empty());
     }
 
     #[test]
@@ -3582,6 +3796,7 @@ mod tests {
             None,
             "conversation",
             live_authorization("live-1", false),
+            None,
             None,
             None,
             None,

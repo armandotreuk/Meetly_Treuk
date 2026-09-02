@@ -1407,7 +1407,15 @@ impl RetrievalRepository {
         cancel: &CancellationToken,
     ) -> Result<Option<MeetingSource>, SqlxError> {
         check_source_cancellation(Some(cancel))?;
-        let source = Self::load_meeting_source_relevant(pool, meeting_id, transcript_ids).await?;
+        // Race the awaited load against the token instead of only checking
+        // before and after it, so a deadline that fires mid-load aborts the
+        // database work instead of letting it run to completion.
+        let source = tokio::select! {
+            source = Self::load_meeting_source_relevant(pool, meeting_id, transcript_ids) => source?,
+            _ = cancel.cancelled() => {
+                return Err(SqlxError::Protocol("retrieval cancelled".into()));
+            }
+        };
         check_source_cancellation(Some(cancel))?;
         Ok(source)
     }

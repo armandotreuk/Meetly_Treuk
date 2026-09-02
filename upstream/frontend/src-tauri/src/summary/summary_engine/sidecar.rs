@@ -8,11 +8,38 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, RwLock};
 
 use super::models;
+
+/// Hard cap for one sidecar response line. A legitimate response is bounded
+/// by its request's `max_tokens` far below this; the cap stops a runaway
+/// line from growing memory without bound before any content check runs.
+const RESPONSE_LINE_CAP: usize = 1024 * 1024;
+
+/// Reads one newline-terminated line, bounded by `cap` bytes. Reaching the
+/// cap without a terminator is an error - the stream is left misaligned and
+/// the caller must restart the sidecar.
+async fn read_capped_line(
+    reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
+    cap: usize,
+) -> Result<String> {
+    let mut line = String::new();
+    let mut taken = reader.take(cap as u64);
+    let read = taken
+        .read_line(&mut line)
+        .await
+        .context("Failed to read response from stdout")?;
+    if read as usize >= cap && !line.ends_with('\n') {
+        anyhow::bail!("Sidecar response exceeded the {} byte cap", cap);
+    }
+    if line.is_empty() {
+        anyhow::bail!("Sidecar closed stdout (process may have crashed)");
+    }
+    Ok(line.trim().to_string())
+}
 
 // ============================================================================
 // Sidecar State Management
@@ -442,7 +469,19 @@ impl SidecarManager {
                 self.update_activity().await;
                 Ok(response)
             }
-            Ok(Err(e)) => Err(e),
+            Ok(Err(e)) => {
+                // A failed (e.g. over-cap) read can leave the stdout stream
+                // misaligned: the sidecar is unusable for the next request,
+                // so stop it and let ensure_running restart it cleanly.
+                log::error!("Sidecar request read failed: {e}; stopping sidecar");
+                if let Err(shutdown_err) = self.shutdown().await {
+                    log::error!(
+                        "Failed to shutdown sidecar after read failure: {}",
+                        shutdown_err
+                    );
+                }
+                Err(e)
+            }
             Err(_) => {
                 // Timeout reached - shutdown sidecar to stop generation
                 log::error!("Request timeout after {:?}, shutting down sidecar", timeout);
@@ -454,24 +493,15 @@ impl SidecarManager {
         }
     }
 
-    /// Read a single line response from stdout
+    /// Read a single line response from stdout, hard-capped so a runaway
+    /// sidecar line can never grow memory without bound.
     async fn read_response(&self) -> Result<String> {
         let mut stdout_lock = self.stdout_reader.lock().await;
         let reader = stdout_lock
             .as_mut()
             .ok_or_else(|| anyhow!("Sidecar not running"))?;
 
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .await
-            .context("Failed to read response from stdout")?;
-
-        if line.is_empty() {
-            return Err(anyhow!("Sidecar closed stdout (process may have crashed)"));
-        }
-
-        Ok(line.trim().to_string())
+        read_capped_line(reader, RESPONSE_LINE_CAP).await
     }
 
     /// Send ping to keep sidecar alive
@@ -735,5 +765,43 @@ impl Drop for SidecarManager {
         // Note: Actual cleanup happens in shutdown() method
         // We can't do async work in Drop, so this is best-effort
         log::debug!("SidecarManager dropped");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[tokio::test]
+    async fn capped_line_reads_a_terminated_line_within_the_cap() {
+        let mut reader = Cursor::new(b"{\"type\":\"response\"}\ntrailing".to_vec());
+        let line = read_capped_line(&mut reader, 1024).await.unwrap();
+        assert_eq!(line, "{\"type\":\"response\"}");
+        // The unread remainder stays in the stream for the next read.
+        let mut rest = String::new();
+        tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut rest)
+            .await
+            .unwrap();
+        assert_eq!(rest, "trailing");
+    }
+
+    #[tokio::test]
+    async fn capped_line_rejects_a_line_that_fills_the_cap_without_a_terminator() {
+        let mut reader = Cursor::new(vec![b'x'; 64]);
+        let error = read_capped_line(&mut reader, 32).await.unwrap_err();
+        assert!(error.to_string().contains("byte cap"), "error: {error}");
+
+        // A line ending exactly at the cap WITH its terminator is valid.
+        let mut reader = Cursor::new(format!("{}\n", "y".repeat(31)).into_bytes());
+        let line = read_capped_line(&mut reader, 32).await.unwrap();
+        assert_eq!(line, "y".repeat(31));
+    }
+
+    #[tokio::test]
+    async fn capped_line_reports_a_closed_stream() {
+        let mut reader = Cursor::new(Vec::new());
+        let error = read_capped_line(&mut reader, 1024).await.unwrap_err();
+        assert!(error.to_string().contains("closed stdout"));
     }
 }

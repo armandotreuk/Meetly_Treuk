@@ -164,12 +164,17 @@ pub enum RetrievalChannel {
 
 /// One channel match behind a candidate: which channel, which query variant,
 /// which lexical mode, and the 1-based rank inside that channel list.
+/// `query_slot` separates independent queries inside one accumulated pool:
+/// `0` is the request's own original/rewritten/core-terms namespaces, and
+/// `1..=n` is the nth Deep planner query, so fusion keeps distinct per-query
+/// rank lists instead of collapsing them all into one rewritten namespace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EvidenceProvenance {
     pub channel: RetrievalChannel,
     pub variant: QueryVariantKind,
     pub mode: Option<LexicalMode>,
     pub rank: usize,
+    pub query_slot: u8,
 }
 
 /// One stable-identity evidence candidate. Field names follow the
@@ -253,8 +258,17 @@ pub enum RetrievalError {
     Database(String),
 }
 
-fn db_error(error: sqlx::Error) -> RetrievalError {
-    RetrievalError::Database(error.to_string())
+/// Maps a repository SQL error onto the retrieval error type. The
+/// repositories' typed cancellation marker arrives wrapped in
+/// `SqlxError::Protocol`, whose Display text is not the marker itself, so the
+/// variant is matched instead of the formatted string.
+pub(crate) fn db_error(error: sqlx::Error) -> RetrievalError {
+    match &error {
+        sqlx::Error::Protocol(message) if message == "retrieval cancelled" => {
+            RetrievalError::Cancelled
+        }
+        _ => RetrievalError::Database(error.to_string()),
+    }
 }
 
 fn ensure_not_cancelled(cancel: &CancellationToken) -> Result<(), RetrievalError> {
@@ -461,6 +475,28 @@ impl RetrievalService {
             ranking,
             semantic_fallback: result.semantic_fallback,
         })
+    }
+
+    /// Revalidates the ORIGINAL authoritative scope's current membership and
+    /// returns the supplied meeting IDs still inside it (input order kept).
+    /// Deep retrieval rounds call this after every planner round as an early
+    /// scope filter; it is NOT the final publication authority - the final
+    /// authoritative hydration re-reads current membership and source
+    /// revisions itself, so `All` (permissive by definition) can never
+    /// publish stale evidence on membership alone.
+    pub async fn revalidate_ids_in_scope(
+        &self,
+        pool: &SqlitePool,
+        scope: &PersistedRetrievalScope,
+        meeting_ids: &[String],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<String>, RetrievalError> {
+        let (membership, _) = self.resolve_membership(pool, scope, cancel).await?;
+        Ok(meeting_ids
+            .iter()
+            .filter(|id| membership.allows(id))
+            .cloned()
+            .collect())
     }
 
     // -- Scope validation and normalization ----------------------------------
@@ -745,6 +781,7 @@ impl RetrievalService {
                             variant,
                             mode: Some(mode),
                             rank,
+                            query_slot: 0,
                         },
                     );
                 }
@@ -923,6 +960,7 @@ impl RetrievalService {
                     variant: QueryVariantKind::CoreTerms,
                     mode: None,
                     rank: rank + 1,
+                    query_slot: 0,
                 },
             );
         }
@@ -1202,6 +1240,7 @@ impl RetrievalService {
                     variant,
                     mode: None,
                     rank,
+                    query_slot: 0,
                 },
             );
         }

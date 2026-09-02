@@ -11,6 +11,7 @@
 //! availability result so callers fall back to FTS5 while any component is
 //! unavailable.
 
+pub mod agent;
 pub mod chunking;
 pub mod commands;
 pub mod hydration;
@@ -23,6 +24,15 @@ pub mod worker;
 #[cfg(test)]
 mod tests;
 
+pub use agent::{
+    parse_planner_action, run_deep_preparation, DeepBounds, DeepPreparation, DeepPreparationError,
+    DeepProgressCallback, DeepProgressEvent, DeepProgressStage, PlannerAction, PlannerActionError,
+    PlannerFailure, PlannerGeneration, PlannerStatus, SharedClientPlanner, DEEP_PREPARATION_BUDGET,
+    PLANNER_CALL_TIMEOUT, PLANNER_MAX_EXPANDS_PER_ROUND, PLANNER_MAX_INPUT_CHARS,
+    PLANNER_MAX_OPENS_PER_ROUND, PLANNER_MAX_OPENS_TOTAL, PLANNER_MAX_OUTPUT_BYTES,
+    PLANNER_MAX_OUTPUT_TOKENS, PLANNER_MAX_QUERIES_PER_ROUND, PLANNER_MAX_QUERY_CHARS,
+    PLANNER_MAX_ROUNDS, PLANNER_SCHEMA_VERSION,
+};
 pub use chunking::{chunk_meeting, ChunkerConfig, SemanticDocument, TokenizerPolicy};
 pub use hydration::{hydrate_context, HydratedContext, HydratedMeeting, HydratedSource};
 pub use index::{QueryIndexService, ScopeFilter, SearchFailure, VectorHit};

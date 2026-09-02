@@ -661,9 +661,9 @@ fn is_semantic_provenance(provenance: &EvidenceProvenance) -> bool {
     matches!(provenance.channel, RetrievalChannel::Semantic)
 }
 
-/// One merged rank list for one channel: each candidate enters at the
-/// position its best provenance earns, ties resolved by evidence ID. The
-/// 1-based position is what RRF consumes.
+/// One merged rank list for one (channel, query-slot) pair: each candidate
+/// enters at the position its best provenance earns, ties resolved by
+/// evidence ID. The 1-based position is what RRF consumes.
 fn channel_positions<K: Ord>(
     candidates: &[RetrievedEvidence],
     select: impl Fn(&EvidenceProvenance) -> bool,
@@ -689,39 +689,80 @@ fn channel_positions<K: Ord>(
         .collect()
 }
 
+/// One merged rank list per query slot. Slot 0 (the request's own
+/// original/rewritten/core-terms variants) is exactly the Fast list, and
+/// each planner query slot `1..=n` is an independent list under the same
+/// key, so a later query's rank-1 candidate is not dominated by the
+/// earliest slot's ordering.
+fn slot_channel_lists<K: Ord>(
+    candidates: &[RetrievedEvidence],
+    select: impl Fn(&EvidenceProvenance) -> bool + Copy,
+    key: impl Fn(&EvidenceProvenance) -> K + Copy,
+) -> Vec<Vec<(&str, usize)>> {
+    let mut slots: Vec<u8> = candidates
+        .iter()
+        .flat_map(|candidate| candidate.provenance.iter())
+        .filter(|provenance| select(provenance))
+        .map(|provenance| provenance.query_slot)
+        .collect();
+    slots.sort_unstable();
+    slots.dedup();
+    slots
+        .into_iter()
+        .map(|slot| {
+            channel_positions(
+                candidates,
+                |provenance| select(provenance) && provenance.query_slot == slot,
+                key,
+            )
+        })
+        .collect()
+}
+
 /// Reciprocal-rank fusion over the two approved channels with the Sprint 1
 /// constants: `score = sum(weight / (k + channel_position))`. Each channel is
-/// one merged rank list built from the candidates' per-variant provenance —
-/// semantic: best variant rank first (the benchmark's vector channel ranks by
-/// best similarity across query variants, so a doc's best rank leads, with
-/// the variant order as the deterministic tie-break); lexical: AND mode
-/// before OR, then variant rank — so raw BM25/cosine values never enter
-/// fusion. Equal fused scores resolve by evidence ID, making the result
+/// fused as independent per-query-slot rank lists built from the candidates'
+/// per-variant provenance — semantic: best variant rank first (the
+/// benchmark's vector channel ranks by best similarity across query
+/// variants, so a doc's best rank leads, with the variant order as the
+/// deterministic tie-break); lexical: AND mode before OR, then variant rank —
+/// so raw BM25/cosine values never enter fusion. Slot 0 is the request's own
+/// list exactly as Fast produced it; each Deep planner query (`1..=n`)
+/// contributes its own list, and a candidate matched by several planner
+/// queries accumulates one bounded contribution per slot instead of
+/// collapsing into one rewritten namespace where the earliest slot dominates.
+/// Equal fused scores resolve by evidence ID, making the result
 /// deterministic for ties.
 pub fn fuse(candidates: &[RetrievedEvidence], config: &RankingConfig) -> Vec<FusedEvidence> {
-    let semantic_list = channel_positions(candidates, is_semantic_provenance, |provenance| {
-        (provenance.rank, variant_order(provenance.variant))
-    });
-    let lexical_list = channel_positions(
-        candidates,
-        |provenance| matches!(provenance.channel, RetrievalChannel::Lexical),
-        |provenance| {
-            (
-                mode_order(provenance.mode),
-                variant_order(provenance.variant),
-                provenance.rank,
-            )
-        },
-    );
     let mut scores: HashMap<&str, f64> = HashMap::new();
-    for (weight, list) in [
-        (config.w_vector, semantic_list),
-        (config.w_lexical, lexical_list),
+    for (weight, lists) in [
+        (
+            config.w_vector,
+            slot_channel_lists(candidates, is_semantic_provenance, |provenance| {
+                (provenance.rank, variant_order(provenance.variant))
+            }),
+        ),
+        (
+            config.w_lexical,
+            slot_channel_lists(
+                candidates,
+                |provenance| matches!(provenance.channel, RetrievalChannel::Lexical),
+                |provenance| {
+                    (
+                        mode_order(provenance.mode),
+                        variant_order(provenance.variant),
+                        provenance.rank,
+                    )
+                },
+            ),
+        ),
     ] {
-        for (id, position) in list {
-            // Positions are 1-based, so k + position equals the Sprint 1
-            // harness's k + rank0 + 1 over 0-based indices.
-            *scores.entry(id).or_insert(0.0) += weight / (config.rrf_k + position as f64);
+        for list in lists {
+            for (id, position) in list {
+                // Positions are 1-based, so k + position equals the Sprint 1
+                // harness's k + rank0 + 1 over 0-based indices.
+                *scores.entry(id).or_insert(0.0) += weight / (config.rrf_k + position as f64);
+            }
         }
     }
     let mut fused: Vec<(&RetrievedEvidence, f64)> = candidates
@@ -753,12 +794,15 @@ pub fn fuse(candidates: &[RetrievedEvidence], config: &RankingConfig) -> Vec<Fus
 
 /// Preserve the repository's BM25 ordering when semantic retrieval is not
 /// available or is deliberately disabled. The lexical channel rank remains
-/// the relevance signal; the selected hybrid weights are not changed.
+/// the relevance signal; the selected hybrid weights are not changed. Each
+/// query slot contributes one independent bounded term, so additional
+/// planner queries accumulate support instead of being dominated by slot 0's
+/// ordering.
 pub fn fuse_lexical_only(
     candidates: &[RetrievedEvidence],
     config: &RankingConfig,
 ) -> Vec<FusedEvidence> {
-    let lexical_list = channel_positions(
+    let lists = slot_channel_lists(
         candidates,
         |provenance| matches!(provenance.channel, RetrievalChannel::Lexical),
         |provenance| {
@@ -769,18 +813,34 @@ pub fn fuse_lexical_only(
             )
         },
     );
-    lexical_list
+    // Slot 0 alone reproduces the repository's BM25 ordering exactly (the
+    // score is strictly decreasing in position); additional planner slots
+    // contribute one independent bounded term per slot, ordered by score.
+    let mut scores: HashMap<&str, f64> = HashMap::new();
+    for list in lists {
+        for (id, position) in list {
+            *scores.entry(id).or_insert(0.0) += config.rrf_k / (config.rrf_k + position as f64);
+        }
+    }
+    let mut fused: Vec<(&RetrievedEvidence, f64)> = candidates
+        .iter()
+        .filter_map(|candidate| {
+            scores
+                .get(candidate.evidence_id.as_str())
+                .map(|score| (candidate, *score))
+        })
+        .collect();
+    fused.sort_by(|a, b| {
+        b.1.total_cmp(&a.1)
+            .then_with(|| a.0.evidence_id.cmp(&b.0.evidence_id))
+    });
+    fused
         .into_iter()
         .enumerate()
-        .filter_map(|(index, (id, position))| {
-            candidates
-                .iter()
-                .find(|candidate| candidate.evidence_id == id)
-                .map(|evidence| FusedEvidence {
-                    evidence: evidence.clone(),
-                    fused_rank: index + 1,
-                    fused_score: config.rrf_k / (config.rrf_k + position as f64),
-                })
+        .map(|(index, (evidence, fused_score))| FusedEvidence {
+            evidence: evidence.clone(),
+            fused_rank: index + 1,
+            fused_score,
         })
         .collect()
 }

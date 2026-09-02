@@ -193,7 +193,11 @@ export interface ChatMessage {
 }
 
 export type ChatRetrievalMode = "fast" | "deep";
-export type ChatPreparationStage = "initial_retrieval" | "answer_generation";
+export type ChatPreparationStage =
+    | "initial_retrieval"
+    | "planner_round"
+    | "additional_search"
+    | "answer_generation";
 
 export interface ChatPreparationProgressPayload {
     streamId: string;

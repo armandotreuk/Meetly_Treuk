@@ -166,15 +166,7 @@ impl HydrationPause {
 }
 
 fn db_error(error: sqlx::Error) -> RetrievalError {
-    RetrievalError::Database(error.to_string())
-}
-
-fn source_error(error: sqlx::Error) -> RetrievalError {
-    if error.to_string() == "retrieval cancelled" {
-        RetrievalError::Cancelled
-    } else {
-        db_error(error)
-    }
+    super::service::db_error(error)
 }
 
 fn ensure_not_cancelled(cancel: &CancellationToken) -> Result<(), RetrievalError> {
@@ -297,7 +289,7 @@ async fn hydrate(
             &cancel,
         )
         .await
-        .map_err(source_error)?
+        .map_err(db_error)?
         else {
             omitted += 1;
             continue;

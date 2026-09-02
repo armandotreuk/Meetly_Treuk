@@ -63,6 +63,7 @@ fn lexical_candidate(
             variant,
             mode,
             rank,
+            query_slot: 0,
         }],
         source_aliases: Vec::new(),
     }
@@ -96,6 +97,7 @@ fn semantic_candidate(
             variant: QueryVariantKind::Original,
             mode: None,
             rank,
+            query_slot: 0,
         }],
         source_aliases: Vec::new(),
     }
@@ -144,6 +146,7 @@ fn fuse_sums_channel_ranks_with_shipped_constants() {
         variant: QueryVariantKind::Original,
         mode: Some(LexicalMode::Or),
         rank: 1,
+        query_slot: 0,
     });
     let candidates = vec![
         both,
@@ -177,6 +180,47 @@ fn fuse_sums_channel_ranks_with_shipped_constants() {
     );
     assert!((fused[1].fused_score - config.w_vector / (k + 2.0)).abs() < 1e-12);
     assert!((fused[2].fused_score - config.w_lexical / (k + 2.0)).abs() < 1e-12);
+}
+
+#[test]
+fn each_planner_query_slot_contributes_independently_to_fusion() {
+    let config = RankingConfig::chat();
+    // "sem-b" trails slot 0 at rank 2, but planner slot 1 independently
+    // ranks it first. The slot-1 support is a bounded extra contribution:
+    // "sem-b" overtakes "sem-a" instead of the extra support being discarded
+    // because each candidate entered the channel list once.
+    let mut b = semantic_candidate("sem-b", "m2", "transcript", None, None, None, 0, 2);
+    b.provenance.push(EvidenceProvenance {
+        channel: RetrievalChannel::Semantic,
+        variant: QueryVariantKind::Original,
+        mode: None,
+        rank: 1,
+        query_slot: 1,
+    });
+    let a = semantic_candidate("sem-a", "m1", "transcript", None, None, None, 0, 1);
+    let fused = fuse(&[a, b], &config);
+    assert_eq!(fused[0].evidence.evidence_id, "sem-b");
+    assert_eq!(fused[1].evidence.evidence_id, "sem-a");
+    let k = config.rrf_k;
+    let expected_b = config.w_vector / (k + 2.0) + config.w_vector / (k + 1.0);
+    assert!((fused[0].fused_score - expected_b).abs() < 1e-12);
+    assert!((fused[1].fused_score - config.w_vector / (k + 1.0)).abs() < 1e-12);
+}
+
+#[test]
+fn same_rank_in_different_planner_slots_ties_into_evidence_id_order() {
+    let config = RankingConfig::chat();
+    let mut slot_one = semantic_candidate("sem-z", "m1", "transcript", None, None, None, 0, 1);
+    slot_one.provenance[0].query_slot = 1;
+    let mut slot_two = semantic_candidate("sem-a", "m2", "transcript", None, None, None, 0, 1);
+    slot_two.provenance[0].query_slot = 2;
+    // Independent per-slot lists give both candidates the same position and
+    // therefore the same score; the deterministic tie-break is evidence ID,
+    // not whichever slot ran first.
+    let fused = fuse(&[slot_two, slot_one], &config);
+    assert_eq!(fused[0].evidence.evidence_id, "sem-a");
+    assert_eq!(fused[1].evidence.evidence_id, "sem-z");
+    assert!((fused[0].fused_score - fused[1].fused_score).abs() < 1e-12);
 }
 
 #[test]
@@ -481,6 +525,7 @@ fn dedupe_retains_summary_note_rows_separately_and_drops_title_candidates() {
             variant: QueryVariantKind::CoreTerms,
             mode: None,
             rank: 1,
+            query_slot: 0,
         }],
         ..semantic_candidate("x", "x", "transcript", None, None, None, 0, 0)
     };
@@ -1551,6 +1596,7 @@ fn title_only_meeting_survives_ranking_behind_evidence_meetings() {
             variant: QueryVariantKind::CoreTerms,
             mode: None,
             rank: 1,
+            query_slot: 0,
         }],
         ..semantic_candidate("x", "x", "transcript", None, None, None, 0, 0)
     };

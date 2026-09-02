@@ -54,6 +54,8 @@ export const en: Record<string, string> = {
     "chat.message.openMeetingAria": "Open meeting {title}",
     "chat.message.liveSourceAria": "Live recording transcript source",
     "chat.preparation.initialRetrieval": "Initial retrieval complete: {completed} of {total}.",
+    "chat.preparation.plannerRound": "Reviewing meetings for more evidence: round {completed} of {total}.",
+    "chat.preparation.additionalSearch": "Additional search: {completed} of {total}.",
     "chat.preparation.answerGeneration": "Preparing answer: {completed} of {total}.",
     "notes.header.title": "Notes",
     "notes.header.loadError": "Couldn't load notes",

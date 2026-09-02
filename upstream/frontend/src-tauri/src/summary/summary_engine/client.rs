@@ -126,6 +126,9 @@ fn get_cached_model_path(app_data_dir: &PathBuf, model_name: &str) -> Result<Pat
 /// * `system_prompt` - System instructions for the model
 /// * `user_prompt` - User message/task
 /// * `cancellation_token` - Optional token for cancellation
+/// * `max_tokens` - Optional output-token cap overriding
+///   [`models::DEFAULT_MAX_TOKENS`] (used by the Deep planner's bounded
+///   generation)
 ///
 /// # Returns
 /// Generated text
@@ -135,6 +138,7 @@ pub async fn generate_with_builtin(
     system_prompt: &str,
     user_prompt: &str,
     cancellation_token: Option<&CancellationToken>,
+    max_tokens: Option<u32>,
 ) -> Result<String> {
     // Check cancellation at start
     if let Some(token) = cancellation_token {
@@ -155,32 +159,58 @@ pub async fn generate_with_builtin(
 
     // Apply model-specific chat template
     let formatted_prompt = models::format_prompt(&model_def.template, system_prompt, user_prompt)?;
-    // Get or initialize sidecar manager
+    // Get or initialize sidecar manager, racing the startup path (global
+    // manager lock + initialization) against cancellation so a deadline that
+    // fires during startup cannot leave the caller waiting on it.
     let manager = {
-        let mut global_manager = SIDECAR_MANAGER.lock().await;
-        if global_manager.is_none() {
-            log::info!("Initializing sidecar manager");
-            let new_manager = SidecarManager::new(app_data_dir.clone())?;
-            *global_manager = Some(Arc::new(new_manager));
+        let acquire = async {
+            let mut global_manager = SIDECAR_MANAGER.lock().await;
+            if global_manager.is_none() {
+                log::info!("Initializing sidecar manager");
+                let new_manager = SidecarManager::new(app_data_dir.clone())?;
+                *global_manager = Some(Arc::new(new_manager));
+            }
+            Ok::<_, anyhow::Error>(global_manager.clone().unwrap())
+        };
+        match cancellation_token {
+            Some(token) => tokio::select! {
+                result = acquire => result?,
+                _ = token.cancelled() => {
+                    return Err(anyhow!("Generation cancelled during sidecar startup"));
+                }
+            },
+            None => acquire.await?,
         }
-        global_manager.clone().unwrap()
     };
 
-    // Ensure sidecar is running with this model
-    manager.ensure_running(model_path.clone()).await?;
-
-    // Check cancellation after sidecar startup
+    // Ensure sidecar is running with this model, racing model switching
+    // against cancellation: a cancelled startup shuts the sidecar down so
+    // no spawn/model switch survives its deadline.
+    let startup = manager.ensure_running(model_path.clone());
     if let Some(token) = cancellation_token {
-        if token.is_cancelled() {
-            return Err(anyhow!("Generation cancelled during sidecar startup"));
+        tokio::select! {
+            result = startup => result?,
+            _ = token.cancelled() => {
+                log::warn!("Generation cancelled during sidecar startup, shutting down sidecar");
+                if let Err(e) = manager.shutdown().await {
+                    log::error!("Failed to shutdown sidecar during cancellation: {}", e);
+                }
+                return Err(anyhow!("Generation cancelled during sidecar startup"));
+            }
         }
+    } else {
+        startup.await?;
     }
 
     // Prepare generation request with model-specific sampling parameters
     let sampling = model_def.sampling.sanitize_for_llama_helper();
     let request = Request::Generate {
         prompt: formatted_prompt,
-        max_tokens: Some(models::DEFAULT_MAX_TOKENS),
+        max_tokens: Some(
+            max_tokens
+                .map(|tokens| tokens as i32)
+                .unwrap_or(models::DEFAULT_MAX_TOKENS),
+        ),
         context_size: Some(model_def.context_size),
         model_path: Some(model_path.to_string_lossy().to_string()),
         temperature: Some(sampling.temperature),

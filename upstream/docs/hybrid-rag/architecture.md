@@ -1472,9 +1472,11 @@ Constraints:
 - Planner generation MUST use planner-specific bounded-generation options inside
   the existing shared LLM client/request builder; it MUST NOT create a second
   provider client or move provider logic into `retrieval/agent.rs`. Every
-  provider has a hard response-byte/parser cap, uses a provider output limit
-  where supported, and receives a scoped child cancellation token. The child
-  token is cancelled on both the per-call and total-preparation deadlines.
+  provider is recorded in the capability matrix below; a provider the matrix
+  records as supported has a hard response-byte/parser cap, uses a provider
+  output limit where supported, and receives a scoped child cancellation
+  token. The child token is cancelled on both the per-call and
+  total-preparation deadlines.
 - Sprint 4 MUST record a capability/fallback matrix for every configured
   provider: OpenAI, Claude, Groq, Ollama, OpenRouter, BuiltInAI, and Custom
   OpenAI. The matrix records provider-specific output-limit support, the hard
@@ -1492,7 +1494,7 @@ Constraints:
   | Groq | Provider output-limit support, shared byte/parser cap, and child-cancellation behavior | Current Fast evidence |
   | Ollama | Provider output-limit support, shared byte/parser cap, and child-cancellation behavior | Current Fast evidence |
   | OpenRouter | Provider output-limit support, shared byte/parser cap, and child-cancellation behavior | Current Fast evidence |
-  | BuiltInAI | Provider output-limit support, shared byte/parser cap, and child-cancellation behavior | Current Fast evidence |
+  | BuiltInAI | Recorded UNSUPPORTED for the Deep planner (output-limit support only): the sidecar carries no hard response-byte cap within the requested bound — the byte cap is checked only after the full response has been read — and sidecar startup/shutdown cleanup can outlive the deadline, so planner generation is refused fail-closed before any sidecar startup | Current Fast evidence; the planner never starts the sidecar |
   | Custom OpenAI | Provider output-limit support, shared byte/parser cap, and child-cancellation behavior | Current Fast evidence |
 
 - Maximum 15 seconds per planner call and **30 seconds total Deep preparation**,

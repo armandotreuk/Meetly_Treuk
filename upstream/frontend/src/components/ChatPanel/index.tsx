@@ -643,12 +643,22 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
                                       completed: preparationProgress.completed,
                                       total: preparationProgress.total,
                                   })
-                                : preparationProgress?.stage === "answer_generation"
-                                  ? t("chat.preparation.answerGeneration", {
+                                : preparationProgress?.stage === "planner_round"
+                                  ? t("chat.preparation.plannerRound", {
                                         completed: preparationProgress.completed,
                                         total: preparationProgress.total,
                                     })
-                                  : t("chat.searching")}
+                                  : preparationProgress?.stage === "additional_search"
+                                    ? t("chat.preparation.additionalSearch", {
+                                          completed: preparationProgress.completed,
+                                          total: preparationProgress.total,
+                                      })
+                                    : preparationProgress?.stage === "answer_generation"
+                                      ? t("chat.preparation.answerGeneration", {
+                                            completed: preparationProgress.completed,
+                                            total: preparationProgress.total,
+                                        })
+                                      : t("chat.searching")}
                         </div>
                     </div>
                 )}

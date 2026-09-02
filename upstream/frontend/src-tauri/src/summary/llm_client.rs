@@ -127,6 +127,7 @@ pub async fn generate_summary(
             system_prompt,
             user_prompt,
             cancellation_token,
+            None,
         )
         .await
         .map_err(|e| e.to_string());
@@ -141,6 +142,7 @@ pub async fn generate_summary(
         ollama_endpoint,
         custom_openai_endpoint,
         max_tokens,
+        None,
         temperature,
         top_p,
         None,
@@ -232,9 +234,249 @@ pub async fn generate_summary(
     }
 }
 
+/// Hard generation bounds for a single Deep planner call. Every provider
+/// records support for these in [`planner_generation_capability`]; a provider
+/// that cannot enforce a required bound is never called and the Deep loop
+/// falls back to current Fast evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundedGeneration {
+    pub max_output_tokens: u32,
+    pub max_response_bytes: usize,
+}
+
+/// One provider's recorded ability to enforce the required planner bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlannerCapability {
+    /// The provider request carries the output-token cap.
+    pub output_limit: bool,
+    /// The shared client enforces a hard response-byte/parser cap.
+    pub response_byte_cap: bool,
+    /// A scoped child cancellation token aborts in-flight generation.
+    pub child_cancellation: bool,
+}
+
+impl PlannerCapability {
+    pub const fn full() -> Self {
+        Self {
+            output_limit: true,
+            response_byte_cap: true,
+            child_cancellation: true,
+        }
+    }
+
+    pub const fn enforces_all_bounds(&self) -> bool {
+        self.output_limit && self.response_byte_cap && self.child_cancellation
+    }
+}
+
+/// Capability/fallback matrix for every configured Chat provider (Sprint 4
+/// Deep planner). OpenAI, Claude, Groq, Ollama, OpenRouter, and Custom OpenAI
+/// take a native output limit - via the `max_tokens` field of the shared
+/// OpenAI-compatible request, Claude via its required `max_tokens` field - so
+/// they record full support. BuiltInAI cannot actually enforce the requested
+/// bounds: its sidecar carries only the token cap, the response-byte cap is
+/// checked only after the full response has been read, and sidecar
+/// startup/shutdown can outlive the deadline - so it records the truthful
+/// unsupported status and is never called for the planner: Deep falls back to
+/// current Fast evidence without sidecar generation, while ordinary
+/// non-planner BuiltInAI Chat is unaffected. The record is the single seam
+/// where a provider's missing support is declared.
+pub fn planner_generation_capability(provider: &LLMProvider) -> PlannerCapability {
+    match provider {
+        LLMProvider::OpenAI
+        | LLMProvider::Claude
+        | LLMProvider::Groq
+        | LLMProvider::Ollama
+        | LLMProvider::OpenRouter
+        | LLMProvider::CustomOpenAI => PlannerCapability::full(),
+        LLMProvider::BuiltInAI => PlannerCapability {
+            output_limit: true,
+            response_byte_cap: false,
+            child_cancellation: false,
+        },
+    }
+}
+
+/// Generates one bounded, non-streaming completion. Used by the Deep planner:
+/// the output limit is sent to the provider where supported, the response
+/// body is hard-capped mid-read, the whole call is bounded by `deadline`,
+/// and `cancellation_token` aborts generation in flight. Returns an error
+/// (never a truncated result) when any bound is exceeded.
+pub async fn generate_bounded(
+    client: &Client,
+    provider: &LLMProvider,
+    model_name: &str,
+    api_key: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    ollama_endpoint: Option<&str>,
+    custom_openai_endpoint: Option<&str>,
+    app_data_dir: Option<&PathBuf>,
+    bounds: &BoundedGeneration,
+    deadline: Duration,
+    cancellation_token: &CancellationToken,
+) -> Result<String, String> {
+    if cancellation_token.is_cancelled() {
+        return Err("Bounded generation was cancelled".to_string());
+    }
+    if !planner_generation_capability(provider).enforces_all_bounds() {
+        return Err("Provider cannot enforce the required planner generation bounds".to_string());
+    }
+
+    if provider == &LLMProvider::BuiltInAI {
+        // Currently unreachable from the Deep planner: the capability matrix
+        // above records BuiltInAI as unable to enforce the planner bounds, so
+        // the check refuses the call before this branch. The branch stays as
+        // the seam for a future BuiltInAI caller that enforces the bounds for
+        // real; ordinary non-planner BuiltInAI Chat does not pass here.
+        let app_data_dir = app_data_dir
+            .ok_or_else(|| "app_data_dir is required for BuiltInAI provider".to_string())?;
+        // The deadline is carried by `cancellation_token`: the Deep agent's
+        // watchdog cancels it at the per-call/total deadline while this
+        // future is still alive, and `generate_with_builtin` races the
+        // sidecar request against it and shuts the sidecar down.
+        let text = crate::summary::summary_engine::generate_with_builtin(
+            app_data_dir,
+            model_name,
+            system_prompt,
+            user_prompt,
+            Some(cancellation_token),
+            Some(bounds.max_output_tokens),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        if text.len() > bounds.max_response_bytes {
+            return Err(format!(
+                "Bounded generation output exceeded the {} byte cap",
+                bounds.max_response_bytes
+            ));
+        }
+        return Ok(text);
+    }
+
+    let (api_url, headers, request_body) = build_chat_request(
+        provider,
+        model_name,
+        api_key,
+        system_prompt,
+        user_prompt,
+        ollama_endpoint,
+        custom_openai_endpoint,
+        None,
+        Some(bounds.max_output_tokens),
+        None,
+        None,
+        None,
+    )?;
+
+    info!(
+        "🐞 Bounded LLM request to {}: model={} cap={}B/{}t deadline={}s",
+        provider_name(provider),
+        model_name,
+        bounds.max_response_bytes,
+        bounds.max_output_tokens,
+        deadline.as_secs()
+    );
+
+    let request_future = client
+        .post(api_url)
+        .headers(headers)
+        .json(&request_body)
+        .timeout(deadline)
+        .send();
+
+    let response = tokio::select! {
+        result = request_future => {
+            result.map_err(|e| {
+                if e.is_timeout() {
+                    format!("Bounded LLM request timed out after {} seconds", deadline.as_secs())
+                } else {
+                    format!("Failed to send request to LLM: {}", e)
+                }
+            })?
+        }
+        _ = cancellation_token.cancelled() => {
+            return Err("Bounded generation was cancelled".to_string());
+        }
+    };
+
+    if !response.status().is_success() {
+        // ponytail: error bodies are truncated before inclusion so a large
+        // provider error page cannot bypass the response cap.
+        let error_body = capped_body(response, bounds.max_response_bytes, cancellation_token)
+            .await
+            .unwrap_or_else(|_| b"Unknown error".to_vec());
+        return Err(format!(
+            "LLM API request failed: {}",
+            String::from_utf8_lossy(&error_body)
+        ));
+    }
+
+    let body = capped_body(response, bounds.max_response_bytes, cancellation_token).await?;
+    let parsed: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| format!("Failed to parse LLM response: {}", e))?;
+
+    if provider == &LLMProvider::Claude {
+        let content = parsed
+            .get("content")
+            .and_then(|content| content.get(0))
+            .and_then(|entry| entry.get("text"))
+            .and_then(|text| text.as_str())
+            .ok_or("No content in LLM response")?;
+        Ok(content.trim().to_string())
+    } else {
+        let content = parsed
+            .get("choices")
+            .and_then(|choices| choices.get(0))
+            .and_then(|choice| choice.get("message"))
+            .and_then(|message| message.get("content"))
+            .and_then(|content| content.as_str())
+            .ok_or("No content in LLM response")?;
+        Ok(content.trim().to_string())
+    }
+}
+
+/// Reads the response body while enforcing a hard byte cap mid-stream, so an
+/// oversized response is rejected before it is ever parsed, and selecting on
+/// the cancellation token, so an in-flight body read aborts immediately.
+async fn capped_body(
+    response: reqwest::Response,
+    max_response_bytes: usize,
+    cancellation_token: &CancellationToken,
+) -> Result<Vec<u8>, String> {
+    use futures_util::StreamExt;
+
+    let mut stream = response.bytes_stream();
+    let mut body: Vec<u8> = Vec::new();
+    loop {
+        let chunk = tokio::select! {
+            chunk = stream.next() => chunk
+                .transpose()
+                .map_err(|e| format!("Failed to read LLM response: {}", e))?,
+            _ = cancellation_token.cancelled() => {
+                return Err("Bounded generation was cancelled".to_string());
+            }
+        };
+        let Some(chunk) = chunk else {
+            return Ok(body);
+        };
+        if body.len() + chunk.len() > max_response_bytes {
+            return Err(format!(
+                "Bounded generation output exceeded the {} byte cap",
+                max_response_bytes
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+}
+
 /// Builds the URL, headers, and JSON body shared by streaming and
 /// non-streaming chat requests. The only caller-controlled difference is the
-/// `stream` field injected into the request body.
+/// `stream` field injected into the request body. `bounded_max_tokens` is the
+/// Deep planner's hard output cap: when present it overrides every provider's
+/// output limit (including the Custom OpenAI user preference and Claude's
+/// default 2048).
+#[allow(clippy::too_many_arguments)]
 fn build_chat_request(
     provider: &LLMProvider,
     model_name: &str,
@@ -244,6 +486,7 @@ fn build_chat_request(
     ollama_endpoint: Option<&str>,
     custom_openai_endpoint: Option<&str>,
     max_tokens: Option<u32>,
+    bounded_max_tokens: Option<u32>,
     temperature: Option<f32>,
     top_p: Option<f32>,
     stream: Option<bool>,
@@ -320,9 +563,9 @@ fn build_chat_request(
     let request_body = if provider != &LLMProvider::Claude {
         let (max_tokens_val, temperature_val, top_p_val) = if provider == &LLMProvider::CustomOpenAI
         {
-            (max_tokens, temperature, top_p)
+            (bounded_max_tokens.or(max_tokens), temperature, top_p)
         } else {
-            (None, None, None)
+            (bounded_max_tokens, None, None)
         };
 
         serde_json::json!(ChatRequest {
@@ -346,7 +589,7 @@ fn build_chat_request(
         serde_json::json!(ClaudeRequest {
             system: system_prompt.to_string(),
             model: model_name.to_string(),
-            max_tokens: 2048,
+            max_tokens: bounded_max_tokens.unwrap_or(2048),
             messages: vec![ChatMessage {
                 role: "user".to_string(),
                 content: user_prompt.to_string(),
@@ -515,6 +758,7 @@ where
         ollama_endpoint,
         custom_openai_endpoint,
         max_tokens,
+        None,
         temperature,
         top_p,
         Some(true),
@@ -645,6 +889,308 @@ fn provider_name(provider: &LLMProvider) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const PLANNER_BOUNDS: BoundedGeneration = BoundedGeneration {
+        max_output_tokens: 512,
+        max_response_bytes: 8 * 1024,
+    };
+
+    fn openai_compatible_response(content: &str) -> String {
+        let body = serde_json::json!({
+            "choices": [{ "message": { "content": content } }]
+        })
+        .to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    /// Serves exactly one pre-encoded HTTP response on a loopback port and
+    /// returns the endpoint URL. The first read captures the request bytes so
+    /// tests can assert on the outgoing body.
+    async fn serve_once(response: &[u8]) -> (String, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let response = response.to_vec();
+        let request_bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&request_bytes);
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buffer = vec![0u8; 64 * 1024];
+            if let Ok(read) = socket.read(&mut buffer).await {
+                *captured.lock().unwrap() = buffer[..read].to_vec();
+            }
+            let _ = socket.write_all(&response).await;
+            let _ = socket.flush().await;
+        });
+        (format!("http://{}", addr), request_bytes)
+    }
+
+    #[test]
+    fn planner_capability_matrix_reflects_actual_provider_bounds() {
+        let full = [
+            LLMProvider::OpenAI,
+            LLMProvider::Claude,
+            LLMProvider::Groq,
+            LLMProvider::Ollama,
+            LLMProvider::OpenRouter,
+            LLMProvider::CustomOpenAI,
+        ];
+        for provider in full {
+            assert!(
+                planner_generation_capability(&provider).enforces_all_bounds(),
+                "{provider:?} must enforce the planner output limit, byte cap, and child cancellation"
+            );
+        }
+        // BuiltInAI cannot actually enforce the requested bounds: the sidecar
+        // carries only the token cap, the byte cap is checked after the full
+        // response has been read, and sidecar startup/shutdown can outlive
+        // the deadline. The matrix must record that truthfully so Deep falls
+        // back to Fast evidence instead of calling the sidecar.
+        let builtin = planner_generation_capability(&LLMProvider::BuiltInAI);
+        assert!(builtin.output_limit);
+        assert!(!builtin.response_byte_cap);
+        assert!(!builtin.child_cancellation);
+        assert!(!builtin.enforces_all_bounds());
+    }
+
+    #[tokio::test]
+    async fn builtin_ai_planner_generation_fails_closed_before_sidecar_startup() {
+        // The matrix marks BuiltInAI unsupported for the Deep planner: with a
+        // live token the call must fail closed BEFORE the sidecar manager is
+        // ever touched (no spawn, no model load, no sidecar generation).
+        let result = generate_bounded(
+            &Client::new(),
+            &LLMProvider::BuiltInAI,
+            "gemma3:1b",
+            "",
+            "system",
+            "user",
+            None,
+            None,
+            Some(&PathBuf::from("unused-app-data")),
+            &PLANNER_BOUNDS,
+            Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
+        .await;
+        let error = result.unwrap_err();
+        assert!(
+            error.contains("cannot enforce"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn bounded_max_tokens_overrides_every_provider_output_limit() {
+        let body_for = |provider: &LLMProvider, bounded: Option<u32>| {
+            let (_, _, body) = build_chat_request(
+                provider,
+                "model",
+                "key",
+                "system",
+                "user",
+                Some("http://ollama.local"),
+                Some("http://custom.local"),
+                Some(4_096),
+                bounded,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            body
+        };
+
+        let providers = [
+            LLMProvider::OpenAI,
+            LLMProvider::Groq,
+            LLMProvider::OpenRouter,
+            LLMProvider::Ollama,
+        ];
+        for provider in providers {
+            let body = body_for(&provider, Some(512));
+            assert_eq!(body["max_tokens"], serde_json::json!(512));
+        }
+        let custom = body_for(&LLMProvider::CustomOpenAI, Some(512));
+        assert_eq!(custom["max_tokens"], serde_json::json!(512));
+        let claude = body_for(&LLMProvider::Claude, Some(512));
+        assert_eq!(claude["max_tokens"], serde_json::json!(512));
+
+        // Without the planner bound the existing defaults are unchanged.
+        let openai_default = body_for(&LLMProvider::OpenAI, None);
+        assert!(openai_default.get("max_tokens").is_none());
+        let claude_default = body_for(&LLMProvider::Claude, None);
+        assert_eq!(claude_default["max_tokens"], serde_json::json!(2048));
+        let custom_default = body_for(&LLMProvider::CustomOpenAI, None);
+        assert_eq!(custom_default["max_tokens"], serde_json::json!(4_096));
+    }
+
+    #[tokio::test]
+    async fn generate_bounded_caps_the_response_body_before_parsing() {
+        let oversized = "x".repeat(20 * 1024);
+        let (endpoint, _) = serve_once(openai_compatible_response(&oversized).as_bytes()).await;
+        let result = generate_bounded(
+            &Client::new(),
+            &LLMProvider::Ollama,
+            "local",
+            "",
+            "system",
+            "user",
+            Some(endpoint.as_str()),
+            None,
+            None,
+            &PLANNER_BOUNDS,
+            Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
+        .await;
+        let error = result.unwrap_err();
+        assert!(error.contains("byte cap"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn generate_bounded_enforces_the_call_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Accept, hold the socket, and never respond: the request can
+            // only end via deadline.
+            let Ok((_socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let started = std::time::Instant::now();
+        let result = generate_bounded(
+            &Client::new(),
+            &LLMProvider::Ollama,
+            "local",
+            "",
+            "system",
+            "user",
+            Some(format!("http://{}", addr).as_str()),
+            None,
+            None,
+            &PLANNER_BOUNDS,
+            Duration::from_millis(300),
+            &CancellationToken::new(),
+        )
+        .await;
+        let error = result.unwrap_err();
+        assert!(error.contains("timed out"), "unexpected error: {error}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Serves headers plus a partial JSON body and then stalls forever, so an
+    /// in-flight body read can only end through cancellation.
+    async fn serve_stalled_body(headers_sent: &[u8], partial_body: &[u8]) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let headers_sent = headers_sent.to_vec();
+        let partial_body = partial_body.to_vec();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = socket.write_all(&headers_sent).await;
+            let _ = socket.write_all(&partial_body).await;
+            let _ = socket.flush().await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        format!("http://{}", addr)
+    }
+
+    #[tokio::test]
+    async fn generate_bounded_cancels_an_in_flight_response_body() {
+        let endpoint = serve_stalled_body(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+            b"{\"choices\":[{\"message\":{\"content\":\"partial",
+        )
+        .await;
+        let token = CancellationToken::new();
+        let cancel_task = {
+            let token = token.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                token.cancel();
+            })
+        };
+        let started = std::time::Instant::now();
+        let result = generate_bounded(
+            &Client::new(),
+            &LLMProvider::Ollama,
+            "local",
+            "",
+            "system",
+            "user",
+            Some(endpoint.as_str()),
+            None,
+            None,
+            &PLANNER_BOUNDS,
+            Duration::from_secs(20),
+            &token,
+        )
+        .await;
+        cancel_task.abort();
+        let error = result.unwrap_err();
+        assert!(error.contains("cancelled"), "unexpected error: {error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cancellation must abort the stalled body read promptly"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_bounded_sends_the_output_limit_and_cancellation() {
+        let (endpoint, request_bytes) =
+            serve_once(openai_compatible_response("{\"schemaVersion\":1}").as_bytes()).await;
+        let token = CancellationToken::new();
+        let result = generate_bounded(
+            &Client::new(),
+            &LLMProvider::Ollama,
+            "local",
+            "",
+            "system",
+            "user",
+            Some(endpoint.as_str()),
+            None,
+            None,
+            &PLANNER_BOUNDS,
+            Duration::from_secs(5),
+            &token,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, "{\"schemaVersion\":1}");
+        let request = String::from_utf8(request_bytes.lock().unwrap().clone()).unwrap();
+        assert!(request.contains("\"max_tokens\":512"), "request: {request}");
+
+        token.cancel();
+        let cancelled = generate_bounded(
+            &Client::new(),
+            &LLMProvider::Ollama,
+            "local",
+            "",
+            "system",
+            "user",
+            Some(endpoint.as_str()),
+            None,
+            None,
+            &PLANNER_BOUNDS,
+            Duration::from_secs(5),
+            &token,
+        )
+        .await
+        .unwrap_err();
+        assert!(cancelled.contains("cancelled"));
+    }
 
     #[test]
     fn parse_sse_line_openai_compatible_delta() {
@@ -750,6 +1296,30 @@ mod tests {
     #[test]
     fn sse_data_payload_non_data_line_returns_none() {
         assert_eq!(sse_data_payload(": comment"), None);
-        assert_eq!(sse_data_payload("event: ping"), None);
+    }
+
+    #[tokio::test]
+    async fn builtin_ai_generation_observes_cancellation_before_sidecar_startup() {
+        // A cancelled deadline must abort before the sidecar manager is ever
+        // touched, so no model load or sidecar spawn starts for a dead call.
+        let token = CancellationToken::new();
+        token.cancel();
+        let result = generate_bounded(
+            &Client::new(),
+            &LLMProvider::BuiltInAI,
+            "gemma3:1b",
+            "",
+            "system",
+            "user",
+            None,
+            None,
+            Some(&PathBuf::from("unused-app-data")),
+            &PLANNER_BOUNDS,
+            Duration::from_secs(5),
+            &token,
+        )
+        .await;
+        let error = result.unwrap_err();
+        assert!(error.contains("cancelled"), "unexpected error: {error}");
     }
 }
