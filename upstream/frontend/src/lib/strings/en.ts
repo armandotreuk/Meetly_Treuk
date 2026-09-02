@@ -17,6 +17,13 @@ export const en: Record<string, string> = {
     "chat.scope.folderNamed": "Folder: {name}",
     "chat.scope.searchResults": "Search results",
     "chat.scope.liveRecording": "Live recording",
+    "chat.mode.label": "Retrieval depth",
+    "chat.mode.fast": "Fast",
+    "chat.mode.deep": "Deep",
+    "chat.mode.fastDescription": "One retrieval pass for a quicker answer.",
+    "chat.mode.deepDescription":
+        "May take longer and make additional requests to your configured Chat provider.",
+    "chat.mode.liveDescription": "Live Chat reads the current transcript directly.",
     "chat.live.disclosure":
         "This will send your in-progress transcript content to a non-local provider. Continue?",
     "chat.live.launcher": "Ask about this recording",
@@ -46,6 +53,8 @@ export const en: Record<string, string> = {
     "chat.message.sources": "Sources:",
     "chat.message.openMeetingAria": "Open meeting {title}",
     "chat.message.liveSourceAria": "Live recording transcript source",
+    "chat.preparation.initialRetrieval": "Initial retrieval complete: {completed} of {total}.",
+    "chat.preparation.answerGeneration": "Preparing answer: {completed} of {total}.",
     "notes.header.title": "Notes",
     "notes.header.loadError": "Couldn't load notes",
     "notes.status.saving": "Saving...",

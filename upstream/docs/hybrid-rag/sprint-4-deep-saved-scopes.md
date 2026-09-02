@@ -115,7 +115,7 @@ no later Fast/Deep result may substitute for them.
 
 | ID | Feature | Task | Size | Owner | Dependencies | Acceptance check | Rollback |
 |---|---|---|---|---|---|---|---|
-| 4.1 | Quality mode | Add Fast/Deep request contract and accessible Chat selector with Deep default. | M | Pending `worker-m` | R40 docs + current user approval; Sprint 3 implementation baseline | UI/backend tests prove explicit mode compatibility, shared ownership/cancellation, default, selection, request propagation, and no persistence/schema change. | Remove optional mode and default backend to Fast broad behavior. |
+| 4.1 | Quality mode | Add Fast/Deep request contract and accessible Chat selector with Deep default. | M | `worker-m` | R40 docs + current user approval; Sprint 3 implementation baseline | UI/backend tests prove explicit mode compatibility, shared ownership/cancellation, default, selection, request propagation, and no persistence/schema change. | Remove optional mode and default backend to Fast broad behavior. |
 | 4.2 | Deep retrieval | Implement bounded structured planner/search/open/expand loop with scope and cancellation enforcement. | L | Pending `worker-l` | 4.1 | Adversarial and functional tests prove iterative recall, max rounds, scope safety, fallback, and hidden planner output. | Disable Deep branch; Fast remains complete. |
 | 4.3 | Saved meeting | Replace saved-meeting transcript anchor selection with hybrid retrieval while preserving authoritative context and fallback. | M | Pending `worker-m` | Sprint 3 implementation baseline (release acceptance remains open) | Saved-meeting regressions prove summary/notes, neighborhoods, no-hit fallback, coverage, and source parity. | Restore lexical `search_meeting_transcripts`; no data change. |
 | 4.4 | Snapshot/today | Make snapshot and today membership query-aware through hybrid retrieval with deterministic Fast broad-summary coverage and bounded Deep actions. | M | Pending `worker-m` | 4.2; Sprint 3 implementation baseline | Tests prove frozen/date membership, query relevance, deleted-member tolerance, broad summarization coverage, and bounds. | Restore deterministic `get_by_meeting_ids`. |
@@ -634,6 +634,35 @@ no Fast/Deep result or task-local check may substitute for a missing gate.
 ## Task Execution Log
 
 <!-- Append one immutable entry per completed, blocked, or cancelled task. -->
+
+### 4.1 - Fast/Deep request contract and UI
+
+**Status:** Complete
+**Owner:** `worker-m` (`openai/gpt-5.6-luna`)
+**Completed:** 2026-09-02
+**Implemented:**
+- Request-level serialized `fast`/`deep` mode, Fast compatibility default, strict invalid-mode rejection, accessible selector, live-scope Fast behavior, and privacy-safe Deep preparation progress rendering.
+- One Chat/sidebar-keyed Rust request ownership/cancellation mechanism for streaming and non-streaming Chat, with stale publication suppression and bounded cleanup.
+**Implementation:**
+- Files: `frontend/src/types/index.ts`, `frontend/src/components/ChatPanel/index.tsx`, `frontend/src/lib/strings/en.ts`, `frontend/tests/components/chat-scope.test.tsx`, `frontend/src-tauri/src/api/chat.rs`, `frontend/src-tauri/src/mcp/server.rs`, `frontend/src-tauri/src/lib.rs`, this doc, `docs/notes-chat-improvement-execution.md`
+- Approach: Keep mode request-scoped and out of conversation identity/history/schema. New interactive panels select and send `deep`; manual Fast sends `fast`; omitted legacy/non-interactive/MCP mode resolves to Fast; live disables the selector and sends Fast. Stream and non-stream Chat use the same Rust-owned request fence; replacement or explicit cancellation removes the active lease, and terminal/error/timeout paths clear it. Progress is serialized as stream ID, stage identity, and counts only, then published through that fence; Fast publishes none.
+**Not implemented:**
+- Task 4.2 planner/iterative retrieval and `retrieval/agent.rs`; Task 4.3/4.4 scope retrieval; Sprint 5 work.
+**Why not implemented:**
+- Task 4.2 owns Deep planner stages. Until that handoff, explicit Deep uses the existing single-pass shared preparation and reports only the truthful initial-retrieval/answer-generation handoff; no planner, query, or evidence progress is emitted.
+**Verification:**
+- `pnpm run typecheck` - pass.
+- `npx vitest run` - pass (20 files, 98 tests).
+- `npx vitest run tests/components/chat-scope.test.tsx` - pass (1 file, 18 tests).
+- `cargo test --manifest-path frontend/src-tauri/Cargo.toml --lib api::chat::tests` - pass (48 tests).
+- `cargo test --manifest-path frontend/src-tauri/Cargo.toml --lib mcp::server::tests` - pass (5 tests).
+- `cargo check --manifest-path frontend/src-tauri/Cargo.toml` - pass; one non-failing `dead_code` warning for the future Sidebar surface.
+- `cargo fmt --manifest-path frontend/src-tauri/Cargo.toml --check` - fails only on pre-existing rejected V10 fixture trailing whitespace in `frontend/src-tauri/tests/fixtures/corpus_validation_v10/cases_pt_01.rs` and `cases_pt_02.rs`; touched files were formatted independently.
+- `git diff --check` - pass; Git reports the existing TypeScript CRLF/LF warning.
+**Rollback:**
+- Remove the optional mode fields, selector/progress UI, and request-state extensions; retain the existing Fast broad path and stream cancellation behavior. No data rollback is needed because no schema or persisted conversation format changed.
+**Decisions and follow-ups:**
+- MCP remains Fast-only: omitted and explicit `fast` share Chat preparation, while explicit `deep` and unknown values are rejected. Sprint 3 release gates remain open; this task makes no release claim.
 
 ### Task Entry Template
 

@@ -1,13 +1,14 @@
 use chrono::{DateTime, Local, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
+use uuid::Uuid;
 
 use crate::retrieval::worker::RetrievalLifecycle;
 use crate::retrieval::{
@@ -229,6 +230,35 @@ pub struct ChatSource {
     pub source_kind: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatRetrievalMode {
+    Fast,
+    Deep,
+}
+
+impl Default for ChatRetrievalMode {
+    fn default() -> Self {
+        Self::Fast
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatPreparationStage {
+    InitialRetrieval,
+    AnswerGeneration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatPreparationProgressPayload {
+    #[serde(rename = "streamId")]
+    pub stream_id: String,
+    pub stage: ChatPreparationStage,
+    pub completed: usize,
+    pub total: usize,
+}
+
 pub const SYSTEM_PROMPT: &str = "You are a helpful meeting assistant. Answer the user's question based on the meeting context provided below. The application temporal reference is authoritative for current-date and latest-saved-meeting questions. If the context doesn't contain enough information, say so. If transcript coverage is marked partial, disclose that limitation in your answer. Be concise and cite specific meetings when relevant. Format your response in clear paragraphs.";
 
 const QUERY_REWRITE_SYSTEM_PROMPT: &str = "You are a search query rewriter. Given a follow-up question and conversation history, rewrite it into a single standalone search query that would find relevant information in a meeting transcript database. Return ONLY the search query, nothing else. Keep it under 10 words. Do not add quotes or explanation.";
@@ -238,6 +268,7 @@ const QUERY_REWRITE_SYSTEM_PROMPT: &str = "You are a search query rewriter. Give
 // by chunk_limit in prepare_chat_inputs_for_scope. Upgrade: relevance-ranked chunk
 // selection instead of the deterministic chunk_id order.
 const SNAPSHOT_REHYDRATION_CHUNK_CAP: u32 = 100;
+const CHAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Inputs shared by both the single-shot and the streaming chat commands.
 pub struct ChatInputs {
@@ -253,6 +284,7 @@ pub struct ChatInputs {
     pub app_data_dir: Option<PathBuf>,
     pub user_prompt: String,
     pub retrieval_diagnostic: RetrievalPreparationDiagnostic,
+    pub retrieval_mode: ChatRetrievalMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,14 +315,145 @@ struct LatestSavedMeeting {
     saved_at: DateTime<Utc>,
 }
 
-/// Holds the currently active chat stream so the stop/cancel command can address it.
-/// Only one chat stream is active at a time; a new stream replaces any previous token.
-#[derive(Clone)]
-pub struct ChatStreamState(pub Arc<Mutex<Option<(String, CancellationToken)>>>);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ChatRequestSurface {
+    Chat,
+    Sidebar,
+}
 
-impl ChatStreamState {
+struct ChatRequestRegistry {
+    active: HashMap<ChatRequestSurface, String>,
+    requests: HashMap<(ChatRequestSurface, String), ChatRequestToken>,
+}
+
+type ChatRequestToken = Arc<CancellationToken>;
+
+#[derive(Clone)]
+pub struct ChatRequestState(Arc<Mutex<ChatRequestRegistry>>);
+
+pub type ChatStreamState = ChatRequestState;
+
+impl ChatRequestState {
     pub fn new() -> Self {
-        Self(Arc::new(Mutex::new(None)))
+        Self(Arc::new(Mutex::new(ChatRequestRegistry {
+            active: HashMap::new(),
+            requests: HashMap::new(),
+        })))
+    }
+
+    pub(crate) fn claim_request(
+        &self,
+        surface: ChatRequestSurface,
+        request_id: &str,
+    ) -> ChatRequestToken {
+        let token = Arc::new(CancellationToken::new());
+        let mut registry = self.0.lock().unwrap();
+        if let Some(previous_id) = registry.active.insert(surface, request_id.to_string()) {
+            if let Some(previous) = registry.requests.remove(&(surface, previous_id)) {
+                previous.cancel();
+            }
+        }
+        registry
+            .requests
+            .insert((surface, request_id.to_string()), token.clone());
+        token
+    }
+
+    pub(crate) fn is_owner(
+        &self,
+        surface: ChatRequestSurface,
+        request_id: &str,
+        token: &ChatRequestToken,
+    ) -> bool {
+        let registry = self.0.lock().unwrap();
+        registry.active.get(&surface).is_some_and(|active_id| {
+            active_id == request_id
+                && registry
+                    .requests
+                    .get(&(surface, active_id.clone()))
+                    .is_some_and(|current| {
+                        Arc::ptr_eq(current, token)
+                            && !current.is_cancelled()
+                            && !token.is_cancelled()
+                    })
+        })
+    }
+
+    pub(crate) fn clear_if_owner(
+        &self,
+        surface: ChatRequestSurface,
+        request_id: &str,
+        token: &ChatRequestToken,
+    ) -> bool {
+        let mut registry = self.0.lock().unwrap();
+        if registry.active.get(&surface).map(String::as_str) != Some(request_id) {
+            return false;
+        }
+        let key = (surface, request_id.to_string());
+        if !registry
+            .requests
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, token))
+        {
+            return false;
+        }
+        registry.active.remove(&surface);
+        registry.requests.remove(&key);
+        true
+    }
+
+    pub(crate) fn cancel_request(
+        &self,
+        surface: ChatRequestSurface,
+        request_id: Option<&str>,
+    ) -> bool {
+        let mut registry = self.0.lock().unwrap();
+        let Some(active_id) = registry.active.get(&surface).cloned() else {
+            return false;
+        };
+        if request_id.is_some_and(|request_id| request_id != active_id) {
+            return false;
+        }
+        registry.active.remove(&surface);
+        if let Some(token) = registry.requests.remove(&(surface, active_id)) {
+            token.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    fn request_count(&self) -> usize {
+        self.0.lock().unwrap().requests.len()
+    }
+
+    fn publish_if_owner<F: FnOnce(&str, serde_json::Value)>(
+        &self,
+        surface: ChatRequestSurface,
+        request_id: &str,
+        token: &ChatRequestToken,
+        event: &str,
+        payload: serde_json::Value,
+        clear: bool,
+        emit: F,
+    ) -> bool {
+        let mut registry = self.0.lock().unwrap();
+        let key = (surface, request_id.to_string());
+        if token.is_cancelled()
+            || registry.active.get(&surface).map(String::as_str) != Some(request_id)
+            || registry.requests.get(&key).map_or(true, |current| {
+                !Arc::ptr_eq(current, token) || current.is_cancelled()
+            })
+        {
+            return false;
+        }
+        if clear {
+            registry.active.remove(&surface);
+            registry.requests.remove(&key);
+        }
+        emit(event, payload);
+        true
     }
 }
 
@@ -318,6 +481,7 @@ pub async fn prepare_chat_inputs_lexical_only(
         None,
         None,
         cancellation_token,
+        Some(ChatRetrievalMode::Fast),
     )
     .await
 }
@@ -331,6 +495,7 @@ pub async fn prepare_chat_inputs_with_lifecycle(
     meeting_id: Option<String>,
     lifecycle: RetrievalLifecycle,
     cancellation_token: Option<&CancellationToken>,
+    retrieval_mode: Option<ChatRetrievalMode>,
 ) -> Result<ChatInputs, String> {
     let retrieval_scope = meeting_id
         .map(ChatRetrievalScope::Meeting)
@@ -345,6 +510,7 @@ pub async fn prepare_chat_inputs_with_lifecycle(
         None,
         Some(lifecycle),
         cancellation_token,
+        retrieval_mode,
     )
     .await
 }
@@ -409,6 +575,7 @@ pub async fn prepare_scoped_chat_inputs(
         },
         cancellation_token,
         None,
+        Some(ChatRetrievalMode::Fast),
     )
     .await
 }
@@ -423,6 +590,7 @@ async fn prepare_scoped_chat_inputs_with_authorization(
     live_authorization: LiveTranscriptAuthorization,
     cancellation_token: Option<&CancellationToken>,
     lifecycle: Option<RetrievalLifecycle>,
+    retrieval_mode: Option<ChatRetrievalMode>,
 ) -> Result<ChatInputs, String> {
     let conversation = ChatRepository::get_conversation(pool, conversation_id)
         .await
@@ -439,6 +607,7 @@ async fn prepare_scoped_chat_inputs_with_authorization(
         Some(live_authorization),
         lifecycle,
         cancellation_token,
+        retrieval_mode,
     )
     .await
 }
@@ -453,7 +622,9 @@ async fn prepare_chat_inputs_for_scope(
     live_authorization: Option<LiveTranscriptAuthorization>,
     lifecycle: Option<RetrievalLifecycle>,
     cancellation_token: Option<&CancellationToken>,
+    retrieval_mode: Option<ChatRetrievalMode>,
 ) -> Result<ChatInputs, String> {
+    let requested_retrieval_mode = retrieval_mode.unwrap_or_default();
     let model_config = SettingsRepository::get_chat_model_config(pool)
         .await
         .map_err(|e| format!("Failed to get model config: {}", e))?
@@ -599,6 +770,14 @@ async fn prepare_chat_inputs_for_scope(
     } else {
         RetrievalPreparationDiagnostic::Hybrid
     };
+    let retrieval_mode = if force_lexical
+        || lifecycle.is_none()
+        || matches!(&retrieval_scope, ChatRetrievalScope::LiveRecording(_))
+    {
+        ChatRetrievalMode::Fast
+    } else {
+        requested_retrieval_mode
+    };
     let (context, sources) = match retrieval_scope {
         ChatRetrievalScope::LiveRecording(scope_key) => {
             ensure_live_scope_matches_active_recording(&scope_key)?;
@@ -738,6 +917,7 @@ async fn prepare_chat_inputs_for_scope(
         app_data_dir,
         user_prompt,
         retrieval_diagnostic,
+        retrieval_mode,
     })
 }
 
@@ -1525,15 +1705,40 @@ fn assemble_prompt(
     format!("{}{}{}", context_block, history.concat(), question_block)
 }
 
+fn finish_non_streaming_chat_request(
+    state: &ChatRequestState,
+    request_id: &str,
+    token: &ChatRequestToken,
+    result: Result<Result<ChatResponse, String>, tokio::time::error::Elapsed>,
+) -> Result<ChatResponse, String> {
+    let timed_out = result.is_err();
+    if timed_out {
+        token.cancel();
+    }
+    if !state.clear_if_owner(ChatRequestSurface::Chat, request_id, token) {
+        return Err("Chat request was cancelled or superseded".to_string());
+    }
+    if timed_out {
+        return Err("Chat request timed out".to_string());
+    }
+    if token.is_cancelled() {
+        return Err("Chat request was cancelled".to_string());
+    }
+    result.expect("non-streaming chat timeout was already handled")
+}
+
 #[tauri::command]
 pub async fn api_chat_with_meetings<R: Runtime>(
     app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
     retrieval: tauri::State<'_, RetrievalLifecycle>,
+    request_state: tauri::State<'_, ChatRequestState>,
     query: String,
     history: Option<Vec<ChatMessage>>,
     auth_token: Option<String>,
     meeting_id: Option<String>,
+    request_id: Option<String>,
+    mode: Option<ChatRetrievalMode>,
 ) -> Result<ChatResponse, String> {
     info!(
         "api_chat_with_meetings called: query_len={}, history_len={:?}, auth_token={}",
@@ -1542,52 +1747,61 @@ pub async fn api_chat_with_meetings<R: Runtime>(
         auth_token.is_some()
     );
 
-    let pool = state.db_manager.pool();
+    let request_id = request_id.unwrap_or_else(|| format!("chat-{}", Uuid::new_v4()));
+    let request_state = request_state.inner().clone();
+    let token = request_state.claim_request(ChatRequestSurface::Chat, &request_id);
+    let pool = state.db_manager.pool().clone();
     let app_data_dir = app.path().app_data_dir().ok();
     let client = reqwest::Client::new();
     let lifecycle = retrieval.inner().clone();
-    let inputs = prepare_chat_inputs_with_lifecycle(
-        pool,
-        app_data_dir,
-        &client,
-        &query,
-        history.as_ref(),
-        meeting_id,
-        lifecycle,
-        None,
-    )
-    .await?;
-    let answer = generate_summary(
-        &client,
-        &inputs.provider,
-        &inputs.model_name,
-        &inputs.api_key,
-        SYSTEM_PROMPT,
-        &inputs.user_prompt,
-        inputs.ollama_endpoint.as_deref(),
-        inputs.custom_openai_endpoint.as_deref(),
-        inputs.custom_openai_max_tokens,
-        inputs.custom_openai_temperature,
-        inputs.custom_openai_top_p,
-        inputs.app_data_dir.as_ref(),
-        None, // no cancellation token for chat
-    )
-    .await
-    .map_err(|e| {
-        tracing::error!("LLM call failed for chat: {}", e);
-        format!("LLM error: {}", e)
-    })?;
+    let result = tokio::time::timeout(CHAT_REQUEST_TIMEOUT, async {
+        let inputs = prepare_chat_inputs_with_lifecycle(
+            &pool,
+            app_data_dir,
+            &client,
+            &query,
+            history.as_ref(),
+            meeting_id,
+            lifecycle,
+            Some(token.as_ref()),
+            mode,
+        )
+        .await?;
+        let answer = generate_summary(
+            &client,
+            &inputs.provider,
+            &inputs.model_name,
+            &inputs.api_key,
+            SYSTEM_PROMPT,
+            &inputs.user_prompt,
+            inputs.ollama_endpoint.as_deref(),
+            inputs.custom_openai_endpoint.as_deref(),
+            inputs.custom_openai_max_tokens,
+            inputs.custom_openai_temperature,
+            inputs.custom_openai_top_p,
+            inputs.app_data_dir.as_ref(),
+            Some(token.as_ref()),
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("LLM call failed for chat: {}", e);
+            format!("LLM error: {}", e)
+        })?;
 
-    info!(
-        "Chat completed: {} sources, {} answer chars",
-        inputs.sources.len(),
-        answer.len()
-    );
+        info!(
+            "Chat completed: {} sources, {} answer chars",
+            inputs.sources.len(),
+            answer.len()
+        );
 
-    Ok(ChatResponse {
-        answer,
-        sources: inputs.sources,
+        Ok(ChatResponse {
+            answer,
+            sources: inputs.sources,
+        })
     })
+    .await;
+
+    finish_non_streaming_chat_request(&request_state, &request_id, &token, result)
 }
 
 #[tauri::command]
@@ -1595,11 +1809,14 @@ pub async fn api_chat_with_scoped_conversation<R: Runtime>(
     app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
     retrieval: tauri::State<'_, RetrievalLifecycle>,
+    request_state: tauri::State<'_, ChatRequestState>,
     conversation_id: String,
     query: String,
     history: Option<Vec<ChatMessage>>,
     auth_token: Option<String>,
     live_transcript_consent: bool,
+    request_id: Option<String>,
+    mode: Option<ChatRetrievalMode>,
 ) -> Result<ChatResponse, String> {
     info!(
         "api_chat_with_scoped_conversation called: conversation_id={}, query_len={}, history_len={:?}, auth_token={}",
@@ -1609,44 +1826,57 @@ pub async fn api_chat_with_scoped_conversation<R: Runtime>(
         auth_token.is_some()
     );
 
+    let request_id = request_id.unwrap_or_else(|| format!("chat-{}", Uuid::new_v4()));
+    let request_state = request_state.inner().clone();
+    let token = request_state.claim_request(ChatRequestSurface::Chat, &request_id);
+    let pool = state.db_manager.pool().clone();
+    let app_data_dir = app.path().app_data_dir().ok();
     let client = reqwest::Client::new();
-    let inputs = prepare_scoped_chat_inputs_with_authorization(
-        state.db_manager.pool(),
-        app.path().app_data_dir().ok(),
-        &client,
-        &query,
-        history.as_ref(),
-        &conversation_id,
-        LiveTranscriptAuthorization {
-            active_scope_key: crate::audio::recording_commands::active_live_transcript_scope_key(),
-            consent: live_transcript_consent,
-        },
-        None,
-        Some(retrieval.inner().clone()),
-    )
-    .await?;
-    let answer = generate_summary(
-        &client,
-        &inputs.provider,
-        &inputs.model_name,
-        &inputs.api_key,
-        SYSTEM_PROMPT,
-        &inputs.user_prompt,
-        inputs.ollama_endpoint.as_deref(),
-        inputs.custom_openai_endpoint.as_deref(),
-        inputs.custom_openai_max_tokens,
-        inputs.custom_openai_temperature,
-        inputs.custom_openai_top_p,
-        inputs.app_data_dir.as_ref(),
-        None,
-    )
-    .await
-    .map_err(|e| format!("LLM error: {}", e))?;
+    let lifecycle = retrieval.inner().clone();
+    let result = tokio::time::timeout(CHAT_REQUEST_TIMEOUT, async {
+        let inputs = prepare_scoped_chat_inputs_with_authorization(
+            &pool,
+            app_data_dir,
+            &client,
+            &query,
+            history.as_ref(),
+            &conversation_id,
+            LiveTranscriptAuthorization {
+                active_scope_key:
+                    crate::audio::recording_commands::active_live_transcript_scope_key(),
+                consent: live_transcript_consent,
+            },
+            Some(token.as_ref()),
+            Some(lifecycle),
+            mode,
+        )
+        .await?;
+        let answer = generate_summary(
+            &client,
+            &inputs.provider,
+            &inputs.model_name,
+            &inputs.api_key,
+            SYSTEM_PROMPT,
+            &inputs.user_prompt,
+            inputs.ollama_endpoint.as_deref(),
+            inputs.custom_openai_endpoint.as_deref(),
+            inputs.custom_openai_max_tokens,
+            inputs.custom_openai_temperature,
+            inputs.custom_openai_top_p,
+            inputs.app_data_dir.as_ref(),
+            Some(token.as_ref()),
+        )
+        .await
+        .map_err(|e| format!("LLM error: {}", e))?;
 
-    Ok(ChatResponse {
-        answer,
-        sources: inputs.sources,
+        Ok(ChatResponse {
+            answer,
+            sources: inputs.sources,
+        })
     })
+    .await;
+
+    finish_non_streaming_chat_request(&request_state, &request_id, &token, result)
 }
 
 #[tauri::command]
@@ -1654,37 +1884,60 @@ pub async fn api_chat_with_meetings_stream<R: Runtime>(
     app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
     retrieval: tauri::State<'_, RetrievalLifecycle>,
-    stream_state: tauri::State<'_, ChatStreamState>,
+    stream_state: tauri::State<'_, ChatRequestState>,
     query: String,
     history: Option<Vec<ChatMessage>>,
     auth_token: Option<String>,
     stream_id: String,
     meeting_id: Option<String>,
+    mode: Option<ChatRetrievalMode>,
 ) -> Result<(), String> {
     info!("api_chat_with_meetings_stream called: query_len={}, history_len={:?}, auth_token={}, stream_id={}", query.len(), history.as_ref().map(|items| items.len()), auth_token.is_some(), stream_id);
     let token = claim_chat_stream(&stream_state, &stream_id).await;
+    let request_state = stream_state.inner().clone();
+    let request_stream_id = stream_id.clone();
     let client = reqwest::Client::new();
-    let inputs = match prepare_chat_inputs_with_lifecycle(
-        state.db_manager.pool(),
-        app.path().app_data_dir().ok(),
-        &client,
-        &query,
-        history.as_ref(),
-        meeting_id.clone(),
-        retrieval.inner().clone(),
-        Some(&token),
-    )
-    .await
-    {
-        Ok(inputs) => inputs,
-        Err(error) => {
-            if suppress_chat_preparation_error(&stream_state, &stream_id, &token) {
-                return Ok(());
+    let result = tokio::time::timeout(CHAT_REQUEST_TIMEOUT, async {
+        let inputs = match prepare_chat_inputs_with_lifecycle(
+            state.db_manager.pool(),
+            app.path().app_data_dir().ok(),
+            &client,
+            &query,
+            history.as_ref(),
+            meeting_id.clone(),
+            retrieval.inner().clone(),
+            Some(token.as_ref()),
+            mode,
+        )
+        .await
+        {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                if suppress_chat_preparation_error(&request_state, &stream_id, &token) {
+                    return Ok(());
+                }
+                return Err(error);
             }
-            return Err(error);
+        };
+        stream_chat(
+            app,
+            request_state.clone(),
+            inputs,
+            stream_id,
+            meeting_id,
+            token.clone(),
+        )
+        .await
+    })
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(_) => {
+            token.cancel();
+            request_state.clear_if_owner(ChatRequestSurface::Chat, &request_stream_id, &token);
+            Err("Chat request timed out".to_string())
         }
-    };
-    stream_chat(app, stream_state, inputs, stream_id, meeting_id, token).await
+    }
 }
 
 #[tauri::command]
@@ -1692,58 +1945,111 @@ pub async fn api_chat_with_scoped_conversation_stream<R: Runtime>(
     app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
     retrieval: tauri::State<'_, RetrievalLifecycle>,
-    stream_state: tauri::State<'_, ChatStreamState>,
+    stream_state: tauri::State<'_, ChatRequestState>,
     conversation_id: String,
     query: String,
     history: Option<Vec<ChatMessage>>,
     auth_token: Option<String>,
     stream_id: String,
     live_transcript_consent: bool,
+    mode: Option<ChatRetrievalMode>,
 ) -> Result<(), String> {
     info!("api_chat_with_scoped_conversation_stream called: conversation_id={}, query_len={}, history_len={:?}, auth_token={}, stream_id={}", conversation_id, query.len(), history.as_ref().map(|items| items.len()), auth_token.is_some(), stream_id);
     let token = claim_chat_stream(&stream_state, &stream_id).await;
+    let request_state = stream_state.inner().clone();
+    let request_stream_id = stream_id.clone();
     let client = reqwest::Client::new();
-    let inputs = match prepare_scoped_chat_inputs_with_authorization(
-        state.db_manager.pool(),
-        app.path().app_data_dir().ok(),
-        &client,
-        &query,
-        history.as_ref(),
-        &conversation_id,
-        LiveTranscriptAuthorization {
-            active_scope_key: crate::audio::recording_commands::active_live_transcript_scope_key(),
-            consent: live_transcript_consent,
-        },
-        Some(&token),
-        Some(retrieval.inner().clone()),
-    )
-    .await
-    {
-        Ok(inputs) => inputs,
-        Err(error) => {
-            if suppress_chat_preparation_error(&stream_state, &stream_id, &token) {
-                return Ok(());
+    let result = tokio::time::timeout(CHAT_REQUEST_TIMEOUT, async {
+        let inputs = match prepare_scoped_chat_inputs_with_authorization(
+            state.db_manager.pool(),
+            app.path().app_data_dir().ok(),
+            &client,
+            &query,
+            history.as_ref(),
+            &conversation_id,
+            LiveTranscriptAuthorization {
+                active_scope_key:
+                    crate::audio::recording_commands::active_live_transcript_scope_key(),
+                consent: live_transcript_consent,
+            },
+            Some(token.as_ref()),
+            Some(retrieval.inner().clone()),
+            mode,
+        )
+        .await
+        {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                if suppress_chat_preparation_error(&request_state, &stream_id, &token) {
+                    return Ok(());
+                }
+                return Err(error);
             }
-            return Err(error);
+        };
+        stream_chat(
+            app,
+            request_state.clone(),
+            inputs,
+            stream_id,
+            None,
+            token.clone(),
+        )
+        .await
+    })
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(_) => {
+            token.cancel();
+            request_state.clear_if_owner(ChatRequestSurface::Chat, &request_stream_id, &token);
+            Err("Chat request timed out".to_string())
         }
-    };
-    stream_chat(app, stream_state, inputs, stream_id, None, token).await
+    }
 }
 
 async fn stream_chat<R: Runtime>(
     app: AppHandle<R>,
-    stream_state: tauri::State<'_, ChatStreamState>,
+    stream_state: ChatRequestState,
     inputs: ChatInputs,
     stream_id: String,
     meeting_id: Option<String>,
-    token: CancellationToken,
+    token: ChatRequestToken,
 ) -> Result<(), String> {
     let client = reqwest::Client::new();
     let sources = inputs.sources.clone();
 
-    if token.is_cancelled() || !is_chat_stream_owner(&stream_state, &stream_id).await {
-        clear_chat_stream_if_owner(&stream_state, &stream_id).await;
+    if token.is_cancelled() || !is_chat_stream_owner(&stream_state, &stream_id, &token).await {
+        clear_chat_stream_if_owner(&stream_state, &stream_id, &token).await;
         return Ok(());
+    }
+
+    if inputs.retrieval_mode == ChatRetrievalMode::Deep {
+        if !emit_chat_preparation_progress_if_owner(
+            &stream_state,
+            &app,
+            ChatPreparationProgressPayload {
+                stream_id: stream_id.clone(),
+                stage: ChatPreparationStage::InitialRetrieval,
+                completed: sources.len(),
+                total: sources.len(),
+            },
+            &token,
+        ) {
+            return Ok(());
+        }
+        if !emit_chat_preparation_progress_if_owner(
+            &stream_state,
+            &app,
+            ChatPreparationProgressPayload {
+                stream_id: stream_id.clone(),
+                stage: ChatPreparationStage::AnswerGeneration,
+                completed: 0,
+                total: 1,
+            },
+            &token,
+        ) {
+            return Ok(());
+        }
     }
 
     if !emit_chat_stream_event_if_owner(
@@ -1763,20 +2069,24 @@ async fn stream_chat<R: Runtime>(
     let app_for_chunk = app.clone();
     let stream_id_for_chunk = stream_id.clone();
     let token_for_chunk = token.clone();
-    let stream_state_for_chunk = stream_state.inner().clone();
+    let stream_state_for_chunk = stream_state.clone();
     let on_chunk = move |chunk: &str| {
-        let active = stream_state_for_chunk.0.lock().unwrap();
-        if token_for_chunk.is_cancelled()
-            || !active
-                .as_ref()
-                .is_some_and(|(active_id, _)| active_id == &stream_id_for_chunk)
-        {
-            return;
-        }
-        partial_for_chunk.lock().unwrap().push_str(chunk);
-        let _ = app_for_chunk.emit(
+        let chunk_text = chunk.to_string();
+        let partial = partial_for_chunk.clone();
+        let app = app_for_chunk.clone();
+        publish_chat_stream_event_if_owner(
+            &stream_state_for_chunk,
+            &stream_id_for_chunk,
+            &token_for_chunk,
             "chat-stream-chunk",
-            serde_json::json!({ "streamId": stream_id_for_chunk, "text": chunk }),
+            serde_json::json!({ "streamId": stream_id_for_chunk.clone(), "text": chunk_text.clone() }),
+            false,
+            move |event, payload| {
+                partial.lock().unwrap().push_str(&chunk_text);
+                if let Err(error) = app.emit(event, payload) {
+                    tracing::error!("Failed to emit {}: {}", event, error);
+                }
+            },
         );
     };
 
@@ -1793,7 +2103,7 @@ async fn stream_chat<R: Runtime>(
         inputs.custom_openai_temperature,
         inputs.custom_openai_top_p,
         inputs.app_data_dir.as_ref(),
-        Some(&token),
+        Some(token.as_ref()),
         on_chunk,
     )
     .await;
@@ -1801,9 +2111,9 @@ async fn stream_chat<R: Runtime>(
     match stream_result {
         Ok(answer) => {
             let Some(payload) =
-                completed_chat_stream_payload(&token, &stream_id, &answer, &sources)
+                completed_chat_stream_payload(token.as_ref(), &stream_id, &answer, &sources)
             else {
-                clear_chat_stream_if_owner(&stream_state, &stream_id).await;
+                clear_chat_stream_if_owner(&stream_state, &stream_id, &token).await;
                 return Ok(());
             };
             info!(
@@ -1825,7 +2135,7 @@ async fn stream_chat<R: Runtime>(
         Err(e) if e.to_lowercase().contains("cancelled") => {
             let answer = partial_text.lock().unwrap().clone();
             tracing::info!("Chat stream cancelled after {} chars", answer.len());
-            clear_chat_stream_if_owner(&stream_state, &stream_id).await;
+            clear_chat_stream_if_owner(&stream_state, &stream_id, &token).await;
             Ok(())
         }
         Err(e) => {
@@ -1868,56 +2178,41 @@ fn completed_chat_stream_payload(
         .then(|| serde_json::json!({ "streamId": stream_id, "answer": answer, "sources": sources }))
 }
 
-async fn claim_chat_stream(state: &ChatStreamState, stream_id: &str) -> CancellationToken {
-    let token = CancellationToken::new();
-    let mut active = state.0.lock().unwrap();
-    if let Some((_, old_token)) = active.take() {
-        old_token.cancel();
-    }
-    *active = Some((stream_id.to_string(), token.clone()));
-    token
+async fn claim_chat_stream(state: &ChatRequestState, stream_id: &str) -> ChatRequestToken {
+    state.claim_request(ChatRequestSurface::Chat, stream_id)
 }
 
-async fn is_chat_stream_owner(state: &ChatStreamState, stream_id: &str) -> bool {
-    state
-        .0
-        .lock()
-        .unwrap()
-        .as_ref()
-        .is_some_and(|(active_id, _)| active_id == stream_id)
+async fn is_chat_stream_owner(
+    state: &ChatRequestState,
+    stream_id: &str,
+    token: &ChatRequestToken,
+) -> bool {
+    state.is_owner(ChatRequestSurface::Chat, stream_id, token)
 }
 
-async fn clear_chat_stream_if_owner(state: &ChatStreamState, stream_id: &str) {
-    let mut active = state.0.lock().unwrap();
-    if active
-        .as_ref()
-        .is_some_and(|(active_id, _)| active_id == stream_id)
-    {
-        *active = None;
-    }
+async fn clear_chat_stream_if_owner(
+    state: &ChatRequestState,
+    stream_id: &str,
+    token: &ChatRequestToken,
+) {
+    state.clear_if_owner(ChatRequestSurface::Chat, stream_id, token);
 }
 
 fn suppress_chat_preparation_error(
-    state: &ChatStreamState,
+    state: &ChatRequestState,
     stream_id: &str,
-    token: &CancellationToken,
+    token: &ChatRequestToken,
 ) -> bool {
-    let mut active = state.0.lock().unwrap();
-    if !active
-        .as_ref()
-        .is_some_and(|(active_id, _)| active_id == stream_id)
-    {
-        return true;
-    }
-    *active = None;
-    token.is_cancelled()
+    let owned = state.is_owner(ChatRequestSurface::Chat, stream_id, token);
+    state.clear_if_owner(ChatRequestSurface::Chat, stream_id, token);
+    !owned || token.is_cancelled()
 }
 
 fn emit_chat_stream_event_if_owner<R: Runtime>(
-    state: &ChatStreamState,
+    state: &ChatRequestState,
     app: &AppHandle<R>,
     stream_id: &str,
-    token: &CancellationToken,
+    token: &ChatRequestToken,
     event: &str,
     payload: serde_json::Value,
     clear: bool,
@@ -1937,47 +2232,65 @@ fn emit_chat_stream_event_if_owner<R: Runtime>(
     )
 }
 
+fn emit_chat_preparation_progress_if_owner<R: Runtime>(
+    state: &ChatRequestState,
+    app: &AppHandle<R>,
+    payload: ChatPreparationProgressPayload,
+    token: &ChatRequestToken,
+) -> bool {
+    let stream_id = payload.stream_id.clone();
+    emit_chat_stream_event_if_owner(
+        state,
+        app,
+        &stream_id,
+        token,
+        "chat-preparation-progress",
+        serde_json::to_value(payload).expect("chat preparation progress is serializable"),
+        false,
+    )
+}
+
 fn publish_chat_stream_event_if_owner<F: FnOnce(&str, serde_json::Value)>(
-    state: &ChatStreamState,
+    state: &ChatRequestState,
     stream_id: &str,
-    token: &CancellationToken,
+    token: &ChatRequestToken,
     event: &str,
     payload: serde_json::Value,
     clear: bool,
     emit: F,
 ) -> bool {
-    let mut active = state.0.lock().unwrap();
-    if token.is_cancelled()
-        || !active
-            .as_ref()
-            .is_some_and(|(active_id, _)| active_id == stream_id)
-    {
-        return false;
-    }
-    if clear {
-        *active = None;
-    }
-    emit(event, payload);
-    true
+    state.publish_if_owner(
+        ChatRequestSurface::Chat,
+        stream_id,
+        token,
+        event,
+        payload,
+        clear,
+        emit,
+    )
 }
 
 /// Cancels an active chat stream. `stream_id: None` cancels any active stream;
 /// a specific id only cancels when it matches the currently active stream.
-async fn cancel_chat_stream(state: &ChatStreamState, stream_id: Option<&str>) {
-    let guard = state.0.lock().unwrap();
-    if let Some((active_id, token)) = guard.as_ref() {
-        if stream_id.map(|id| id == active_id).unwrap_or(true) {
-            token.cancel();
-        }
-    }
+async fn cancel_chat_stream(state: &ChatRequestState, stream_id: Option<&str>) {
+    state.cancel_request(ChatRequestSurface::Chat, stream_id);
 }
 
 #[tauri::command]
 pub async fn api_cancel_chat_stream(
-    stream_state: tauri::State<'_, ChatStreamState>,
+    stream_state: tauri::State<'_, ChatRequestState>,
     stream_id: Option<String>,
 ) -> Result<(), String> {
     cancel_chat_stream(&stream_state, stream_id.as_deref()).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn api_cancel_chat_request(
+    request_state: tauri::State<'_, ChatRequestState>,
+    request_id: String,
+) -> Result<(), String> {
+    request_state.cancel_request(ChatRequestSurface::Chat, Some(&request_id));
     Ok(())
 }
 
@@ -2025,6 +2338,43 @@ mod tests {
             folder_id: None,
             folder_name: "General".to_string(),
             rank: 0.0,
+        }
+    }
+
+    #[test]
+    fn chat_retrieval_mode_serializes_lowercase_and_rejects_unknown_values() {
+        assert_eq!(ChatRetrievalMode::default(), ChatRetrievalMode::Fast);
+        assert_eq!(
+            serde_json::to_string(&ChatRetrievalMode::Deep).unwrap(),
+            "\"deep\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ChatRetrievalMode>("\"fast\"").unwrap(),
+            ChatRetrievalMode::Fast
+        );
+        assert!(serde_json::from_str::<ChatRetrievalMode>("\"turbo\"").is_err());
+    }
+
+    #[test]
+    fn preparation_progress_payload_contains_only_stage_identity_and_counts() {
+        let value = serde_json::to_value(ChatPreparationProgressPayload {
+            stream_id: "stream".to_string(),
+            stage: ChatPreparationStage::InitialRetrieval,
+            completed: 2,
+            total: 3,
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "streamId": "stream",
+                "stage": "initial_retrieval",
+                "completed": 2,
+                "total": 3,
+            })
+        );
+        for forbidden in ["planner", "query", "evidence", "text"] {
+            assert!(value.get(forbidden).is_none());
         }
     }
 
@@ -2306,6 +2656,7 @@ mod tests {
             None,
             None,
             None,
+            Some(ChatRetrievalMode::Deep),
         )
         .await
         .unwrap();
@@ -2896,6 +3247,7 @@ mod tests {
             None,
             None,
             None,
+            Some(ChatRetrievalMode::Deep),
         )
         .await
         .unwrap();
@@ -2904,6 +3256,7 @@ mod tests {
             inputs.retrieval_diagnostic,
             RetrievalPreparationDiagnostic::ForcedLexical
         );
+        assert_eq!(inputs.retrieval_mode, ChatRetrievalMode::Fast);
         assert!(!inputs.sources.is_empty());
         assert!(inputs
             .sources
@@ -3231,6 +3584,7 @@ mod tests {
             live_authorization("live-1", false),
             None,
             None,
+            None,
         )
         .await
         .err()
@@ -3242,28 +3596,28 @@ mod tests {
     #[tokio::test]
     async fn cancel_chat_stream_cancels_matching_id() {
         let state = ChatStreamState::new();
-        let token = CancellationToken::new();
-        *state.0.lock().unwrap() = Some(("s1".to_string(), token.clone()));
+        let token = claim_chat_stream(&state, "s1").await;
         cancel_chat_stream(&state, Some("s1")).await;
         assert!(token.is_cancelled());
+        assert_eq!(state.request_count(), 0);
     }
 
     #[tokio::test]
     async fn cancel_chat_stream_ignores_mismatched_id() {
         let state = ChatStreamState::new();
-        let token = CancellationToken::new();
-        *state.0.lock().unwrap() = Some(("s1".to_string(), token.clone()));
+        let token = claim_chat_stream(&state, "s1").await;
         cancel_chat_stream(&state, Some("s2")).await;
         assert!(!token.is_cancelled());
+        assert_eq!(state.request_count(), 1);
     }
 
     #[tokio::test]
     async fn cancel_chat_stream_any_cancels_active_stream() {
         let state = ChatStreamState::new();
-        let token = CancellationToken::new();
-        *state.0.lock().unwrap() = Some(("s1".to_string(), token.clone()));
+        let token = claim_chat_stream(&state, "s1").await;
         cancel_chat_stream(&state, None).await;
         assert!(token.is_cancelled());
+        assert_eq!(state.request_count(), 0);
     }
 
     #[tokio::test]
@@ -3305,7 +3659,8 @@ mod tests {
         let delayed_old_token = old_token.clone();
         let old_work = tokio::spawn(async move {
             delayed_done.notified().await;
-            !delayed_old_token.is_cancelled() && is_chat_stream_owner(&delayed_state, "old").await
+            !delayed_old_token.is_cancelled()
+                && is_chat_stream_owner(&delayed_state, "old", &delayed_old_token).await
         });
 
         let new_token = claim_chat_stream(&state, "new").await;
@@ -3313,8 +3668,144 @@ mod tests {
 
         assert!(old_token.is_cancelled());
         assert!(!old_work.await.unwrap());
-        clear_chat_stream_if_owner(&state, "old").await;
-        assert!(is_chat_stream_owner(&state, "new").await);
+        clear_chat_stream_if_owner(&state, "old", &old_token).await;
+        assert!(is_chat_stream_owner(&state, "new", &new_token).await);
         assert!(!new_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn reused_stream_id_cannot_clear_replacement() {
+        let state = ChatStreamState::new();
+        let old_token = claim_chat_stream(&state, "same").await;
+        let new_token = claim_chat_stream(&state, "same").await;
+
+        assert!(old_token.is_cancelled());
+        assert!(!is_chat_stream_owner(&state, "same", &old_token).await);
+        clear_chat_stream_if_owner(&state, "same", &old_token).await;
+        assert!(is_chat_stream_owner(&state, "same", &new_token).await);
+        assert_eq!(state.request_count(), 1);
+    }
+
+    #[test]
+    fn request_ownership_allows_chat_and_sidebar_to_coexist() {
+        let state = ChatRequestState::new();
+        let old_chat = state.claim_request(ChatRequestSurface::Chat, "chat-old");
+        let sidebar = state.claim_request(ChatRequestSurface::Sidebar, "sidebar");
+        let new_chat = state.claim_request(ChatRequestSurface::Chat, "chat-new");
+
+        assert!(old_chat.is_cancelled());
+        assert!(!sidebar.is_cancelled());
+        assert!(!state.is_owner(ChatRequestSurface::Chat, "chat-old", &old_chat));
+        assert!(state.is_owner(ChatRequestSurface::Chat, "chat-new", &new_chat));
+        assert!(state.is_owner(ChatRequestSurface::Sidebar, "sidebar", &sidebar));
+        assert_eq!(state.request_count(), 2);
+    }
+
+    #[test]
+    fn replaced_or_cancelled_progress_cannot_publish_and_cleanup_stays_bounded() {
+        let state = ChatRequestState::new();
+        let old = state.claim_request(ChatRequestSurface::Chat, "old");
+        let current = state.claim_request(ChatRequestSurface::Chat, "current");
+        let mut events = Vec::new();
+
+        assert!(!publish_chat_stream_event_if_owner(
+            &state,
+            "old",
+            &old,
+            "chat-preparation-progress",
+            serde_json::json!({"stage": "initial_retrieval", "completed": 1, "total": 1}),
+            false,
+            |event, payload| events.push((event.to_string(), payload)),
+        ));
+        assert!(publish_chat_stream_event_if_owner(
+            &state,
+            "current",
+            &current,
+            "chat-preparation-progress",
+            serde_json::json!({"stage": "initial_retrieval", "completed": 1, "total": 1}),
+            false,
+            |event, payload| events.push((event.to_string(), payload)),
+        ));
+        let foreign = Arc::new(CancellationToken::new());
+        assert!(!publish_chat_stream_event_if_owner(
+            &state,
+            "current",
+            &foreign,
+            "chat-preparation-progress",
+            serde_json::json!({"stage": "answer_generation", "completed": 0, "total": 1}),
+            false,
+            |event, payload| events.push((event.to_string(), payload)),
+        ));
+        assert!(state.is_owner(ChatRequestSurface::Chat, "current", &current));
+        state.cancel_request(ChatRequestSurface::Chat, Some("current"));
+        assert!(!publish_chat_stream_event_if_owner(
+            &state,
+            "current",
+            &current,
+            "chat-preparation-progress",
+            serde_json::json!({"stage": "answer_generation", "completed": 0, "total": 1}),
+            false,
+            |event, payload| events.push((event.to_string(), payload)),
+        ));
+        assert_eq!(events.len(), 1);
+        assert_eq!(state.request_count(), 0);
+
+        for index in 0..64 {
+            let id = format!("terminal-{index}");
+            let token = state.claim_request(ChatRequestSurface::Chat, &id);
+            assert!(state.clear_if_owner(ChatRequestSurface::Chat, &id, &token));
+        }
+        assert_eq!(state.request_count(), 0);
+    }
+
+    #[test]
+    fn non_streaming_error_and_timeout_cleanup_release_request_ownership() {
+        let state = ChatRequestState::new();
+        let error_token = state.claim_request(ChatRequestSurface::Chat, "error");
+        let error = finish_non_streaming_chat_request(
+            &state,
+            "error",
+            &error_token,
+            Ok(Err("provider failed".to_string())),
+        )
+        .unwrap_err();
+        assert_eq!(error, "provider failed");
+        assert_eq!(state.request_count(), 0);
+
+        let success_token = state.claim_request(ChatRequestSurface::Chat, "success");
+        let response = finish_non_streaming_chat_request(
+            &state,
+            "success",
+            &success_token,
+            Ok(Ok(ChatResponse {
+                answer: "answer".to_string(),
+                sources: Vec::new(),
+            })),
+        )
+        .unwrap();
+        assert_eq!(response.answer, "answer");
+        assert_eq!(state.request_count(), 0);
+
+        let old_token = state.claim_request(ChatRequestSurface::Chat, "old");
+        let new_token = state.claim_request(ChatRequestSurface::Chat, "new");
+        let superseded = finish_non_streaming_chat_request(
+            &state,
+            "old",
+            &old_token,
+            Ok(Ok(ChatResponse {
+                answer: "stale".to_string(),
+                sources: Vec::new(),
+            })),
+        )
+        .unwrap_err();
+        assert!(superseded.contains("superseded"));
+        assert!(state.is_owner(ChatRequestSurface::Chat, "new", &new_token));
+        assert!(state.clear_if_owner(ChatRequestSurface::Chat, "new", &new_token));
+        assert_eq!(state.request_count(), 0);
+
+        let timeout_token = state.claim_request(ChatRequestSurface::Chat, "timeout");
+        timeout_token.cancel();
+        assert!(state.clear_if_owner(ChatRequestSurface::Chat, "timeout", &timeout_token));
+        assert_eq!(state.request_count(), 0);
     }
 }

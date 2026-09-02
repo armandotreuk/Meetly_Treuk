@@ -18,6 +18,8 @@ import type {
     ChatMessageRow,
     ChatSource,
     ChatScope,
+    ChatRetrievalMode,
+    ChatPreparationProgressPayload,
 } from "@/types";
 
 interface ChatPanelProps {
@@ -60,6 +62,9 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
     const [input, setInput] = useState("");
     const [isLoading, setIsLoading] = useState(false);
     const [isStreaming, setIsStreaming] = useState(false);
+    const [retrievalMode, setRetrievalMode] = useState<ChatRetrievalMode>("deep");
+    const [preparationProgress, setPreparationProgress] =
+        useState<ChatPreparationProgressPayload | null>(null);
     const [conversationId, setConversationId] = useState<string | null>(null);
     const conversationIdRef = useRef<string | null>(null);
     const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -126,6 +131,8 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
         cleanupListeners();
         setIsLoading(false);
         setIsStreaming(false);
+        setRetrievalMode("deep");
+        setPreparationProgress(null);
         conversationIdRef.current = null;
         setConversationId(null);
         setMessages([]);
@@ -223,6 +230,7 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
         setInput("");
         if (inputRef.current) inputRef.current.style.height = "auto";
         setIsLoading(true);
+        setPreparationProgress(null);
 
         // Build history from previous messages (last 10), excluding error bubbles
         const history = messages
@@ -265,10 +273,24 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
             }
             unlisteners.push(unlistenStart);
 
+            const unlistenProgress = await listen<ChatPreparationProgressPayload>(
+                "chat-preparation-progress",
+                (event) => {
+                    if (!isCurrentRequest() || event.payload.streamId !== streamId) return;
+                    setPreparationProgress(event.payload);
+                }
+            );
+            if (!isCurrentRequest()) {
+                unlistenProgress();
+                return;
+            }
+            unlisteners.push(unlistenProgress);
+
             const unlistenChunk = await listen<ChatStreamChunkPayload>(
                 "chat-stream-chunk",
                 (event) => {
                     if (!isCurrentRequest() || event.payload.streamId !== streamId) return;
+                    setPreparationProgress(null);
                     setMessages((prev) => {
                         const last = prev[prev.length - 1];
                         if (!last || last.role !== "assistant" || last.isError) {
@@ -294,6 +316,7 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
                 (event) => {
                     if (!isCurrentRequest() || event.payload.streamId !== streamId) return;
                     setIsStreaming(false);
+                    setPreparationProgress(null);
                     cleanupListeners();
                     saveMessage(streamConversationId, {
                         role: "assistant",
@@ -328,6 +351,7 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
                     if (!isCurrentRequest() || event.payload.streamId !== streamId) return;
                     setIsLoading(false);
                     setIsStreaming(false);
+                    setPreparationProgress(null);
                     cleanupListeners();
                     logger.error("Chat stream error:", event.payload.error);
                     const errorMessage: ChatMessageType = {
@@ -365,11 +389,13 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
                 streamId,
                 conversationId: streamConversationId,
                 liveTranscriptConsent,
+                mode: scope.kind === "live_recording" ? "fast" : retrievalMode,
             });
         } catch (error) {
             if (!isCurrentRequest()) return;
             setIsLoading(false);
             setIsStreaming(false);
+            setPreparationProgress(null);
             cleanupListeners();
             logger.error("Chat error:", error);
             const errorMessage: ChatMessageType = {
@@ -389,11 +415,20 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
 
     const handleStop = async () => {
         const streamId = streamIdRef.current;
-        if (!streamId || !isStreaming) return;
+        if (!streamId || (!isLoading && !isStreaming)) return;
         try {
             await invoke("api_cancel_chat_stream", { streamId });
         } catch (error) {
             logger.error("Failed to cancel chat stream:", error);
+        } finally {
+            if (streamIdRef.current === streamId) {
+                streamIdRef.current = null;
+                setIsLoading(false);
+                setIsStreaming(false);
+                setPreparationProgress(null);
+                cleanupListeners();
+                inputRef.current?.focus();
+            }
         }
     };
 
@@ -427,6 +462,8 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
     };
 
     const isBusy = isLoading || isStreaming;
+    const isLiveScope = scope.kind === "live_recording";
+    const selectedRetrievalMode: ChatRetrievalMode = isLiveScope ? "fast" : retrievalMode;
     const providerCategory = classifyProvider(providerKind);
     const providerBadge =
         providerCategory === "local"
@@ -523,6 +560,38 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
                 </div>
             </div>
 
+            <div className="flex items-start gap-3 border-b border-gray-200 px-4 py-2">
+                <div className="flex items-center gap-2">
+                    <label
+                        htmlFor="chat-retrieval-mode"
+                        className="text-xs font-medium text-gray-600"
+                    >
+                        {t("chat.mode.label")}
+                    </label>
+                    <select
+                        id="chat-retrieval-mode"
+                        value={selectedRetrievalMode}
+                        onChange={(event) =>
+                            setRetrievalMode(event.currentTarget.value as ChatRetrievalMode)
+                        }
+                        disabled={isLiveScope || isBusy}
+                        aria-label={t("chat.mode.label")}
+                        aria-describedby="chat-retrieval-mode-help"
+                        className="rounded border border-gray-300 bg-white px-2 py-1 text-xs text-gray-700 focus:border-transparent focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:cursor-not-allowed disabled:bg-gray-50 disabled:text-gray-400"
+                    >
+                        <option value="fast">{t("chat.mode.fast")}</option>
+                        <option value="deep">{t("chat.mode.deep")}</option>
+                    </select>
+                </div>
+                <p id="chat-retrieval-mode-help" className="text-xs text-gray-500">
+                    {isLiveScope
+                        ? t("chat.mode.liveDescription")
+                        : selectedRetrievalMode === "deep"
+                          ? t("chat.mode.deepDescription")
+                          : t("chat.mode.fastDescription")}
+                </p>
+            </div>
+
             {/* Messages */}
             <div className="flex-1 overflow-y-auto p-4 space-y-4">
                 {messages.length === 0 && (
@@ -563,13 +632,23 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
                         }
                     />
                 ))}
-                {isLoading && (
-                    <div className="flex justify-start">
+                {(isLoading || preparationProgress !== null) && (
+                    <div className="flex justify-start" role="status" aria-live="polite" aria-atomic="true">
                         <div className="w-7 h-7 rounded-full bg-blue-100 flex items-center justify-center">
                             <Loader2 className="h-4 w-4 text-blue-600 animate-spin" />
                         </div>
                         <div className="ml-2 bg-gray-100 rounded-lg px-3 py-2 text-sm text-gray-500">
-                            {t("chat.searching")}
+                            {preparationProgress?.stage === "initial_retrieval"
+                                ? t("chat.preparation.initialRetrieval", {
+                                      completed: preparationProgress.completed,
+                                      total: preparationProgress.total,
+                                  })
+                                : preparationProgress?.stage === "answer_generation"
+                                  ? t("chat.preparation.answerGeneration", {
+                                        completed: preparationProgress.completed,
+                                        total: preparationProgress.total,
+                                    })
+                                  : t("chat.searching")}
                         </div>
                     </div>
                 )}
@@ -589,7 +668,7 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
                         disabled={isBusy || !conversationId}
                         className="max-h-[120px] flex-1 resize-none overflow-y-auto rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-transparent focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-50 disabled:text-gray-400"
                     />
-                    {isStreaming ? (
+                    {isBusy ? (
                         <button
                             onClick={handleStop}
                             aria-label={t("chat.stop.aria")}

@@ -636,7 +636,7 @@ pub fn run() {
         )) as NotificationManagerState<tauri::Wry>)
         .manage(audio::init_system_audio_state())
         .manage(summary::summary_engine::ModelManagerState(Arc::new(tokio::sync::Mutex::new(None))))
-        .manage(api::chat::ChatStreamState::new())
+        .manage(api::chat::ChatRequestState::new())
         .setup(|_app| {
             log::info!("Application setup complete");
 
@@ -894,6 +894,7 @@ pub fn run() {
             api::api_chat_with_meetings_stream,
             api::api_chat_with_scoped_conversation_stream,
             api::api_cancel_chat_stream,
+            api::api_cancel_chat_request,
             api::api_chat_create_conversation,
             api::api_chat_get_conversation,
             api::api_chat_get_or_create_scoped_conversation,

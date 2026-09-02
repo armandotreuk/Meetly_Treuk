@@ -167,6 +167,9 @@ describe("ChatHost scoped panel", () => {
         await act(async () => (container.querySelector("button") as HTMLButtonElement).click());
         await flush();
         const textarea = container.querySelector("textarea")!;
+        const mode = container.querySelector("#chat-retrieval-mode") as HTMLSelectElement;
+        expect(mode.disabled).toBe(true);
+        expect(mode.value).toBe("fast");
         await act(async () => {
             Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, "question");
             textarea.dispatchEvent(new Event("input", { bubbles: true }));
@@ -179,8 +182,83 @@ describe("ChatHost scoped panel", () => {
         await flush();
         expect(confirm).toHaveBeenCalledTimes(2);
         const request = mocks.invoke.mock.calls.find(([command]) => command === "api_chat_with_scoped_conversation_stream");
-        expect(request?.[1]).toMatchObject({ liveTranscriptConsent: true });
+        expect(request?.[1]).toMatchObject({ liveTranscriptConsent: true, mode: "fast" });
         confirm.mockRestore();
+    });
+
+    it("defaults to Deep and sends the selected mode without changing the conversation", async () => {
+        const scope: ChatScope = { kind: "all", key: "all" };
+        await act(async () => root.render(<ChatHost><Launcher scope={scope} label="all" /></ChatHost>));
+        await act(async () => (container.querySelector("button") as HTMLButtonElement).click());
+        await flush();
+
+        const mode = container.querySelector("#chat-retrieval-mode") as HTMLSelectElement;
+        expect(mode.value).toBe("deep");
+        await act(async () => {
+            mode.value = "fast";
+            mode.dispatchEvent(new Event("change", { bubbles: true }));
+        });
+        expect(mode.value).toBe("fast");
+
+        const textarea = container.querySelector("textarea")!;
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, "question");
+            textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        await act(async () => (container.querySelector('[aria-label="Send message"]') as HTMLButtonElement).click());
+        await flush();
+
+        const request = mocks.invoke.mock.calls.find(([command]) => command === "api_chat_with_scoped_conversation_stream");
+        expect(request?.[1]).toMatchObject({ mode: "fast" });
+        expect(mocks.invoke.mock.calls.filter(([command]) => command === "api_chat_get_or_create_scoped_conversation")).toHaveLength(1);
+    });
+
+    it("sends Deep explicitly for a new interactive request", async () => {
+        const scope: ChatScope = { kind: "all", key: "all" };
+        await act(async () => root.render(<ChatHost><Launcher scope={scope} label="all" /></ChatHost>));
+        await act(async () => (container.querySelector("button") as HTMLButtonElement).click());
+        await flush();
+
+        const textarea = container.querySelector("textarea")!;
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, "question");
+            textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        await act(async () => (container.querySelector('[aria-label="Send message"]') as HTMLButtonElement).click());
+        await flush();
+
+        const request = mocks.invoke.mock.calls.find(([command]) => command === "api_chat_with_scoped_conversation_stream");
+        expect(request?.[1]).toMatchObject({ mode: "deep" });
+    });
+
+    it("renders only privacy-safe preparation progress and cancels during preparation", async () => {
+        const scope: ChatScope = { kind: "all", key: "all" };
+        await act(async () => root.render(<ChatHost><Launcher scope={scope} label="all" /></ChatHost>));
+        await act(async () => (container.querySelector("button") as HTMLButtonElement).click());
+        await flush();
+        const textarea = container.querySelector("textarea")!;
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, "question");
+            textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        await act(async () => (container.querySelector('[aria-label="Send message"]') as HTMLButtonElement).click());
+        await flush();
+        const streamId = mocks.invoke.mock.calls.find(([command]) => command === "api_chat_with_scoped_conversation_stream")![1].streamId;
+        const progress = mocks.listeners.get("chat-preparation-progress")!;
+
+        await act(async () => progress({ payload: { streamId, stage: "initial_retrieval", completed: 2, total: 3 } }));
+        expect(container.querySelector('[role="status"]')?.textContent).toContain("2 of 3");
+        expect(container.querySelector('[role="status"]')?.textContent).not.toContain("question");
+        await act(async () => progress({ payload: { streamId: "stale", stage: "answer_generation", completed: 0, total: 1 } }));
+        expect(container.querySelector('[role="status"]')?.textContent).not.toContain("Preparing answer");
+        await act(async () => mocks.listeners.get("chat-stream-start")!({ payload: { streamId, sources: [] } }));
+        expect(container.querySelector('[role="status"]')?.textContent).toContain("2 of 3");
+        await act(async () => mocks.listeners.get("chat-stream-chunk")!({ payload: { streamId, text: "answer" } }));
+        expect(container.querySelector('[role="status"]')).toBeNull();
+
+        await act(async () => (container.querySelector('[aria-label="Stop generating"]') as HTMLButtonElement).click());
+        expect(mocks.invoke).toHaveBeenCalledWith("api_cancel_chat_stream", { streamId });
+        expect(container.querySelector('[aria-label="Stop generating"]')).toBeNull();
     });
 
     it("promotes an open live host to the saved meeting without mixing scopes", async () => {
@@ -322,7 +400,9 @@ describe("ChatHost scoped panel", () => {
         const streamId = mocks.invoke.mock.calls.find(([command]) => command === "api_chat_with_scoped_conversation_stream")![1].streamId;
         await act(async () => mocks.listeners.get("chat-stream-start")!({ payload: { streamId: "other", sources: [] } }));
         await act(async () => mocks.listeners.get("chat-stream-chunk")!({ payload: { streamId: "other", text: "wrong" } }));
+        await act(async () => mocks.listeners.get("chat-preparation-progress")!({ payload: { streamId: "other", stage: "initial_retrieval", completed: 1, total: 1 } }));
         expect(container.textContent).not.toContain("wrong");
+        expect(container.textContent).not.toContain("Initial retrieval complete");
         await act(async () => mocks.listeners.get("chat-stream-start")!({ payload: { streamId, sources: [] } }));
         await act(async () => mocks.listeners.get("chat-stream-chunk")!({ payload: { streamId, text: "right" } }));
         expect(container.textContent).toContain("right");

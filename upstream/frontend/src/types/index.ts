@@ -192,6 +192,16 @@ export interface ChatMessage {
     isStreaming?: boolean;
 }
 
+export type ChatRetrievalMode = "fast" | "deep";
+export type ChatPreparationStage = "initial_retrieval" | "answer_generation";
+
+export interface ChatPreparationProgressPayload {
+    streamId: string;
+    stage: ChatPreparationStage;
+    completed: number;
+    total: number;
+}
+
 /** Payload for `chat-stream-start` Tauri events. */
 export interface ChatStreamStartPayload {
     streamId: string;

@@ -7,7 +7,7 @@ use sqlx::SqlitePool;
 use tokio::net::TcpListener;
 use tracing::info;
 
-use crate::api::chat::{prepare_chat_inputs_with_lifecycle, SYSTEM_PROMPT};
+use crate::api::chat::{prepare_chat_inputs_with_lifecycle, ChatRetrievalMode, SYSTEM_PROMPT};
 use crate::database::repositories::{folder::FolderRepository, fts::FtsRepository};
 use crate::export::build_context_markdown;
 use crate::summary::llm_client::generate_summary;
@@ -225,6 +225,17 @@ async fn prepare_mcp_chat_inputs(
         .ok_or("Missing 'query' parameter")?
         .to_string();
     let meeting_id = params["meetingId"].as_str().map(str::to_string);
+    let mode = params
+        .get("mode")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            serde_json::from_value::<ChatRetrievalMode>(value.clone())
+                .map_err(|_| "Invalid chat retrieval mode; expected 'fast' or 'deep'".to_string())
+        })
+        .transpose()?;
+    if mode == Some(ChatRetrievalMode::Deep) {
+        return Err("MCP Chat supports Fast mode only".to_string());
+    }
     let inputs = prepare_chat_inputs_with_lifecycle(
         pool,
         app_data_dir.clone(),
@@ -234,6 +245,7 @@ async fn prepare_mcp_chat_inputs(
         meeting_id,
         retrieval,
         None,
+        mode,
     )
     .await?;
     let sources = serialize_chat_sources(&inputs.sources)?;
@@ -495,14 +507,15 @@ mod tests {
             INSERT INTO meeting_fts (meeting_id, chunk_type, chunk_id, text, folder_name) VALUES ('m1', 'note', 'n1', 'alpha', 'General');"#)
             .execute(&pool).await.unwrap();
 
+        let lifecycle = crate::retrieval::worker::RetrievalLifecycle::new(
+            crate::retrieval::worker::LifecycleConfig::production(None),
+        );
         let (inputs, sources) = prepare_mcp_chat_inputs(
             &pool,
             &json!({"query": "alpha"}),
             &None,
             &reqwest::Client::new(),
-            crate::retrieval::worker::RetrievalLifecycle::new(
-                crate::retrieval::worker::LifecycleConfig::production(None),
-            ),
+            lifecycle.clone(),
         )
         .await
         .unwrap();
@@ -510,8 +523,37 @@ mod tests {
             inputs.retrieval_diagnostic,
             crate::api::chat::RetrievalPreparationDiagnostic::ForcedLexical
         );
+        assert_eq!(inputs.retrieval_mode, ChatRetrievalMode::Fast);
         assert!(inputs.sources[0].source_kind.is_none());
         assert!(sources[0].get("sourceKind").is_none());
         assert_eq!(sources[0]["meetingId"], "m1");
+
+        let error = match prepare_mcp_chat_inputs(
+            &pool,
+            &json!({"query": "alpha", "mode": "deep"}),
+            &None,
+            &reqwest::Client::new(),
+            lifecycle.clone(),
+        )
+        .await
+        {
+            Ok(_) => panic!("Deep MCP mode must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("Fast mode only"));
+
+        let error = match prepare_mcp_chat_inputs(
+            &pool,
+            &json!({"query": "alpha", "mode": "unknown"}),
+            &None,
+            &reqwest::Client::new(),
+            lifecycle,
+        )
+        .await
+        {
+            Ok(_) => panic!("Unknown MCP retrieval mode must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("Invalid chat retrieval mode"));
     }
 }
