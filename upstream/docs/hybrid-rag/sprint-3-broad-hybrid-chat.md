@@ -2,9 +2,11 @@
 
 ## Status
 
-In progress, 2026-08-29. Sprint 2 closed with user approval. This PRD received
-mandatory pre-start amendments and user approval. Task 3.1 is complete; later
-tasks remain pending their individual batch approvals.
+In progress, 2026-08-30. Sprint 2 closed with user approval. This PRD received
+mandatory pre-start amendments and user approval. Task 3.1 is complete. Task
+3.2 implementation/remediation is complete and awaiting final review; its
+release-hardware latency evidence is owned by Task 3.5 and no longer blocks
+Task 3.3 code from proceeding after the ranking contract is approved.
 
 Revised 2026-08-21 after pre-implementation critique: reranking sub-budget and
 a mandatory runtime kill switch added. Revised 2026-08-29 after architecture
@@ -25,7 +27,7 @@ measured cause:
 | `pt-ref-nps-detrator` | raw bi-encoder ranks the target **1**; fused aggregation demotes it to 2 | **Task 3.2** |
 | `pt-ref-chaves-acesso` | terminological gap; raw bi-encoder rank 4 | **Task 3.6** |
 
-This gate MUST be re-measured at Sprint 3 close and MUST pass before release.
+This gate MUST be re-measured by Task 3.2 and MUST pass before release.
 It is retained, not waived: Sprint 1 established that all five critical
 meetings already land inside the hydration window with 100% required-fact
 coverage and zero retrieval-stage contamination, so what remains is ranking
@@ -117,11 +119,15 @@ encoding, or exact-backend contract.
   permits, bounded interactive queue, cancellation, and recording/import
   pressure controls. Broad Chat must not create a second runtime, scheduler, or
   model-session owner.
-- The inherited **critical Recall@1 = 100%** release gate MUST be re-measured
-  before sprint close, with the three named cases reported individually.
-- The inherited `pt-ref-chaves-acesso` debt remains owned by Task 3.6. Task 3.6
-  may not delay the 3.4 rollout, but its selected approach and a 5/5 critical
-  Recall@1 result are required before Sprint 3 can close.
+- The active **critical Recall@3 = 100%** release gate MUST be re-measured
+  before sprint close: every expected meeting in each of the five critical
+  cases must have final meeting rank <= 3, with the three named cases reported
+  individually. The strict target-over-decoy ordering rule remains a separate
+  stronger condition and is not weakened by this phase.
+- Task 3.2 remeasures all five critical cases. If reviewed production ranking
+  reaches 5/5, Task 3.6 is not required. If a terminological-gap case remains
+  the sole attributable miss, Task 3.6 becomes dependency-ready only after the
+  user selects an approach. The 5/5 Sprint-close threshold is unchanged.
 - Any tuning of fusion, aggregation, or reranking constants in this sprint MUST
   use **threshold semantics**: satisfy every gate threshold first, then
   optimize quality inside the feasible set. Sprint 1's lexicographic
@@ -136,23 +142,24 @@ encoding, or exact-backend contract.
 | ID | Feature | Task | Size | Owner | Dependencies | Acceptance check | Rollback |
 |---|---|---|---|---|---|---|---|
 | 3.1 | Hybrid candidates | Add concrete persisted-scope retrieval requests and scope-safe FTS/vector candidate generation. | L | `worker-l` (complete) | Sprint 2 | Tests prove all/folder allow-lists, query variants, cancellation, semantic fallback, and no out-of-scope candidates. | Route broad Chat back to existing `resolve_scope_results`; index remains unused. |
-| 3.2 | Ranking | Add RRF, stable dedupe, meeting aggregation/diversity, and local cross-encoder reranking. **Owns the inherited critical Recall@1 debt for `pt-ref-sla-suporte` and `pt-ref-nps-detrator`**, whose targets the bi-encoder already ranks first. | L | Pending `worker-l` | 3.1 | Evaluation proves correct meeting ranking and reranker improvement without exact-term regression; both inherited cases reach rank 1; constants tuned with threshold semantics. | Disable reranking/fusion service and use ordered lexical candidates. |
+| 3.2 | Ranking | Add RRF, stable dedupe, meeting aggregation/diversity, and local cross-encoder reranking. Remeasure all five critical cases and own the inherited fusion demotions for `pt-ref-sla-suporte` and `pt-ref-nps-detrator`. | L | Implementation complete; review pending | 3.1 | Production-path evaluation proves correct meeting ranking and reranker improvement without exact-term regression; every critical expected meeting reaches rank <=3 under the active Recall@3 gate, and the strict target-over-decoy ordering rule remains separately enforced; constants use threshold semantics. Release-hardware p95 is Task 3.5 evidence. | Disable reranking/fusion service and use ordered lexical candidates. |
 | 3.3 | Context | Add authoritative multi-meeting hydration, bounded allocation, coverage, and retained-source output. | L | Pending `worker-l` | 3.2 | Reference context contains complete schedule/MPV facts and all sources match retained evidence. | Keep old generic context builder and lexical path. |
-| 3.4 | Broad Chat rollout | Integrate Fast hybrid retrieval into all/folder streaming and non-streaming Chat through shared preparation, and ship the mandatory `force_lexical_retrieval` kill switch. | M | Pending `worker-m` | 3.1-3.3 | Product-path tests prove all/folder Fast behavior, lexical fallback, kill-switch behavior, cancellation, and source events. | Enable `force_lexical_retrieval` at runtime; no rebuild or reinstall required. |
-| 3.5 | Quality regression | Run/fix multilingual evaluation, context budgets, performance, Sprint 2 R13 full-application calibration/refusal evidence, and Windows native broad-Chat smoke/release evidence. | M | Pending `worker-m` | 3.4 | Required quality deltas and reference answer facts pass; no context/latency/R13 gate regresses; current-head Windows evidence passes. | Test/threshold changes revert independently; production rollback is Task 3.4 flag/path. |
-| 3.6 | Query expansion | Add single-turn query expansion as an additional query variant, after the user resolves its open architecture question. | M | Pending `worker-l` (decision deferred) | 3.1-3.3, **user architecture decision** | Terminological-gap cases (`pt-ref-chaves-acesso` and its siblings) improve measurably against the Sprint 1 corpus with no exact-term regression or Fast-budget breach; the inherited critical Recall@1 gate reaches 5/5 before Sprint close. | Drop the expansion variant; original/rewritten/core variants continue unchanged. |
+| 3.4 | Broad Chat rollout | Integrate Fast hybrid retrieval into all/folder streaming and non-streaming Chat through shared preparation, ship the mandatory `force_lexical_retrieval` kill switch, and retire the pre-query GC exception. | M | Pending `worker-m` | 3.1-3.3 | Product-path tests prove all/folder Fast behavior, lexical fallback, kill-switch behavior, cancellation with no final answer/source/done event, source events, and GC requiring an acknowledged clean Fast query. | Enable `force_lexical_retrieval` at runtime; no rebuild or reinstall required. |
+| 3.5 | Quality regression | Run/fix multilingual evaluation, final answer/source checks, production-bundle performance, Sprint 2 R13 full-application calibration/refusal evidence, and Windows native broad-Chat smoke/release evidence. | M | Pending `worker-m` | 3.4 | Required quality deltas, answer non-assertion, production-bundle latency, context/source parity, and R13 evidence pass; current-head Windows evidence passes. | Test/threshold changes revert independently; production rollback is Task 3.4 flag/path. |
+| 3.6 | Conditional query expansion | Only if reviewed Task 3.2 evidence leaves an attributable terminological-gap miss, add single-turn expansion after the user resolves its architecture question. | M | Conditional; no dispatch while 3.2 is 5/5 | Reviewed 3.2 miss, 3.1-3.3, **user architecture decision** | Terminological-gap cases improve measurably without exact-term, privacy, or Fast-budget regression, and the unchanged 5/5 release gate passes. | Drop the expansion variant; original/rewritten/core variants continue unchanged. |
 
 ## Dependency Order
 
 `3.1 -> 3.2 -> 3.3 -> 3.4 -> 3.5`
 
-`3.1-3.3 -> 3.6` (additionally gated on the user's architecture decision)
+`reviewed Task 3.2 terminological-gap miss + 3.1-3.3 + user decision -> 3.6`
 
 Every task shares retrieval contracts or `api/chat.rs` behavior with the next;
 no implementation tasks are safely parallel by default. Tasks 3.1-3.3 are L
 and run alone. Task `3.6` may run after `3.5` closes or alongside it once the
-expansion approach is approved; it must not delay the `3.4` rollout, but it
-blocks Sprint closure until the inherited 5/5 Recall@1 gate passes.
+expansion approach is approved. It is omitted when reviewed Task 3.2 evidence
+already reaches 5/5. The quality threshold, not implementation of Task 3.6,
+blocks Sprint closure.
 
 ## Task Specifications
 
@@ -240,7 +247,10 @@ complete relevant evidence rather than frequent isolated chunks.
 - New `frontend/src-tauri/src/retrieval/ranking.rs`
 - `frontend/src-tauri/src/retrieval/mod.rs`
 - Model/reranker API from Sprint 2
-- Evaluation harness and fixtures
+- `frontend/src-tauri/tests/retrieval_evaluation.rs` (production pipeline
+  wiring plus the unenforced semantic gate)
+- `frontend/src-tauri/tests/fixtures/evaluation_policy.json`
+- Production reranker runtime (Task 3.5 owns release-hardware p95 evidence)
 
 **Required implementation:**
 
@@ -255,6 +265,12 @@ complete relevant evidence rather than frequent isolated chunks.
 - Select a bounded evidence set for local cross-encoder reranking, using the
   **candidate depth Sprint 1 derived from the 900 ms p95 sub-budget** — not the
   provisional 30-50 range from `architecture.md`, which predates measurement.
+  Sprint 1 derived and recorded these constants; start from them verbatim:
+  chat rerank depth `50` (`floor(900 ms / measured p95)`, capped at the
+  `RERANK_SET` ceiling), batch `1`, intra-op `4`, `gamma = 0`,
+  `support_cap = 3` (`docs/hybrid-rag/task-1.3-final-selection.md:136-158`,
+  `docs/hybrid-rag/task-1.3-final-selection.md:293-298`). Any deviation
+  requires a documented evidence addendum, not silent tuning.
 - Implement the Sprint 1 adaptive depth policy if one was approved: rerank a
   reduced head when the fused top-k margin is unambiguous. The policy MUST be
   deterministic and MUST NOT vary by wall-clock timing, which would make
@@ -266,25 +282,68 @@ complete relevant evidence rather than frequent isolated chunks.
 - On reranker failure, retain deterministic fused ordering.
 - Emit local diagnostics without exposing raw content or treating scores as
   calibrated confidence.
+- Apply the active critical Recall@3 gate: every expected meeting in each of
+  the five critical cases must reach rank <=3. The strict target-over-decoy
+  ordering rule remains a separate, stronger condition; it is not replaced by
+  Recall@3. Remeasure and report all five critical cases. A reviewed result
+  meeting the active gates makes Task 3.6 unnecessary only when no attributable
+  terminological-gap miss remains.
+- **Wire the production retrieval + ranking path into
+  `tests/retrieval_evaluation.rs` as a second evaluated pipeline alongside the
+  pinned `run_current_fts` baseline, and assert `validate_quality_gates`
+  against its metrics.** Today those gates are only ever executed against
+  `oracle_results` and deliberately mutated copies of it
+  (`frontend/src-tauri/tests/retrieval_evaluation.rs:904`,
+  `frontend/src-tauri/tests/retrieval_evaluation.rs:2033-2112`), and the
+  harness does not import `RetrievalService` at all. Without this wiring every
+  ranking acceptance criterion below is unfalsifiable: the suite passes 6/6
+  while measuring a hand-built oracle. Keep the existing FTS baseline and its
+  `expectedBaseline` snapshot intact for comparison.
+- Enforce the `semanticRecallAt3DeltaPoints` gate (currently `10.0`) inside
+  `validate_quality_gates`. It is declared in
+  `tests/fixtures/evaluation_policy.json` but never checked — only printed as
+  a "semantic future gate" report line. This task produces the first fused
+  semantic ranking, so the gate goes live here; enforce it, or record an
+  explicit deferral decision with its reason and target task.
 
 **Acceptance criteria:**
 
-- The reference meeting ranks first in folder and all evaluation cases.
-- Similar-topic distractor meetings do not outrank stronger complete evidence.
+Every criterion below must be decided by an assertion over the production
+retrieval + ranking pipeline. A criterion whose only evidence is the oracle
+path, a printed report line, or reviewer judgement does not count as met.
+
+- The reference meeting ranks first in folder and all evaluation cases,
+  asserted against the production pipeline's metrics rather than
+  `oracle_results`.
+- All five critical cases are reported from the production pipeline and every
+  expected critical meeting reaches rank <=3 under the active Recall@3 gate.
+  The strict target-over-decoy ordering remains a separate stronger assertion;
+  meeting the Recall@3 threshold alone does not close it or Task 3.6.
+- On every `similar_topic_distractor` case, the expected meeting outranks that
+  case's named distractor meeting — asserted per case, not inferred from
+  aggregate Recall@1.
 - Duplicating irrelevant chunks in a long meeting does not raise it above the
   correct meeting.
 - Exact names/numbers remain retrievable through FTS even when semantic rank is
   weak.
 - RRF results are deterministic for ties.
-- Reranking passes the Sprint 1 designated-case and aggregate numeric gates.
-- **The reranking stage p95 is at or below 900 ms on reference hardware**,
-  measured separately from the rest of Fast preparation and reported as its own
-  figure.
+- Reranking passes the Sprint 1 designated-case and aggregate numeric gates,
+  including the `semanticRecallAt3DeltaPoints` gate or its recorded deferral.
+- The ranking stage exposes one production runtime path that Task 3.5 can
+  benchmark with the signed bundle. Task 3.2 does not depend on the obsolete
+  Sprint 1 multi-candidate staging tree. The unchanged reranking p95 <=900 ms
+  release gate remains mandatory and is measured in Task 3.5 from at least 50
+  complete warmed depth-50 production-runtime samples; synthetic evaluation
+  latency and `solo-pair p95 * 50` are diagnostic only.
 - If an adaptive depth policy is used, identical inputs produce identical depth
   and identical ordering across runs.
 - Reranker component failure produces deterministic fused fallback; user/stream
   cancellation propagates and produces no answer/source event.
-- No constants are tuned solely to one evaluation case.
+- No constants are tuned solely to one evaluation case, demonstrated by the
+  Sprint 1 isolation protocol — retune with the critical/pinned cases held out,
+  then report both held-out and full-corpus figures — not by assertion. This
+  sits in deliberate tension with the two named Recall@1 cases above; the
+  protocol, not judgement, resolves it.
 
 **Required verification:**
 
@@ -297,8 +356,16 @@ cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check
 git diff --check
 ```
 
+A `cargo test` filter that matches zero tests exits `0`, so report the observed
+test count for every command above; `0 passed` is a failure to report, not a
+pass.
+
 **Worker report additions:** Record the final formula/constants with Sprint 1
 evidence, reranker batch size, tie-breaking, and rejected ranking alternatives.
+Additionally record: the production-pipeline harness wiring and the gate
+results it produced (distinct from the retained FTS baseline snapshot); the
+held-out and full-corpus figures from the constants-isolation protocol; and either the
+`semanticRecallAt3DeltaPoints` result or its recorded deferral.
 
 ### 3.3 - Authoritative multi-meeting hydration [L]
 
@@ -417,8 +484,12 @@ cancellation behavior.
     model or index failure.
   - The Settings control is delivered in Sprint 5.3; this task delivers the
     setting, the backend behavior, and a temporary command to toggle it.
-  - Apply the setting in shared preparation so MCP Chat inherits it without a
-    separate retrieval implementation.
+- Apply the setting in shared preparation so MCP Chat inherits it without a
+  separate retrieval implementation.
+- Remove the Sprint 2 transitional retired-generation GC alternative. Once this
+  product path can acknowledge a clean Fast hybrid query, cleanup again requires
+  one clean restart plus one acknowledged successful Fast hybrid query; zero
+  acknowledged queries can never trigger GC.
 
 **Acceptance criteria:**
 
@@ -428,7 +499,9 @@ cancellation behavior.
 - Cancellation during embedding/reranking/hydration cannot emit into a newer
   stream.
 - Explicit user/stream cancellation aborts preparation and cannot fall through
-  to lexical answer generation.
+  to lexical answer generation or emit a final answer, source, or
+  `chat-stream-done` event. Internal cancellation cleanup is not a user-visible
+  completion event.
 - Source events and saved `sources_json` contain only retained evidence.
 - Meeting-list and live branches bypass broad hybrid retrieval.
 - **With `force_lexical_retrieval` enabled, every scope answers through the
@@ -439,6 +512,8 @@ cancellation behavior.
 - Fresh and upgraded databases persist the default and toggled setting, and MCP
   Chat receives the same forced-lexical preparation as Tauri Chat.
 - Existing scope/persistence/live tests remain green.
+- Retired-generation GC cannot run with zero acknowledged successful Fast
+  hybrid queries after this integration is active.
 
 **Required verification:**
 
@@ -473,11 +548,27 @@ budget, latency, Sprint 2 R13 activation evidence, and native product checks.
 - Run the full approved evaluation suite comparing FTS baseline, vector-only
   diagnostic, hybrid, and hybrid+reranker.
 - Verify reference required facts from retained context and final answer.
+- Evaluate every answer-stage forbidden fact whose current-authoritative carrier
+  is retained. Folder/all generated answers assert zero such facts; report the
+  eligible and total denominators, including the pinned WhatsApp case.
 - Verify Portuguese/English and distractor breakdowns.
 - Measure Fast stage p50/p95 and RAM at current and 250k synthetic scale,
-  **reporting the reranking stage as its own figure against its 900 ms
-  sub-budget**.
+  including a representative run while bounded background indexing is active.
+- Measure the reranking stage from the hash-verified production bundle through
+  `RetrievalModels::rerank` in a Rust `--release` build. After warm-up, collect
+  at least 50 complete depth-50 request samples and report p50/p95/max, pair and
+  sample counts, bundle/manifest digest, hardware/OS, ORT provider, and thread
+  settings. The stage includes production tokenization, blocking-pool dispatch,
+  and ONNX inference; scheduler queue wait remains part of the separate Fast
+  preparation figure. Missing/mismatched artifacts or insufficient samples
+  fail the evidence run. The Sprint 1 multi-candidate tree and
+  `solo-pair p95 * 50` estimate are historical evidence, not prerequisites.
 - Measure derived disk against its envelope at the same scales.
+- Record whether current Sprint 3 query plans make
+  `retrieval_documents_by_meeting_lookup` load-bearing. Retain the applied
+  index unless measured evidence and a migration-risk review justify a later
+  forward-only removal; do not create a drop migration merely to satisfy a
+  calendar deadline.
 - Verify local lexical fallback with model/index deliberately unavailable.
 - Verify the `force_lexical_retrieval` kill switch end to end on the native
   build, including persistence across restart.
@@ -495,14 +586,18 @@ budget, latency, Sprint 2 R13 activation evidence, and native product checks.
 - Before execution, predeclare the independent eligible activation-trial count.
   Report admissions, RAM-gate refusals, non-RAM exclusions, and refusal rate as
   RAM-gate refusals divided by eligible activation trials, using the existing
-  privacy-safe refusal reason. Any ceiling change requires a separate
+  privacy-safe refusal reason. Refusal rate is diagnostic, not a tolerated
+  percentage gate; the run must include at least one eligible admission below
+  the ceiling, while threshold/unit tests prove refusal at or above the ceiling
+  and when measurement is unavailable. Any ceiling change requires a separate
   user-approved architecture amendment, fresh review, and package evidence; no
   evidence permits a gate bypass.
-- Dispatch the root Windows release workflow on the exact final workflow/package
-  head. Record its URL, both job conclusions, workspace Cargo Check exit `0`,
-  helper staging, MSI/NSIS diagnostic outcomes, final-gate outcomes, and package
-  artifact IDs. Re-dispatch after every later product, workflow, gate, or
-  package-source change.
+- Dispatch the root Windows release workflow on the exact final
+  workflow/package head. Intermediate runs are diagnostic; only the final-head
+  run is closure evidence. Record its URL, both job conclusions, workspace
+  Cargo Check exit `0`, helper staging, MSI/NSIS diagnostic outcomes,
+  final-gate outcomes, and package artifact IDs. Re-dispatch only when later
+  changes affect product code, workflow, gates, or package sources.
 - Fix only defects required by already-approved Sprint 3 acceptance. Record
   larger findings as follow-ups.
 
@@ -513,9 +608,12 @@ budget, latency, Sprint 2 R13 activation evidence, and native product checks.
   count and measured value.
 - Hybrid+reranker does not underperform FTS on exact-number/name cases.
 - Reference folder/all answer includes complete required facts.
+- Folder/all generated answers assert zero eligible answer-stage forbidden
+  facts, with denominators recorded.
 - Context and source parity is exact.
 - Fast retrieval remains within approved latency, RAM, and disk gates, with the
-  reranking stage inside its own sub-budget.
+  production-runtime reranking stage inside its own sub-budget and active
+  indexing pressure included in Fast qualification.
 - Lexical fallback works with semantic resources unavailable.
 - The kill switch works at runtime and persists across restart.
 - Windows native smoke proves visible answer/sources and scope isolation.
@@ -545,21 +643,24 @@ git diff --check
 Record the benchmark, R13 calibration/refusal procedure and results, exact-head
 Windows evidence, and native-smoke procedure/results in the execution entry.
 
-### 3.6 - Single-turn query expansion [M]
+### 3.6 - Conditional single-turn query expansion [M]
 
 **Outcome:** A query whose vocabulary differs from the content that answers it
 can still retrieve that content, through an additional query variant rather
 than through corpus authoring or a hand-maintained lexicon.
 
-**Origin.** Sprint 1 Task `1.3G` left `pt-ref-chaves-acesso` unresolved: the
+**Conditional origin.** Sprint 1 Task `1.3G` left `pt-ref-chaves-acesso`
+unresolved before production ranking existed: the
 question says *trocar as chaves de acesso* while the decision says *rotação
 periódica de credenciais*, and no production stage bridges that gap. The
 implemented rewrite path at `frontend/src-tauri/src/api/chat.rs:465-494` is
 **follow-up-only** — it triggers on conversational history, and the case is
 single-turn, so it structurally cannot apply. Sprint 1 patched the fixture's
 title so a production channel could discriminate, which closed the
-admissibility defect but narrowed what the case tests. This task is the real
-remedy, and Sprint 1's record defers that case to it.
+admissibility defect but narrowed what the case tests. Task 3.2 now remeasures
+the case through production ranking. This task is needed only if reviewed Task
+3.2 evidence still shows an attributable terminological-gap miss; a reviewed
+5/5 result closes the release gate without adding expansion.
 
 **Blocking architecture question — user decision required before dispatch.**
 The approach is not pre-decided, and the three candidates differ materially:
@@ -570,10 +671,11 @@ The approach is not pre-decided, and the three candidates differ materially:
 | (b) Local LLM expansion via the existing provider path | Reuses infrastructure the app already has, but puts a provider round-trip **inside the retrieval path** against the 2 s Fast budget, and makes retrieval quality depend on provider choice and availability — a material change for a local-first product. `architecture.md` already counts the follow-up rewrite in its worst-case round-trip budget. |
 | (c) Pseudo-relevance feedback (Rocchio-style) | Purely local, deterministic, no new dependency — but expands toward the first pass's top results, which for this failure mode are the neighbours that own the surface vocabulary. Query drift is the expected outcome and it may worsen the case it targets. |
 
-Do not begin implementation until the user selects an approach and it is
-recorded in this sprint's decision log. The user deferred this decision on
-2026-08-29; Task 3.6 is not dispatchable and Sprint 3 cannot close until a
-selection and its acceptance evidence are recorded.
+Do not begin implementation unless reviewed Task 3.2 evidence first proves the
+need, then the user selects an approach and it is recorded in this sprint's
+decision log. The user deferred this decision on 2026-08-29. While reviewed
+production ranking remains 5/5, Task 3.6 is not dispatchable and is not a
+Sprint-close dependency.
 
 **Required implementation (approach-independent):**
 
@@ -627,14 +729,16 @@ budget; and the failure/fallback behavior actually exercised.
 - Hybrid quality beats approved FTS baseline without exact-term regression.
 - Semantic failure preserves lexical Chat.
 - Existing meeting/snapshot/today/live behavior remains unchanged.
-- The inherited critical Recall@1 gate is 5/5, including
-  `pt-ref-chaves-acesso`; Task 3.6 may not be waived from Sprint closure.
+- The active critical Recall@3 gate is 5/5: every expected critical meeting is
+  at rank <=3, including `pt-ref-chaves-acesso`; the strict target-over-decoy
+  ordering gate remains separate and stronger. Task 3.6 is required only if
+  reviewed production ranking cannot meet the active gates without expansion.
 - The R13 full-application calibration/refusal-rate evidence confirms the fixed
   gate or records a separately approved amendment; the gate remains fail-closed.
-- Exact-head root Windows CI records both green jobs, Cargo Check exit `0` after
+- Final-head root Windows CI records both green jobs, Cargo Check exit `0` after
   helper staging, MSI/NSIS installed diagnostic success, final gates, URL, and
-  package artifact IDs; it is re-dispatched after every later product, workflow,
-  gate, or package-source change.
+  package artifact IDs. It is re-dispatched only for later product, workflow,
+  gate, or package-source changes.
 - Full Rust, frontend, format, diff, evaluation, performance, and Windows
   native checks pass.
 - Code and architecture reviews approve the first production retrieval path.
@@ -677,6 +781,11 @@ budget; and the failure/fallback behavior actually exercised.
 | 2026-08-29 | Approve Sprint 3 start and the first batch, Task 3.1 only. | Task 3.1 is the sole dependency-ready L task; ranking, hydration, rollout, calibration, and expansion remain sequenced or separately gated. | Start multiple tasks, or defer the foundation. | User |
 | 2026-08-29 | Task 3.1 code review (R16) finding 14 (incompatible cross-channel `evidence_id` namespaces) is not remediated in `3.1.R1`; the doc's overclaiming contract text is corrected instead. | Semantic documents are 384-token sliding windows that generally span multiple transcript segments, while FTS chunks are per-segment - there is no clean bijection to key shared identity on without the overlap-range fusion Task 3.2 already owns. Building partial fusion inside Task 3.1 would duplicate that work under a narrower, riskier scope. | Attempt a heuristic cross-channel identity match inside Task 3.1. | Main agent |
 | 2026-08-29 | Approve Task `3.1.R3`: folder semantic scans materialize at most 20,000 current meeting IDs behind `ScopeFilter::Meetings(Arc<BTreeSet<_>>)`, while `verified_semantic_meetings` applies the authoritative recursive root-folder SQL gate for every folder candidate. Folders above the cap scan a bounded global over-fetch and may return fewer semantic candidates than an exact folder-local top-k, but may never return an out-of-scope candidate. `ResolvedScope` retains only the persisted scope tag. | Review R21 found unbounded request membership allocation after R20's FTS/title fixes. The bounded scan accelerator avoids a migration and per-variant/result cloning; the root SQL gate, not the accelerator, establishes scope correctness. | A versioned folder-scope projection/migration for exact folder-local top-k; disable folder semantic retrieval and use lexical fallback; leave Task 3.1 blocked. | User |
+| 2026-08-29 | Amend Task `3.2` acceptance and evaluation checks before dispatch: assert the quality gates against the production retrieval + ranking pipeline, enforce `semanticRecallAt3DeltaPoints`, source the 900 ms reranker p95 from `model_benchmark.rs` rather than the evaluation harness, and make the distractor and constants-tuning criteria falsifiable. | As written the criteria had no executable path: `validate_quality_gates` runs only against `oracle_results` and mutated copies, `retrieval_evaluation.rs` never imports `RetrievalService`, the declared semantic delta gate is printed but never checked, the latency hooks are explicitly observational over in-memory SQLite, and two criteria resolved to reviewer judgement. A worker could have reported 6/6 passing while measuring a hand-built oracle — the same overclaiming shape R20/R21 caught twice. | Dispatch 3.2 against the approved criteria unchanged and rely on R24 to catch unfalsifiable claims; or defer the harness wiring to Task 3.3. | User |
+| 2026-08-30 | Replace Task 3.2's obsolete Sprint 1 multi-candidate benchmark prerequisite with Task 3.5 production-bundle release evidence; retain the unchanged 900 ms p95 threshold. | The current signed bundle correctly omits retired/benchmark-only candidate artifacts, so the historical `MEETLY_RAG_MODELS_DIR` harness cannot measure the release package. Task 3.2 gates correctness through `RetrievalService::retrieve_ranked`; Task 3.5 owns a fail-closed release-build benchmark through the hash-verified production runtime with 50 complete warmed depth-50 samples. | Restore retired/f32 artifacts to the package; lower or waive the threshold; use synthetic evaluation timing. | User |
+| 2026-08-30 | Make Task 3.6 conditional on reviewed Task 3.2 evidence rather than a standing Sprint-close obligation. | Query expansion is high-risk scope with three materially different architectures. If production ranking already reaches 5/5, expansion is unnecessary. If an attributable terminological-gap miss remains, the user still selects the approach before dispatch. The 5/5 gate itself remains mandatory. | Build expansion regardless; lower the gate; let an implementer choose the approach. | User |
+| 2026-08-30 | Move first answer-stage non-assertion and production-bundle reranker latency evidence to Task 3.5; keep source parity split across ranking, hydration, and caller stages. | Ranking cannot test generated answers or final provider-budgeted sources, and historical benchmark layouts do not prove current runtime latency. The owners now match the product boundary each gate actually measures without relaxing safety or quality thresholds. | Treat ranking fixtures as answer/source proof; gate current release on retired artifact layouts. | User |
+| 2026-09-01 | Adopt the active critical Recall@3 phase and define feasibility-first selection precisely: full-gate eligibility includes critical/pinned cases, while objective and tie-order use only the tuning partition; retain strict target-over-decoy ordering and v3 release validation. | Reconciles the executable evaluation protocol with the user-approved policy without weakening any full gate or treating v1/v2 as release evidence. | Restore critical Recall@1 wording; select from infeasible candidates; accept v1/v2 as release validation. | User |
 
 ## Task Execution Log
 
@@ -1107,12 +1216,14 @@ streaming integration.
 - Sprint 2 close is approved.
 - User approval of this PRD is recorded. Separate batch approval is required
   before Sprint 3 TODO creation or Task 3.1 dispatch.
-- Task 3.1's individual batch approval is recorded and complete. Tasks 3.2-3.3
-  remain L and require individual batch approval.
-- Task 3.6 remains blocked by the deferred user architecture decision and its
-  inherited 5/5 Recall@1 gate blocks Sprint close.
-- Ranking constants or model limits that differ from Sprint 1 require a
-  documented evidence addendum, not silent tuning.
-- The final workflow/package source requires exact-head root Windows evidence
+- Tasks 3.1 and 3.2 were individually approved; Task 3.2 source is awaiting
+  the user's manual review. The user authorized Task 3.3 as the next Sprint 3
+  batch after the 2026-08-30 plan update. Task 3.4 must not integrate a ranking
+  contract with unresolved final review findings.
+- Task 3.6 remains blocked unless reviewed Task 3.2 evidence leaves an
+  attributable terminological-gap miss and the user selects its approach.
+- Ranking-constant deviations require a documented, reproducible held-out
+  evidence addendum. Model/runtime limits remain separately approved contracts.
+- The final workflow/package source requires final-head root Windows evidence
   before Sprint close.
 - Sprint-close approval is required before Sprint 4 begins.

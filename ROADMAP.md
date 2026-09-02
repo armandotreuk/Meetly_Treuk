@@ -222,7 +222,7 @@ This is the canonical gap list for features that fit Meetily's local-first direc
 Deliver as two independently reviewed increments. Do not begin 6B until 6A is reviewed and stable.
 
 - [ ] **Sprint 6A — Chat as a work surface**
-  - [ ] 6.1 `[L]` **Contextual Chat everywhere** — home/all-meetings, folder-scoped, selected-meeting, and live-recording entry points. Live Chat must include the current in-memory transcript rather than waiting for DB persistence.
+  - [x] 6.1 `[L]` **Contextual Chat everywhere** — home/all-meetings, folder-scoped, selected-meeting, and live-recording entry points. Live Chat must include the current in-memory transcript rather than waiting for DB persistence.
   - [ ] 6.2 `[L]` **Chat actions and AI note editing** — copy; append to notes; create a note section; rewrite selected note text with preview/confirmation. Direct mutation of an active generated summary is out of scope until summaries have an explicit revision/undo contract.
   - [ ] 6.3 `[M]` **Local Recipes** — SQLite-backed saved prompts, slash menu, single-meeting vs multi-meeting scope, optional model preference, and useful built-ins (actions, decisions, follow-up draft, PRD/brief). Personal/local only: no sharing or marketplace.
   - _Review: per-task review for 6.1/6.2, then a 6A integration review._
@@ -301,10 +301,10 @@ _Goal: make folder and all-meetings Chat answer detailed questions as completely
 
 | Sprint | Scope | Estimate | Status |
 |---|---|---|---|
-| 1 — Quality gates | Correctness prerequisites, evaluation corpus, model/reranker selection, vector backend, model supply chain | 6–9 days | in progress — Tasks 1.1 and 1.2R complete; 1.3 blocked by quality gates |
-| 2A — Index foundation | Persistence schema, ONNX model runtime, deterministic chunking | 8–12 days | blocked by Sprint 1 |
-| 2B — Index runtime | Background worker, query index, generation activation | 8–12 days | blocked by 2A |
-| 3 — Broad hybrid Chat | Fusion, meeting aggregation, reranking, authoritative hydration, folder/all rollout, retrieval kill switch | 8–12 days | blocked by Sprint 2 |
+| 1 — Quality gates | Correctness prerequisites, evaluation corpus, model/reranker selection, vector backend, model supply chain | 6–9 days | closed with user approval |
+| 2A — Index foundation | Persistence schema, ONNX model runtime, deterministic chunking | 8–12 days | closed with user approval |
+| 2B — Index runtime | Background worker, query index, generation activation | 8–12 days | closed with user approval |
+| 3 — Broad hybrid Chat | Fusion, meeting aggregation, reranking, authoritative hydration, folder/all rollout, retrieval kill switch | 8–12 days | in progress — 3.1 complete; 3.2 awaits final review; 3.3 authorized next |
 | 4 — Deep and saved scopes | Fast/Deep modes, bounded iterative retrieval, remaining persisted scopes | 6–9 days | blocked by Sprint 3 |
 | 5 — Search surfaces and release | Sidebar, Tauri/MCP contracts, index diagnostics, packaging, scale validation | 8–12 days | blocked by Sprint 4 |
 
@@ -341,7 +341,7 @@ Roughly **45–65 working days** total. These are planning figures, not commitme
 | Phase 3 | F5, F6, F9 | partial — Chat shipped and was hardened in Phase 4; diarization/calendar remain |
 | Phase 4 | F12 Notes & Chat | Sprints 1–5 ✅ approved/shippable; revised Sprint 6 pending |
 | Phase 5 | F13 Meeting context & relationship memory | scoped; pending Sprint 6 completion |
-| Phase 6 | F14 Local hybrid retrieval | Sprint 1 in progress; Tasks 1.1 and 1.2R complete; Task 1.3 blocked by quality gates |
+| Phase 6 | F14 Local hybrid retrieval | Sprint 3 in progress; Sprints 1-2 closed, 3.1 complete, 3.2 awaiting final review, 3.3 authorized next |
 
 ### Build verification results (Phase 0.1)
 

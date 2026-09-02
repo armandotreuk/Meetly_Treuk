@@ -7,12 +7,22 @@ use sqlx::SqlitePool;
 use tokio::net::TcpListener;
 use tracing::info;
 
-use crate::api::chat::{prepare_chat_inputs, SYSTEM_PROMPT};
+use crate::api::chat::{prepare_chat_inputs_with_lifecycle, SYSTEM_PROMPT};
 use crate::database::repositories::{folder::FolderRepository, fts::FtsRepository};
 use crate::export::build_context_markdown;
 use crate::summary::llm_client::generate_summary;
 
 pub const DEFAULT_PORT: u16 = 5167;
+
+pub(crate) fn serialize_chat_sources(
+    sources: &[crate::api::chat::ChatSource],
+) -> Result<Vec<serde_json::Value>, String> {
+    sources
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<_, _>>()
+        .map_err(|error| format!("Failed to serialize chat source: {error}"))
+}
 
 #[derive(Clone)]
 pub struct McpState {
@@ -21,7 +31,7 @@ pub struct McpState {
     pub client: reqwest::Client,
     /// Clone of the process-wide retrieval lifecycle. MCP shares the Tauri
     /// runtime instead of constructing duplicate workers or model sessions.
-    pub retrieval: Option<crate::retrieval::worker::RetrievalLifecycle>,
+    pub retrieval: crate::retrieval::worker::RetrievalLifecycle,
 }
 
 // ---------- JSON-RPC request/response ----------
@@ -179,38 +189,10 @@ async fn execute_chat_with_meetings(
     params: &serde_json::Value,
     app_data_dir: &Option<std::path::PathBuf>,
     client: &reqwest::Client,
+    retrieval: crate::retrieval::worker::RetrievalLifecycle,
 ) -> Result<serde_json::Value, String> {
-    let query = params["query"]
-        .as_str()
-        .ok_or("Missing 'query' parameter")?
-        .to_string();
-
-    let meeting_id = params["meetingId"].as_str().map(str::to_string);
-    let inputs = prepare_chat_inputs(
-        pool,
-        app_data_dir.clone(),
-        client,
-        &query,
-        None,
-        meeting_id,
-        None,
-    )
-    .await?;
-
-    let sources: Vec<serde_json::Value> = inputs
-        .sources
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "meetingId": r.meeting_id,
-                "meetingTitle": r.meeting_title,
-                "chunkType": r.chunk_type,
-                "snippet": r.snippet,
-                "folderName": r.folder_name,
-            })
-        })
-        .collect();
-
+    let (inputs, sources) =
+        prepare_mcp_chat_inputs(pool, params, app_data_dir, client, retrieval).await?;
     let answer = generate_summary(
         client,
         &inputs.provider,
@@ -228,11 +210,34 @@ async fn execute_chat_with_meetings(
     )
     .await
     .map_err(|e| format!("LLM call failed: {}", e))?;
+    Ok(serde_json::json!({ "answer": answer, "sources": sources }))
+}
 
-    Ok(serde_json::json!({
-        "answer": answer,
-        "sources": sources
-    }))
+async fn prepare_mcp_chat_inputs(
+    pool: &SqlitePool,
+    params: &serde_json::Value,
+    app_data_dir: &Option<std::path::PathBuf>,
+    client: &reqwest::Client,
+    retrieval: crate::retrieval::worker::RetrievalLifecycle,
+) -> Result<(crate::api::chat::ChatInputs, Vec<serde_json::Value>), String> {
+    let query = params["query"]
+        .as_str()
+        .ok_or("Missing 'query' parameter")?
+        .to_string();
+    let meeting_id = params["meetingId"].as_str().map(str::to_string);
+    let inputs = prepare_chat_inputs_with_lifecycle(
+        pool,
+        app_data_dir.clone(),
+        client,
+        &query,
+        None,
+        meeting_id,
+        retrieval,
+        None,
+    )
+    .await?;
+    let sources = serialize_chat_sources(&inputs.sources)?;
+    Ok((inputs, sources))
 }
 
 async fn execute_list_folders(pool: &SqlitePool) -> Result<serde_json::Value, String> {
@@ -309,6 +314,7 @@ async fn handle_jsonrpc(
                         tool_args,
                         &state.app_data_dir,
                         &state.client,
+                        state.retrieval.clone(),
                     )
                     .await
                 }
@@ -369,9 +375,13 @@ pub fn spawn_from_app<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
             .try_state::<crate::retrieval::worker::RetrievalLifecycle>()
             .map(|lifecycle| lifecycle.inner().clone());
         let app_data_dir = app.path().app_data_dir().ok();
-        tauri::async_runtime::spawn(async move {
-            start_server(pool, app_data_dir, None, retrieval).await;
-        });
+        if let Some(retrieval) = retrieval {
+            tauri::async_runtime::spawn(async move {
+                start_server(pool, app_data_dir, None, retrieval).await;
+            });
+        } else {
+            tracing::error!("RetrievalLifecycle not available, MCP server not started");
+        }
     } else {
         tracing::warn!("AppState not available, MCP server not started");
     }
@@ -381,7 +391,7 @@ pub async fn start_server(
     pool: SqlitePool,
     app_data_dir: Option<std::path::PathBuf>,
     port: Option<u16>,
-    retrieval: Option<crate::retrieval::worker::RetrievalLifecycle>,
+    retrieval: crate::retrieval::worker::RetrievalLifecycle,
 ) {
     let port = port.unwrap_or(DEFAULT_PORT);
     let state = McpState {
@@ -452,5 +462,56 @@ mod tests {
         let s = serde_json::to_string(&resp).unwrap();
         assert!(s.contains("error"));
         assert!(!s.contains("result"));
+    }
+
+    #[test]
+    fn shared_chat_source_serialization_preserves_source_kind() {
+        let source = crate::api::chat::ChatSource {
+            meeting_id: "meeting".into(),
+            meeting_title: "Title".into(),
+            chunk_type: "transcript".into(),
+            snippet: "text".into(),
+            folder_name: "Folder".into(),
+            source_kind: Some("transcript".into()),
+        };
+        let value = serialize_chat_sources(&[source]).unwrap();
+        assert_eq!(value[0]["sourceKind"], "transcript");
+        assert_eq!(value[0]["snippet"], "text");
+    }
+
+    #[tokio::test]
+    async fn chat_preparation_uses_managed_forced_lexical_boundary() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::query(r#"CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT NOT NULL, folder_id TEXT, created_at TEXT, saved_at TEXT);
+            CREATE TABLE meeting_folders (id TEXT PRIMARY KEY, name TEXT NOT NULL, parent_id TEXT, created_at TEXT NOT NULL);
+            CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, transcript TEXT NOT NULL, timestamp TEXT NOT NULL, speaker TEXT, audio_start_time REAL, audio_end_time REAL);
+            CREATE TABLE meeting_notes (meeting_id TEXT PRIMARY KEY, notes_markdown TEXT);
+            CREATE TABLE summary_processes (meeting_id TEXT NOT NULL, template_id TEXT NOT NULL, updated_at TEXT NOT NULL, result TEXT, PRIMARY KEY (meeting_id, template_id));
+            CREATE TABLE search_source_state (meeting_id TEXT PRIMARY KEY, source_revision INTEGER);
+            CREATE TABLE settings (id TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL, whisperModel TEXT NOT NULL, groqApiKey TEXT, openaiApiKey TEXT, anthropicApiKey TEXT, ollamaApiKey TEXT, openRouterApiKey TEXT, ollamaEndpoint TEXT, customOpenAIConfig TEXT, customVocabulary TEXT, chatProvider TEXT, chatModel TEXT, chatOllamaEndpoint TEXT, force_lexical_retrieval BOOLEAN NOT NULL DEFAULT FALSE);
+            CREATE VIRTUAL TABLE meeting_fts USING fts5(meeting_id UNINDEXED, chunk_type UNINDEXED, chunk_id UNINDEXED, text, speaker UNINDEXED, timestamp_label UNINDEXED, folder_id UNINDEXED, folder_name);
+            INSERT INTO meetings (id, title, created_at, saved_at) VALUES ('m1', 'Title', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z');
+            INSERT INTO settings (id, provider, model, whisperModel, chatProvider, chatModel, force_lexical_retrieval) VALUES ('1', 'ollama', 'local', 'whisper', 'ollama', 'local', TRUE);
+            INSERT INTO meeting_fts (meeting_id, chunk_type, chunk_id, text, folder_name) VALUES ('m1', 'note', 'n1', 'alpha', 'General');"#)
+            .execute(&pool).await.unwrap();
+
+        let (inputs, sources) = prepare_mcp_chat_inputs(
+            &pool,
+            &json!({"query": "alpha"}),
+            &None,
+            &reqwest::Client::new(),
+            crate::retrieval::worker::RetrievalLifecycle::new(
+                crate::retrieval::worker::LifecycleConfig::production(None),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            inputs.retrieval_diagnostic,
+            crate::api::chat::RetrievalPreparationDiagnostic::ForcedLexical
+        );
+        assert!(inputs.sources[0].source_kind.is_none());
+        assert!(sources[0].get("sourceKind").is_none());
+        assert_eq!(sources[0]["meetingId"], "m1");
     }
 }

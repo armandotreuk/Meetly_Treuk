@@ -421,6 +421,10 @@ cancellation, sources, failure fallback, and native product integration.
   deleted meeting and recheck source existence before final source/done events.
 - Verify history rewriting plus Deep does not lose the original user question.
 - Run full evaluation with Fast/Deep answer fact/source metrics.
+- Evaluate every answer-stage forbidden fact whose current-authoritative carrier
+  remains in final context. Generated answers across each persisted scope assert
+  zero such facts; report eligible and total denominators rather than treating
+  retrieval-only contamination checks as answer evidence.
 - Measure Deep request count/latency and enforce approved ceilings, reporting
   total provider round-trips rather than planner calls alone.
 - **Produce the evidence the user needs to revisit Deep-as-default at sprint
@@ -444,6 +448,8 @@ cancellation, sources, failure fallback, and native product integration.
 - A race test deletes the meeting after source emission but before delayed
   message save and proves no source is re-persisted or emitted as final.
 - Required facts and exact retained sources pass evaluation.
+- Generated answers across every persisted scope assert zero eligible
+  answer-stage forbidden facts, with denominators recorded.
 - Full Rust/frontend suites and native smoke pass.
 
 **Required verification:**

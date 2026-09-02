@@ -1749,8 +1749,7 @@ async fn update_publication_lag(pool: &SqlitePool, service: &QueryIndexService) 
 
 /// Terminal generations stop being served, but unacknowledged journal changes
 /// still block cleanup. Deletion additionally waits for one clean restart plus
-/// one successful Fast hybrid query - or, until that surface exists, its
-/// approved transitional stand-in ([`transitional_replacement_serving`]).
+/// one successful Fast hybrid query.
 async fn gc_retired_generations(
     pool: &SqlitePool,
     service: &QueryIndexService,
@@ -1771,9 +1770,10 @@ async fn gc_retired_generations(
             .parse::<DateTime<Utc>>()
             .map(|retired| retired < service.process_start())
             .unwrap_or(false);
-        let query_condition =
-            acknowledged_fast_hybrid_query_or_transitional(pool, service, &generation_id).await;
-        if survived_restart && query_condition && !cancel.is_cancelled() {
+        if survived_restart
+            && service.acknowledged_fast_hybrid_queries() > 0
+            && !cancel.is_cancelled()
+        {
             match RetrievalRepository::delete_generation(pool, &generation_id).await {
                 Ok(true) => log::info!("Garbage-collected retired generation {generation_id}"),
                 Ok(false) => {}
@@ -1781,40 +1781,6 @@ async fn gc_retired_generations(
             }
         }
     }
-}
-
-/// The successful-Fast-hybrid-query condition of "Generation Activation",
-/// together with its **transitional** stand-in.
-///
-/// ponytail: transitional Sprint 2 branch (architecture.md clause dated
-/// 2026-08-26; expires at Sprint 3 close when `acknowledge_fast_hybrid_query`
-/// gains its real caller): no semantic query surface exists yet, so the
-/// successful-query requirement counts as satisfied once the replacement
-/// generation is active with zero publication lag. Sprint 3 deletes the
-/// `_or_transitional` arm below; the restart term in
-/// [`gc_retired_generations`] and every other guard are permanent.
-async fn acknowledged_fast_hybrid_query_or_transitional(
-    pool: &SqlitePool,
-    service: &QueryIndexService,
-    retired: &str,
-) -> bool {
-    if service.acknowledged_fast_hybrid_queries() > 0 {
-        return true;
-    }
-    transitional_replacement_serving(pool, retired).await
-}
-
-async fn transitional_replacement_serving(pool: &SqlitePool, retired: &str) -> bool {
-    let Ok(Some(active)) = RetrievalRepository::active_generation_id(pool).await else {
-        return false;
-    };
-    if active == retired {
-        return false;
-    }
-    matches!(
-        RetrievalRepository::publication_lag(pool, &active).await,
-        Ok(Some((canonical, published))) if canonical <= published
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3479,7 +3445,11 @@ mod tests {
         );
 
         // The backlog drained during that pass, so the next tick satisfies
-        // the transitional clause - WITHOUT any Fast hybrid query having run.
+        // the post-restart acknowledgement requirement.
+        publish_tick(&pool, &restarted).await.unwrap();
+        assert!(retired_listed(&pool, "old").await);
+        assert!(search_all(&restarted, "content").await.is_ok());
+        restarted.acknowledge_fast_hybrid_query();
         publish_tick(&pool, &restarted).await.unwrap();
         assert!(
             !retired_listed(&pool, "old").await,
@@ -3602,6 +3572,8 @@ mod tests {
             Some(shadow.clone()),
             "the rebuilt replacement must be serving before cleanup may run"
         );
+        assert!(search_all(&restarted, "rebuilt").await.is_ok());
+        restarted.acknowledge_fast_hybrid_query();
         publish_tick(&pool, &restarted).await.unwrap();
         assert!(!retired_listed(&pool, "old").await);
     }
@@ -3642,13 +3614,16 @@ mod tests {
             "two retained generations must refuse a third before reclamation"
         );
 
-        // One clean restart with gen2 active and fully published reclaims
-        // gen1 under the transitional clause; the retention slot frees.
+        // One clean restart with gen2 active and fully published still needs
+        // one acknowledged Fast query before gen1 can be reclaimed.
         sqlx::query("UPDATE retrieval_generations SET retired_at = '2000-01-01T00:00:00Z' WHERE generation_id = 'gen1'")
             .execute(&pool)
             .await
             .unwrap();
         let restarted = fresh_service();
+        publish_tick(&pool, &restarted).await.unwrap();
+        assert!(search_all(&restarted, "rebuild one").await.is_ok());
+        restarted.acknowledge_fast_hybrid_query();
         publish_tick(&pool, &restarted).await.unwrap();
         assert!(!retired_listed(&pool, "gen1").await);
 
@@ -3704,12 +3679,15 @@ mod tests {
             "first corrupt-active recovery rebuild must activate"
         );
 
-        // Transitional reclaim frees the failed generation across a restart.
+        // Acknowledged Fast retrieval frees the failed generation across a restart.
         sqlx::query("UPDATE retrieval_generations SET retired_at = '2000-01-01T00:00:00Z' WHERE generation_id = 'gen1'")
             .execute(&pool)
             .await
             .unwrap();
         let second_restart = fresh_service();
+        publish_tick(&pool, &second_restart).await.unwrap();
+        assert!(search_all(&second_restart, "second").await.is_ok());
+        second_restart.acknowledge_fast_hybrid_query();
         publish_tick(&pool, &second_restart).await.unwrap();
         assert!(!retired_listed(&pool, "gen1").await);
 

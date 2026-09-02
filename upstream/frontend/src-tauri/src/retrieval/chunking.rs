@@ -621,11 +621,15 @@ mod tests {
         MeetingSource {
             meeting_id: "m-1".to_string(),
             title: title.to_string(),
+            folder_name: String::new(),
             source_revision: Some(7),
             latest_summary_template_id: None,
             latest_summary_markdown: None,
             notes_markdown: None,
             transcripts,
+            transcript_positions: Vec::new(),
+            transcript_segments_total: 0,
+            complete: true,
         }
     }
 

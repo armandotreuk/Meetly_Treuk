@@ -925,7 +925,7 @@ async fn repair_fts_item(
     if cancel.is_cancelled() {
         return FtsRepairOutcome::BackedOff;
     }
-    match FtsRepository::refresh_meeting(pool, &item.meeting_id).await {
+    match FtsRepository::refresh_meeting_unmarked(pool, &item.meeting_id).await {
         Ok(()) => {
             // Fence against lost updates: only mark the revision this repair
             // actually refreshed. A concurrent source/folder mutation that
@@ -1023,6 +1023,18 @@ async fn process_semantic_item(
             return;
         }
     };
+    if !source.complete {
+        record_item_failure(
+            pool,
+            index,
+            generation_id,
+            meeting_id,
+            item,
+            "authoritative source exceeds the supported limit",
+        )
+        .await;
+        return;
+    }
     let Some(revision) = source.source_revision else {
         return;
     };

@@ -409,13 +409,13 @@ git diff --check
 CI/package links, installed paths, hashes, and diagnostic output are mandatory
 execution-log evidence.
 
-**Worker report additions:** Provide per-platform artifact layout, installed
+**Worker report additions:** Provide Windows x64 artifact layout, installed
 smoke commands/results, signing impact, package sizes, and fallback proof.
 
 ### 5.5 - Release qualification and program close [L]
 
-**Outcome:** Hybrid RAG is demonstrably correct, recoverable, private,
-cross-platform, and within approved scale/resource limits.
+**Outcome:** Hybrid RAG is demonstrably correct, recoverable, private, on the
+supported Windows x64 package, and within approved scale/resource limits.
 
 **Likely touchpoints:**
 
@@ -438,7 +438,9 @@ cross-platform, and within approved scale/resource limits.
 - Meeting deletion before/after vector publication.
 - Deleted-meeting Chat source scrub while answer text remains.
 - Folder move without re-embedding and authoritative scope filtering.
-- Model/chunker upgrade shadow build and activation.
+- Model/chunker upgrade shadow build and activation, only when this release
+  introduces a second approved bundle/chunker identity. Otherwise record the
+  prior-model retention row as not applicable; never fabricate a prior bundle.
 - Corrupt vector row/cache/sidecar/model resource.
 - Initial and partial backfill lexical-only behavior.
 - Every Chat scope in Fast/Deep, live direct path, sidebar, Tauri, and MCP.
@@ -476,6 +478,10 @@ cross-platform, and within approved scale/resource limits.
 - Deleted/out-of-scope meetings never appear from stale vectors.
 - Every semantic failure has a verified lexical fallback.
 - No raw query/content/embedding appears in logs.
+- If this release introduces a second approved bundle/chunker identity, the
+  prior-bundle package, identity derivation, combined RAM envelope, fallback,
+  and upgrade tests pass. Otherwise the upgrade-retention qualification is
+  recorded not applicable by architecture authority.
 - Audio/transcription scheduler qualification shows no new drop/overflow
   warning and no more than 10% p95 throughput degradation versus paused index.
 - Full Rust/frontend suites, typecheck, formatting, diff, evaluation,
@@ -547,7 +553,7 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 | 2026-08-21 | Preserve existing lexical Tauri/MCP tools and add hybrid contracts. | Concrete external consumers may depend on BM25 score semantics. | Silently change existing tools to hybrid. | Main agent, pending sprint approval |
 | 2026-08-21 | Put index controls in existing Settings structure unless content proves a new tab necessary. | Minimize navigation/UI expansion. | Add a Search tab immediately. | Main agent, pending sprint approval |
 | 2026-08-21 | Require installed-package inference, not package file inspection. | ORT resource/dylib failures appear only after installation. | Treat successful `tauri build` as proof. | Main agent, pending sprint approval |
-| 2026-08-21 | Descope packaging to Windows x64 and drop Task 5.4 from L to M. | The macOS/Linux workflows in this fork are nested under `upstream/` and never execute; the original gate could not be satisfied. | Add root-level macOS/Linux workflows and keep the three-platform gate. | Main agent, **requires user approval — product scope change** |
+| 2026-08-21 | Descope packaging to Windows x64 and drop Task 5.4 from L to M. | The macOS/Linux workflows in this fork are nested under `upstream/` and never execute; the original gate could not be satisfied. | Add root-level macOS/Linux workflows and keep the three-platform gate. | User |
 | 2026-08-21 | Surface the force-lexical kill switch in Settings as a first-class control. | It is the user's own rollback from a bad retrieval result and is useless if undiscoverable. | Keep it as a hidden or developer-only setting. | Main agent, pending sprint approval |
 | 2026-08-21 | Add derived-disk qualification at every scale, including the rebuild peak. | Derived text plus vectors plus two retained generations plausibly reach ~2 GiB with no prior ceiling anywhere in the program. | Report disk as an unanchored metric. | Main agent, pending sprint approval |
 | 2026-08-21 | Guard sidebar reranking with a minimum query length, `Search` depth, and in-flight cancellation. | Sidebar runs the cross-encoder per debounced keystroke; an empty-query check alone does not bound that cost. | Rely on debounce and the empty-query guard. | Main agent, pending sprint approval |
@@ -593,7 +599,7 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 ### Architecture Review
 
 **Required because:** External Tauri/MCP contracts, sidebar behavior, destructive
-derived-state controls, signed cross-platform model packaging, 250k scale,
+derived-state controls, signed Windows x64 model packaging, 250k scale,
 failure recovery, privacy, and final release claims.
 
 **Reviewer:** Pending

@@ -533,6 +533,21 @@ impl FtsRepository {
     /// Delete all FTS rows for a meeting and re-insert from current data.
     /// Called after transcript save or summary completion.
     pub async fn refresh_meeting(pool: &SqlitePool, meeting_id: &str) -> Result<(), sqlx::Error> {
+        Self::refresh_meeting_inner(pool, meeting_id, true).await
+    }
+
+    pub(crate) async fn refresh_meeting_unmarked(
+        pool: &SqlitePool,
+        meeting_id: &str,
+    ) -> Result<(), sqlx::Error> {
+        Self::refresh_meeting_inner(pool, meeting_id, false).await
+    }
+
+    async fn refresh_meeting_inner(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        mark_indexed: bool,
+    ) -> Result<(), sqlx::Error> {
         let mut tx = pool.begin().await?;
         sqlx::query("DELETE FROM meeting_fts WHERE meeting_id = ?")
             .bind(meeting_id)
@@ -596,6 +611,22 @@ impl FtsRepository {
         .bind(meeting_id)
         .execute(&mut *tx)
         .await?;
+
+        if mark_indexed {
+            let revision_columns: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pragma_table_info('search_source_state') WHERE name IN ('fts_projection_revision', 'fts_indexed_revision')",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if revision_columns == 2 {
+                sqlx::query(
+                    "UPDATE search_source_state SET fts_indexed_revision = fts_projection_revision, fts_attempt_count = 0, fts_next_attempt_at = NULL, fts_last_error = NULL WHERE meeting_id = ?",
+                )
+                .bind(meeting_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
 
         tx.commit().await?;
         info!("Refreshed FTS index for meeting {}", meeting_id);
@@ -761,6 +792,25 @@ fn append_folder_filter(query: &mut QueryBuilder<'_, Sqlite>, folder_id: Option<
     }
 }
 
+async fn fts_revision_schema_available(pool: &SqlitePool) -> Result<bool, sqlx::Error> {
+    let columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('search_source_state') WHERE name IN ('fts_projection_revision', 'fts_indexed_revision')",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(columns == 2)
+}
+
+fn append_fts_freshness(query: &mut QueryBuilder<'_, Sqlite>, revision_schema: bool) {
+    if revision_schema {
+        query.push(
+            " LEFT JOIN search_source_state ss ON ss.meeting_id = m.id WHERE (ss.meeting_id IS NULL OR ss.fts_indexed_revision = ss.fts_projection_revision)",
+        );
+    } else {
+        query.push(" WHERE 1 = 1");
+    }
+}
+
 async fn fetch_search_rows(
     pool: &SqlitePool,
     query_text: &str,
@@ -776,11 +826,12 @@ async fn fetch_search_rows(
         return Ok(Vec::new());
     }
     let mut query = QueryBuilder::<Sqlite>::new("");
+    let revision_schema = fts_revision_schema_available(pool).await?;
     append_folder_scope_cte(&mut query, folder_id);
     append_result_select(&mut query, snippet_mode, false);
-    query.push(
-        " FROM meeting_fts fts JOIN meetings m ON fts.meeting_id = m.id WHERE meeting_fts MATCH ",
-    );
+    query.push(" FROM meeting_fts fts JOIN meetings m ON fts.meeting_id = m.id");
+    append_fts_freshness(&mut query, revision_schema);
+    query.push(" AND meeting_fts MATCH ");
     query.push_bind(safe_query);
     append_folder_filter(&mut query, folder_id);
     if let Some(meeting_id) = meeting_id {
@@ -806,10 +857,11 @@ async fn fetch_folder_rows(
     snippet_mode: SnippetMode,
 ) -> Result<Vec<FtsRow>, sqlx::Error> {
     let mut query = QueryBuilder::<Sqlite>::new("");
+    let revision_schema = fts_revision_schema_available(pool).await?;
     append_result_select(&mut query, snippet_mode, true);
-    query.push(
-        " FROM meeting_fts fts JOIN meetings m ON fts.meeting_id = m.id LEFT JOIN meeting_folders folder ON m.folder_id = folder.id WHERE meeting_fts MATCH ",
-    );
+    query.push(" FROM meeting_fts fts JOIN meetings m ON fts.meeting_id = m.id LEFT JOIN meeting_folders folder ON m.folder_id = folder.id");
+    append_fts_freshness(&mut query, revision_schema);
+    query.push(" AND meeting_fts MATCH ");
     query.push_bind(safe_query);
     query.push(" AND m.folder_id IN (");
     let mut ids = query.separated(", ");
@@ -831,11 +883,12 @@ async fn fetch_meeting_search_rows(
     snippet_mode: SnippetMode,
 ) -> Result<Vec<FtsRow>, sqlx::Error> {
     let mut query = QueryBuilder::<Sqlite>::new("");
+    let revision_schema = fts_revision_schema_available(pool).await?;
     append_folder_scope_cte(&mut query, folder_id);
     append_result_select(&mut query, snippet_mode, false);
-    query.push(
-        " FROM meeting_fts fts JOIN meetings m ON fts.meeting_id = m.id WHERE meeting_fts MATCH ",
-    );
+    query.push(" FROM meeting_fts fts JOIN meetings m ON fts.meeting_id = m.id");
+    append_fts_freshness(&mut query, revision_schema);
+    query.push(" AND meeting_fts MATCH ");
     query.push_bind(safe_query);
     append_folder_filter(&mut query, folder_id);
     query.push(" AND fts.meeting_id IN (");
@@ -855,9 +908,12 @@ async fn fetch_meeting_rows(
     per_meeting_limit: u32,
     total_limit: u32,
 ) -> Result<Vec<FtsRow>, sqlx::Error> {
+    let revision_schema = fts_revision_schema_available(pool).await?;
     let mut query = QueryBuilder::<Sqlite>::new(
-        "SELECT meeting_id, title, chunk_type, chunk_id, snippet, speaker, timestamp_label, folder_id, folder_name, rank FROM (SELECT fts.meeting_id, m.title, fts.chunk_type, fts.chunk_id, substr(fts.text, 1, 400) AS snippet, fts.speaker, fts.timestamp_label, fts.folder_id, COALESCE(fts.folder_name, '') AS folder_name, 0.0 AS rank, ROW_NUMBER() OVER (PARTITION BY fts.meeting_id ORDER BY CASE fts.chunk_type WHEN 'summary' THEN 0 WHEN 'note' THEN 1 ELSE 2 END, fts.chunk_id) AS rn FROM meeting_fts fts JOIN meetings m ON fts.meeting_id = m.id WHERE fts.meeting_id IN (",
+        "SELECT meeting_id, title, chunk_type, chunk_id, snippet, speaker, timestamp_label, folder_id, folder_name, rank FROM (SELECT fts.meeting_id, m.title, fts.chunk_type, fts.chunk_id, substr(fts.text, 1, 400) AS snippet, fts.speaker, fts.timestamp_label, fts.folder_id, COALESCE(fts.folder_name, '') AS folder_name, 0.0 AS rank, ROW_NUMBER() OVER (PARTITION BY fts.meeting_id ORDER BY CASE fts.chunk_type WHEN 'summary' THEN 0 WHEN 'note' THEN 1 ELSE 2 END, fts.chunk_id) AS rn FROM meeting_fts fts JOIN meetings m ON fts.meeting_id = m.id",
     );
+    append_fts_freshness(&mut query, revision_schema);
+    query.push(" AND fts.meeting_id IN (");
     let mut ids = query.separated(", ");
     for meeting_id in meeting_ids {
         ids.push_bind(meeting_id);
@@ -1530,6 +1586,43 @@ mod tests {
         assert_eq!(results[0].meeting_id, "m1");
         assert_eq!(results[0].chunk_type, "transcript");
         assert!(results[0].snippet.contains("<mark>"));
+    }
+
+    #[tokio::test]
+    async fn search_excludes_stale_fts_projection() {
+        let pool = setup_fts_db().await;
+        sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES ('m1', 'Meeting', 'now', 'now')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO meeting_fts (meeting_id, chunk_type, chunk_id, text) VALUES ('m1', 'transcript', 't1', 'stale needle')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE search_source_state (meeting_id TEXT PRIMARY KEY, source_revision INTEGER NOT NULL, fts_projection_revision INTEGER NOT NULL, fts_indexed_revision INTEGER NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO search_source_state VALUES ('m1', 7, 2, 2)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            FtsRepository::search(&pool, "needle", 10, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        sqlx::query("UPDATE search_source_state SET fts_projection_revision = 3")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(FtsRepository::search(&pool, "needle", 10, None)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

@@ -5,14 +5,18 @@
 //! durable FTS/semantic index worker in [`worker`]; Task 2.5 owns the
 //! immutable query index, journal publication, and activation in [`index`];
 //! Sprint 3 Task 3.1 adds the concrete persisted-scope retrieval service in
-//! [`service`]. Semantic components are strictly additive: every failure is a
-//! typed availability result so callers fall back to FTS5 while any component
-//! is unavailable.
+//! [`service`]; Task 3.2 adds rank fusion, cross-channel evidence
+//! deduplication, meeting aggregation, and local reranking in [`ranking`].
+//! Semantic components are strictly additive: every failure is a typed
+//! availability result so callers fall back to FTS5 while any component is
+//! unavailable.
 
 pub mod chunking;
 pub mod commands;
+pub mod hydration;
 pub mod index;
 pub mod model;
+pub mod ranking;
 pub mod service;
 pub mod worker;
 
@@ -20,11 +24,20 @@ pub mod worker;
 mod tests;
 
 pub use chunking::{chunk_meeting, ChunkerConfig, SemanticDocument, TokenizerPolicy};
+pub use hydration::{hydrate_context, HydratedContext, HydratedMeeting, HydratedSource};
 pub use index::{QueryIndexService, ScopeFilter, SearchFailure, VectorHit};
 pub use model::{get_or_load, RetrievalModelError, RetrievalModels};
+pub use ranking::{
+    aggregate_meetings, apply_rerank, concept_coverage, coverage_regions, dedupe_candidates, fuse,
+    select_rerank_head, title_overlap, AggregationTerms, FusedEvidence, RankedEvidence,
+    RankedMeeting, RankingConfig, RankingOutcome, RerankFallback, SegmentOrder, CHAT_RERANK_DEPTH,
+    CONCEPT_DELTA, RERANK_GAMMA, RRF_K, SUPPORT_ALPHA, SUPPORT_CAP, SUPPORT_WINDOW, TITLE_BETA,
+    W_LEXICAL, W_VECTOR,
+};
 pub use service::{
     CoreTermLanguage, EvidenceProvenance, LexicalMode, PersistedRetrievalScope, QueryVariantKind,
-    ResolvedScope, RetrievalChannel, RetrievalError, RetrievalLimits, RetrievalPurpose,
-    RetrievalRequest, RetrievalResult, RetrievalService, RetrievedEvidence, SemanticFallbackReason,
+    RankedRetrieval, ResolvedScope, RetrievalChannel, RetrievalError, RetrievalLimits,
+    RetrievalPurpose, RetrievalRequest, RetrievalResult, RetrievalService, RetrievedEvidence,
+    SemanticFallbackReason, SourceAlias,
 };
 pub use worker::RetrievalLifecycle;

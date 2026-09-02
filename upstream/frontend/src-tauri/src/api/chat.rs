@@ -9,6 +9,11 @@ use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+use crate::retrieval::worker::RetrievalLifecycle;
+use crate::retrieval::{
+    hydrate_context, PersistedRetrievalScope, RetrievalLimits, RetrievalPurpose, RetrievalRequest,
+    RetrievalService,
+};
 use crate::{
     database::repositories::{
         chat::{
@@ -44,6 +49,25 @@ pub async fn api_chat_create_conversation(
     )
     .await
     .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn api_chat_get_force_lexical_retrieval(
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    SettingsRepository::get_force_lexical_retrieval(state.db_manager.pool())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn api_chat_set_force_lexical_retrieval(
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    SettingsRepository::set_force_lexical_retrieval(state.db_manager.pool(), enabled)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -228,6 +252,15 @@ pub struct ChatInputs {
     pub custom_openai_top_p: Option<f32>,
     pub app_data_dir: Option<PathBuf>,
     pub user_prompt: String,
+    pub retrieval_diagnostic: RetrievalPreparationDiagnostic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetrievalPreparationDiagnostic {
+    Hybrid,
+    ForcedLexical,
+    SemanticFallback,
+    LifecycleUnavailable,
 }
 
 #[derive(Clone)]
@@ -263,7 +296,7 @@ impl ChatStreamState {
 
 /// Performs FTS search, source extraction, prompt building, and config/API-key
 /// resolution so the two chat commands share exactly one setup path.
-pub async fn prepare_chat_inputs(
+pub async fn prepare_chat_inputs_lexical_only(
     pool: &SqlitePool,
     app_data_dir: Option<PathBuf>,
     client: &reqwest::Client,
@@ -283,6 +316,34 @@ pub async fn prepare_chat_inputs(
         history,
         retrieval_scope,
         None,
+        None,
+        cancellation_token,
+    )
+    .await
+}
+
+pub async fn prepare_chat_inputs_with_lifecycle(
+    pool: &SqlitePool,
+    app_data_dir: Option<PathBuf>,
+    client: &reqwest::Client,
+    query: &str,
+    history: Option<&Vec<ChatMessage>>,
+    meeting_id: Option<String>,
+    lifecycle: RetrievalLifecycle,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<ChatInputs, String> {
+    let retrieval_scope = meeting_id
+        .map(ChatRetrievalScope::Meeting)
+        .unwrap_or(ChatRetrievalScope::All);
+    prepare_chat_inputs_for_scope(
+        pool,
+        app_data_dir,
+        client,
+        query,
+        history,
+        retrieval_scope,
+        None,
+        Some(lifecycle),
         cancellation_token,
     )
     .await
@@ -347,6 +408,7 @@ pub async fn prepare_scoped_chat_inputs(
             consent: live_transcript_consent,
         },
         cancellation_token,
+        None,
     )
     .await
 }
@@ -360,6 +422,7 @@ async fn prepare_scoped_chat_inputs_with_authorization(
     conversation_id: &str,
     live_authorization: LiveTranscriptAuthorization,
     cancellation_token: Option<&CancellationToken>,
+    lifecycle: Option<RetrievalLifecycle>,
 ) -> Result<ChatInputs, String> {
     let conversation = ChatRepository::get_conversation(pool, conversation_id)
         .await
@@ -374,6 +437,7 @@ async fn prepare_scoped_chat_inputs_with_authorization(
         history,
         retrieval_scope_from_conversation(&conversation)?,
         Some(live_authorization),
+        lifecycle,
         cancellation_token,
     )
     .await
@@ -387,6 +451,7 @@ async fn prepare_chat_inputs_for_scope(
     history: Option<&Vec<ChatMessage>>,
     retrieval_scope: ChatRetrievalScope,
     live_authorization: Option<LiveTranscriptAuthorization>,
+    lifecycle: Option<RetrievalLifecycle>,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<ChatInputs, String> {
     let model_config = SettingsRepository::get_chat_model_config(pool)
@@ -524,6 +589,16 @@ async fn prepare_chat_inputs_for_scope(
     }
     let persisted_context_budget =
         context_budget_for_prompt(query, &search_query, &temporal_context, max_context_chars);
+    let force_lexical = SettingsRepository::get_force_lexical_retrieval(pool)
+        .await
+        .map_err(|e| format!("Failed to get retrieval kill switch: {}", e))?;
+    let mut retrieval_diagnostic = if force_lexical {
+        RetrievalPreparationDiagnostic::ForcedLexical
+    } else if lifecycle.is_none() {
+        RetrievalPreparationDiagnostic::LifecycleUnavailable
+    } else {
+        RetrievalPreparationDiagnostic::Hybrid
+    };
     let (context, sources) = match retrieval_scope {
         ChatRetrievalScope::LiveRecording(scope_key) => {
             ensure_live_scope_matches_active_recording(&scope_key)?;
@@ -563,7 +638,59 @@ async fn prepare_chat_inputs_for_scope(
                     .map(chat_source_from_result)
                     .collect();
                 (built.markdown, sources)
+            } else if !force_lexical
+                && lifecycle.is_some()
+                && matches!(
+                    scope,
+                    ChatRetrievalScope::All | ChatRetrievalScope::Folder(_)
+                )
+            {
+                let persisted_scope = match &scope {
+                    ChatRetrievalScope::All => PersistedRetrievalScope::All,
+                    ChatRetrievalScope::Folder(folder_id) => {
+                        PersistedRetrievalScope::Folder(folder_id.clone())
+                    }
+                    _ => unreachable!(),
+                };
+                let persisted_scope = today_meeting_ids
+                    .as_ref()
+                    .map(|ids| PersistedRetrievalScope::AllowedMeetingIds(ids.clone()))
+                    .unwrap_or(persisted_scope);
+                let lifecycle =
+                    lifecycle.ok_or_else(|| "Retrieval lifecycle unavailable".to_string())?;
+                let ranked = RetrievalService::new(lifecycle)
+                    .retrieve_ranked(
+                        pool,
+                        RetrievalRequest {
+                            original_query: query.to_string(),
+                            rewritten_query: Some(search_query.clone()),
+                            scope: persisted_scope,
+                            purpose: RetrievalPurpose::Chat,
+                            limits: RetrievalLimits {
+                                lexical_per_variant: chunk_limit as usize,
+                                vector_per_variant: chunk_limit as usize,
+                            },
+                            core_language: crate::retrieval::service::CoreTermLanguage::Unknown,
+                            cancellation: cancellation_token.cloned(),
+                        },
+                    )
+                    .await
+                    .map_err(|e| format!("Retrieval failed: {}", e))?;
+                if ranked.semantic_fallback.is_some() {
+                    retrieval_diagnostic = RetrievalPreparationDiagnostic::SemanticFallback;
+                }
+                let hydrated =
+                    hydrate_context(pool, &ranked, persisted_context_budget, cancellation_token)
+                        .await
+                        .map_err(|e| format!("Retrieval hydration failed: {}", e))?;
+                let sources = hydrated
+                    .sources
+                    .iter()
+                    .map(chat_source_from_hydrated)
+                    .collect();
+                (hydrated.markdown, sources)
             } else {
+                log::info!("Chat retrieval preparation mode: {retrieval_diagnostic:?}");
                 let results = resolve_scope_results(
                     pool,
                     &search_query,
@@ -610,6 +737,7 @@ async fn prepare_chat_inputs_for_scope(
         custom_openai_top_p,
         app_data_dir,
         user_prompt,
+        retrieval_diagnostic,
     })
 }
 
@@ -1042,6 +1170,17 @@ fn chat_source_from_result(
     }
 }
 
+fn chat_source_from_hydrated(source: &crate::retrieval::HydratedSource) -> ChatSource {
+    ChatSource {
+        meeting_id: source.meeting_id.clone(),
+        meeting_title: source.meeting_title.clone(),
+        chunk_type: source.source_kind.clone(),
+        snippet: source.snippet.clone(),
+        folder_name: source.folder_name.clone(),
+        source_kind: Some(source.source_kind.clone()),
+    }
+}
+
 async fn resolve_meeting_context(
     pool: &SqlitePool,
     meeting_id: &str,
@@ -1049,90 +1188,90 @@ async fn resolve_meeting_context(
     original_query: &str,
     chunk_limit: u32,
 ) -> Result<MeetingChatContext, String> {
-    let metadata: (String, String, Option<String>, Option<String>) = sqlx::query_as(
-        r#"
-        SELECT m.title, COALESCE(f.name, ''),
-               (SELECT notes_markdown FROM meeting_notes WHERE meeting_id = m.id AND trim(notes_markdown) != ''),
-               (SELECT json_extract(result, '$.markdown') FROM summary_processes
-                WHERE meeting_id = m.id AND result IS NOT NULL
-                  AND json_extract(result, '$.markdown') IS NOT NULL
-                  AND trim(json_extract(result, '$.markdown')) != ''
-                ORDER BY updated_at DESC, template_id DESC LIMIT 1)
-        FROM meetings m LEFT JOIN meeting_folders f ON m.folder_id = f.id WHERE m.id = ?
-        "#,
-    )
-    .bind(meeting_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|error| format!("Failed to load meeting context: {}", error))?
-    .ok_or_else(|| "Meeting not found".to_string())?;
-
+    // Shared authoritative saved-meeting loader (same latest-summary policy
+    // and transcript chronology as the retrieval worker and Task 3.3
+    // hydration); the FTS hit selection below stays chat-specific.
     let hits =
         search_meeting_transcripts(pool, meeting_id, search_query, original_query, chunk_limit)
             .await?;
-    let rows: Vec<(String, String, String, Option<String>, Option<f64>)> = sqlx::query_as(
-        r#"
-        SELECT id, transcript, timestamp, speaker, audio_start_time FROM transcripts
-        WHERE meeting_id = ? AND transcript IS NOT NULL AND transcript != ''
-        ORDER BY CASE WHEN audio_start_time IS NULL THEN 1 ELSE 0 END,
-                 audio_start_time ASC, timestamp ASC, id ASC
-        "#,
-    )
-    .bind(meeting_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|error| format!("Failed to load meeting transcript: {}", error))?;
-    let total_transcript_segments = rows.len();
     let hit_ids = hits
         .iter()
-        .map(|hit| hit.chunk_id.as_str())
-        .collect::<HashSet<_>>();
-    let mapped_hit_ids = rows
+        .map(|hit| hit.chunk_id.clone())
+        .collect::<Vec<_>>();
+    let mut source = crate::database::repositories::retrieval::RetrievalRepository::load_meeting_source_relevant(
+        pool, meeting_id, &hit_ids,
+    )
+    .await
+    .map_err(|error| format!("Failed to load meeting context: {}", error))?
+    .ok_or_else(|| "Meeting not found".to_string())?;
+    let total_transcript_segments = source.transcript_segments_total;
+    let hit_ids = hit_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+    let has_mapped_hit = source
+        .transcripts
         .iter()
-        .filter(|row| hit_ids.contains(row.0.as_str()))
-        .map(|row| row.0.as_str())
+        .filter(|row| hit_ids.contains(row.id.as_str()))
+        .next()
+        .is_some();
+    if !has_mapped_hit {
+        source = crate::database::repositories::retrieval::RetrievalRepository::load_meeting_source_relevant(
+            pool, meeting_id, &[],
+        )
+        .await
+        .map_err(|error| format!("Failed to load meeting context: {}", error))?
+        .ok_or_else(|| "Meeting not found".to_string())?;
+    }
+    let mapped_hit_ids = source
+        .transcripts
+        .iter()
+        .filter(|row| hit_ids.contains(row.id.as_str()))
+        .map(|row| row.id.as_str())
         .collect::<HashSet<_>>();
     let included = if mapped_hit_ids.is_empty() {
-        (0..rows.len().min(chunk_limit as usize)).collect::<HashSet<_>>()
-    } else if rows.is_empty() {
+        (0..total_transcript_segments.min(chunk_limit as usize)).collect::<HashSet<_>>()
+    } else if source.transcripts.is_empty() {
         HashSet::new()
     } else {
-        rows.iter()
-            .enumerate()
-            .filter(|(_, row)| mapped_hit_ids.contains(row.0.as_str()))
-            .flat_map(|(index, _)| {
+        source
+            .transcripts
+            .iter()
+            .zip(source.transcript_positions.iter().copied())
+            .filter(|(row, _)| mapped_hit_ids.contains(row.id.as_str()))
+            .flat_map(|(_, position)| {
                 [
-                    index.saturating_sub(1),
-                    index,
-                    (index + 1).min(rows.len() - 1),
+                    position.saturating_sub(1),
+                    position,
+                    (position + 1).min(total_transcript_segments - 1),
                 ]
             })
             .collect::<HashSet<_>>()
     };
-    let transcripts = rows
-        .into_iter()
-        .enumerate()
-        .filter(|(index, _)| included.contains(index))
-        .map(|(_, (chunk_id, snippet, timestamp_label, speaker, _))| {
-            crate::database::repositories::fts::FtsSearchResult {
+    let transcripts = source
+        .transcripts
+        .iter()
+        .zip(source.transcript_positions.iter().copied())
+        .filter(|(_, position)| included.contains(position))
+        .map(
+            |(segment, _)| crate::database::repositories::fts::FtsSearchResult {
                 meeting_id: meeting_id.to_string(),
-                meeting_title: metadata.0.clone(),
+                meeting_title: source.title.clone(),
                 chunk_type: "transcript".to_string(),
-                chunk_id,
-                snippet,
-                speaker,
-                timestamp_label: Some(timestamp_label),
+                chunk_id: segment.id.clone(),
+                snippet: segment.text.clone(),
+                speaker: segment.speaker.clone(),
+                timestamp_label: Some(segment.timestamp.clone()),
                 folder_id: None,
-                folder_name: metadata.1.clone(),
+                folder_name: source.folder_name.clone(),
                 rank: 0.0,
-            }
-        })
+            },
+        )
         .collect();
     Ok(MeetingChatContext {
-        meeting_id: meeting_id.to_string(),
-        meeting_title: metadata.0,
-        summary: metadata.3,
-        notes: metadata.2,
+        meeting_id: source.meeting_id,
+        meeting_title: source.title,
+        summary: source.latest_summary_markdown,
+        notes: source
+            .notes_markdown
+            .filter(|notes| !notes.trim().is_empty()),
         transcripts,
         total_transcript_segments,
     })
@@ -1390,6 +1529,7 @@ fn assemble_prompt(
 pub async fn api_chat_with_meetings<R: Runtime>(
     app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
+    retrieval: tauri::State<'_, RetrievalLifecycle>,
     query: String,
     history: Option<Vec<ChatMessage>>,
     auth_token: Option<String>,
@@ -1405,13 +1545,15 @@ pub async fn api_chat_with_meetings<R: Runtime>(
     let pool = state.db_manager.pool();
     let app_data_dir = app.path().app_data_dir().ok();
     let client = reqwest::Client::new();
-    let inputs = prepare_chat_inputs(
+    let lifecycle = retrieval.inner().clone();
+    let inputs = prepare_chat_inputs_with_lifecycle(
         pool,
         app_data_dir,
         &client,
         &query,
         history.as_ref(),
         meeting_id,
+        lifecycle,
         None,
     )
     .await?;
@@ -1452,6 +1594,7 @@ pub async fn api_chat_with_meetings<R: Runtime>(
 pub async fn api_chat_with_scoped_conversation<R: Runtime>(
     app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
+    retrieval: tauri::State<'_, RetrievalLifecycle>,
     conversation_id: String,
     query: String,
     history: Option<Vec<ChatMessage>>,
@@ -1467,15 +1610,19 @@ pub async fn api_chat_with_scoped_conversation<R: Runtime>(
     );
 
     let client = reqwest::Client::new();
-    let inputs = prepare_scoped_chat_inputs(
+    let inputs = prepare_scoped_chat_inputs_with_authorization(
         state.db_manager.pool(),
         app.path().app_data_dir().ok(),
         &client,
         &query,
         history.as_ref(),
         &conversation_id,
-        live_transcript_consent,
+        LiveTranscriptAuthorization {
+            active_scope_key: crate::audio::recording_commands::active_live_transcript_scope_key(),
+            consent: live_transcript_consent,
+        },
         None,
+        Some(retrieval.inner().clone()),
     )
     .await?;
     let answer = generate_summary(
@@ -1506,6 +1653,7 @@ pub async fn api_chat_with_scoped_conversation<R: Runtime>(
 pub async fn api_chat_with_meetings_stream<R: Runtime>(
     app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
+    retrieval: tauri::State<'_, RetrievalLifecycle>,
     stream_state: tauri::State<'_, ChatStreamState>,
     query: String,
     history: Option<Vec<ChatMessage>>,
@@ -1516,13 +1664,14 @@ pub async fn api_chat_with_meetings_stream<R: Runtime>(
     info!("api_chat_with_meetings_stream called: query_len={}, history_len={:?}, auth_token={}, stream_id={}", query.len(), history.as_ref().map(|items| items.len()), auth_token.is_some(), stream_id);
     let token = claim_chat_stream(&stream_state, &stream_id).await;
     let client = reqwest::Client::new();
-    let inputs = match prepare_chat_inputs(
+    let inputs = match prepare_chat_inputs_with_lifecycle(
         state.db_manager.pool(),
         app.path().app_data_dir().ok(),
         &client,
         &query,
         history.as_ref(),
         meeting_id.clone(),
+        retrieval.inner().clone(),
         Some(&token),
     )
     .await
@@ -1542,6 +1691,7 @@ pub async fn api_chat_with_meetings_stream<R: Runtime>(
 pub async fn api_chat_with_scoped_conversation_stream<R: Runtime>(
     app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
+    retrieval: tauri::State<'_, RetrievalLifecycle>,
     stream_state: tauri::State<'_, ChatStreamState>,
     conversation_id: String,
     query: String,
@@ -1553,15 +1703,19 @@ pub async fn api_chat_with_scoped_conversation_stream<R: Runtime>(
     info!("api_chat_with_scoped_conversation_stream called: conversation_id={}, query_len={}, history_len={:?}, auth_token={}, stream_id={}", conversation_id, query.len(), history.as_ref().map(|items| items.len()), auth_token.is_some(), stream_id);
     let token = claim_chat_stream(&stream_state, &stream_id).await;
     let client = reqwest::Client::new();
-    let inputs = match prepare_scoped_chat_inputs(
+    let inputs = match prepare_scoped_chat_inputs_with_authorization(
         state.db_manager.pool(),
         app.path().app_data_dir().ok(),
         &client,
         &query,
         history.as_ref(),
         &conversation_id,
-        live_transcript_consent,
+        LiveTranscriptAuthorization {
+            active_scope_key: crate::audio::recording_commands::active_live_transcript_scope_key(),
+            consent: live_transcript_consent,
+        },
         Some(&token),
+        Some(retrieval.inner().clone()),
     )
     .await
     {
@@ -1599,7 +1753,6 @@ async fn stream_chat<R: Runtime>(
         &token,
         "chat-stream-start",
         serde_json::json!({ "streamId": stream_id, "sources": sources, "meetingId": meeting_id }),
-        false,
         false,
     ) {
         return Ok(());
@@ -1647,6 +1800,12 @@ async fn stream_chat<R: Runtime>(
 
     match stream_result {
         Ok(answer) => {
+            let Some(payload) =
+                completed_chat_stream_payload(&token, &stream_id, &answer, &sources)
+            else {
+                clear_chat_stream_if_owner(&stream_state, &stream_id).await;
+                return Ok(());
+            };
             info!(
                 "Chat stream completed: {} sources, {} answer chars",
                 sources.len(),
@@ -1658,8 +1817,7 @@ async fn stream_chat<R: Runtime>(
                 &stream_id,
                 &token,
                 "chat-stream-done",
-                serde_json::json!({ "streamId": stream_id, "answer": answer, "sources": sources }),
-                true,
+                payload,
                 true,
             );
             Ok(())
@@ -1667,16 +1825,7 @@ async fn stream_chat<R: Runtime>(
         Err(e) if e.to_lowercase().contains("cancelled") => {
             let answer = partial_text.lock().unwrap().clone();
             tracing::info!("Chat stream cancelled after {} chars", answer.len());
-            emit_chat_stream_event_if_owner(
-                &stream_state,
-                &app,
-                &stream_id,
-                &token,
-                "chat-stream-done",
-                serde_json::json!({ "streamId": stream_id, "answer": answer, "sources": sources }),
-                true,
-                true,
-            );
+            clear_chat_stream_if_owner(&stream_state, &stream_id).await;
             Ok(())
         }
         Err(e) => {
@@ -1703,11 +1852,20 @@ async fn stream_chat<R: Runtime>(
                 event,
                 payload,
                 true,
-                true,
             );
             Ok(())
         }
     }
+}
+
+fn completed_chat_stream_payload(
+    token: &CancellationToken,
+    stream_id: &str,
+    answer: &str,
+    sources: &[ChatSource],
+) -> Option<serde_json::Value> {
+    (!token.is_cancelled())
+        .then(|| serde_json::json!({ "streamId": stream_id, "answer": answer, "sources": sources }))
 }
 
 async fn claim_chat_stream(state: &ChatStreamState, stream_id: &str) -> CancellationToken {
@@ -1762,11 +1920,34 @@ fn emit_chat_stream_event_if_owner<R: Runtime>(
     token: &CancellationToken,
     event: &str,
     payload: serde_json::Value,
-    allow_cancelled: bool,
     clear: bool,
 ) -> bool {
+    publish_chat_stream_event_if_owner(
+        state,
+        stream_id,
+        token,
+        event,
+        payload,
+        clear,
+        |event, payload| {
+            if let Err(error) = app.emit(event, payload) {
+                tracing::error!("Failed to emit {}: {}", event, error);
+            }
+        },
+    )
+}
+
+fn publish_chat_stream_event_if_owner<F: FnOnce(&str, serde_json::Value)>(
+    state: &ChatStreamState,
+    stream_id: &str,
+    token: &CancellationToken,
+    event: &str,
+    payload: serde_json::Value,
+    clear: bool,
+    emit: F,
+) -> bool {
     let mut active = state.0.lock().unwrap();
-    if (!allow_cancelled && token.is_cancelled())
+    if token.is_cancelled()
         || !active
             .as_ref()
             .is_some_and(|(active_id, _)| active_id == stream_id)
@@ -1776,9 +1957,7 @@ fn emit_chat_stream_event_if_owner<R: Runtime>(
     if clear {
         *active = None;
     }
-    if let Err(error) = app.emit(event, payload) {
-        tracing::error!("Failed to emit {}: {}", event, error);
-    }
+    emit(event, payload);
     true
 }
 
@@ -1855,9 +2034,10 @@ mod tests {
             r#"
             CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT NOT NULL, folder_id TEXT, created_at TEXT, saved_at TEXT);
             CREATE TABLE meeting_folders (id TEXT PRIMARY KEY, name TEXT NOT NULL, parent_id TEXT, created_at TEXT NOT NULL);
-            CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, transcript TEXT NOT NULL, timestamp TEXT NOT NULL, speaker TEXT, audio_start_time REAL);
+            CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, transcript TEXT NOT NULL, timestamp TEXT NOT NULL, speaker TEXT, audio_start_time REAL, audio_end_time REAL);
             CREATE TABLE meeting_notes (meeting_id TEXT PRIMARY KEY, notes_markdown TEXT);
             CREATE TABLE summary_processes (meeting_id TEXT NOT NULL, template_id TEXT NOT NULL, updated_at TEXT NOT NULL, result TEXT, PRIMARY KEY (meeting_id, template_id));
+            CREATE TABLE search_source_state (meeting_id TEXT PRIMARY KEY, source_revision INTEGER);
             CREATE VIRTUAL TABLE meeting_fts USING fts5(
                 meeting_id UNINDEXED, chunk_type UNINDEXED, chunk_id UNINDEXED,
                 text, speaker UNINDEXED, timestamp_label UNINDEXED,
@@ -2083,7 +2263,7 @@ mod tests {
     #[tokio::test]
     async fn ordinary_meeting_preparation_keeps_authoritative_context_and_source_parity() {
         let pool = scope_pool().await;
-        sqlx::query("CREATE TABLE settings (id TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL, whisperModel TEXT NOT NULL, groqApiKey TEXT, openaiApiKey TEXT, anthropicApiKey TEXT, ollamaApiKey TEXT, openRouterApiKey TEXT, ollamaEndpoint TEXT, customOpenAIConfig TEXT, customVocabulary TEXT, chatProvider TEXT, chatModel TEXT, chatOllamaEndpoint TEXT)")
+        sqlx::query("CREATE TABLE settings (id TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL, whisperModel TEXT NOT NULL, groqApiKey TEXT, openaiApiKey TEXT, anthropicApiKey TEXT, ollamaApiKey TEXT, openRouterApiKey TEXT, ollamaEndpoint TEXT, customOpenAIConfig TEXT, customVocabulary TEXT, chatProvider TEXT, chatModel TEXT, chatOllamaEndpoint TEXT, force_lexical_retrieval BOOLEAN NOT NULL DEFAULT FALSE)")
             .execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO settings (id, provider, model, whisperModel, chatProvider, chatModel) VALUES ('1', 'ollama', 'local', 'whisper', 'ollama', 'local')")
             .execute(&pool).await.unwrap();
@@ -2123,6 +2303,7 @@ mod tests {
             "needle",
             None,
             ChatRetrievalScope::Meeting("m2".to_string()),
+            None,
             None,
             None,
         )
@@ -2687,10 +2868,14 @@ mod tests {
     #[tokio::test]
     async fn broad_preparation_emits_only_sources_delivered_to_model() {
         let pool = scope_pool().await;
-        sqlx::query("CREATE TABLE settings (id TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL, whisperModel TEXT NOT NULL, groqApiKey TEXT, openaiApiKey TEXT, anthropicApiKey TEXT, ollamaApiKey TEXT, openRouterApiKey TEXT, ollamaEndpoint TEXT, customOpenAIConfig TEXT, customVocabulary TEXT, chatProvider TEXT, chatModel TEXT, chatOllamaEndpoint TEXT)")
+        sqlx::query("CREATE TABLE settings (id TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL, whisperModel TEXT NOT NULL, groqApiKey TEXT, openaiApiKey TEXT, anthropicApiKey TEXT, ollamaApiKey TEXT, openRouterApiKey TEXT, ollamaEndpoint TEXT, customOpenAIConfig TEXT, customVocabulary TEXT, chatProvider TEXT, chatModel TEXT, chatOllamaEndpoint TEXT, force_lexical_retrieval BOOLEAN NOT NULL DEFAULT FALSE)")
             .execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO settings (id, provider, model, whisperModel, chatProvider, chatModel) VALUES ('1', 'ollama', 'local', 'whisper', 'ollama', 'local')")
             .execute(&pool).await.unwrap();
+        sqlx::query("UPDATE settings SET force_lexical_retrieval = TRUE WHERE id = '1'")
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query("UPDATE meetings SET saved_at = '2026-08-22T00:00:00Z'")
             .execute(&pool)
             .await
@@ -2710,10 +2895,15 @@ mod tests {
             ChatRetrievalScope::All,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
 
+        assert_eq!(
+            inputs.retrieval_diagnostic,
+            RetrievalPreparationDiagnostic::ForcedLexical
+        );
         assert!(!inputs.sources.is_empty());
         assert!(inputs
             .sources
@@ -2724,6 +2914,10 @@ mod tests {
             .iter()
             .all(|source| inputs.user_prompt.contains(&source.snippet)));
         assert!(inputs.user_prompt.chars().count() <= 64_000);
+        let serialized = crate::mcp::server::serialize_chat_sources(&inputs.sources).unwrap();
+        assert!(serialized
+            .iter()
+            .all(|source| source.get("sourceKind").is_none()));
     }
 
     #[test]
@@ -3036,6 +3230,7 @@ mod tests {
             "conversation",
             live_authorization("live-1", false),
             None,
+            None,
         )
         .await
         .err()
@@ -3069,6 +3264,35 @@ mod tests {
         *state.0.lock().unwrap() = Some(("s1".to_string(), token.clone()));
         cancel_chat_stream(&state, None).await;
         assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancelled_stream_publication_boundary_emits_no_start_source_done_or_answer() {
+        let state = ChatStreamState::new();
+        let token = claim_chat_stream(&state, "s1").await;
+        let mut events = Vec::new();
+        token.cancel();
+        assert!(!publish_chat_stream_event_if_owner(
+            &state,
+            "s1",
+            &token,
+            "chat-stream-start",
+            serde_json::json!({"sources": [{"sourceKind": "transcript"}]}),
+            false,
+            |event, payload| events.push((event.to_string(), payload)),
+        ));
+        let done_token = claim_chat_stream(&state, "s2").await;
+        done_token.cancel();
+        assert!(!publish_chat_stream_event_if_owner(
+            &state,
+            "s2",
+            &done_token,
+            "chat-stream-done",
+            serde_json::json!({"answer": "partial", "sources": [{"sourceKind": "transcript"}]}),
+            true,
+            |event, payload| events.push((event.to_string(), payload)),
+        ));
+        assert!(events.is_empty());
     }
 
     #[tokio::test]

@@ -71,10 +71,9 @@ The main agent owns product context, approvals, dependency ordering,
 verification, and documentation. It does not implement a task delegated to a
 worker. Workers must not absorb neighboring tasks or edit another sprint's PRD.
 
-For this implementation, use a new `worker-l` session for every implementation
-task regardless of its S/M/L complexity label. Every worker must use
-`opencode-go/ox-alpha-free`; do not dispatch `worker-s` or `worker-m`, and do
-not substitute another model.
+Use a new implementation session for each task. Match the worker to the
+task's S/M/L complexity and let explicit user direction override that default.
+Do not merge tasks into one growing session merely to retain context.
 Sprint reviews use the standard configured `reviewer` and `arch-reviewer`.
 Complexity labels remain scope classifications, not agent-tier selections.
 
@@ -93,56 +92,19 @@ Every worker must return:
 An implementation is not complete because code exists. It is complete only
 after its acceptance checks pass and its sprint execution entry is written.
 
-## Caching Strategy
+## Dispatch Context
 
-Every worker dispatch resends `architecture.md` (~1,800 lines) plus the sprint
-PRD in full, per the Execution Protocol's step 5 — this is intentional and
-MUST NOT be trimmed per task, since the point of full-document dispatch is to
-stop workers reinterpreting product decisions. Full resend is expensive if
-done carelessly. It is nearly free if the prefix is structured for prompt
-caching, which is keyed to **content**, not to session — a cache write from
-one subagent's dispatch is readable by the next subagent's dispatch, as long
-as the prefix bytes match and the read happens within the cache TTL. This is
-why sessions are not merged for caching purposes: merging trades an
-already-available saving for a real loss of isolation.
+Dispatch the smallest complete task contract. Include the exact task section,
+the relevant architecture invariants and decisions, file boundaries,
+acceptance checks, required commands, current worktree constraints, and a
+clear report format. Link to the source documents rather than pasting their
+full history; workers read the named sections before editing.
 
-**Assemble every dispatch in this order:**
-
-```text
-[stable, byte-identical across every dispatch in a sprint]
-  architecture.md (full)
-  sprint PRD (full)
-  cache_control breakpoint, ttl: "1h"
-[volatile, per-task]
-  exact task section
-  file boundaries
-  acceptance checks
-  required commands
-```
-
-**Rules:**
-
-- The stable block MUST be byte-identical across dispatches. Any variation
-  before the breakpoint — a timestamp, a reordered field, a per-task
-  annotation inserted into the architecture doc — invalidates the cache for
-  the entire prefix, not just the changed part.
-- Use an extended cache TTL (1 hour) rather than the 5-minute default. Batches
-  are already dispatched close together under step 3's batch-approval flow, so
-  a 1-hour TTL lets task 2 through N in an approved batch read the cache
-  written by task 1.
-- Prompt caching is per-model. All implementation tasks use
-  `opencode-go/ox-alpha-free` through `worker-l`, so byte-identical stable
-  prefixes can share that model's cache across distinct task sessions.
-- Do not shrink or excerpt `architecture.md` per task to "save context." That
-  reintroduces the reinterpretation risk this directory exists to prevent, for
-  a saving the cache already provides without it.
-- Do not merge multiple tasks into one continuous agent session to avoid
-  resending the architecture document. A continuous session resends its own
-  growing transcript — prior tasks' file reads, diffs, and dead ends — on
-  every turn, which is typically larger than the architecture document by the
-  time a sprint's later tasks run. It also blurs the per-task review and
-  rollback boundary this protocol depends on: a bad turn in one task should be
-  discardable without contaminating the next task's context.
+Do not replay old reviews, superseded benchmark output, or unrelated sprint
+plans into an implementation prompt. A fresh session is still required per
+task, but its context should contain the current decision and runnable evidence
+only. This preserves task isolation while preventing historical execution logs
+from crowding out the code and acceptance contract.
 
 ## Verification Environment
 
@@ -172,28 +134,15 @@ would require.
 
 ## Program Status
 
-**Status:** **Task `1.3` is complete and the production model pair is
-approved** (2026-08-24). Batch 7's final selection run stopped at Critical
-Recall@1 `2/5`; the user resolved it by **splitting the critical gate** —
-hydration-window membership (`5/5`) is the Sprint 1 model-selection gate, and
-Recall@1 keeps its 100% threshold as a **Sprint 3 release gate** owned by the
-stages that decide ordinal position. Selected: **`e5-base-int8` +
-`mmarco-quint8`**, int8 vector storage, `k=5 w_vector=1 w_lexical=0.5
-alpha=0.5 beta=1 gamma=0`, chunk profile 384/64, 1118.3 MiB inside the
-approved band. Tasks `1.4` and `1.5` are unblocked. Sprint 6.1 is closed.
-**Task `1.4` is now complete: exact search is selected and ANN was not
-evaluated.** Its 250k p95 is `61.1 ms`, recall@150 is `1.0000`, and the
-highest valid same-process rebuild peak `1319.9 MiB` remains inside the
-explicitly approved 1.30 GiB transient ceiling. **Task `1.5` is complete:** the
-selected bundle is hash/license pinned and staged before packaging, and its lazy
-verifier is ready for Sprint 2 integration. `1.R1a` corrected the active CI
- staging path and `1.R3a` corrected bounded journal publication; final reviews
- approve, and hosted Windows run
- [`#31`](https://github.com/armandotreuk/Meetly_Treuk/actions/runs/32907148572)
- passed all required gates. **The user approved Sprint 1 closure on 2026-08-25.**
- Sprint 2 remains subject to its approved PRD and explicit batch-approval gate.
+**Current:** Sprints 1 and 2 are closed with user approval. Sprint 3 is in
+progress: Task 3.1 is complete, Task 3.2 has production-path implementation
+evidence and awaits the user's final review, and Task 3.3 is the authorized next
+batch. Task 3.5 owns current-bundle release performance/R13 evidence. Task 3.6
+is conditional on a reviewed terminological-gap miss; the 5/5 critical Recall@1
+threshold, scope/privacy/fallback invariants, and Windows x64 release scope are
+unchanged.
 
-Current execution state:
+Historical Sprint 1 execution record:
 
 1. **Batch 1:** Task 1.1 is complete and unaffected. Task 1.2 is **superseded
    by Task `1.2R`** — its harness and metrics are retained, its corpus is not.

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,8 @@ pub const EXACT_INDEX_BACKEND: &str = "exact";
 /// [`RetrievalRepository::replace_meeting_documents`]: one revision-fenced
 /// transaction never materializes more documents than one approved batch.
 const REPLACEMENT_PAGE_DOCUMENTS: i64 = crate::retrieval::worker::MAX_STAGE_DOCUMENTS as i64;
+const MAX_SUMMARY_ROWS: usize = 256;
+const MAX_TRANSCRIPT_ROWS: usize = 10_000;
 
 /// Encodings admitted at the repository boundary. The approved production
 /// bundle stores int8; f32 is the reference encoding. There is intentionally
@@ -192,16 +194,21 @@ pub struct SourceTranscript {
 
 /// Authoritative meeting content read from primary tables (never from
 /// `meeting_fts`), using the same latest-summary policy and transcript
-/// chronology as saved-meeting Chat.
+/// chronology as saved-meeting Chat. Shared by the index worker's chunker,
+/// saved-meeting Chat, and Task 3.3 authoritative hydration.
 #[derive(Debug, Clone)]
 pub struct MeetingSource {
     pub meeting_id: String,
     pub title: String,
+    pub folder_name: String,
     pub source_revision: Option<i64>,
     pub latest_summary_template_id: Option<String>,
     pub latest_summary_markdown: Option<String>,
     pub notes_markdown: Option<String>,
     pub transcripts: Vec<SourceTranscript>,
+    pub transcript_positions: Vec<usize>,
+    pub transcript_segments_total: usize,
+    pub complete: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -267,6 +274,35 @@ pub(crate) struct DocumentCountDivergence {
 }
 
 pub struct RetrievalRepository;
+
+fn check_source_cancellation(cancel: Option<&CancellationToken>) -> Result<(), SqlxError> {
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        Err(SqlxError::Protocol("retrieval cancelled".into()))
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptChronology {
+    pub segments: HashMap<String, Vec<String>>,
+    pub omitted_meetings: Vec<String>,
+}
+
+impl TranscriptChronology {
+    pub fn complete(&self) -> bool {
+        self.omitted_meetings.is_empty()
+    }
+}
+
+/// Meeting IDs bound per statement, matching the chunked allow-list
+/// convention the FTS repository uses; a recursive/unbounded candidate set
+/// must never become one `IN (...)` list.
+const SEGMENT_CHRONOLOGY_ID_CHUNK: usize = 400;
+/// Upper bound on the total segments retained for one ranking request.
+const SEGMENT_CHRONOLOGY_MAX_SEGMENTS: usize = 50_000;
+/// Upper bound on one meeting's retained chronology.
+const SEGMENT_CHRONOLOGY_MAX_PER_MEETING: usize = 10_000;
 
 impl RetrievalRepository {
     #[cfg(any(debug_assertions, test))]
@@ -936,6 +972,137 @@ impl RetrievalRepository {
         Ok(query.build_query_as().fetch_all(pool).await?)
     }
 
+    /// Chronological transcript segment IDs per meeting, in the exact order
+    /// the chunker builds windows from (`chunking::ordered_transcripts`:
+    /// audio time ascending with nulls last, then timestamp, then stable ID),
+    /// over the same live segments the chunker windows (it drops
+    /// whitespace-only rows before building atoms, so this query must too or
+    /// the positions would not line up with the windows they resolve).
+    /// Backs Task 3.2 cross-channel evidence deduplication: a semantic window
+    /// records only its first/last segment IDs, so whether an FTS segment
+    /// lies inside that range is answered by position, never by comparing
+    /// random UUIDs lexicographically.
+    ///
+    /// Bounded like every other multi-meeting read in this layer: meeting IDs
+    /// are bound in chunks (never one unbounded `IN (...)`), the SQL read
+    /// itself carries the remaining row budget as a `LIMIT` (so the cap
+    /// bounds the FETCH, not just what is kept afterwards), and rows arrive
+    /// grouped by `meeting_id` so completeness is decidable.
+    ///
+    /// Only PROVABLY COMPLETE chronologies are returned. A truncating read
+    /// can only cut the last meeting group, which is dropped whole; meetings
+    /// never reached, dropped by a cap, or over the per-meeting bound are
+    /// simply absent. An absent meeting makes its transcript candidates
+    /// non-mergeable — the same documented degradation as a failed read —
+    /// whereas a PARTIAL chronology would silently shift positions and merge
+    /// the wrong segments, so it must never be retained.
+    pub async fn ordered_transcript_segment_ids(
+        pool: &SqlitePool,
+        meeting_ids: &[String],
+        cancel: &CancellationToken,
+    ) -> Result<TranscriptChronology, SqlxError> {
+        if meeting_ids.is_empty() {
+            return Ok(TranscriptChronology {
+                segments: HashMap::new(),
+                omitted_meetings: Vec::new(),
+            });
+        }
+        if cancel.is_cancelled() {
+            return Err(SqlxError::Protocol("retrieval cancelled".into()));
+        }
+        let mut meeting_ids = meeting_ids.to_vec();
+        meeting_ids.sort();
+        meeting_ids.dedup();
+        let mut by_meeting: BTreeMap<String, Vec<(String, Option<f64>, String)>> = BTreeMap::new();
+        let mut omitted = BTreeSet::new();
+        let mut budget: usize = SEGMENT_CHRONOLOGY_MAX_SEGMENTS;
+        for chunk in meeting_ids.chunks(SEGMENT_CHRONOLOGY_ID_CHUNK) {
+            if cancel.is_cancelled() {
+                return Err(SqlxError::Protocol("retrieval cancelled".into()));
+            }
+            if budget == 0 {
+                omitted.extend(chunk.iter().cloned());
+                break;
+            }
+            let mut query = QueryBuilder::<Sqlite>::new(
+                "SELECT meeting_id, id, audio_start_time, timestamp FROM transcripts WHERE meeting_id IN (",
+            );
+            let mut binds = query.separated(", ");
+            for meeting_id in chunk {
+                binds.push_bind(meeting_id);
+            }
+            drop(binds);
+            // Whitespace-only segments are excluded by the chunker before
+            // windowing; excluding them here keeps both orderings identical.
+            // ORDER BY meeting_id groups each meeting's rows contiguously, so
+            // a LIMIT can only truncate the final group; one row beyond the
+            // budget is requested purely to detect that truncation.
+            query.push(
+                ") AND TRIM(transcript, ' ' || char(9) || char(10) || char(13) || char(11) || char(12)) != '' ORDER BY meeting_id LIMIT ",
+            );
+            query.push_bind(budget as i64 + 1);
+            let rows: Vec<(String, String, Option<f64>, String)> =
+                query.build_query_as().fetch_all(pool).await?;
+            if cancel.is_cancelled() {
+                return Err(SqlxError::Protocol("retrieval cancelled".into()));
+            }
+            let truncated = rows.len() > budget;
+            let last_meeting = rows.last().map(|(meeting_id, ..)| meeting_id.clone());
+            for (meeting_id, id, audio_start_time, timestamp) in rows.into_iter().take(budget) {
+                by_meeting
+                    .entry(meeting_id)
+                    .or_default()
+                    .push((id, audio_start_time, timestamp));
+            }
+            if truncated {
+                // The final group is the only one the LIMIT can have cut, and
+                // the budget row may itself have removed rows from it: drop it
+                // whole rather than retain a partial chronology, then stop.
+                if let Some(meeting_id) = last_meeting {
+                    by_meeting.remove(&meeting_id);
+                    omitted.insert(meeting_id);
+                }
+                omitted.extend(
+                    chunk
+                        .iter()
+                        .filter(|id| !by_meeting.contains_key(*id))
+                        .cloned(),
+                );
+                break;
+            }
+            budget = SEGMENT_CHRONOLOGY_MAX_SEGMENTS
+                .saturating_sub(by_meeting.values().map(Vec::len).sum::<usize>());
+        }
+        let mut ordered = HashMap::with_capacity(by_meeting.len());
+        for (meeting_id, segments) in by_meeting {
+            if segments.len() > SEGMENT_CHRONOLOGY_MAX_PER_MEETING {
+                // Non-mergeable rather than unbounded: absent from the map.
+                omitted.insert(meeting_id.clone());
+                continue;
+            }
+            let mut segments: Vec<(String, Option<f64>, String)> = segments;
+            segments.sort_by(|left, right| {
+                left.1
+                    .is_none()
+                    .cmp(&right.1.is_none())
+                    .then_with(|| match (left.1, right.1) {
+                        (Some(left), Some(right)) => left.total_cmp(&right),
+                        _ => std::cmp::Ordering::Equal,
+                    })
+                    .then_with(|| left.2.cmp(&right.2))
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            ordered.insert(
+                meeting_id,
+                segments.into_iter().map(|(id, _, _)| id).collect(),
+            );
+        }
+        Ok(TranscriptChronology {
+            segments: ordered,
+            omitted_meetings: omitted.into_iter().collect(),
+        })
+    }
+
     /// Canonical chunk text for semantic candidate documents of one
     /// generation. Documents absent from the generation are absent from the
     /// result, so a vanished canonical row can never become evidence.
@@ -965,18 +1132,38 @@ impl RetrievalRepository {
         pool: &SqlitePool,
         meeting_id: &str,
     ) -> Result<Option<MeetingSource>, SqlxError> {
-        let meta: Option<(String, Option<i64>)> = sqlx::query_as(
-            "SELECT m.title, s.source_revision
-             FROM meetings m LEFT JOIN search_source_state s ON s.meeting_id = m.id
+        Self::load_meeting_source_inner(pool, meeting_id, None).await
+    }
+
+    pub async fn load_meeting_source_with_cancellation(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Option<MeetingSource>, SqlxError> {
+        Self::load_meeting_source_inner(pool, meeting_id, Some(cancel)).await
+    }
+
+    async fn load_meeting_source_inner(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Option<MeetingSource>, SqlxError> {
+        check_source_cancellation(cancel)?;
+        let meta: Option<(String, String, Option<i64>)> = sqlx::query_as(
+            "SELECT m.title, COALESCE(f.name, ''), s.source_revision
+             FROM meetings m
+             LEFT JOIN meeting_folders f ON m.folder_id = f.id
+             LEFT JOIN search_source_state s ON s.meeting_id = m.id
              WHERE m.id = ?",
         )
         .bind(meeting_id)
         .fetch_optional(pool)
         .await?;
-        let Some((title, source_revision)) = meta else {
+        let Some((title, folder_name, source_revision)) = meta else {
             return Ok(None);
         };
 
+        check_source_cancellation(cancel)?;
         let notes: Option<(Option<String>,)> =
             sqlx::query_as("SELECT notes_markdown FROM meeting_notes WHERE meeting_id = ?")
                 .bind(meeting_id)
@@ -988,15 +1175,20 @@ impl RetrievalRepository {
         // result cannot fail an otherwise valid extraction; older readable
         // summaries still apply. Unreadable results are counted for a
         // privacy-safe log (never content) and skipped.
+        check_source_cancellation(cancel)?;
         let summary_rows: Vec<(Option<String>, String)> = sqlx::query_as(
             "SELECT result, template_id
              FROM summary_processes
              WHERE meeting_id = ? AND result IS NOT NULL
-             ORDER BY updated_at DESC, template_id DESC",
+             ORDER BY updated_at DESC, template_id DESC
+             LIMIT ?",
         )
         .bind(meeting_id)
+        .bind((MAX_SUMMARY_ROWS + 1) as i64)
         .fetch_all(pool)
         .await?;
+        check_source_cancellation(cancel)?;
+        let summaries_truncated = summary_rows.len() > MAX_SUMMARY_ROWS;
         let mut latest_summary_template_id = None;
         let mut latest_summary_markdown = None;
         let mut unreadable_summaries = 0_usize;
@@ -1024,6 +1216,7 @@ impl RetrievalRepository {
             );
         }
 
+        check_source_cancellation(cancel)?;
         let transcripts: Vec<(
             String,
             String,
@@ -1036,21 +1229,28 @@ impl RetrievalRepository {
                  FROM transcripts
                  WHERE meeting_id = ? AND transcript IS NOT NULL AND transcript != ''
                  ORDER BY CASE WHEN audio_start_time IS NULL THEN 1 ELSE 0 END,
-                          audio_start_time ASC, timestamp ASC, id ASC",
+                           audio_start_time ASC, timestamp ASC, id ASC
+                  LIMIT ?",
         )
         .bind(meeting_id)
+        .bind((MAX_TRANSCRIPT_ROWS + 1) as i64)
         .fetch_all(pool)
         .await?;
+        check_source_cancellation(cancel)?;
+        let transcripts_truncated = transcripts.len() > MAX_TRANSCRIPT_ROWS;
 
+        let transcript_segments_total = transcripts.len().min(MAX_TRANSCRIPT_ROWS);
         Ok(Some(MeetingSource {
             meeting_id: meeting_id.to_string(),
             title,
+            folder_name,
             source_revision,
             latest_summary_template_id,
             latest_summary_markdown,
             notes_markdown: notes.and_then(|(markdown,)| markdown),
             transcripts: transcripts
                 .into_iter()
+                .take(MAX_TRANSCRIPT_ROWS)
                 .map(
                     |(id, text, speaker, timestamp, audio_start_time, audio_end_time)| {
                         SourceTranscript {
@@ -1064,7 +1264,152 @@ impl RetrievalRepository {
                     },
                 )
                 .collect(),
+            transcript_positions: (0..transcript_segments_total).collect(),
+            transcript_segments_total,
+            complete: !summaries_truncated && !transcripts_truncated,
         }))
+    }
+
+    /// Loads only the transcript rows needed by a saved-meeting context. The
+    /// caller supplies ranked hit identities; one chronological neighbor on
+    /// either side is included without materializing the whole meeting.
+    pub async fn load_meeting_source_relevant(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        transcript_ids: &[String],
+    ) -> Result<Option<MeetingSource>, SqlxError> {
+        let meta: Option<(String, String, Option<i64>)> = sqlx::query_as(
+            "SELECT m.title, COALESCE(f.name, ''), s.source_revision FROM meetings m LEFT JOIN meeting_folders f ON m.folder_id = f.id LEFT JOIN search_source_state s ON s.meeting_id = m.id WHERE m.id = ?",
+        ).bind(meeting_id).fetch_optional(pool).await?;
+        let Some((title, folder_name, source_revision)) = meta else {
+            return Ok(None);
+        };
+        let notes: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT notes_markdown FROM meeting_notes WHERE meeting_id = ?")
+                .bind(meeting_id)
+                .fetch_optional(pool)
+                .await?;
+        let summary_rows: Vec<(Option<String>, String)> = sqlx::query_as(
+            "SELECT result, template_id FROM summary_processes WHERE meeting_id = ? AND result IS NOT NULL ORDER BY updated_at DESC, template_id DESC LIMIT ?",
+        ).bind(meeting_id).bind((MAX_SUMMARY_ROWS + 1) as i64).fetch_all(pool).await?;
+        let mut latest_summary_template_id = None;
+        let mut latest_summary_markdown = None;
+        for (result, template_id) in &summary_rows {
+            let markdown = result
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .and_then(|value| {
+                    value
+                        .get("markdown")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                })
+                .filter(|value| !value.trim().is_empty());
+            if markdown.is_some() {
+                latest_summary_template_id = Some(template_id.clone());
+                latest_summary_markdown = markdown;
+                break;
+            }
+        }
+        let total: usize = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM transcripts WHERE meeting_id = ? AND transcript IS NOT NULL AND transcript != ''",
+        ).bind(meeting_id).fetch_one(pool).await? as usize;
+        let mut source = MeetingSource {
+            meeting_id: meeting_id.to_string(),
+            title,
+            folder_name,
+            source_revision,
+            latest_summary_template_id,
+            latest_summary_markdown,
+            notes_markdown: notes.and_then(|(value,)| value),
+            transcripts: Vec::new(),
+            transcript_positions: Vec::new(),
+            transcript_segments_total: total,
+            complete: summary_rows.len() <= MAX_SUMMARY_ROWS,
+        };
+        if transcript_ids.is_empty() {
+            let rows: Vec<(String, String, Option<String>, String, Option<f64>, Option<f64>)> = sqlx::query_as(
+                "SELECT id, transcript, speaker, timestamp, audio_start_time, audio_end_time FROM transcripts WHERE meeting_id = ? AND transcript IS NOT NULL AND transcript != '' ORDER BY CASE WHEN audio_start_time IS NULL THEN 1 ELSE 0 END, audio_start_time ASC, timestamp ASC, id ASC LIMIT ?",
+            ).bind(meeting_id).bind(MAX_TRANSCRIPT_ROWS as i64).fetch_all(pool).await?;
+            source.transcript_positions = (0..rows.len()).collect();
+            source.transcripts = rows
+                .into_iter()
+                .map(
+                    |(id, text, speaker, timestamp, audio_start_time, audio_end_time)| {
+                        SourceTranscript {
+                            id,
+                            text,
+                            speaker,
+                            timestamp,
+                            audio_start_time,
+                            audio_end_time,
+                        }
+                    },
+                )
+                .collect();
+            source.complete = source.complete && total <= MAX_TRANSCRIPT_ROWS;
+            return Ok(Some(source));
+        }
+        let ordered = "WITH ordered AS (SELECT id, transcript, speaker, timestamp, audio_start_time, audio_end_time, ROW_NUMBER() OVER (ORDER BY CASE WHEN audio_start_time IS NULL THEN 1 ELSE 0 END, audio_start_time ASC, timestamp ASC, id ASC) - 1 AS pos FROM transcripts WHERE meeting_id = ";
+        let mut count_query = QueryBuilder::<Sqlite>::new(ordered);
+        count_query.push_bind(meeting_id).push(" AND transcript IS NOT NULL AND transcript != ''), targets AS (SELECT pos FROM ordered WHERE id IN (");
+        let mut ids = count_query.separated(", ");
+        for id in transcript_ids {
+            ids.push_bind(id);
+        }
+        drop(ids);
+        count_query.push(") ), selected AS (SELECT DISTINCT o.pos FROM ordered o JOIN targets t ON o.pos BETWEEN t.pos - 1 AND t.pos + 1) SELECT COUNT(*) FROM ordered o JOIN selected s ON s.pos = o.pos");
+        let selected_count: i64 = count_query.build_query_scalar().fetch_one(pool).await?;
+        if selected_count as usize > MAX_TRANSCRIPT_ROWS {
+            return Ok(Some(source));
+        }
+        let mut query = QueryBuilder::<Sqlite>::new(ordered);
+        query.push_bind(meeting_id).push(" AND transcript IS NOT NULL AND transcript != ''), targets AS (SELECT pos FROM ordered WHERE id IN (");
+        let mut ids = query.separated(", ");
+        for id in transcript_ids {
+            ids.push_bind(id);
+        }
+        drop(ids);
+        query.push(") ), selected AS (SELECT DISTINCT o.pos FROM ordered o JOIN targets t ON o.pos BETWEEN t.pos - 1 AND t.pos + 1) SELECT o.pos, o.id, o.transcript, o.speaker, o.timestamp, o.audio_start_time, o.audio_end_time FROM ordered o JOIN selected s ON s.pos = o.pos ORDER BY o.pos");
+        let rows: Vec<(
+            i64,
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<f64>,
+            Option<f64>,
+        )> = query.build_query_as().fetch_all(pool).await?;
+        source.transcript_positions = rows.iter().map(|(pos, ..)| *pos as usize).collect();
+        source.transcripts = rows
+            .into_iter()
+            .map(
+                |(_, id, text, speaker, timestamp, audio_start_time, audio_end_time)| {
+                    SourceTranscript {
+                        id,
+                        text,
+                        speaker,
+                        timestamp,
+                        audio_start_time,
+                        audio_end_time,
+                    }
+                },
+            )
+            .collect();
+        source.complete = source.complete && total <= MAX_TRANSCRIPT_ROWS;
+        Ok(Some(source))
+    }
+
+    pub async fn load_meeting_source_relevant_with_cancellation(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        transcript_ids: &[String],
+        cancel: &CancellationToken,
+    ) -> Result<Option<MeetingSource>, SqlxError> {
+        check_source_cancellation(Some(cancel))?;
+        let source = Self::load_meeting_source_relevant(pool, meeting_id, transcript_ids).await?;
+        check_source_cancellation(Some(cancel))?;
+        Ok(source)
     }
 
     // -- Staged atomic replacement ----------------------------------------
@@ -2568,7 +2913,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn folder_metadata_advances_only_the_fts_projection() {
+    async fn folder_membership_advances_only_fts_revision() {
         let pool = migrated_pool().await;
         insert_meeting(&pool, "m", "Filed").await;
         assert_eq!(source_state(&pool, "m").await, Some((1, 1, 0)));
@@ -4680,6 +5025,43 @@ mod tests {
         assert_eq!(source.latest_summary_markdown, None);
         assert_eq!(source.latest_summary_template_id, None);
         assert_eq!(source.title, "All Broken");
+    }
+
+    #[tokio::test]
+    async fn source_extraction_bounds_transcripts_and_marks_truncation() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "large", "Large").await;
+        let mut tx = pool.begin().await.unwrap();
+        for index in 0..=MAX_TRANSCRIPT_ROWS {
+            sqlx::query(
+                "INSERT INTO transcripts (id, meeting_id, transcript, timestamp) VALUES (?, 'large', ?, '10:00')",
+            )
+            .bind(format!("t{index}"))
+            .bind(format!("segment {index}"))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let source = RetrievalRepository::load_meeting_source(&pool, "large")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.transcripts.len(), MAX_TRANSCRIPT_ROWS);
+        assert!(!source.complete);
+
+        let relevant = RetrievalRepository::load_meeting_source_relevant(
+            &pool,
+            "large",
+            &["t10000".to_string()],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(relevant.transcripts.len() <= 3);
+        assert!(relevant.transcripts.iter().any(|row| row.id == "t10000"));
+        assert_eq!(relevant.transcript_segments_total, MAX_TRANSCRIPT_ROWS + 1);
     }
 
     #[tokio::test]

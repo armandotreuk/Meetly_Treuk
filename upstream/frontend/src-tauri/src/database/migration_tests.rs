@@ -7,6 +7,7 @@ use sqlx::SqlitePool;
 use std::str::FromStr;
 
 use crate::database::repositories::meeting::MeetingsRepository;
+use crate::database::repositories::setting::SettingsRepository;
 
 async fn connect() -> SqlitePool {
     let options = SqliteConnectOptions::from_str("sqlite::memory:")
@@ -17,6 +18,122 @@ async fn connect() -> SqlitePool {
         .connect_with(options)
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn force_lexical_setting_defaults_persists_and_survives_upgrade() {
+    let path = std::env::temp_dir().join(format!(
+        "meetly-force-lexical-{}-{}.sqlite",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let options = SqliteConnectOptions::new()
+        .filename(&path)
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    assert!(!SettingsRepository::get_force_lexical_retrieval(&pool)
+        .await
+        .unwrap());
+    SettingsRepository::set_force_lexical_retrieval(&pool, true)
+        .await
+        .unwrap();
+    assert!(SettingsRepository::get_force_lexical_retrieval(&pool)
+        .await
+        .unwrap());
+    SettingsRepository::set_force_lexical_retrieval(&pool, false)
+        .await
+        .unwrap();
+    assert!(!SettingsRepository::get_force_lexical_retrieval(&pool)
+        .await
+        .unwrap());
+    SettingsRepository::set_force_lexical_retrieval(&pool, true)
+        .await
+        .unwrap();
+    assert!(SettingsRepository::get_force_lexical_retrieval(&pool)
+        .await
+        .unwrap());
+    pool.close().await;
+
+    let reopened = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(false)
+                .foreign_keys(true),
+        )
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&reopened).await.unwrap();
+    assert!(SettingsRepository::get_force_lexical_retrieval(&reopened)
+        .await
+        .unwrap());
+    SettingsRepository::set_force_lexical_retrieval(&reopened, false)
+        .await
+        .unwrap();
+    assert!(!SettingsRepository::get_force_lexical_retrieval(&reopened)
+        .await
+        .unwrap());
+    reopened.close().await;
+    let _ = std::fs::remove_file(path);
+
+    let upgraded = connect().await;
+    let migrator = sqlx::migrate!("./migrations");
+    for migration in migrator
+        .migrations
+        .iter()
+        .filter(|migration| migration.version < 20260901000000)
+    {
+        sqlx::raw_sql(&migration.sql)
+            .execute(&upgraded)
+            .await
+            .unwrap();
+    }
+    sqlx::query("INSERT INTO settings (id, provider, model, whisperModel) VALUES ('1', 'openai', 'model', 'large-v3')")
+        .execute(&upgraded)
+        .await
+        .unwrap();
+    let force_migration = migrator
+        .migrations
+        .iter()
+        .find(|migration| migration.version == 20260901000000)
+        .unwrap();
+    sqlx::raw_sql(&force_migration.sql)
+        .execute(&upgraded)
+        .await
+        .unwrap();
+    assert!(!SettingsRepository::get_force_lexical_retrieval(&upgraded)
+        .await
+        .unwrap());
+    SettingsRepository::set_force_lexical_retrieval(&upgraded, true)
+        .await
+        .unwrap();
+    assert!(SettingsRepository::get_force_lexical_retrieval(&upgraded)
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn force_lexical_setting_missing_column_is_not_hidden() {
+    let pool = connect().await;
+    sqlx::query(
+        "CREATE TABLE settings (id TEXT PRIMARY KEY, provider TEXT, model TEXT, whisperModel TEXT)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(SettingsRepository::get_force_lexical_retrieval(&pool)
+        .await
+        .is_err());
 }
 
 async fn object_exists(pool: &SqlitePool, sql: &str) -> bool {

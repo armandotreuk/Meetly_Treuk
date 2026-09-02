@@ -199,6 +199,18 @@ pub struct RetrievedEvidence {
     pub speaker: Option<String>,
     pub timestamp_label: Option<String>,
     pub provenance: Vec<EvidenceProvenance>,
+    /// Bounded source identities absorbed during cross-channel dedupe. These
+    /// aliases remain available to the authoritative hydration stage.
+    pub source_aliases: Vec<SourceAlias>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceAlias {
+    pub evidence_id: String,
+    pub source_kind: String,
+    pub source_start_id: Option<String>,
+    pub source_end_id: Option<String>,
+    pub text: String,
 }
 
 /// The normalized scope: the tagged scope after `folder:"..."` normalization.
@@ -260,6 +272,19 @@ pub struct RetrievalResult {
     pub candidates: Vec<RetrievedEvidence>,
     /// `None` when the semantic channel ran (whether or not it produced
     /// candidates); otherwise the documented reason it degraded to lexical.
+    pub semantic_fallback: Option<SemanticFallbackReason>,
+}
+
+/// The ranked Fast-retrieval result: the request scope plus the Task 3.2
+/// ranking outcome (final evidence order, meeting order, reranker state).
+#[derive(Debug, Clone)]
+pub struct RankedRetrieval {
+    pub scope: ResolvedScope,
+    pub ranking: crate::retrieval::ranking::RankingOutcome,
+    /// The candidate stage's typed semantic availability: `None` when the
+    /// semantic channel ran, otherwise the documented reason it degraded to
+    /// lexical-only. Carried through ranking so a caller can never mistake
+    /// lexical-only output for healthy hybrid output.
     pub semantic_fallback: Option<SemanticFallbackReason>,
 }
 
@@ -376,6 +401,65 @@ impl RetrievalService {
             scope: normalized.resolved(),
             candidates,
             semantic_fallback,
+        })
+    }
+
+    /// Resolves the scope once, runs the lexical, current-title, and semantic
+    /// candidate channels, then the Task 3.2 ranking stage (cross-channel
+    /// deduplication, reciprocal-rank fusion, meeting aggregation, and the
+    /// bounded local cross-encoder head) under the approved Chat
+    /// configuration. Broad-Chat caller wiring is Task 3.4; hydration and
+    /// source publication are Task 3.3.
+    ///
+    /// Query policy, derived here with the SAME rules
+    /// [`Self::normalize_request`] applied to the candidate channels, so one
+    /// request never carries two disagreeing derivations:
+    /// - the effective query (the reranker question) is the folder-operator
+    ///   stripped rewritten query when it is non-empty and differs from the
+    ///   stripped original, else the stripped original;
+    /// - the core terms are derived from the stripped ORIGINAL query, which
+    ///   is the exact set that already drove the CoreTerms lexical variant
+    ///   and Task 3.1's title top-k selection. Deriving them from the
+    ///   rewritten text instead would score the Task 3.2 title-overlap term
+    ///   against different terms than the title channel selected on.
+    ///
+    /// Both values are carried on the outcome so no consumer re-derives them.
+    pub async fn retrieve_ranked(
+        &self,
+        pool: &SqlitePool,
+        request: RetrievalRequest,
+    ) -> Result<RankedRetrieval, RetrievalError> {
+        let cancel = request.cancellation.clone().unwrap_or_default();
+        let result = self.retrieve(pool, request.clone()).await?;
+        ensure_not_cancelled(&cancel)?;
+        let lexical_original = strip_folder_operators(request.original_query.trim().to_string());
+        let effective_query = request
+            .rewritten_query
+            .as_deref()
+            .map(|rewritten| strip_folder_operators(rewritten.to_string()))
+            .filter(|rewritten| !rewritten.trim().is_empty() && rewritten != &lexical_original)
+            .unwrap_or_else(|| lexical_original.clone());
+        let core_terms = core_terms(&lexical_original, request.core_language);
+        let ranking_mode = if result.semantic_fallback.is_some() {
+            crate::retrieval::ranking::RankingMode::LexicalOnly
+        } else {
+            crate::retrieval::ranking::RankingMode::Hybrid
+        };
+        let ranking = crate::retrieval::ranking::rank_with_mode(
+            &self.lifecycle,
+            pool,
+            result.candidates,
+            effective_query.trim(),
+            core_terms,
+            &crate::retrieval::ranking::RankingConfig::chat(),
+            ranking_mode,
+            &cancel,
+        )
+        .await?;
+        Ok(RankedRetrieval {
+            scope: result.scope,
+            ranking,
+            semantic_fallback: result.semantic_fallback,
         })
     }
 
@@ -1199,6 +1283,7 @@ fn lexical_evidence(result: FtsSearchResult) -> RetrievedEvidence {
         speaker: result.speaker,
         timestamp_label: result.timestamp_label,
         provenance: Vec::new(),
+        source_aliases: Vec::new(),
     }
 }
 
@@ -1217,6 +1302,7 @@ fn title_evidence(meeting_id: String, title: String) -> RetrievedEvidence {
         speaker: None,
         timestamp_label: None,
         provenance: Vec::new(),
+        source_aliases: Vec::new(),
     }
 }
 
@@ -1235,6 +1321,7 @@ fn semantic_evidence(hit: &VectorHit, meeting_title: String, content: String) ->
         speaker: None,
         timestamp_label: None,
         provenance: Vec::new(),
+        source_aliases: Vec::new(),
     }
 }
 

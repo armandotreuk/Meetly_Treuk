@@ -678,7 +678,7 @@ async fn stale_fts_folder_metadata_cannot_bypass_current_membership() {
         "stale FTS folder metadata must not bypass current membership"
     );
 
-    // The meeting remains retrievable in the scope it actually lives in.
+    // The stale projection is fail-closed until its repair catches up.
     let result = service
         .retrieve(
             &pool,
@@ -692,14 +692,11 @@ async fn stale_fts_folder_metadata_cannot_bypass_current_membership() {
         )
         .await
         .unwrap();
-    assert!(result
-        .candidates
-        .iter()
-        .any(|candidate| candidate.meeting_id == "m-moved"));
+    assert!(result.candidates.is_empty());
 }
 
 #[tokio::test]
-async fn moved_in_meeting_is_found_by_current_folder_membership() {
+async fn moved_in_meeting_with_stale_projection_is_omitted() {
     let pool = migrated_pool().await;
     insert_folder(&pool, "f-2", "Later", None).await;
     insert_meeting(&pool, "m-new", "New meeting").await;
@@ -724,10 +721,7 @@ async fn moved_in_meeting_is_found_by_current_folder_membership() {
         )
         .await
         .unwrap();
-    assert!(result
-        .candidates
-        .iter()
-        .any(|candidate| candidate.meeting_id == "m-new"));
+    assert!(result.candidates.is_empty());
 }
 
 #[tokio::test]
@@ -1261,7 +1255,7 @@ async fn snapshot_journal_behind_canonical_falls_back_after_bounded_catchup() {
 }
 
 #[tokio::test]
-async fn dirty_semantic_rows_are_ineligible_but_lexical_stays_current() {
+async fn dirty_source_rows_are_ineligible_for_all_channels() {
     let pool = migrated_pool().await;
     insert_meeting(&pool, "m-dirty", "Dirty").await;
     add_transcript(&pool, "t-dirty", "m-dirty", "needle indexed content").await;
@@ -1297,14 +1291,7 @@ async fn dirty_semantic_rows_are_ineligible_but_lexical_stays_current() {
         .await
         .unwrap();
     assert!(result.semantic_fallback.is_none());
-    assert!(result
-        .candidates
-        .iter()
-        .any(|candidate| candidate.meeting_id == "m-dirty"
-            && candidate
-                .provenance
-                .iter()
-                .any(|provenance| provenance.channel == RetrievalChannel::Lexical)));
+    assert!(result.candidates.is_empty());
     assert!(result.candidates.iter().all(|candidate| candidate
         .provenance
         .iter()

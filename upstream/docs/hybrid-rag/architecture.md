@@ -539,9 +539,11 @@ user-approved architecture amendment.
 | Reranker runtime | Chat depth 50; Search depth 25; batch 1; ORT intra-op 4 |
 
 The measured projected 250k peak is 1118.3 MiB, inside the user-approved
-1-1.25 GiB e5-base band. The measured depth-50 rerank cost is 720 ms, inside
-the 900 ms reranking sub-budget. Derived disk is 558 B per document, projected
-at 0.13 GiB steady state and 0.26 GiB during shadow rebuild.
+1-1.25 GiB e5-base band. Sprint 1's measured depth-50 rerank figure is a
+historical derived estimate (`solo-pair p95 * 50`) of 720 ms. It justified the
+initial depth but is not a current release-stage p95 measurement. Derived disk
+is 558 B per document, projected at 0.13 GiB steady state and 0.26 GiB during
+shadow rebuild.
 
 This selection is **title-assisted**, not an embedding-only claim. Holding all
 other earned constants fixed, reference-category Recall@1 is 12/15 at
@@ -555,6 +557,15 @@ probe's 78 quint8 configurations passed only Critical Recall@1, critical
 retrieval-stage contamination, and exact-term no-regression. It did not test
 every gate for those configurations and MUST NOT be cited as proof that an
 alternative fully-passing configuration exists.
+
+The fusion/aggregation row above is the Sprint 1 starting policy, not a
+permanent ban on production-pipeline retuning. A later ranking task MAY replace
+those ranking-only constants through its predeclared held-out protocol and
+recorded evidence addendum. Model, tokenizer, encoding, chunking, batch size,
+ORT thread caps, and rerank depth remain separate runtime contracts and do not
+change by implication. The active production constants live in the reviewed
+ranking implementation and its sprint execution entry; historical selection
+reports remain evidence, not runtime authority.
 
 ### Prior-Model Retention Across Upgrade (2026-08-26)
 
@@ -993,7 +1004,8 @@ one clean application restart and one successful Fast hybrid query. Cleanup is
 idempotent and never removes the active generation, active snapshot, or a
 generation with unacknowledged journal changes.
 
-**Transitional clause (2026-08-26; expires at Sprint 3 close).** The Fast
+**Transitional clause (2026-08-26; expires when Task 3.4 activates Fast hybrid
+Chat).** The Fast
 hybrid query surface does not exist before Sprint 3, so the
 successful-query condition above is unsatisfiable until then — and against
 the two-generation retention ceiling that makes manual rebuild a single-use
@@ -1001,8 +1013,10 @@ operation and eventually dead-ends corrupt-active recovery. While no semantic
 query surface exists, that condition is satisfied instead by one clean
 application restart with the new generation active and its publication lag
 zero. The restart condition itself is never relaxed, and every other cleanup
-guard stands unchanged. When Sprint 3 lands the Fast hybrid path this clause
-is removed and the successful-query condition applies as originally written.
+guard stands unchanged. Task 3.4 MUST remove this clause when the product Fast
+hybrid path is activated; from that point the successful-query condition
+applies as originally written. Sprint-close timing is not the authority: the
+presence of a real product query surface is.
 
 ## Vector Search Backend
 
@@ -1268,6 +1282,15 @@ normalization/core-term policy, concept extraction, and meeting-aggregation
 constants from the evaluation corpus. A subagent MUST NOT tune constants only
 for the reference WhatsApp query.
 
+Later production ranking work may retune ranking-only constants when it uses a
+predeclared search space, evaluates the exact full-gate predicate for every
+configuration, and selects only by the tuning-partition objective among the
+full-gate-feasible configurations. Critical/pinned cases therefore authorize
+eligibility, while their post-selection recomputation remains defense-in-depth
+verification; a miss must fail rather than change the selected configuration.
+Historical model-selection constants are the required baseline candidate, not
+an immutable production configuration.
+
 ## Meeting Aggregation
 
 Broad retrieval ranks meetings before final context construction. Meeting
@@ -1283,6 +1306,14 @@ ranking considers:
 
 Long meetings MUST NOT win solely because they produce more chunks. Per-meeting
 contribution is capped and diversity is measured separately.
+
+"Considers" requires each signal to be represented and measured; it does not
+require every signal to have a separate non-zero additive coefficient. A
+meeting profile may participate through its fused rank, concept coverage may be
+measured with a zero coefficient when the held-out protocol does not earn one,
+and diversity may be implemented as distinct-region support rather than raw
+chunk count. Any zero or implicit treatment must be explicit in the ranking
+contract and protected by long-meeting, overlap, and ablation regressions.
 
 ## Local Reranking
 
@@ -1818,7 +1849,9 @@ approval after baseline evidence, are:
 |---|---|
 | Reference/critical meeting hydration (rank within the hydrated set, currently top 5) | 100%. **Sprint 1 model-selection gate.** This is the property that determines whether the answer can be correct: a critical meeting inside the hydration window contributes its evidence to the prompt. Corroborated by critical required-fact coverage and critical retrieval-stage contamination, which are gated separately |
 | Reference/critical meeting Recall@1 | 100%. **Sprint 3 release gate, not a Sprint 1 model-selection gate** (2026-08-24). Ordinal position is produced by fusion, meeting aggregation, and reranking — built and tuned in Sprint 3 Task 3.2 — not by the embedding pair Sprint 1 selects. The threshold is unchanged at 100%; only the sprint that owns it moved. It MUST be re-measured at Sprint 3 close and MUST pass before release. The pinned Reference Acceptance Case retains its own rank-1 requirement in Sprint 1 |
-| Scope safety and retained-source precision | 100% |
+| Scope safety | 100%; no out-of-scope, deleted, or stale-derived evidence enters ranking, hydration, prompts, or sources |
+| Ranked-output retained-ID precision | 100% for the ranked/context-builder boundary. This is not final prompt/source parity |
+| Final prompt/source parity | Exactly the user-visible and persisted sources whose evidence remains after authoritative hydration and final provider budgeting; owned by hydration/caller integration, not Task 3.2 ranking |
 | Overall meeting Recall@3 | At least 95% |
 | Overall meeting Recall@5 | At least 98% |
 | Required evidence Recall@10 | At least 90% |
@@ -1826,7 +1859,7 @@ approval after baseline evidence, are:
 | Semantic/paraphrase category | At least +10 percentage points Recall@3 over FTS, or at least 95% when baseline is already above 85% |
 | Reranker designated cases | Improves pairwise/NDCG metric and causes no critical-case regression |
 | Forbidden-fact contamination in critical cases (retrieval stage) | 0 for forbidden facts carried by superseded, stale-derived, or deleted sources. Forbidden facts carried by current authoritative content inside a correctly retrieved meeting are answer-stage facts: retrieval delivers that content by design (hydration includes current notes wholesale), and the safety property is that the **answer** does not assert them — evaluated by the answer-stage non-assertion gate below, not by this row. Each critical forbidden fact is classified by its carrier's source state, computed from fixture text |
-| Answer-stage non-assertion (deferred evaluation) | The generated answer asserts no forbidden fact present in its retrieved context (the Reference Acceptance Case's "does not reduce the schedule to only 3 and 4 days" is this gate's pinned instance). Defined here so Sprint 1 can classify facts against it; **measured only when an answer pipeline exists (Sprint 3/4)**. Sprint 1 MUST NOT claim to have evaluated it |
+| Answer-stage non-assertion | The generated answer asserts no forbidden fact present in its retrieved context (the Reference Acceptance Case's "does not reduce the schedule to only 3 and 4 days" is this gate's pinned instance). Sprint 3.5 owns the first folder/all product-path measurement; Sprint 4.5 repeats it for every persisted Fast/Deep scope; Sprint 5.5 repeats installed-release qualification. Retrieval-only tests MUST NOT claim this gate |
 | Gate admissibility | Every zero-tolerance gate carries a supervised existence proof — computed from fixture text with expected IDs as labels only — that at least one retrieval ordering satisfies it, before any model is benchmarked against it. A gate without an admissibility proof is not a gate; it is an unfalsifiable trap (materialized twice: `1.2` corpus solvability, `1.3` rerun critical contamination) |
 | Retrieval RAM at 250k | `<=1 GiB` automatic pass; `>1 GiB` through `1.25 GiB` requires explicit user risk/quality approval; `>1.25 GiB` fails without a product scope change. Includes active sessions, ANN graph if selected, and old/new snapshot overlap. |
 | Derived disk at 250k | `<=2 GiB` steady state and `<=3 GiB` during shadow rebuild automatic pass; above either figure requires explicit user approval. Includes documents, staging, sidecars, and all retained generations. |
@@ -1865,8 +1898,18 @@ ceilings:
 - Target at most 2 GiB derived disk in steady state and 3 GiB during shadow
   rebuild. Above either figure blocks release until explicitly approved.
 - Vector-search stage p95 below 500 ms on reference hardware.
-- Cross-encoder reranking stage p95 below 900 ms on reference hardware. This is
-  a sub-budget of Fast preparation, not additional to it.
+- Cross-encoder reranking stage p95 below 900 ms on declared Windows x64
+  reference hardware. This is a sub-budget of Fast preparation, not additional
+  to it. The authoritative run uses the hash-verified production bundle and
+  `RetrievalModels::rerank` in a Rust `--release` build. After explicit warm-up,
+  collect at least 50 complete depth-50 request samples; report p50, p95,
+  maximum, sample count, actual pair count, bundle/manifest identity, ORT
+  provider/thread settings, OS, and hardware. The measurement includes
+  production tokenization, blocking-pool dispatch, and ONNX inference, but
+  excludes scheduler queue wait and the rest of Fast preparation. Bundle
+  absence, artifact mismatch, fewer than 50 pairs, or insufficient samples
+  fails the evidence run rather than skipping. `solo-pair p95 * depth` is a
+  historical derived estimate only and cannot close the release gate.
 - Fast local retrieval preparation p95 below 2 seconds excluding final LLM
   answer generation. If Sprint 1 measurement shows the selected reranker cannot
   fit its sub-budget at any useful candidate depth, the correct response is an
@@ -1881,6 +1924,27 @@ ceilings:
 If no candidate model/backend satisfies these gates, Sprint 1 stops for an
 architecture decision. It does not silently lower quality, scale, or platform
 support.
+
+### Gate Ownership And Evidence Lifecycle
+
+Historical selection harnesses prove why a model/backend/depth was chosen; they
+are not required release artifact layouts. Current acceptance uses the smallest
+production path that measures the stated behavior:
+
+- Task correctness gates block dependent code only when the contract itself is
+  unsafe or failing. Hardware/package evidence may move to the sprint's
+  dedicated validation task when later integration is required to measure it.
+- Sprint/release gates still block sprint or release closure. Moving evidence
+  ownership never lowers a threshold or converts a failed gate into a pass.
+- Quality gates use the exact returned production pipeline. Oracle output,
+  reconstructed ranking, printed diagnostics, or skipped artifact-gated tests
+  are not acceptance evidence.
+- Release performance uses the current signed production bundle and runtime.
+  A legacy tree containing retired candidate models or benchmark-only f32
+  exports MUST NOT be reconstructed or packaged merely to run historical code.
+- Refusal rate is diagnostic, not a percentage threshold. Record a predeclared
+  eligible-trial denominator, admissions, RAM refusals, and non-RAM exclusions;
+  the fail-closed activation ceiling itself remains unchanged.
 
 ## Packaging And Platform Gates
 
@@ -2095,7 +2159,7 @@ Architecture reviewers focus on:
 - Sprint 3: scope filtering, ranking, hydration, prompt budgets, and source
   parity.
 - Sprint 4: planner safety, cancellation, provider behavior, and bounded cost.
-- Sprint 5: external contracts, cross-platform packages, scale, recovery, and
+- Sprint 5: external contracts, Windows x64 packages, scale, recovery, and
   privacy claims.
 
 No sprint closes with unresolved blocker or should-fix findings.
@@ -2196,3 +2260,8 @@ Any failure to resolve one of these gates blocks Sprint 2 approval.
 | 2026-08-28 | Accept the whole-process activation RAM gate as-is for Sprint 2 with the ceiling unchanged, and move full-application calibration into Sprint 3 as a close obligation. | Both corrections were proven unavailable rather than deferred: `2.R13` showed a retrieval-scoped gate is not implementable against ORT 1.22 as bound, and `2C.3` showed full-application calibration is not producible on the development host (Whisper artifact absent, audio stack requires live WASAPI contention, no WebView residency proof). The mismatch errs fail-safe — activation is withheld and lexical retrieval serves every surface — and semantic retrieval has no query surface in Sprint 2, so the defect is unreachable by users today. Sprint 3 is the first build where a real fully loaded application runs a semantic query, which is exactly the measurement `2C.3` could not manufacture; calibrating there uses better evidence than any synthetic harness could produce, at no cost to a sprint with no deadline. | User |
 | 2026-08-28 | Require activation-refusal observability before the release that first exposes semantic retrieval. | The gate's refusal reason is written to `pending_blockers` and read by nothing — not logged, not surfaced. Accepting a knowingly conservative gate without this makes "working" and "never once activated" indistinguishable in the field, which would leave the Sprint 3 calibration obligation unmeasurable. Harmless while no query surface exists; unacceptable from the build that adds one. | User |
 | 2026-08-28 | Retain the `retrieval_documents(meeting_id, generation_id)` index despite it serving only a `debug_assertions`-gated query, and revisit at Sprint 3 close. | Measured against SQLite 3.49.1, the release-path deletion decrement is a covering-index search on the pre-existing `retrieval_documents_by_meeting` with or without the new index, so release builds carry it unused. Removing it costs a third forward-only migration in a codebase where two of three migration incidents broke application startup, and restores the write-lock scan `2C.1` was commissioned to remove. Trading a bounded cost (order 10-20 MB and a small write-throughput margin on a 250k-document corpus) for a high-risk operation is a poor exchange; Sprint 3 adds query surfaces that may make the index load-bearing, at which point the question is decidable on evidence. | User |
+| 2026-08-29 | Record external prior art from `0x12th/meetily-memory` (an independent, Python-based Meetily indexing tool) as corroborating evidence for two existing design choices; no design change. (1) Its contract explicitly forbids accepting "a generation-local integer" as evidence identity, requiring `source UUID + external ID + fingerprint` instead — independent confirmation that keeping `RetrievedEvidence.evidence_id` (line ~1210) a stable identity separate from `generation_id` was the right call. (2) Its index-rebuild swap (`BEGIN EXCLUSIVE`, WAL checkpoint/truncate, verify no `-wal`/`-shm`/`-journal` sidecars, then swap the file) solves a narrower problem than this program's in-process atomic generation/snapshot switch with hash-verified atomic rename and durable journal replay ("Generation Activation", line ~964) — not a gap, but confirms file-level atomic swap-then-verify is a recognized pattern for the same class of problem. | User |
+| 2026-08-30 | Replace historical-artifact release gates with current production-path evidence while preserving every numeric threshold and fail-closed invariant. | The Sprint 1 multi-candidate staging tree contains retired and benchmark-only models that the signed production bundle correctly excludes. Requiring that obsolete layout made current release evidence impossible without weakening package authority. Task correctness now uses the exact production retrieval/ranking path; release reranker p95 uses complete depth-50 calls through the hash-verified production bundle/runtime; the old `solo-pair p95 * 50` result remains dated selection evidence only. | User |
+| 2026-08-30 | Make Task 3.6 query expansion conditional on reviewed post-ranking evidence rather than an unconditional Sprint-close dependency. | Task 3.2 must remeasure all five critical cases. If reviewed production ranking reaches 5/5, building expansion only to satisfy an already-closed case is YAGNI and adds privacy/latency/provider risk. If `pt-ref-chaves-acesso` or another terminological-gap case remains the sole attributable miss, Task 3.6 becomes dependency-ready after the user selects an approach. The 5/5 Sprint-close threshold is unchanged. | User |
+| 2026-08-30 | Keep `retrieval_documents_by_meeting_lookup` installed without a Sprint 3 removal deadline. | An automatic reconsideration deadline created pressure to delete an applied migration despite no measured regression or replacement query. Removal now requires measured evidence that the index is obsolete, a forward-only migration, and a query-plan regression proving deletion cannot return to a table scan. | User |
+| 2026-08-30 | Clarify meeting-aggregation signal requirements as measured behavior rather than mandatory non-zero coefficients. | Requiring a separate non-zero weight for every listed signal invites arbitrary constants when held-out evidence does not support them. Profile participation through fused rank, zero-weight but reported concept coverage, and distinct-region support are valid only when explicit and regression-tested; user-visible quality floors remain the authority. | User |

@@ -2,8 +2,8 @@
 
 ## Status
 
-Changes requested. Sprint 1 closed on 2026-08-25. The user approved this
-Sprint 2 PRD and authorized all remaining Sprint 2 tasks on 2026-08-25.
+Closed with user approval. Sprint 1 closed on 2026-08-25. The user approved
+this Sprint 2 PRD and authorized all remaining Sprint 2 tasks on 2026-08-25.
 
 Revised 2026-08-21 after pre-implementation critique: split into two
 independently reviewed halves, and schema semantics corrected.

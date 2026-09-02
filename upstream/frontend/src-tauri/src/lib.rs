@@ -902,6 +902,8 @@ pub fn run() {
             api::api_chat_clear_conversation,
             api::api_chat_promote_live_recording,
             api::api_chat_discard_live_recording,
+            api::chat::api_chat_get_force_lexical_retrieval,
+            api::chat::api_chat_set_force_lexical_retrieval,
             api::api_get_profile,
             api::api_save_profile,
             api::api_update_profile,

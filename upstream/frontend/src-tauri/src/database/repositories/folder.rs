@@ -299,7 +299,7 @@ impl FolderRepository {
         tx.commit().await?;
 
         // Refresh FTS for the meeting to update folder_id and folder_name (best-effort)
-        if let Err(e) = FtsRepository::refresh_meeting(pool, meeting_id).await {
+        if let Err(e) = FtsRepository::refresh_meeting_unmarked(pool, meeting_id).await {
             error!(
                 "Failed to refresh FTS for meeting {} after folder change: {}",
                 meeting_id, e
@@ -334,6 +334,11 @@ mod tests {
                 folder_path TEXT,
                 folder_id TEXT
             );
+            CREATE TABLE search_source_state (
+                meeting_id TEXT PRIMARY KEY,
+                source_revision INTEGER NOT NULL DEFAULT 0,
+                changed_at TEXT
+            );
             "#,
         )
         .execute(&pool)
@@ -362,6 +367,14 @@ mod tests {
                 .await
                 .expect("read meeting folder_id");
         row.and_then(|(v,)| v)
+    }
+
+    async fn source_revision(pool: &SqlitePool, id: &str) -> i64 {
+        sqlx::query_scalar("SELECT source_revision FROM search_source_state WHERE meeting_id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("read source revision")
     }
 
     #[tokio::test]
@@ -408,6 +421,48 @@ mod tests {
         assert_eq!(meeting_folder_id(&pool, "m-2").await, None);
         // Folder rows gone.
         assert_eq!(FolderRepository::get_all(&pool).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn recursive_folder_membership_mutations_do_not_advance_source_revision() {
+        let pool = setup().await;
+        let first = FolderRepository::create(&pool, "First", None)
+            .await
+            .unwrap();
+        let second = FolderRepository::create(&pool, "Second", None)
+            .await
+            .unwrap();
+        seed_meeting(&pool, "m-1").await;
+        seed_meeting(&pool, "m-2").await;
+        sqlx::query("INSERT INTO search_source_state (meeting_id, source_revision) VALUES ('m-1', 7), ('m-2', 11)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(
+            FolderRepository::set_meeting_folder(&pool, "m-1", Some(&first.id))
+                .await
+                .unwrap()
+        );
+        assert_eq!(source_revision(&pool, "m-1").await, 7);
+        assert!(
+            FolderRepository::set_meeting_folder(&pool, "m-2", Some(&second.id))
+                .await
+                .unwrap()
+        );
+        let after_attach = source_revision(&pool, "m-1").await;
+        FolderRepository::move_folder(&pool, &first.id, Some(&second.id))
+            .await
+            .unwrap();
+        let after_folder_move = source_revision(&pool, "m-1").await;
+        assert_eq!(after_folder_move, after_attach);
+        assert_eq!(source_revision(&pool, "m-2").await, 11);
+
+        FolderRepository::delete_with_cascade(&pool, &second.id)
+            .await
+            .unwrap();
+        assert_eq!(source_revision(&pool, "m-1").await, after_folder_move);
+        assert_eq!(source_revision(&pool, "m-2").await, 11);
     }
 
     #[tokio::test]
@@ -467,6 +522,11 @@ mod tests {
                 updated_at TEXT NOT NULL,
                 folder_path TEXT,
                 folder_id TEXT
+            );
+            CREATE TABLE search_source_state (
+                meeting_id TEXT PRIMARY KEY,
+                source_revision INTEGER NOT NULL DEFAULT 0,
+                changed_at TEXT
             );
             "#,
         )

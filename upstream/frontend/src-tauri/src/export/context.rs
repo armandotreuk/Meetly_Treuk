@@ -12,16 +12,32 @@ pub struct ContextBuild {
     pub retained_evidence_ids: Vec<String>,
 }
 
-pub fn build_meeting_context_markdown(
-    _meeting_id: &str,
-    meeting_title: &str,
+/// One meeting's authoritative sections (summary, notes, transcript ranges,
+/// coverage notice) without the meeting header. Shared by the single-meeting
+/// builder and Task 3.3 multi-meeting hydration so both apply identical
+/// mandatory-section ordering, Unicode-safe truncation, and coverage rules.
+pub(crate) struct MeetingSections {
+    pub markdown: String,
+    /// Summary/notes text as published (post-truncation); `None` when the
+    /// source is absent or blank, so sources are only built from published
+    /// text.
+    pub summary: Option<String>,
+    pub notes: Option<String>,
+    pub retained_transcript_ids: Vec<String>,
+}
+
+/// `prefix_chars` is the char count of everything rendered above these
+/// sections inside `max_context_chars` (the meeting header plus any document
+/// prefix), so a caller-supplied header consumes budget exactly like the
+/// single-meeting builder's own header.
+pub(crate) fn build_meeting_sections(
     summary: Option<&str>,
     notes: Option<&str>,
     transcripts: &[FtsSearchResult],
     total_transcript_segments: usize,
     max_context_chars: usize,
-) -> MeetingContextBuild {
-    let mut out = format!("# Meeting Context\n\n## {}\n\n", meeting_title);
+    prefix_chars: usize,
+) -> MeetingSections {
     let mandatory = [("Summary", summary), ("Notes", notes)]
         .into_iter()
         .filter_map(|(heading, content)| {
@@ -31,6 +47,10 @@ pub fn build_meeting_context_markdown(
         })
         .collect::<Vec<_>>();
     let coverage_reserve = coverage_prefix_len(total_transcript_segments);
+    let mut markdown = String::new();
+    let mut used = prefix_chars;
+    let mut published_summary: Option<String> = None;
+    let mut published_notes: Option<String> = None;
     for (index, (heading, content)) in mandatory.iter().enumerate() {
         let remaining = mandatory.len() - index;
         let future_headers = mandatory[index + 1..]
@@ -43,17 +63,22 @@ pub fn build_meeting_context_markdown(
             .sum::<usize>();
         let heading_text = format!("### {}\n", heading);
         let available = max_context_chars
-            .saturating_sub(out.chars().count())
+            .saturating_sub(used)
             .saturating_sub(coverage_reserve)
             .saturating_sub(future_headers)
             / remaining;
-        out.push_str(&heading_text);
+        markdown.push_str(&heading_text);
         let content = truncate_with_marker(
             content,
             available.saturating_sub(heading_text.chars().count() + 2),
         );
-        out.push_str(&content);
-        out.push_str("\n\n");
+        used += heading_text.chars().count() + content.chars().count() + 2;
+        markdown.push_str(&content);
+        markdown.push_str("\n\n");
+        match *heading {
+            "Summary" => published_summary = Some(content),
+            _ => published_notes = Some(content),
+        }
     }
 
     let coverage_prefix = "### Transcript coverage\n";
@@ -68,7 +93,7 @@ pub fn build_meeting_context_markdown(
         } else {
             ""
         };
-        if out.chars().count()
+        if used
             + coverage_prefix.chars().count()
             + coverage.chars().count()
             + transcript_heading.chars().count()
@@ -79,21 +104,50 @@ pub fn build_meeting_context_markdown(
             break;
         }
         transcript_text.push_str(&section);
+        // `transcript_text` is counted explicitly in the check above (the
+        // heading and the accumulated sections are appended once after the
+        // loop), exactly like the original builder's accounting.
         retained_transcript_ids.push(transcript.chunk_id.clone());
     }
     if retained_transcript_ids.len() < total_transcript_segments {
         let coverage = coverage_notice(retained_transcript_ids.len(), total_transcript_segments);
-        out.push_str(coverage_prefix);
-        out.push_str(&coverage);
-        out.push_str("\n\n");
+        markdown.push_str(coverage_prefix);
+        markdown.push_str(&coverage);
+        markdown.push_str("\n\n");
     }
     if !transcript_text.is_empty() {
-        out.push_str("### Transcript\n");
-        out.push_str(&transcript_text);
+        markdown.push_str("### Transcript\n");
+        markdown.push_str(&transcript_text);
     }
-    MeetingContextBuild {
-        markdown: out,
+    MeetingSections {
+        markdown,
+        summary: published_summary,
+        notes: published_notes,
         retained_transcript_ids,
+    }
+}
+
+pub fn build_meeting_context_markdown(
+    _meeting_id: &str,
+    meeting_title: &str,
+    summary: Option<&str>,
+    notes: Option<&str>,
+    transcripts: &[FtsSearchResult],
+    total_transcript_segments: usize,
+    max_context_chars: usize,
+) -> MeetingContextBuild {
+    let header = format!("# Meeting Context\n\n## {}\n\n", meeting_title);
+    let sections = build_meeting_sections(
+        summary,
+        notes,
+        transcripts,
+        total_transcript_segments,
+        max_context_chars,
+        header.chars().count(),
+    );
+    MeetingContextBuild {
+        markdown: format!("{}{}", header, sections.markdown),
+        retained_transcript_ids: sections.retained_transcript_ids,
     }
 }
 

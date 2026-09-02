@@ -135,6 +135,10 @@ pub struct Setting {
     #[sqlx(rename = "chatOllamaEndpoint")]
     #[serde(rename = "chatOllamaEndpoint")]
     pub chat_ollama_endpoint: Option<String>,
+    #[sqlx(rename = "force_lexical_retrieval")]
+    #[serde(rename = "forceLexicalRetrieval")]
+    #[sqlx(default)]
+    pub force_lexical_retrieval: bool,
 }
 
 impl Setting {

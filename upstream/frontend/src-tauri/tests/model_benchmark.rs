@@ -3869,8 +3869,8 @@ async fn hybrid_corpus_and_resource_benchmark() {
     // compared under identical conditions: batch=1 (with dynamic-int8 exports
     // each pair's activation scale then depends only on itself, keeping the
     // ordering reproducible) and depth=RERANK_SET. A candidate is viable only
-    // if its measured solo per-pair p95 fits the 900 ms sub-budget at that
-    // depth; anything else is recorded as a gate conflict, not silently dropped.
+    // if its measured solo per-pair p95 fits the historical depth-cost probe;
+    // anything else is recorded as a model-selection exclusion, not silently dropped.
 
     // Probe pairs from the largest corpus case, fused order, evidence only.
     let probe_case = cases

@@ -29,6 +29,26 @@ pub struct SettingsRepository;
 // NOTE: Handle data exclusion in the higher layer as this is database abstraction layer(using SELECT *)
 
 impl SettingsRepository {
+    pub async fn get_force_lexical_retrieval(pool: &SqlitePool) -> Result<bool, sqlx::Error> {
+        (sqlx::query_scalar("SELECT force_lexical_retrieval FROM settings WHERE id = '1' LIMIT 1")
+            .fetch_optional(pool)
+            .await)
+            .map(|value: Option<bool>| value.unwrap_or(false))
+    }
+
+    pub async fn set_force_lexical_retrieval(
+        pool: &SqlitePool,
+        enabled: bool,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO settings (id, provider, model, whisperModel, force_lexical_retrieval) VALUES ('1', 'openai', 'gpt-4o-2024-11-20', 'large-v3', ?) ON CONFLICT(id) DO UPDATE SET force_lexical_retrieval = excluded.force_lexical_retrieval",
+        )
+        .bind(enabled)
+        .execute(pool)
+        .await
+        .map(|_| ())
+    }
+
     pub async fn get_model_config(
         pool: &SqlitePool,
     ) -> std::result::Result<Option<Setting>, sqlx::Error> {
