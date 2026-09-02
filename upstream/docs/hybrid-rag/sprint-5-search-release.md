@@ -2,7 +2,9 @@
 
 ## Status
 
-Planned, blocked by Sprint 4 approval and completion.
+Planned, blocked for implementation by Sprint 4 approval and completion.
+Sprint 3 release acceptance also remains open as a mandatory inherited gate for
+Task 5.5 and release close.
 
 Revised 2026-08-21 after pre-implementation critique: packaging descoped to
 Windows x64, derived-disk gate added, kill-switch UI added, and a sidebar
@@ -19,7 +21,9 @@ validation passes.
 ## Architecture Authority
 
 All work follows [`architecture.md`](architecture.md) and the reviewed runtime,
-retrieval, context, and Deep-mode contracts from Sprints 1-4.
+retrieval, context, and Deep-mode contracts from Sprints 1-4. The reviewed
+Sprint 3 implementation baseline is commits `62d7730` and `1047367`; it does
+not close Sprint 3 release acceptance.
 
 ## Scope
 
@@ -76,6 +80,21 @@ retrieval, context, and Deep-mode contracts from Sprints 1-4.
 - Sprints 2-4 provide backend status/control, hybrid search internals, context
   retention, and all persisted Chat behavior.
 
+## Sprint 3 Release-Gate Inheritance (R40)
+
+Sprint 5 remains implementation-dependent on Sprint 4 approval/completion. Its
+release and close criteria additionally inherit Sprint 3's still-open gates:
+
+- a valid independently authored Portuguese corpus;
+- production-path quality and final provider-answer evidence;
+- native Windows/R13 hermetic session evidence;
+- exact-head GitHub Actions evidence.
+
+V1-V10 and the currently rejected corpus fixtures/harnesses are not acceptance
+evidence. Internal production testing without a corpus is diagnostic only. Task
+5.5 and release close MUST NOT bypass these gates, and no later Fast/Deep result
+may substitute for them.
+
 ## Sprint Requirements
 
 - Sidebar and context surfaces use the same reviewed retrieval service, not a
@@ -89,20 +108,27 @@ retrieval, context, and Deep-mode contracts from Sprints 1-4.
 - Installed-package inference is tested, not inferred from `cargo test`.
 - Release scale includes index plus active model sessions in RAM measurements.
 - Every semantic failure preserves lexical functionality.
+- The single persisted `force_lexical_retrieval` setting is read at the shared
+  Rust preparation/service boundary for every sidebar, Tauri, and MCP hybrid
+  request, and for every initial/additional Deep retrieval; preserve typed
+  `ForcedLexical` and do not add a second setting or diagnostics service.
+- MCP timeout owns an internal deadline cancellation token passed through shared
+  retrieval so queued/running scheduler and ONNX work terminates without a
+  public MCP cancel API.
 
 ## Task List
 
 | ID | Feature | Task | Size | Owner | Dependencies | Acceptance check | Rollback |
 |---|---|---:|---|---|---|---|---|
 | 5.1 | Sidebar search | Consume the approved Tauri hybrid contract for meeting-level sidebar search, relevance snippets/provenance, lexical fallback, cancellation, and stable snapshot IDs. | M | Pending `worker-m` | 5.2 | Frontend/Rust tests prove ranking, fallback, folder filters, request cancellation, dedupe, keyboard/a11y, and snapshot membership. | Switch sidebar invocation back to existing FTS command. |
-| 5.2 | API and MCP | Add explicit cancellable Tauri and versioned bounded Fast-only MCP hybrid search/context contracts while preserving all lexical tools. | M | Pending `worker-m` | Sprint 4 | Contract/execution tests prove surface classification, scope composition, provenance, source retention, cancellation/bounds, compatibility, and no score ambiguity. | Remove additive commands/tools; existing lexical APIs remain. |
+| 5.2 | API and MCP | Add explicit cancellable Tauri and versioned bounded Fast-only MCP hybrid search/context contracts while preserving all lexical tools. | M | Pending `worker-m` | Sprint 4 approved contract; Task 4.1 shared ownership mechanism | Contract/execution tests prove surface classification, scope composition, provenance, source retention, shared cancellation/timeout bounds, compatibility, and no score ambiguity. | Remove additive commands/tools; existing lexical APIs remain. |
 | 5.3 | Index UX | Add Settings status, progress, pause/resume, rebuild, force-lexical toggle, error/retry, model/license, and local-size UI. | M | Pending `worker-m` | 2.5, 3.4 | UI/backend tests prove controls, lexical-only state, kill switch, disk reporting, accessibility, and rebuild cannot delete primary data. | Remove additive UI/commands; background index continues or can be disabled. |
 | 5.4 | Packaging | Bundle, sign, attribute, install, and smoke-test embedding/reranker resources on **Windows x64**. | M | Pending `worker-m` | 1.5, Sprint 2 | The installed Windows package loads/tokenizes/embeds/reranks/queries and fails over when resources are unavailable. | Remove resources and ship lexical-only build; never claim hybrid availability. |
-| 5.5 | Release qualification | Run/fix scale, concurrency, crash, upgrade, deletion, corruption, privacy, evaluation, native, and rollback gates. | L | Pending `worker-l` | 5.1-5.4 | All architecture release gates pass and final code/architecture reviews approve. | Disable semantic feature paths and retain FTS; restore pre-upgrade backup when release procedure requires. |
+| 5.5 | Release qualification | Run/fix scale, concurrency, crash, upgrade, deletion, corruption, privacy, evaluation, native, and rollback gates. | L | Pending `worker-l` | 5.1-5.4; inherited Sprint 3 release gates | All architecture release gates pass, including every inherited Sprint 3 gate, and final code/architecture reviews approve. | Disable semantic feature paths and retain FTS; restore pre-upgrade backup when release procedure requires. |
 
 ## Dependency Order
 
-`Sprint 4 -> 5.2 -> 5.1 -> 5.5`
+`Sprint 4 approved implementation -> 5.2 -> 5.1 -> 5.5`
 
 `2.5 -> 5.3 -> 5.5`
 
@@ -113,6 +139,9 @@ types, command registrations, and settings/search components are disjoint.
 Task `5.2` owns all serialized Tauri/MCP hybrid contracts and runs before its
 sidebar consumer. Task `5.5` is L and runs alone. Task `5.4` dropped from L to
 M when packaging was descoped to Windows x64 only.
+The Sprint 4 dependency here means its approved implementation contract; it does
+not convert Sprint 3's open release gates into an implementation or evidence
+waiver for Task 5.5.
 
 ## Task Specifications
 
@@ -145,6 +174,10 @@ membership.
 - Resolve folder restrictions authoritatively in Rust.
 - Use existing FTS results when semantic state is building, unavailable, or
   failed.
+- Read the single persisted `force_lexical_retrieval` setting at the shared Rust
+  preparation/service boundary; when enabled, use the existing lexical fallback
+  and preserve the typed `ForcedLexical` reason rather than adding a sidebar
+  switch or diagnostics service.
 - Keep search-snapshot launch based on the ordered visible meeting IDs.
 - Preserve loading/empty/error behavior, keyboard navigation, and accessibility.
 - Avoid displaying internal model/index errors as raw Rust messages.
@@ -181,6 +214,9 @@ membership.
 - Typing rapidly while a Chat request is streaming does not delay that stream
   beyond the approved scheduler policy.
 - Debounce/cancellation prevents stale older results replacing newer results.
+- Enabling force-lexical affects the next sidebar request, survives restart, and
+  disabling it restores hybrid behavior; the same setting and typed reason are
+  used by every hybrid surface.
 - Search controls/results remain keyboard and screen-reader accessible.
 
 **Required verification:**
@@ -224,15 +260,24 @@ and retained hybrid context without breaking existing BM25 consumers.
 - Accept exactly one tagged scope through backend validation. Reject conflicting
   folder/allowed-ID/query-folder combinations and enforce existing ID bounds;
   never accept raw renderer-provided evidence.
-- Require a request ID for interactive Tauri hybrid search/context and provide
-  cancellation/ownership so superseded sidebar work stops in Rust.
+- Reuse the one Rust request-ownership/cancellation mechanism established by
+  Sprint 4 Task 4.1, keyed so Chat and sidebar requests may coexist; do not add
+  a parallel request registry. Require a request ID for interactive Tauri
+  hybrid search/context and provide cancellation/ownership so superseded
+  sidebar work stops in Rust, with terminal/error/timeout cleanup.
 - Add versioned or separately named MCP hybrid search/context tools.
 - Keep existing lexical MCP tools and descriptions.
 - Update hybrid tool descriptions to state local semantic+lexical behavior and
   score/provenance semantics.
 - Keep MCP Chat and hybrid search/context Fast-only in this release.
-- Give MCP hybrid tools strict candidate/context/time bounds and server-side
-  timeout. Do not claim MCP cancellation support.
+- Read the single persisted `force_lexical_retrieval` setting at the shared Rust
+  preparation/service boundary for every Tauri and MCP hybrid request. When
+  enabled, use the existing lexical fallback and preserve the typed
+  `ForcedLexical` reason; do not add a second setting or diagnostics service.
+- Give MCP hybrid tools strict candidate/context/time bounds and a server-side
+  timeout. The timeout owns an internal deadline cancellation token passed
+  through shared retrieval so queued/running scheduler and ONNX work terminates;
+  do not claim a public MCP cancellation API.
 - Enforce limits and local scope before serialization.
 - Do not expose embeddings or private diagnostics.
 
@@ -247,9 +292,16 @@ and retained hybrid context without breaking existing BM25 consumers.
 - Invalid/oversized input fails with a stable safe error.
 - MCP tool definitions and execution tests cover hybrid success, fallback,
   limit, and error semantics.
-- MCP Chat still uses shared Fast Chat preparation and cannot request Deep.
+- MCP Chat still uses shared Fast Chat preparation, cannot request Deep, and has
+  a behavioral regression through that shared-preparation path.
 - Superseded Tauri request IDs cancel queued/running retrieval without stale
-  result publication.
+  result publication; stale/replaced/cancelled progress is also suppressed and
+  terminal/error/timeout cleanup leaves the shared registry bounded.
+- MCP timeout cancellation reaches queued/running retrieval and ONNX work
+  rather than merely dropping publication.
+- Enabling force-lexical affects the next Tauri/sidebar/MCP hybrid request,
+  survives restart, disabling restores hybrid behavior, and Fast/Deep Chat plus
+  all hybrid surfaces preserve the typed `ForcedLexical` reason.
 - No provider/API key or raw content appears in logs.
 
 **Required verification:**
@@ -268,8 +320,10 @@ Add an executable MCP tool-routing test if current coverage only serializes
 definitions. Record final tool names/versions and JSON examples.
 
 **Worker report additions:** Provide compatibility table, exact score/provenance
-semantics, scope composition rules, request-ID/cancellation behavior, MCP
-timeout/bounds, and external rollback path.
+semantics, scope composition rules, reuse of the Task 4.1 ownership mechanism,
+request-ID/cancellation behavior, MCP deadline-token timeout/bounds, shared
+preparation regression, forced-lexical round-trip evidence, and external
+rollback path.
 
 ### 5.3 - Semantic index Settings and diagnostics [M]
 
@@ -300,6 +354,10 @@ without touching files or risking meeting data.
   matching instead of meaning-based matching — and make clear that it does not
   delete the index and can be turned off at any time. This is the user's own
   rollback for a bad retrieval result and must be discoverable, not buried.
+- Keep this as the one persisted setting: the shared Rust preparation/service
+  boundary reads it for Fast/Deep Chat and every sidebar/Tauri/MCP hybrid
+  request, including all initial/additional Deep retrieval. Preserve the typed
+  `ForcedLexical` reason; do not add a second setting or diagnostics service.
 - Show forced-lexical state distinctly from a semantic failure state, so a user
   never mistakes their own setting for a broken index.
 - Confirm rebuild clearly states that transcripts, summaries, notes, recordings,
@@ -320,6 +378,9 @@ without touching files or risking meeting data.
 - **The force-lexical toggle round-trips: enabling it changes retrieval on the
   next request, it survives restart, disabling it restores hybrid behavior, and
   neither transition pauses or invalidates the index.**
+- The enable-next-request, restart, and disable-restore checks cover Fast and
+  Deep Chat plus sidebar, Tauri, and MCP hybrid requests and preserve the typed
+  `ForcedLexical` reason.
 - **User-forced lexical state is visually and textually distinct from a
   semantic failure state.**
 - Disk usage is shown against its envelope, with a clear indication when the
@@ -445,7 +506,15 @@ supported Windows x64 package, and within approved scale/resource limits.
 - Initial and partial backfill lexical-only behavior.
 - Every Chat scope in Fast/Deep, live direct path, sidebar, Tauri, and MCP.
 - **Forced lexical-only retrieval across every surface, its persistence across
-  restart, and clean restoration of hybrid behavior when disabled.**
+  restart, and clean restoration of hybrid behavior when disabled.** The shared
+  Rust boundary reads the one persisted setting for every initial/additional
+  Deep retrieval and sidebar/Tauri/MCP hybrid request and preserves typed
+  `ForcedLexical`; no second setting or diagnostics service is permitted.
+- One shared Rust ownership/cancellation mechanism reused from Task 4.1,
+  including stale/replaced/cancelled progress, terminal/error/timeout cleanup,
+  and bounded registry lifetime.
+- MCP server timeout cancellation of queued/running shared retrieval and ONNX
+  work through its internal deadline token, without a public MCP cancel claim.
 - **Derived disk at 12k/50k/250k in steady state and during a shadow rebuild,
   measured against the 2 GiB / 3 GiB envelope.**
 - **Reranking stage p95 measured separately against its 900 ms sub-budget, for
@@ -462,6 +531,12 @@ supported Windows x64 package, and within approved scale/resource limits.
 
 - All `architecture.md` correctness, privacy, availability, scope, performance,
   packaging, evaluation, and reference-case gates pass.
+- Task 5.5 and release close also require valid evidence for the independently
+  authored Portuguese corpus, production-path quality and final provider-answer
+  evidence, native Windows/R13 hermetic session evidence, and exact-head GitHub
+  Actions evidence. V1-V10 and currently rejected corpus fixtures/harnesses are
+  not acceptance evidence; corpus-free internal production testing is diagnostic
+  only. No Fast/Deep result may bypass these gates.
 - Peak retrieval RAM at 250k is at most 1 GiB on reference hardware, including
   the ANN graph when selected, or has the explicit required approval for a
   measured 1-1.25 GiB result; above 1.25 GiB fails without a product scope
@@ -505,6 +580,9 @@ git diff --check
 
 Run every approved scale/packaging/native command and attach summarized results
 to the execution entry.
+The execution entry MUST report each inherited Sprint 3 gate separately; a
+task-local evaluation, native check, or Fast/Deep result cannot substitute for a
+missing gate.
 
 **Worker report additions:** Provide the complete gate matrix with pass/fail,
 measured metrics, fixes made, omissions, residual risks, and rollback drill.
@@ -530,6 +608,11 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 - **External consumer breakage:** additive commands/tools and explicit score
   fields.
 - **Sidebar stale result race:** request cancellation/generation ownership.
+- **Parallel cancellation state or unfenced progress:** reuse Task 4.1's single
+  Rust ownership/cancellation mechanism and Chat publication fence, with bounded
+  cleanup/lifetime tests.
+- **MCP timeout only drops results:** pass the server-owned internal deadline
+  token through shared retrieval so queued and ONNX work is cancelled.
 - **Unsafe rebuild UI:** derived-only backend contract plus confirmation/tests.
 - **Installer failure/size:** pinned CI artifacts, package reports, installed
   smoke.
@@ -545,6 +628,12 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
   typing.
 - **Recovery claim without proof:** crash injection and restart tests.
 - **Privacy regression:** local network/log audit and no remote telemetry.
+- **Forced-lexical drift:** one shared-boundary persisted setting, typed
+  `ForcedLexical`, and enable-next-request/restart/disable-restore coverage on
+  Fast/Deep and every hybrid surface.
+- **Release-gate laundering:** Task 5.5 and release close inherit the four
+  named Sprint 3 gates; rejected fixtures and corpus-free diagnostics cannot
+  become evidence.
 
 ## Decisions And Change Log
 
@@ -557,6 +646,9 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 | 2026-08-21 | Surface the force-lexical kill switch in Settings as a first-class control. | It is the user's own rollback from a bad retrieval result and is useless if undiscoverable. | Keep it as a hidden or developer-only setting. | Main agent, pending sprint approval |
 | 2026-08-21 | Add derived-disk qualification at every scale, including the rebuild peak. | Derived text plus vectors plus two retained generations plausibly reach ~2 GiB with no prior ceiling anywhere in the program. | Report disk as an unanchored metric. | Main agent, pending sprint approval |
 | 2026-08-21 | Guard sidebar reranking with a minimum query length, `Search` depth, and in-flight cancellation. | Sidebar runs the cross-encoder per debounced keystroke; an empty-query check alone does not bound that cost. | Rely on debounce and the empty-query guard. | Main agent, pending sprint approval |
+| 2026-09-02 | Carry Sprint 3's open release gates into Task 5.5 and release close while retaining commits `62d7730` and `1047367` as the reviewed implementation baseline. | R40 separates implementation dependencies from release acceptance; valid corpus, production-path quality/provider-answer, native Windows/R13 hermetic session, and exact-head Actions evidence remain mandatory. | Treat Sprint 4/5 implementation results or broad architecture wording as release evidence. | User-authorized R40 |
+| 2026-09-02 | Reuse one Rust ownership/cancellation mechanism and Chat publication fence for sidebar/Tauri/MCP work, including internal MCP deadline cancellation. | Prevents parallel registries, stale progress, and timeouts that merely drop results while preserving Fast-only MCP compatibility. | Add another request registry or public MCP cancel API. | User-authorized R40 |
+| 2026-09-02 | Carry the single persisted `force_lexical_retrieval` decision through all Deep rounds and sidebar/Tauri/MCP hybrid requests. | Shared-boundary reads, typed `ForcedLexical`, and next-request/restart/disable-restore checks keep rollback consistent without a second service. | Per-surface settings or diagnostics. | User-authorized R40 |
 
 ## Task Execution Log
 
@@ -609,6 +701,14 @@ failure recovery, privacy, and final release claims.
 ## Approval Gates
 
 - Sprint 4 close must be approved first.
+- Sprint 3 release acceptance remains open and is mandatory for Task 5.5 and
+  release close: valid independently authored Portuguese corpus, production-
+  path quality and final provider-answer evidence, native Windows/R13 hermetic
+  session evidence, and exact-head GitHub Actions evidence.
+- V1-V10 and currently rejected corpus fixtures/harnesses are not acceptance
+  evidence; corpus-free internal production testing is diagnostic only. Task
+  5.5 and release close MUST NOT bypass the inherited gates or substitute a
+  later Fast/Deep result for them.
 - User approval of this PRD is required before Sprint 5 TODO creation.
 - Task 5.2 external contracts require a dedicated approved batch unless proven
   safe with another task.

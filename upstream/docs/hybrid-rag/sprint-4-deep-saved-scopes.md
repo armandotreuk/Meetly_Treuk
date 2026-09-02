@@ -2,7 +2,9 @@
 
 ## Status
 
-Planned, blocked by Sprint 3 approval and completion.
+Planned; implementation may proceed in dependency order after the R40
+documentation amendment and current user approval. Sprint 3 release acceptance
+remains open and blocks Sprint 4 close and release claims.
 
 Revised 2026-08-21 after pre-implementation critique: Deep preparation progress
 contract added, budget reduced from 45 s to 30 s, and the mode selector
@@ -19,7 +21,9 @@ making Fast retrieval a weak fallback.
 ## Architecture Authority
 
 All work follows [`architecture.md`](architecture.md) and the reviewed broad
-Fast retrieval contracts delivered by Sprint 3.
+Fast retrieval contracts delivered by Sprint 3. The reviewed implementation
+baseline is commits `62d7730` and `1047367`; this is an implementation
+dependency, not Sprint 3 release acceptance.
 
 ## Scope
 
@@ -67,10 +71,30 @@ Fast retrieval contracts delivered by Sprint 3.
 - Sprint 3 provides scope-safe Fast retrieval, local reranking, authoritative
   broad hydration, and lexical fallback.
 
+## Sprint 3 Baseline And Release-Gate Inheritance (R40)
+
+After this documentation amendment and the user's current approval, Sprint 4
+implementation may start in the dependency order below, beginning with 4.1.
+Sprint 3 release acceptance remains open on:
+
+- a valid independently authored Portuguese corpus;
+- production-path quality and final provider-answer evidence;
+- native Windows/R13 hermetic session evidence;
+- exact-head GitHub Actions evidence.
+
+V1-V10 and the currently rejected corpus fixtures/harnesses are not acceptance
+evidence. Internal production testing without a corpus is diagnostic only. Task
+4.5, Sprint 4 close, Task 5.5, and release close MUST NOT bypass these gates;
+no later Fast/Deep result may substitute for them.
+
 ## Sprint Requirements
 
-- Fast remains one retrieval pass with no planner model call.
+- Fast remains one retrieval pass with no Deep planner call. The existing
+  follow-up query rewrite may use the configured Chat provider.
 - Deep is default only for new interactive Chat sessions.
+- New interactive UI sessions explicitly send `deep`; omitted mode for every
+  legacy, non-interactive, or MCP contract resolves to `fast`; explicit unknown
+  mode is rejected; live sends `fast` and never enters Deep.
 - The mode is request-level; no schema change is needed.
 - Planner output is strict internal data and never rendered/persisted as an
   assistant answer.
@@ -78,6 +102,10 @@ Fast retrieval contracts delivered by Sprint 3.
 - Meeting content is untrusted evidence and cannot issue planner actions.
 - Non-cancellation Deep component failure always continues from current Fast
   evidence; user/request cancellation aborts.
+- One persisted `force_lexical_retrieval` setting is read at the shared Rust
+  preparation/service boundary and governs every initial/additional Deep
+  retrieval and every Tauri, MCP, or sidebar hybrid request, preserving the
+  typed `ForcedLexical` reason.
 - Saved-meeting mandatory summary/notes and no-hit behavior remain intact.
 - Snapshot membership stays frozen by meeting IDs.
 - Today membership stays date-derived and current.
@@ -87,23 +115,27 @@ Fast retrieval contracts delivered by Sprint 3.
 
 | ID | Feature | Task | Size | Owner | Dependencies | Acceptance check | Rollback |
 |---|---|---|---|---|---|---|---|
-| 4.1 | Quality mode | Add Fast/Deep request contract and accessible Chat selector with Deep default. | M | Pending `worker-m` | Sprint 3 | UI/backend tests prove default, selection, request propagation, and no persistence/schema change. | Remove optional mode and default backend to Fast broad behavior. |
+| 4.1 | Quality mode | Add Fast/Deep request contract and accessible Chat selector with Deep default. | M | Pending `worker-m` | R40 docs + current user approval; Sprint 3 implementation baseline | UI/backend tests prove explicit mode compatibility, shared ownership/cancellation, default, selection, request propagation, and no persistence/schema change. | Remove optional mode and default backend to Fast broad behavior. |
 | 4.2 | Deep retrieval | Implement bounded structured planner/search/open/expand loop with scope and cancellation enforcement. | L | Pending `worker-l` | 4.1 | Adversarial and functional tests prove iterative recall, max rounds, scope safety, fallback, and hidden planner output. | Disable Deep branch; Fast remains complete. |
-| 4.3 | Saved meeting | Replace saved-meeting transcript anchor selection with hybrid retrieval while preserving authoritative context and fallback. | M | Pending `worker-m` | Sprint 3 | Saved-meeting regressions prove summary/notes, neighborhoods, no-hit fallback, coverage, and source parity. | Restore lexical `search_meeting_transcripts`; no data change. |
-| 4.4 | Snapshot/today | Make snapshot and today membership query-aware through hybrid retrieval with deterministic Fast broad-summary coverage and bounded Deep actions. | M | Pending `worker-m` | 4.2 | Tests prove frozen/date membership, query relevance, deleted-member tolerance, broad summarization coverage, and bounds. | Restore deterministic `get_by_meeting_ids`. |
-| 4.5 | Cross-scope hardening | Complete Fast/Deep integration, deleted-meeting source scrubbing/disclosure, provider/failure/cancellation/source tests, evaluation, and native smoke. | M | Pending `worker-m` | 4.2-4.4 | Full evaluation/native/deletion checks pass with no scope leak, stale deleted source, or source mismatch. | Disable Deep/per-scope hybrid paths; source scrub rollback requires explicit privacy approval. |
+| 4.3 | Saved meeting | Replace saved-meeting transcript anchor selection with hybrid retrieval while preserving authoritative context and fallback. | M | Pending `worker-m` | Sprint 3 implementation baseline (release acceptance remains open) | Saved-meeting regressions prove summary/notes, neighborhoods, no-hit fallback, coverage, and source parity. | Restore lexical `search_meeting_transcripts`; no data change. |
+| 4.4 | Snapshot/today | Make snapshot and today membership query-aware through hybrid retrieval with deterministic Fast broad-summary coverage and bounded Deep actions. | M | Pending `worker-m` | 4.2; Sprint 3 implementation baseline | Tests prove frozen/date membership, query relevance, deleted-member tolerance, broad summarization coverage, and bounds. | Restore deterministic `get_by_meeting_ids`. |
+| 4.5 | Cross-scope hardening | Complete Fast/Deep integration, deleted-meeting source scrubbing/disclosure, provider/failure/cancellation/source tests, evaluation, and native smoke. | M | Pending `worker-m` | 4.2-4.4; inherited Sprint 3 release gates | Full evaluation/native/deletion checks pass with no scope leak, stale deleted source, or source mismatch, and every inherited Sprint 3 release gate has valid evidence. | Disable Deep/per-scope hybrid paths; source scrub rollback requires explicit privacy approval. |
 
 ## Dependency Order
 
-`4.1 -> 4.2 -> 4.5`
+`R40 docs + current user approval -> 4.1 -> 4.2 -> 4.5`
 
-`Sprint 3 -> 4.3 -> 4.5`
+`Sprint 3 implementation baseline -> 4.3 -> 4.5`
 
-`Sprint 3 -> 4.2 -> 4.4 -> 4.5`
+`Sprint 3 implementation baseline -> 4.2 -> 4.4 -> 4.5`
 
 Tasks `4.3` and `4.4` are conceptually independent but both are likely to edit
 `api/chat.rs` and retrieval scope contracts, so they run sequentially unless a
 fresh diff proves disjoint file ownership. Task 4.2 is L and runs alone.
+The Sprint 3 implementation-baseline edges above do not waive Sprint 3 release
+acceptance; those gates remain closure/release dependencies.
+Every Sprint 4 implementation task remains subject to the R40 amendment and its
+existing per-task human approval; 4.1 is the first implementation task.
 
 ## Task Specifications
 
@@ -125,29 +157,41 @@ default to Deep without altering conversation identity or persistence.
 
 - Add a serialized `fast`/`deep` retrieval-mode contract mirrored in Rust and
   TypeScript.
-- Make new interactive Chat panel/session state default to Deep.
+- Make new interactive Chat panel/session state default to Deep and explicitly
+  send `deep` for its new-session request; an explicit Fast selection sends
+  `fast`.
 - Add an accessible selector in the established Chat visual language.
 - Explain that Deep may take longer and make additional requests to the
   configured Chat provider.
 - Pass the selected mode through both scoped streaming and supported
   non-streaming Chat commands.
-- Add a request ID/backend cancellation token registry and explicit cancel
-  command for non-streaming Chat. A newer request or explicit cancel owns the
-  terminal result and suppresses stale completion.
+- Generalize/reuse the accepted Sprint 3 Rust ownership/cancellation semantics
+  as one request mechanism for Chat and sidebar work, keyed so both surfaces
+  may coexist. A newer request or explicit cancel owns the terminal result and
+  suppresses stale completion; retain the explicit non-streaming Chat cancel
+  command through this mechanism and do not add a parallel registry.
+- Ensure terminal, error, and timeout paths clean up the mechanism and add
+  bounded-registry-lifetime tests.
 - Keep conversation scope/key/history unchanged when mode changes.
 - Do not add a database column or alter conversation uniqueness.
-- Backend must validate unknown mode values and apply an explicit default.
+- Omitted mode for every legacy, non-interactive, or MCP contract resolves to
+  `fast`; an explicit unknown mode is rejected.
 - MCP Chat remains Fast-only in this release; do not expose Deep mode through
   unauthenticated localhost MCP.
+- Add a behavioral MCP regression through the same shared Chat preparation,
+  proving that it remains Fast-only rather than only checking serialization.
 - **Disable the selector in live-recording scope** with a short explanation
   that live Chat reads the current transcript directly. Live retrieval ignores
-  the mode entirely, and presenting an active "Deep" control that does nothing
+  the mode entirely; the live UI sends `fast` and no Deep planner runs, and
+  presenting an active "Deep" control that does nothing
   misleads the user in the scope most likely to want extra depth. Follow the
   Mode Applicability By Scope table in `architecture.md`.
 - **Emit stage-level Deep preparation progress** through the existing Chat
   event channel, per `architecture.md` "Deep Preparation Progress". Events
   carry stage identity and counts only — never planner output, queries, or
-  evidence text. Fast emits no preparation progress.
+  evidence text — and pass through Chat's current ownership/cancellation
+  publication fence. A privacy-safe sink in `retrieval/agent.rs` must not own
+  Tauri events, `AppHandle`, or a second event bus.
 - Render progress accessibly, replacing the current silent gap between send and
   first token.
 
@@ -158,8 +202,12 @@ default to Deep without altering conversation identity or persistence.
 - Closing/reopening need not remember a manual Fast choice; this is documented.
 - Streaming and non-streaming requests carry the same validated enum.
 - Non-streaming Deep can be cancelled while queued, planning, retrieving, or
-  generating and cannot return a stale final result.
-- Unknown backend values fail or use the explicitly documented safe default.
+  generating and cannot return a stale final result through the shared
+  ownership mechanism.
+- Omitted legacy/non-interactive/MCP mode is always Fast, explicit unknown mode
+  is rejected, and a new interactive request explicitly carries Deep.
+- The behavioral MCP regression traverses shared Chat preparation and proves
+  omitted MCP mode is Fast-only with no Deep planner call.
 - Selector has accessible name, keyboard behavior, and explanatory text.
 - **In live-recording scope the selector is disabled and explains why; no
   request carries a Deep mode that live retrieval would ignore.**
@@ -168,6 +216,8 @@ default to Deep without altering conversation identity or persistence.
   evidence content appears in any progress payload.
 - Progress is announced accessibly without excessive screen-reader chatter.
 - Cancellation remains available throughout the progress phase.
+- Stale, replaced, and cancelled progress is suppressed; terminal/error/timeout
+  cleanup runs, and registry lifetime stays bounded under repeated requests.
 - Existing scope switch and stream-isolation tests remain green.
 - No migration or persisted conversation format change occurs.
 
@@ -178,6 +228,7 @@ pnpm --dir "frontend" run typecheck
 pnpm --dir "frontend" exec vitest run tests/components/chat-scope.test.tsx
 $env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA "meetily-cargo-target"
 cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib api::chat::tests
+cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib mcp::server::tests
 cargo check --manifest-path "frontend/src-tauri/Cargo.toml"
 cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check
 git diff --check
@@ -185,7 +236,8 @@ git diff --check
 
 **Worker report additions:** Record default semantics for interactive,
 non-interactive, MCP, and live callers and all changed IPC signatures. Explain
-that MCP is intentionally Fast-only.
+that MCP is intentionally Fast-only, identify the shared ownership mechanism,
+and report stale-progress and cleanup/lifetime regressions.
 
 ### 4.2 - Bounded Deep retrieval loop [L]
 
@@ -209,6 +261,16 @@ additional scope-safe retrieval before the final answer.
 - Mark meeting content as untrusted evidence and separate it from instructions.
 - Use provider-independent non-streaming generation rather than provider-native
   tool calling.
+- Route planner generation through planner-specific bounded-generation options in
+  the existing shared LLM client/request builder; do not create a second client
+  or fork provider logic into `retrieval/agent.rs`.
+- Every provider MUST have a hard response-byte/parser cap, use its output limit
+  where supported, and receive a scoped child cancellation token cancelled on
+  both the per-call and total-preparation deadline. A provider that cannot
+  enforce a required generation or cancellation bound falls back to current
+  Fast evidence. Populate and test the
+  capability/fallback matrix for OpenAI, Claude, Groq, Ollama, OpenRouter,
+  BuiltInAI, and Custom OpenAI.
 - Parse a strict whole-payload JSON object. Any prefix/suffix prose, reasoning
   tags, trailing object, unknown field, or oversized output is malformed and
   triggers Fast-evidence fallback.
@@ -220,6 +282,8 @@ additional scope-safe retrieval before the final answer.
   default path and the budget is time the user spends watching nothing happen).
 - Emit a stage-level progress event at each phase boundary: initial retrieval,
   each planner round, each additional search, and handoff to answer generation.
+  Publish through Chat's current ownership/cancellation publication fence; the
+  agent may receive only a privacy-safe progress sink.
 - Count and report **total provider round-trips per Deep turn**, including the
   pre-existing follow-up query-rewrite call at `api/chat.rs:465-494`. The worst
   case is four: rewrite, two planner calls, and final generation. Reporting
@@ -227,8 +291,16 @@ additional scope-safe retrieval before the final answer.
 - Deduplicate queries/actions and prevent loops.
 - Merge additional evidence through the same fusion/rerank/hydration contracts,
   not by appending arbitrary planner text.
+- Restrict `openMeetingIds` to the bounded candidate/meeting-card IDs supplied to
+  the current planner round, and `expandEvidenceIds` to evidence IDs currently
+  known and retained by that round. Revalidate authoritative scope after every
+  round and before final publication.
 - Pass the streaming ownership token or non-streaming request token through
   planner, retrieval, and final generation.
+- Read the single persisted `force_lexical_retrieval` setting at the shared Rust
+  preparation/service boundary before initial retrieval and honor it through
+  every additional round, preserving the typed `ForcedLexical` reason. Do not
+  add another setting or diagnostics service.
 - On timeout, malformed output, unsupported provider behavior, refusal, empty
   action, or component failure, continue with current Fast evidence.
 - User/stream cancellation is typed separately and aborts preparation without
@@ -251,7 +323,15 @@ additional scope-safe retrieval before the final answer.
 - Duplicate/self-repeating actions stop within max rounds.
 - Every numeric planner limit above is tested at boundary and over-boundary.
 - Malformed JSON, timeout, and provider error fall back to Fast evidence;
-  user/stream cancellation aborts without stale stream events.
+  user/stream cancellation aborts without stale stream events. Unsupported
+  provider bounds also fall back to Fast evidence.
+- Open-meeting actions outside the current round's supplied candidate/cards and
+  evidence expansions outside its known/retained IDs are rejected, including in
+  `All`; scope revalidation remains enforced.
+- Stale, replaced, and cancelled progress is not published; terminal, error,
+  and timeout cleanup completes and the shared registry lifetime remains bounded.
+- Fast/Deep and cross-surface tests cover force-lexical enable-next-request,
+  restart persistence, and disable-restore behavior with the typed reason.
 - Fast mode makes no planner call and emits no preparation progress events.
 - Planner requests are observable through privacy-safe stage metrics only.
 - **Deep preparation p95 is at or below 30 seconds**, measured and reported.
@@ -264,6 +344,7 @@ additional scope-safe retrieval before the final answer.
 ```powershell
 $env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA "meetily-cargo-target"
 cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib retrieval::agent::tests
+cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib summary::llm_client::tests
 cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib api::chat::tests
 cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --test retrieval_evaluation
 cargo check --manifest-path "frontend/src-tauri/Cargo.toml"
@@ -404,7 +485,12 @@ cancellation, sources, failure fallback, and native product integration.
 - Test all, folder, saved meeting, snapshot, and today in Fast and Deep.
 - Verify live remains direct and scope-safe when Deep is selected in UI.
 - Test provider error, planner error, model/index unavailable, cancellation at
-  each preparation stage, and replaced stream ownership.
+  each preparation stage, and replaced stream ownership through the one shared
+  Rust ownership/cancellation mechanism, including stale/replaced/cancelled
+  progress and terminal/error/timeout cleanup with bounded registry lifetime.
+- Exercise the single persisted `force_lexical_retrieval` setting at the shared
+  Rust boundary through initial/additional Deep retrieval and every scope, with
+  typed `ForcedLexical` diagnostics.
 - Verify source serialization/resume after Deep evidence additions.
 - On meeting deletion, preserve conversation answer text but scrub every source
   entry for that meeting from meeting-scoped and broad message `sources_json`;
@@ -450,6 +536,12 @@ cancellation, sources, failure fallback, and native product integration.
 - Required facts and exact retained sources pass evaluation.
 - Generated answers across every persisted scope assert zero eligible
   answer-stage forbidden facts, with denominators recorded.
+- Task 4.5 is not complete unless the valid independently authored Portuguese
+  corpus, production-path quality and final provider-answer evidence, native
+  Windows/R13 hermetic session evidence, and exact-head GitHub Actions evidence
+  all exist. V1-V10 and currently rejected corpus fixtures/harnesses do not
+  satisfy these gates; corpus-free internal production testing is diagnostic
+  only.
 - Full Rust/frontend suites and native smoke pass.
 
 **Required verification:**
@@ -466,6 +558,8 @@ git diff --check
 ```
 
 Record Deep request/latency metrics and native-smoke steps/results.
+The verification record MUST identify each inherited Sprint 3 gate separately;
+no Fast/Deep result or task-local check may substitute for a missing gate.
 
 ## Sprint Acceptance Criteria
 
@@ -481,6 +575,12 @@ Record Deep request/latency metrics and native-smoke steps/results.
 - All persisted scopes pass Fast/Deep quality and source evaluation.
 - Live scope remains direct and unchanged.
 - Full automated/native checks and code/architecture reviews pass.
+- Sprint 3 release acceptance is still explicitly satisfied by the valid
+  independently authored Portuguese corpus, production-path quality and final
+  provider-answer evidence, native Windows/R13 hermetic session evidence, and
+  exact-head GitHub Actions evidence; without all four, Sprint 4 cannot close.
+- V1-V10 and currently rejected corpus fixtures/harnesses are not acceptance
+  evidence, and corpus-free internal production testing is diagnostic only.
 
 ## Risks And Mitigations
 
@@ -494,11 +594,26 @@ Record Deep request/latency metrics and native-smoke steps/results.
 - **Prompt injection:** strict action schema, content delimiters, allow-lists,
   and evidence-is-data system rules.
 - **Scope widening:** resolve original allow-list once and validate every action.
-- **Planner instability:** provider-independent JSON parser plus Fast fallback.
+- **Planner instability/provider variance:** provider-independent JSON parser,
+  shared-client bounded generation, capability/fallback matrix, child deadline
+  cancellation, and Fast fallback.
+- **Stale or leaked progress:** one Rust ownership/cancellation mechanism,
+  Chat publication fence, terminal cleanup, and bounded registry tests; no
+  parallel registries or agent-owned Tauri bus.
+- **Rollback drift:** the one persisted `force_lexical_retrieval` setting is read
+  at the shared Rust boundary for every initial/additional round and surface;
+  typed `ForcedLexical` plus enable-next-request/restart/disable-restore tests
+  protect the behavior.
+- **Authority widening:** planner open IDs are limited to supplied
+  candidate/card IDs and evidence expansion to known/retained IDs, with scope
+  revalidation after each round and before publication.
 - **First-token delay:** communicate Deep behavior and preserve Fast.
 - **Saved-meeting regression:** reuse authoritative builder and exhaustive task
   `6.1.R10` tests from `../sprint-6-1-contextual-chat.md`.
 - **Broad-summary starvation:** explicit bounded per-meeting coverage policy.
+- **Release-gate laundering:** carry Sprint 3's four named gates into Task 4.5
+  and sprint close; rejected fixtures and corpus-free diagnostics cannot become
+  release evidence.
 
 ## Decisions And Change Log
 
@@ -511,6 +626,10 @@ Record Deep request/latency metrics and native-smoke steps/results.
 | 2026-08-21 | Disable the Fast/Deep selector in live-recording scope. | Live retrieval ignores the mode; an active control that does nothing misleads the user in the scope most likely to want depth. | Accept and silently ignore the mode. | Main agent, pending sprint approval |
 | 2026-08-21 | Report total provider round-trips per Deep turn, not planner calls alone. | The pre-existing query-rewrite call makes the true worst case four round-trips; reporting two understates user-visible cost. | Report planner calls only. | Main agent, pending sprint approval |
 | 2026-08-21 | Task 4.5 supplies evidence for the Deep-as-default question but must not change the default. | Deep-as-default is a recorded user decision; only the user may revise it, and they need measured latency, cost, and quality-delta data to do so. | Change the default based on implementation judgement. | Main agent, **open question for user at sprint close** |
+| 2026-09-02 | Permit sequenced Sprint 4 implementation after the R40 documentation amendment and current user approval while retaining Sprint 3's open release gates. | Commits `62d7730` and `1047367` are the reviewed implementation baseline; implementation dependency is not release acceptance. | Require Sprint 3 release closure before any Sprint 4 implementation. | User-authorized R40 |
+| 2026-09-02 | Make mode compatibility explicit and use one Rust ownership/cancellation mechanism for Chat/sidebar, with Chat-fenced Deep progress. | New interactive requests send `deep`, omissions are Fast, live is Fast/no-Deep, stale progress is fenced, and no parallel registries or agent-owned event bus are permitted. | Separate non-streaming/sidebar registries or agent-owned progress events. | User-authorized R40 |
+| 2026-09-02 | Bound planner generation inside the shared LLM client and enforce candidate/evidence action authority. | Provider capability/fallback handling, hard 512-token/8 KiB caps, deadline cancellation, and per-round supplied-ID bounds prevent cost, parser, and scope failures. | New planner client or broad-scope ID validation only. | User-authorized R40 |
+| 2026-09-02 | Carry the single persisted `force_lexical_retrieval` setting through every Deep round and hybrid surface. | Shared-boundary reads, typed `ForcedLexical`, and enable-next-request/restart/disable-restore tests preserve one reversible fallback without a second service. | Per-surface switches or diagnostics services. | User-authorized R40 |
 
 ## Task Execution Log
 
@@ -562,7 +681,9 @@ to all saved Chat retrieval paths.
 
 ## Approval Gates
 
-- Sprint 3 close must be approved first.
+- Sprint 3 release acceptance need not precede sequenced Sprint 4 implementation
+  after this R40 amendment and current user approval, but remains mandatory for
+  Task 4.5 and Sprint 4 close.
 - User approval of this PRD is required before Sprint 4 TODO creation.
 - Task 4.2 is L and requires a single-task batch approval.
 - Planner actions/rounds, remote data behavior, or conversation persistence
@@ -571,4 +692,10 @@ to all saved Chat retrieval paths.
   and quality-delta evidence and ask the user to confirm or change
   Deep-as-default.** Record the outcome in the `architecture.md` decision log
   either way.
+- Task 4.5, Sprint 4 close, Task 5.5, and release close MUST each have valid
+  evidence for the independently authored Portuguese corpus, production-path
+  quality and final provider-answer evidence, native Windows/R13 hermetic
+  session evidence, and exact-head GitHub Actions evidence. V1-V10 and
+  currently rejected corpus fixtures/harnesses are not acceptance evidence;
+  corpus-free internal production testing is diagnostic only.
 - Sprint-close approval is required before Sprint 5 begins.

@@ -205,6 +205,24 @@ Consequences that Sprint 1 MUST treat as given rather than rediscover:
   does **not** set `CARGO_TARGET_DIR`, contrary to `MIGRATION.md`. Every
   verification command in this program sets it explicitly.
 
+## Sprint 3 Baseline And Release-Gate Inheritance (R40)
+
+The reviewed Sprint 3 implementation baseline is commits `62d7730` and
+`1047367`. These commits establish the implementation baseline for sequenced
+later work; they do not mean Sprint 3 release acceptance is closed.
+
+Sprint 3 release acceptance remains open on all of the following gates:
+
+- a valid independently authored Portuguese corpus;
+- production-path quality and final provider-answer evidence;
+- native Windows/R13 hermetic session evidence;
+- exact-head GitHub Actions evidence.
+
+V1-V10 and the currently rejected corpus fixtures/harnesses are not acceptance
+evidence. Internal production testing without a corpus is diagnostic only.
+Task 4.5, Sprint 4 close, Task 5.5, and release close MUST NOT bypass these
+gates, and no later Fast/Deep result may be substituted for them.
+
 ## Relationship To Other Program Records
 
 This program is registered in the project `ROADMAP.md` under Phase 6. It is not
@@ -278,6 +296,11 @@ a parallel or competing plan.
   the request's scope MUST NOT enter fusion, reranking, hydration, sources, or
   prompts.
 - Deep-mode actions MUST NOT widen the original scope.
+- A Deep round's `openMeetingIds` MUST be a subset of the bounded candidate or
+  meeting-card IDs supplied to that round, not merely an ID that happens to
+  exist in the authoritative scope. `expandEvidenceIds` MUST be limited to
+  evidence IDs currently known and retained by that round. Scope revalidation
+  remains required after every round and before publication.
 
 ### Availability
 
@@ -364,7 +387,7 @@ real retrieval implementation. Proposed files:
 | `chunking.rs` | Deterministic source extraction and token-window construction. |
 | `index.rs` | Immutable vector snapshots, exact scan, optional ANN, delta handling, and atomic swaps. |
 | `ranking.rs` | RRF, deduplication, meeting aggregation, diversity, and reranker integration. |
-| `agent.rs` | Deep-mode action schema, validation, bounded loop, and fallback. |
+| `agent.rs` | Deep-mode action schema, validation, bounded loop, and fallback; it may accept a privacy-safe progress sink but does not own Tauri events, `AppHandle`, or a second event bus. |
 
 Do not add provider traits before a second concrete provider exists. Local
 bundled inference is the only approved embedding provider.
@@ -1409,7 +1432,10 @@ lexical + vector candidates
 -> final answer
 ```
 
-Fast does not call the Chat model before final answer generation.
+Fast means one retrieval pass with no Deep planner call. The existing
+follow-up query rewrite may use the configured Chat provider before retrieval,
+so Fast does not mean that there can be no provider round-trip before final
+answer generation.
 
 ## Deep Mode
 
@@ -1443,6 +1469,32 @@ Constraints:
 - Maximum ten expanded evidence IDs per round.
 - Maximum planner input of 24,000 Unicode characters and strict output of one
   JSON object no larger than 8 KiB/512 output tokens.
+- Planner generation MUST use planner-specific bounded-generation options inside
+  the existing shared LLM client/request builder; it MUST NOT create a second
+  provider client or move provider logic into `retrieval/agent.rs`. Every
+  provider has a hard response-byte/parser cap, uses a provider output limit
+  where supported, and receives a scoped child cancellation token. The child
+  token is cancelled on both the per-call and total-preparation deadlines.
+- Sprint 4 MUST record a capability/fallback matrix for every configured
+  provider: OpenAI, Claude, Groq, Ollama, OpenRouter, BuiltInAI, and Custom
+  OpenAI. The matrix records provider-specific output-limit support, the hard
+  byte/parser cap, child-cancellation behavior, and the fallback. A provider
+  that cannot enforce the requested generation or cancellation bound falls back to the current
+  Fast evidence; the 512-token, 8 KiB, 15-second, and 30-second limits are not
+  weakened.
+- The required provider capability/fallback matrix MUST record supported or
+  unsupported status for each capability and is:
+
+  | Provider | Required capability record | Fallback when a required bound/capability is unsupported |
+  |---|---|---|
+  | OpenAI | Provider output-limit support, shared byte/parser cap, and child-cancellation behavior | Current Fast evidence |
+  | Claude | Provider output-limit support, shared byte/parser cap, and child-cancellation behavior | Current Fast evidence |
+  | Groq | Provider output-limit support, shared byte/parser cap, and child-cancellation behavior | Current Fast evidence |
+  | Ollama | Provider output-limit support, shared byte/parser cap, and child-cancellation behavior | Current Fast evidence |
+  | OpenRouter | Provider output-limit support, shared byte/parser cap, and child-cancellation behavior | Current Fast evidence |
+  | BuiltInAI | Provider output-limit support, shared byte/parser cap, and child-cancellation behavior | Current Fast evidence |
+  | Custom OpenAI | Provider output-limit support, shared byte/parser cap, and child-cancellation behavior | Current Fast evidence |
+
 - Maximum 15 seconds per planner call and **30 seconds total Deep preparation**,
   reduced from 45 seconds because Deep is the default path and the budget is
   time a user spends watching nothing happen.
@@ -1454,6 +1506,12 @@ Constraints:
 - Every action is schema-validated and allow-listed.
 - Meeting text is untrusted data and cannot alter system instructions.
 - Scope cannot widen.
+- `openMeetingIds` is additionally restricted to the bounded candidate or
+  meeting-card IDs supplied to the current planner round; an existing ID that
+  was not offered in that round is not authorized. `expandEvidenceIds` is
+  restricted to evidence IDs currently known and retained by that round.
+- Authoritative scope membership is revalidated after each round and
+  immediately before final evidence/source publication.
 - Planner output is internal and is not persisted as an assistant answer.
 - Provider timeout, malformed output, refusal, or component failure falls back
   to the current Fast evidence.
@@ -1461,11 +1519,15 @@ Constraints:
   it never falls back into answer generation.
 - Final answer generation continues through the existing streaming boundary.
 
-Interactive Chat accepts a request-level Fast/Deep selection. New
-conversations default to Deep. Do not add conversation persistence for the
-mode unless a later approved task requires it. MCP Chat is not an interactive
-conversation and remains Fast-only in this release. Deep through unauthenticated
-localhost MCP is deferred until it has an approved cancellation/cost contract.
+Interactive Chat accepts a request-level Fast/Deep selection. New interactive
+conversations explicitly send `deep`; selecting Fast explicitly sends `fast`.
+An omitted mode in every legacy, non-interactive, or MCP contract resolves to
+`fast`, while an explicit unknown mode is rejected. Live sends `fast` and uses
+its direct path with no Deep planner. Do not add conversation persistence for
+the mode unless a later approved task requires it. MCP Chat is not an
+interactive conversation and remains Fast-only in this release. Deep through
+unauthenticated localhost MCP is deferred until it has an approved
+cancellation/cost contract.
 
 ### Deep Preparation Progress
 
@@ -1474,7 +1536,8 @@ begins streaming almost immediately. Static explanatory copy is not sufficient
 for a default experience; silence reads as a hang.
 
 - Deep preparation MUST emit stage-level progress events through the existing
-  Chat event channel before final answer streaming begins.
+  Chat event channel before final answer streaming begins, through Chat's
+  current ownership/cancellation publication fence.
 - Events carry **stage identity and counts only** — for example searching,
   ranking, reviewing N meetings, expanding evidence, or writing the answer.
 - Events MUST NOT carry planner output, reasoning text, queries, meeting
@@ -1508,8 +1571,8 @@ The selector MUST NOT present a choice that the backend ignores.
 | Scope | Fast/Deep behavior | Required UI |
 |---|---|---|
 | All, folder, meeting, snapshot, today | Both modes are honored | Selector enabled |
-| Live recording | Retrieval is the direct in-memory transcript path; mode has no effect | Selector disabled, with a short explanation that live Chat reads the current transcript directly |
-| MCP Chat | Fast-only by decision | Not applicable; no MCP selector exists |
+| Live recording | The UI sends `fast`; retrieval is the direct in-memory transcript path and never enters Deep | Selector disabled, with a short explanation that live Chat reads the current transcript directly |
+| MCP Chat | Omitted mode resolves to Fast; Fast-only by decision | Not applicable; no MCP selector exists |
 
 ## Scope Semantics
 
@@ -1565,8 +1628,8 @@ Current surface classification:
 
 Keep existing lexical tools. Add versioned hybrid search and hybrid context
 tools with explicit descriptions and provenance. Shared MCP Chat inherits
-hybrid Chat preparation. MCP hybrid tools remain local-only and do not expose
-raw embeddings.
+hybrid Chat preparation, but remains Fast-only. MCP hybrid tools remain
+local-only and do not expose raw embeddings.
 
 ## Cancellation And Concurrency
 
@@ -1576,16 +1639,26 @@ raw embeddings.
   answer/source event. It is never a quality fallback.
 - Check cancellation before/after every blocking/model/database stage and while
   waiting in a queue.
-- Interactive Tauri search/context requests carry a request ID. New sidebar
-  requests cancel the older request owned by that sidebar search session. An
-  explicit cancel command covers other non-streaming clients that need it.
-- Non-streaming Chat requests also carry a request ID registered to a backend
-  cancellation token and have an explicit cancel command. Replacement uses
-  request ownership checks so a cancelled/older Deep call cannot return stale
+- One small Rust-owned request-ownership/cancellation mechanism, generalized
+  from the accepted Sprint 3 Chat stream guard, serves Chat and sidebar
+  requests. It is keyed so those surfaces may coexist; Sprint 4 Task 4.1
+  establishes it and Sprint 5 Task 5.2 reuses it. There are no parallel request
+  registries. Interactive Tauri search/context requests carry a request ID, and
+  non-streaming Chat requests use the same mechanism and its explicit cancel
+  path. Replacement uses ownership checks so stale or older work cannot publish
   final content.
-- MCP hybrid search/context is Fast, strictly bounded, and does not claim
-  cancellation in the first release. MCP Chat remains Fast-only. A request is
-  terminated by its server-side timeout even if the client disconnects.
+- Deep progress is emitted by the Chat adapter through that same stream-ID
+  ownership/cancellation publication fence. `retrieval/agent.rs` MAY accept a
+  privacy-safe sink, but MUST NOT own `AppHandle`, Tauri events, or a second
+  event bus.
+- Terminal, error, and timeout paths MUST clean up ownership entries. Tests MUST
+  cover stale, replaced, and cancelled progress, cleanup on each terminal path,
+  and bounded request-registry lifetime.
+- MCP hybrid search/context is Fast and strictly bounded and does not claim
+  public client cancellation in the first release. MCP Chat remains Fast-only.
+  The server owns an internal deadline cancellation token and passes it through
+  shared retrieval; a timeout cancels queued/running scheduler and ONNX work
+  even without a public MCP cancel API.
 - Blocking operations use `spawn_blocking` or a dedicated bounded worker.
 - Do not hold async locks across ONNX inference or vector scans.
 - One global retrieval scheduler prioritizes interactive Chat/search over
@@ -1625,7 +1698,7 @@ raw embeddings.
 | User/stream cancellation | Propagate typed cancellation; stop preparation and emit no stale/final answer or source event. |
 | Scope validation failure | Fail closed before retrieval. |
 | Database/index write contention | Retry derived work; never fail the primary meeting mutation. |
-| User forced lexical-only | Use FTS for every surface; report as an explicit user-selected state, not a failure. |
+| User forced lexical-only | Read the one persisted setting at the shared Rust preparation/service boundary; use FTS for every initial/additional Deep retrieval and every Tauri, MCP, or sidebar hybrid request, preserving the typed `ForcedLexical` reason. Report it as an explicit user-selected state, not a failure. |
 | Derived disk envelope exceeded | Report in diagnostics, block generation activation, and offer rebuild/cleanup; never delete primary data automatically. |
 
 ## Security And Privacy
@@ -1651,6 +1724,12 @@ raw embeddings.
   rechecked before final source/done emission.
 - Scope restrictions apply before reranking and hydration.
 - Deep planner actions are data, not executable instructions.
+- The single persisted `force_lexical_retrieval` setting is read at the shared
+  Rust preparation/service boundary and governs initial and additional Deep
+  retrieval plus every Tauri, MCP, and sidebar hybrid request. It preserves the
+  typed `ForcedLexical` reason. Enable-next-request, restart, and
+  disable-restore tests cover Fast, Deep, and all hybrid surfaces; no second
+  setting or diagnostics service may be introduced.
 - Prompts label retrieved content as untrusted meeting evidence.
 - Logs contain lengths, counts, stage timings, model IDs, and status, never raw
   queries, transcript text, notes, summaries, embeddings, or API keys.
@@ -1700,17 +1779,25 @@ result on a user's real corpus requires a reinstall.
 
 - A persisted `force_lexical_retrieval` setting MUST exist and MUST be
   surfaced in Settings.
-- When enabled, every retrieval surface — Chat in all scopes, sidebar search,
-  Tauri hybrid commands, and MCP hybrid tools — takes the same lexical path
-  used when semantic state is unavailable. No new code path is introduced; the
-  switch reuses the existing fallback.
+- The setting is read at the shared Rust preparation/service boundary. When
+  enabled, every initial/additional Deep retrieval and every retrieval surface
+  — Chat in all scopes, sidebar search, Tauri hybrid commands, and MCP hybrid
+  tools — takes the same lexical path used when semantic state is unavailable.
+  No new code path is introduced; the switch reuses the existing fallback and
+  preserves the typed `ForcedLexical` reason.
 - It takes effect on the next request without restart, and does not delete,
   invalidate, or pause the semantic index. Turning it off restores hybrid
   behavior immediately.
 - Diagnostics MUST report it as an explicit distinct reason, so a
   user-forced lexical state is never mistaken for a model failure.
+- Fast/Deep and all-surface tests MUST cover enabling for the next request,
+  persistence across restart, and disabling to restore hybrid behavior. No
+  second setting or diagnostics service may be introduced.
 
-Chat exposes Fast and Deep. New conversations default to Deep. The UI explains
+Chat exposes Fast and Deep. New interactive conversations explicitly send
+`deep`; omitted mode on legacy/non-interactive/MCP contracts resolves to
+`fast`, explicit unknown mode is rejected, and live sends `fast` without a Deep
+planner. The UI explains
 that Deep may take longer and use additional requests to the configured Chat
 provider, and shows stage-level progress during Deep preparation. The selector
 is disabled in live-recording scope, where mode has no effect. No hidden
@@ -2053,6 +2140,13 @@ Rollback principles, ordered from cheapest to most disruptive:
 - Snapshot/today allow-lists.
 - Saved-meeting authoritative hydration.
 - Deep loop bounded actions and fallback.
+- Explicit interactive `deep`/`fast` propagation, omitted-mode Fast
+  compatibility, rejected unknown mode, live Fast/no-Deep behavior, and an MCP
+  behavioral regression through shared Chat preparation.
+- One shared Rust ownership/cancellation mechanism, Chat-fenced progress,
+  stale/replaced/cancelled progress, terminal/error/timeout cleanup, and bounded
+  registry lifetime.
+- Planner provider capability/fallback matrix and hard output/deadline bounds.
 - Sidebar, Tauri, and MCP contracts.
 
 ### Performance Tests
@@ -2164,6 +2258,12 @@ Architecture reviewers focus on:
 
 No sprint closes with unresolved blocker or should-fix findings.
 
+The Sprint 3 release gates named in the R40 carry-forward section remain open
+until independently valid evidence closes them. They are mandatory for Task
+4.5, Sprint 4 close, Task 5.5, and release close; V1-V10/rejected corpus
+fixtures are not acceptance evidence, and corpus-free internal production tests
+are diagnostic only.
+
 ## Decisions Deferred To Measured Gates
 
 These are not open product questions. Sprint 1 must resolve them with recorded
@@ -2265,3 +2365,7 @@ Any failure to resolve one of these gates blocks Sprint 2 approval.
 | 2026-08-30 | Make Task 3.6 query expansion conditional on reviewed post-ranking evidence rather than an unconditional Sprint-close dependency. | Task 3.2 must remeasure all five critical cases. If reviewed production ranking reaches 5/5, building expansion only to satisfy an already-closed case is YAGNI and adds privacy/latency/provider risk. If `pt-ref-chaves-acesso` or another terminological-gap case remains the sole attributable miss, Task 3.6 becomes dependency-ready after the user selects an approach. The 5/5 Sprint-close threshold is unchanged. | User |
 | 2026-08-30 | Keep `retrieval_documents_by_meeting_lookup` installed without a Sprint 3 removal deadline. | An automatic reconsideration deadline created pressure to delete an applied migration despite no measured regression or replacement query. Removal now requires measured evidence that the index is obsolete, a forward-only migration, and a query-plan regression proving deletion cannot return to a table scan. | User |
 | 2026-08-30 | Clarify meeting-aggregation signal requirements as measured behavior rather than mandatory non-zero coefficients. | Requiring a separate non-zero weight for every listed signal invites arbitrary constants when held-out evidence does not support them. Profile participation through fused rank, zero-weight but reported concept coverage, and distinct-region support are valid only when explicit and regression-tested; user-visible quality floors remain the authority. | User |
+| 2026-09-02 | Separate Sprint 4 implementation dependency from Sprint 3 release/close gates and record commits `62d7730` and `1047367` as the reviewed implementation baseline. | R40 permits sequenced Sprint 4 implementation after this documentation amendment and current user approval, while Sprint 3 release acceptance remains open and is inherited by later close/release gates. | User-authorized R40 |
+| 2026-09-02 | Make Fast/Deep compatibility deterministic and extend one Rust ownership/cancellation publication fence from Sprint 3 to Chat and sidebar. | Explicit interactive modes, omitted-mode Fast compatibility, live Fast/no-Deep behavior, fenced progress, cleanup, and bounded ownership prevent accidental Deep calls, stale publication, and parallel registries. | User-authorized R40 |
+| 2026-09-02 | Require bounded Deep generation options in the shared LLM client, a provider capability/fallback matrix, and candidate/evidence authority bounds. | Provider-specific output limits, hard byte/parser caps, deadline cancellation, and per-round offered-ID validation preserve the 512-token/8 KiB/15-second/30-second contract without a second client or scope widening. | User-authorized R40 |
+| 2026-09-02 | Carry the single persisted `force_lexical_retrieval` decision through every hybrid round/surface and give MCP timeouts an internal shared-retrieval cancellation token. | The typed `ForcedLexical` fallback remains reversible across requests/restarts, while server timeouts terminate queued/running work without claiming a public MCP cancel API. | User-authorized R40 |
