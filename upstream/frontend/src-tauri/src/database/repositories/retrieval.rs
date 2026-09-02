@@ -1278,6 +1278,15 @@ impl RetrievalRepository {
         meeting_id: &str,
         transcript_ids: &[String],
     ) -> Result<Option<MeetingSource>, SqlxError> {
+        Self::load_meeting_source_relevant_ranges(pool, meeting_id, transcript_ids, &[]).await
+    }
+
+    pub async fn load_meeting_source_relevant_ranges(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        transcript_ids: &[String],
+        transcript_ranges: &[(String, String)],
+    ) -> Result<Option<MeetingSource>, SqlxError> {
         let meta: Option<(String, String, Option<i64>)> = sqlx::query_as(
             "SELECT m.title, COALESCE(f.name, ''), s.source_revision FROM meetings m LEFT JOIN meeting_folders f ON m.folder_id = f.id LEFT JOIN search_source_state s ON s.meeting_id = m.id WHERE m.id = ?",
         ).bind(meeting_id).fetch_optional(pool).await?;
@@ -1327,7 +1336,7 @@ impl RetrievalRepository {
             transcript_segments_total: total,
             complete: summary_rows.len() <= MAX_SUMMARY_ROWS,
         };
-        if transcript_ids.is_empty() {
+        if transcript_ids.is_empty() && transcript_ranges.is_empty() {
             let rows: Vec<(String, String, Option<String>, String, Option<f64>, Option<f64>)> = sqlx::query_as(
                 "SELECT id, transcript, speaker, timestamp, audio_start_time, audio_end_time FROM transcripts WHERE meeting_id = ? AND transcript IS NOT NULL AND transcript != '' ORDER BY CASE WHEN audio_start_time IS NULL THEN 1 ELSE 0 END, audio_start_time ASC, timestamp ASC, id ASC LIMIT ?",
             ).bind(meeting_id).bind(MAX_TRANSCRIPT_ROWS as i64).fetch_all(pool).await?;
@@ -1350,27 +1359,47 @@ impl RetrievalRepository {
             source.complete = source.complete && total <= MAX_TRANSCRIPT_ROWS;
             return Ok(Some(source));
         }
-        let ordered = "WITH ordered AS (SELECT id, transcript, speaker, timestamp, audio_start_time, audio_end_time, ROW_NUMBER() OVER (ORDER BY CASE WHEN audio_start_time IS NULL THEN 1 ELSE 0 END, audio_start_time ASC, timestamp ASC, id ASC) - 1 AS pos FROM transcripts WHERE meeting_id = ";
-        let mut count_query = QueryBuilder::<Sqlite>::new(ordered);
-        count_query.push_bind(meeting_id).push(" AND transcript IS NOT NULL AND transcript != ''), targets AS (SELECT pos FROM ordered WHERE id IN (");
-        let mut ids = count_query.separated(", ");
-        for id in transcript_ids {
-            ids.push_bind(id);
-        }
-        drop(ids);
-        count_query.push(") ), selected AS (SELECT DISTINCT o.pos FROM ordered o JOIN targets t ON o.pos BETWEEN t.pos - 1 AND t.pos + 1) SELECT COUNT(*) FROM ordered o JOIN selected s ON s.pos = o.pos");
+        let append_selection = |query: &mut QueryBuilder<Sqlite>| {
+            query.push("WITH ordered AS (SELECT id, transcript, speaker, timestamp, audio_start_time, audio_end_time, ROW_NUMBER() OVER (ORDER BY CASE WHEN audio_start_time IS NULL THEN 1 ELSE 0 END, audio_start_time ASC, timestamp ASC, id ASC) - 1 AS pos FROM transcripts WHERE meeting_id = ");
+            query.push_bind(meeting_id.to_string());
+            query.push(" AND transcript IS NOT NULL AND transcript != ''), range_targets(start_id, end_id) AS (");
+            if transcript_ranges.is_empty() {
+                query.push("SELECT NULL, NULL WHERE 0");
+            } else {
+                for (index, (start_id, end_id)) in transcript_ranges.iter().enumerate() {
+                    if index > 0 {
+                        query.push(" UNION ALL ");
+                    }
+                    query.push("SELECT ");
+                    query.push_bind(start_id.clone());
+                    query.push(", ");
+                    query.push_bind(end_id.clone());
+                }
+            }
+            query.push("), targets AS (SELECT pos FROM ordered WHERE ");
+            if transcript_ids.is_empty() {
+                query.push("0");
+            } else {
+                query.push("id IN (");
+                let mut ids = query.separated(", ");
+                for id in transcript_ids {
+                    ids.push_bind(id.clone());
+                }
+                drop(ids);
+                query.push(")");
+            }
+            query.push(") , ranges AS (SELECT starts.pos AS start_pos, ends.pos AS end_pos FROM range_targets r JOIN ordered starts ON starts.id = r.start_id JOIN ordered ends ON ends.id = r.end_id WHERE starts.pos <= ends.pos), selected AS (SELECT DISTINCT o.pos FROM ordered o JOIN targets t ON o.pos BETWEEN t.pos - 1 AND t.pos + 1 UNION SELECT DISTINCT o.pos FROM ordered o JOIN ranges r ON o.pos BETWEEN r.start_pos - 1 AND r.end_pos + 1) ");
+        };
+        let mut count_query = QueryBuilder::<Sqlite>::new("");
+        append_selection(&mut count_query);
+        count_query.push("SELECT COUNT(*) FROM ordered o JOIN selected s ON s.pos = o.pos");
         let selected_count: i64 = count_query.build_query_scalar().fetch_one(pool).await?;
         if selected_count as usize > MAX_TRANSCRIPT_ROWS {
             return Ok(Some(source));
         }
-        let mut query = QueryBuilder::<Sqlite>::new(ordered);
-        query.push_bind(meeting_id).push(" AND transcript IS NOT NULL AND transcript != ''), targets AS (SELECT pos FROM ordered WHERE id IN (");
-        let mut ids = query.separated(", ");
-        for id in transcript_ids {
-            ids.push_bind(id);
-        }
-        drop(ids);
-        query.push(") ), selected AS (SELECT DISTINCT o.pos FROM ordered o JOIN targets t ON o.pos BETWEEN t.pos - 1 AND t.pos + 1) SELECT o.pos, o.id, o.transcript, o.speaker, o.timestamp, o.audio_start_time, o.audio_end_time FROM ordered o JOIN selected s ON s.pos = o.pos ORDER BY o.pos");
+        let mut query = QueryBuilder::<Sqlite>::new("");
+        append_selection(&mut query);
+        query.push("SELECT o.pos, o.id, o.transcript, o.speaker, o.timestamp, o.audio_start_time, o.audio_end_time FROM ordered o JOIN selected s ON s.pos = o.pos ORDER BY o.pos");
         let rows: Vec<(
             i64,
             String,
@@ -1406,12 +1435,29 @@ impl RetrievalRepository {
         transcript_ids: &[String],
         cancel: &CancellationToken,
     ) -> Result<Option<MeetingSource>, SqlxError> {
+        Self::load_meeting_source_relevant_ranges_with_cancellation(
+            pool,
+            meeting_id,
+            transcript_ids,
+            &[],
+            cancel,
+        )
+        .await
+    }
+
+    pub async fn load_meeting_source_relevant_ranges_with_cancellation(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        transcript_ids: &[String],
+        transcript_ranges: &[(String, String)],
+        cancel: &CancellationToken,
+    ) -> Result<Option<MeetingSource>, SqlxError> {
         check_source_cancellation(Some(cancel))?;
         // Race the awaited load against the token instead of only checking
         // before and after it, so a deadline that fires mid-load aborts the
         // database work instead of letting it run to completion.
         let source = tokio::select! {
-            source = Self::load_meeting_source_relevant(pool, meeting_id, transcript_ids) => source?,
+            source = Self::load_meeting_source_relevant_ranges(pool, meeting_id, transcript_ids, transcript_ranges) => source?,
             _ = cancel.cancelled() => {
                 return Err(SqlxError::Protocol("retrieval cancelled".into()));
             }
@@ -5070,6 +5116,43 @@ mod tests {
         assert!(relevant.transcripts.len() <= 3);
         assert!(relevant.transcripts.iter().any(|row| row.id == "t10000"));
         assert_eq!(relevant.transcript_segments_total, MAX_TRANSCRIPT_ROWS + 1);
+
+        let ranged = RetrievalRepository::load_meeting_source_relevant_ranges(
+            &pool,
+            "large",
+            &["t1000".to_string(), "t1009".to_string()],
+            &[("t1000".to_string(), "t1009".to_string())],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let start = source
+            .transcripts
+            .iter()
+            .position(|row| row.id == "t1000")
+            .unwrap();
+        let end = source
+            .transcripts
+            .iter()
+            .position(|row| row.id == "t1009")
+            .unwrap();
+        assert!(start < end);
+        let expected = source
+            .transcripts
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| *position >= start.saturating_sub(1) && *position <= end + 1)
+            .map(|(_, row)| row.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ranged
+                .transcripts
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(ranged.transcript_segments_total, MAX_TRANSCRIPT_ROWS + 1);
     }
 
     #[tokio::test]

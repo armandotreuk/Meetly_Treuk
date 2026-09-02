@@ -307,6 +307,7 @@ pub struct RankedRetrieval {
 struct NormalizedRequest {
     scope: PersistedRetrievalScope,
     membership: ScopeFilter,
+    transcript_only: bool,
     /// Folder membership exceeded [`MAX_FOLDER_SCAN_MEMBERSHIP`]: the
     /// semantic scan runs unscoped and the repository's recursive root-folder
     /// gate is the sole semantic admission authority.
@@ -558,6 +559,7 @@ impl RetrievalService {
         ensure_not_cancelled(cancel)?;
         let core_terms = core_terms(&lexical_original, request.core_language);
         Ok(NormalizedRequest {
+            transcript_only: matches!(&scope, PersistedRetrievalScope::Meeting(_)),
             scope,
             membership,
             folder_over_cap,
@@ -712,6 +714,11 @@ impl RetrievalService {
         cancel: &CancellationToken,
         candidates: &mut HashMap<String, RetrievedEvidence>,
     ) -> Result<(), RetrievalError> {
+        if normalized.transcript_only {
+            return self
+                .meeting_transcript_lexical_channel(pool, normalized, limits, cancel, candidates)
+                .await;
+        }
         let mut variants: Vec<(QueryVariantKind, String)> = vec![(
             QueryVariantKind::Original,
             normalized.lexical_original.clone(),
@@ -793,6 +800,68 @@ impl RetrievalService {
         Ok(())
     }
 
+    async fn meeting_transcript_lexical_channel(
+        &self,
+        pool: &SqlitePool,
+        normalized: &NormalizedRequest,
+        limits: RetrievalLimits,
+        cancel: &CancellationToken,
+        candidates: &mut HashMap<String, RetrievedEvidence>,
+    ) -> Result<(), RetrievalError> {
+        if limits.lexical_per_variant == 0 {
+            return Ok(());
+        }
+        let mut queries = Vec::with_capacity(2);
+        if let Some(rewritten) = &normalized.lexical_rewritten {
+            queries.push((QueryVariantKind::Rewritten, rewritten.clone()));
+        }
+        queries.push((
+            QueryVariantKind::Original,
+            normalized.lexical_original.clone(),
+        ));
+        for (variant, text) in queries {
+            ensure_not_cancelled(cancel)?;
+            let mut mode = MatchMode::And;
+            let mut results = self
+                .fts_for_scope(pool, &text, limits.lexical_per_variant, normalized, mode)
+                .await?;
+            if results.is_empty() {
+                mode = MatchMode::Or;
+                results = self
+                    .fts_for_scope(
+                        pool,
+                        &text,
+                        limits.lexical_per_variant,
+                        normalized,
+                        MatchMode::Or,
+                    )
+                    .await?;
+            }
+            ensure_not_cancelled(cancel)?;
+            if results.is_empty() {
+                continue;
+            }
+            for (rank, result) in results.into_iter().enumerate() {
+                record_candidate(
+                    candidates,
+                    lexical_evidence(result),
+                    EvidenceProvenance {
+                        channel: RetrievalChannel::Lexical,
+                        variant,
+                        mode: Some(match mode {
+                            MatchMode::And => LexicalMode::And,
+                            _ => LexicalMode::Or,
+                        }),
+                        rank: rank + 1,
+                        query_slot: 0,
+                    },
+                );
+            }
+            break;
+        }
+        Ok(())
+    }
+
     async fn fts_for_scope(
         &self,
         pool: &SqlitePool,
@@ -810,7 +879,7 @@ impl RetrievalService {
                 FtsRepository::search_with_mode_plain(pool, text, limit, None, mode).await
             }
             PersistedRetrievalScope::Meeting(meeting_id) => {
-                FtsRepository::search_with_mode_plain(pool, text, limit, Some(meeting_id), mode)
+                FtsRepository::search_transcripts_with_mode(pool, text, limit, meeting_id, mode)
                     .await
             }
             PersistedRetrievalScope::Folder(folder_id) => {
@@ -1073,12 +1142,13 @@ impl RetrievalService {
             let mut retried = Vec::new();
             for (variant, vector) in pending {
                 match index
-                    .search_pinned(
+                    .search_pinned_for_source(
                         &vector,
                         scope_filter.clone(),
                         scan_limit,
                         cancel,
                         &generation_id,
+                        normalized.transcript_only.then_some("transcript"),
                     )
                     .await
                 {

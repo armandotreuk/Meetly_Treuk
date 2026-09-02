@@ -403,6 +403,7 @@ fn scan_snapshot(
     scope: &ScopeFilter,
     limit: usize,
     cancel: &CancellationToken,
+    source_kind: Option<&str>,
 ) -> Result<Vec<VectorHit>, SearchFailure> {
     const CANCEL_CHECK_ROWS: usize = 4096;
     let mut heap =
@@ -414,6 +415,9 @@ fn scan_snapshot(
             return Err(SearchFailure::Cancelled);
         }
         if snapshot.overlay.shadows_meeting(&meta.meeting_id) || !scope.allows(&meta.meeting_id) {
+            continue;
+        }
+        if source_kind.is_some_and(|kind| meta.source_kind != kind) {
             continue;
         }
         let start = row * dimensions;
@@ -436,6 +440,9 @@ fn scan_snapshot(
         }
         for doc in docs.iter() {
             if !scope.allows(&doc.meta.meeting_id) {
+                continue;
+            }
+            if source_kind.is_some_and(|kind| doc.meta.source_kind != kind) {
                 continue;
             }
             push_candidate(
@@ -893,6 +900,19 @@ impl QueryIndexService {
             .await
     }
 
+    pub(crate) async fn search_pinned_for_source(
+        &self,
+        query: &[f32],
+        scope: ScopeFilter,
+        limit: usize,
+        cancel: &CancellationToken,
+        pinned_generation: &str,
+        source_kind: Option<&str>,
+    ) -> Result<Vec<VectorHit>, SearchFailure> {
+        self.search_pinned_with_source(query, scope, limit, cancel, pinned_generation, source_kind)
+            .await
+    }
+
     /// The same search pinned to one generation: the query is only ever
     /// scored against the snapshot whose generation was observed before query
     /// embedding. An activation/snapshot switch that installs a newer active
@@ -905,6 +925,19 @@ impl QueryIndexService {
         limit: usize,
         cancel: &CancellationToken,
         pinned_generation: &str,
+    ) -> Result<Vec<VectorHit>, SearchFailure> {
+        self.search_pinned_with_source(query, scope, limit, cancel, pinned_generation, None)
+            .await
+    }
+
+    async fn search_pinned_with_source(
+        &self,
+        query: &[f32],
+        scope: ScopeFilter,
+        limit: usize,
+        cancel: &CancellationToken,
+        pinned_generation: &str,
+        source_kind: Option<&str>,
     ) -> Result<Vec<VectorHit>, SearchFailure> {
         if cancel.is_cancelled() {
             return Err(SearchFailure::Cancelled);
@@ -947,6 +980,7 @@ impl QueryIndexService {
             return Err(SearchFailure::Cancelled);
         };
         let scan_cancel = cancel.clone();
+        let source_kind = source_kind.map(str::to_string);
         let scanned = tokio::task::spawn_blocking(move || {
             scan_snapshot(
                 &snapshot,
@@ -954,6 +988,7 @@ impl QueryIndexService {
                 &scope,
                 limit.min(MAX_QUERY_LIMIT),
                 &scan_cancel,
+                source_kind.as_deref(),
             )
         })
         .await
@@ -2290,6 +2325,7 @@ mod tests {
             &ScopeFilter::All,
             10,
             &CancellationToken::new(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2337,6 +2373,7 @@ mod tests {
             &ScopeFilter::All,
             1,
             &CancellationToken::new(),
+            None,
         )
         .unwrap();
         assert_eq!(hit_ids(&hits), vec!["doc-aa".to_string()]);
@@ -2348,9 +2385,55 @@ mod tests {
             &ScopeFilter::All,
             1,
             &CancellationToken::new(),
+            None,
         )
         .unwrap();
         assert_eq!(hit_ids(&hits), vec!["doc-aa".to_string()]);
+    }
+
+    #[test]
+    fn source_filter_excludes_non_transcript_base_rows() {
+        let snapshot = IndexSnapshot::new(
+            "gen-source".to_string(),
+            MODEL_ID.to_string(),
+            2,
+            BaseRows {
+                metas: vec![
+                    DocumentMeta {
+                        document_id: "doc-summary".to_string(),
+                        meeting_id: "m".to_string(),
+                        source_kind: "summary".to_string(),
+                        source_start_id: None,
+                        source_end_id: None,
+                        source_template_id: Some("template".to_string()),
+                        heading: None,
+                        ordinal: 0,
+                    },
+                    DocumentMeta {
+                        document_id: "doc-transcript".to_string(),
+                        meeting_id: "m".to_string(),
+                        source_kind: "transcript".to_string(),
+                        source_start_id: Some("segment".to_string()),
+                        source_end_id: Some("segment".to_string()),
+                        source_template_id: None,
+                        heading: None,
+                        ordinal: 0,
+                    },
+                ],
+                vectors: [127u8, 0, 127u8, 0].to_vec(),
+            },
+            Overlay::default(),
+        );
+        let hits = scan_snapshot(
+            &snapshot,
+            &[127, 0],
+            &ScopeFilter::All,
+            10,
+            &CancellationToken::new(),
+            Some("transcript"),
+        )
+        .unwrap();
+        assert_eq!(hit_ids(&hits), vec!["doc-transcript".to_string()]);
     }
 
     #[tokio::test]

@@ -117,7 +117,7 @@ no later Fast/Deep result may substitute for them.
 |---|---|---|---|---|---|---|---|
 | 4.1 | Quality mode | Add Fast/Deep request contract and accessible Chat selector with Deep default. | M | `worker-m` | R40 docs + current user approval; Sprint 3 implementation baseline | UI/backend tests prove explicit mode compatibility, shared ownership/cancellation, default, selection, request propagation, and no persistence/schema change. | Remove optional mode and default backend to Fast broad behavior. |
 | 4.2 | Deep retrieval | Implement bounded structured planner/search/open/expand loop with scope and cancellation enforcement. | L | `worker-l` | 4.1 | Adversarial and functional tests prove iterative recall, max rounds, scope safety, fallback, and hidden planner output. | Disable Deep branch; Fast remains complete. |
-| 4.3 | Saved meeting | Replace saved-meeting transcript anchor selection with hybrid retrieval while preserving authoritative context and fallback. | M | Pending `worker-m` | Sprint 3 implementation baseline (release acceptance remains open) | Saved-meeting regressions prove summary/notes, neighborhoods, no-hit fallback, coverage, and source parity. | Restore lexical `search_meeting_transcripts`; no data change. |
+| 4.3 | Saved meeting | Replace saved-meeting transcript anchor selection with hybrid retrieval while preserving authoritative context and fallback. | M | `worker-m` | Sprint 3 implementation baseline (release acceptance remains open) | Saved-meeting regressions prove summary/notes, neighborhoods, no-hit fallback, coverage, and source parity. | Restore lexical `search_meeting_transcripts`; no data change. |
 | 4.4 | Snapshot/today | Make snapshot and today membership query-aware through hybrid retrieval with deterministic Fast broad-summary coverage and bounded Deep actions. | M | Pending `worker-m` | 4.2; Sprint 3 implementation baseline | Tests prove frozen/date membership, query relevance, deleted-member tolerance, broad summarization coverage, and bounds. | Restore deterministic `get_by_meeting_ids`. |
 | 4.5 | Cross-scope hardening | Complete Fast/Deep integration, deleted-meeting source scrubbing/disclosure, provider/failure/cancellation/source tests, evaluation, and native smoke. | M | Pending `worker-m` | 4.2-4.4; inherited Sprint 3 release gates | Full evaluation/native/deletion checks pass with no scope leak, stale deleted source, or source mismatch, and every inherited Sprint 3 release gate has valid evidence. | Disable Deep/per-scope hybrid paths; source scrub rollback requires explicit privacy approval. |
 
@@ -702,6 +702,39 @@ no Fast/Deep result or task-local check may substitute for a missing gate.
 - The 30-second Deep budget is enforced at operation boundaries (before each planner call and additional search); the initial retrieval and final hydration reuse the unmodified Fast boundary timing, so Deep adds at most the bounded planning cost on top of Fast's own stages. Deep p95 measurement remains Task 4.5's gate.
 - Open/expand actions are realized as additional `AllowedMeetingIds`-scoped retrievals through the same candidate/fusion/rerank/hydration contracts, differing in their capability-token source (round cards vs. retained evidence IDs); meeting opens get one dedicated retrieval each so every opened meeting receives the full per-variant candidate budget.
 - Sprint 3 release gates remain open; this task makes no release or corpus-quality claim.
+
+### 4.3 - Hybrid saved-meeting transcript anchors
+
+**Status:** Complete
+**Owner:** `worker-m` (`openai/gpt-5.6-luna`)
+**Completed:** 2026-09-02
+**Implemented:**
+- Ordinary saved-meeting Chat now uses shared hybrid retrieval for transcript anchors under the exact meeting scope, with semantic/lexical fallback and authoritative source reconstruction.
+- Existing summary/notes, one-segment neighborhoods, overlap deduplication, chronology, Unicode budgeting, coverage disclosure, no-hit head fallback, and retained-source parity remain intact.
+**Implementation:**
+- Files: `frontend/src-tauri/src/api/chat.rs`, `frontend/src-tauri/src/retrieval/index.rs`, `frontend/src-tauri/src/retrieval/service.rs`, `docs/notes-chat-improvement-execution.md`, this doc
+- Approach: Limit both lexical FTS and semantic index scans to transcript sources for Meeting requests, pass original/rewritten queries through `RetrievalService::retrieve_ranked`, validate semantic range hashes against the authoritative transcript, ignore stale ranges without consuming valid-anchor capacity, then reuse `build_meeting_context_markdown` for the unchanged authoritative output contract. The old path remains for forced-lexical or unavailable-lifecycle requests.
+**Not implemented:**
+- Task 4.4/4.5, Sprint 5, release-gate closure, corpus/evaluation/debug fixture work, persistence/schema changes, and MCP/UI changes.
+**Why not implemented:**
+- Outside Task 4.3 scope.
+**Verification:**
+- `pnpm run typecheck` - pass.
+- `npx vitest run` - pass (20 files, 98 tests).
+- `cargo test --manifest-path frontend/src-tauri/Cargo.toml --lib api::chat::tests` - pass (51 tests).
+- `cargo test --manifest-path frontend/src-tauri/Cargo.toml --lib export::context::tests` - pass (11 tests).
+- `$env:CARGO_TARGET_DIR="C:\Users\arman\cargo-target"; cargo check --manifest-path src-tauri/Cargo.toml` - pass; one pre-existing `Sidebar` dead-code warning.
+- `cargo fmt --manifest-path frontend/src-tauri/Cargo.toml --check` - blocked only by pre-existing rejected V10 fixture trailing whitespace; touched Rust files pass targeted rustfmt.
+- `git diff --check` - pass.
+- `cargo test --test retrieval_evaluation` - intentionally not run because the evaluation harness/corpus is prohibited and contaminated for this task.
+**Rollback:**
+- Restore the saved-meeting branch to `resolve_meeting_context`/`search_meeting_transcripts` and remove the transcript-only semantic source filter; no data rollback is required.
+**Decisions and follow-ups:**
+- Old lexical ordering remains rewritten-query AND→OR, then original-query AND→OR only when the rewritten query has no hits. Semantic unavailable/stale evidence falls back safely without suppressing authoritative summary/notes or the bounded chronological head. Task 6.1.R10 invariants remain preserved; Task 4.3 acceptance and inherited Sprint 3 release gates remain open for review.
+
+**2026-09-02 R47 remediation addendum:** The hybrid saved-meeting resolver now passes ranked transcript endpoint/alias identities to the existing relevant-row loader, preserving the authoritative full transcript count while materializing only bounded hit neighborhoods; stale anchors still fall back to the chronological head. Production-path tests now cover semantic paraphrase, exact lexical retrieval, genuine zero-hit fallback, and a lexical hit after the 10,000-row source cap, including final prompt/source parity. Focused Chat, export, retrieval-index, retrieval, cargo-check, typecheck, Vitest, touched-file rustfmt, and diff checks passed. Repository-wide fmt remains blocked only by the pre-existing rejected V10 fixture whitespace; retrieval evaluation remains intentionally prohibited. No prior Task 4.3 or R47 record was altered.
+
+**2026-09-02 R48 remediation addendum:** Relevant saved-meeting loading now accepts semantic endpoint pairs and selects each complete authoritative inclusive range plus its existing adjacent rows, while point anchors retain endpoint-neighborhood behavior. Fingerprint validation still hashes the full authoritative range and rejects missing, reversed, or stale spans. A production-path multi-segment semantic-range regression reaches final prompt/source publication and verifies parity. Focused checks passed; targeted touched-file rustfmt passed; repository fmt remains blocked only by rejected V10 fixture whitespace; retrieval evaluation remains intentionally prohibited. No prior Task 4.3, R47, or R48 record was rewritten.
 
 ### Task Entry Template
 

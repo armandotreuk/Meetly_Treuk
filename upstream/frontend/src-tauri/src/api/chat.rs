@@ -1,7 +1,8 @@
 use chrono::{DateTime, Local, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,8 +13,8 @@ use uuid::Uuid;
 
 use crate::retrieval::worker::RetrievalLifecycle;
 use crate::retrieval::{
-    agent::DeepProgressCallback, hydrate_context, PersistedRetrievalScope, RetrievalLimits,
-    RetrievalPurpose, RetrievalRequest, RetrievalService,
+    agent::DeepProgressCallback, hydrate_context, PersistedRetrievalScope, RetrievalChannel,
+    RetrievalLimits, RetrievalPurpose, RetrievalRequest, RetrievalService, SemanticFallbackReason,
 };
 use crate::{
     database::repositories::{
@@ -807,9 +808,47 @@ async fn prepare_chat_inputs_for_scope(
                 let ChatRetrievalScope::Meeting(meeting_id) = scope else {
                     unreachable!()
                 };
-                let meeting =
-                    resolve_meeting_context(pool, &meeting_id, &search_query, query, chunk_limit)
-                        .await?;
+                let (meeting, semantic_fallback) = if !force_lexical {
+                    if let Some(lifecycle) = lifecycle.as_ref() {
+                        resolve_meeting_context_hybrid(
+                            pool,
+                            &meeting_id,
+                            &search_query,
+                            query,
+                            chunk_limit,
+                            lifecycle,
+                            cancellation_token,
+                        )
+                        .await?
+                    } else {
+                        (
+                            resolve_meeting_context(
+                                pool,
+                                &meeting_id,
+                                &search_query,
+                                query,
+                                chunk_limit,
+                            )
+                            .await?,
+                            None,
+                        )
+                    }
+                } else {
+                    (
+                        resolve_meeting_context(
+                            pool,
+                            &meeting_id,
+                            &search_query,
+                            query,
+                            chunk_limit,
+                        )
+                        .await?,
+                        None,
+                    )
+                };
+                if semantic_fallback.is_some() {
+                    retrieval_diagnostic = RetrievalPreparationDiagnostic::SemanticFallback;
+                }
                 ensure_not_cancelled(cancellation_token)?;
                 let built = build_meeting_context_markdown(
                     &meeting.meeting_id,
@@ -840,10 +879,10 @@ async fn prepare_chat_inputs_for_scope(
             {
                 let lifecycle =
                     lifecycle.ok_or_else(|| "Retrieval lifecycle unavailable".to_string())?;
-                // Task 4.2 keeps the Deep lifecycle scoped to the supported
-                // persisted All/Folder paths; today's derived allow-list,
-                // snapshot, saved-meeting, and live scopes stay Fast until
-                // Tasks 4.3/4.4 extend them.
+                // Task 4.2 keeps the Deep planner scoped to persisted All/Folder
+                // paths; saved meetings use shared hybrid anchors without the
+                // planner, while today's allow-list, snapshots, and live scopes
+                // remain Fast until later scope work.
                 let deep_eligible =
                     deep_preparation_eligible(retrieval_mode, today_meeting_ids.as_ref());
                 let persisted_scope = match &scope {
@@ -1453,6 +1492,232 @@ fn chat_source_from_hydrated(source: &crate::retrieval::HydratedSource) -> ChatS
         folder_name: source.folder_name.clone(),
         source_kind: Some(source.source_kind.clone()),
     }
+}
+
+async fn resolve_meeting_context_hybrid(
+    pool: &SqlitePool,
+    meeting_id: &str,
+    search_query: &str,
+    original_query: &str,
+    chunk_limit: u32,
+    lifecycle: &RetrievalLifecycle,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<(MeetingChatContext, Option<SemanticFallbackReason>), String> {
+    let cancel = cancellation_token.cloned().unwrap_or_default();
+    let ranked = RetrievalService::new(lifecycle.clone())
+        .retrieve_ranked(
+            pool,
+            RetrievalRequest {
+                original_query: original_query.to_string(),
+                rewritten_query: Some(search_query.to_string()),
+                scope: PersistedRetrievalScope::Meeting(meeting_id.to_string()),
+                purpose: RetrievalPurpose::Chat,
+                limits: RetrievalLimits {
+                    lexical_per_variant: chunk_limit as usize,
+                    vector_per_variant: chunk_limit as usize,
+                },
+                core_language: crate::retrieval::service::CoreTermLanguage::Unknown,
+                cancellation: Some(cancel.clone()),
+            },
+        )
+        .await
+        .map_err(|error| format!("Retrieval failed: {}", error))?;
+    ensure_not_cancelled(Some(&cancel))?;
+    let mut transcript_ids = BTreeSet::new();
+    let mut transcript_ranges = BTreeSet::new();
+    let mut add_range = |start: Option<&String>, end: Option<&String>| {
+        let Some(start) = start else {
+            return;
+        };
+        let end = end.unwrap_or(start);
+        transcript_ids.insert(start.clone());
+        transcript_ids.insert(end.clone());
+        transcript_ranges.insert((start.clone(), end.clone()));
+    };
+    for item in ranked.ranking.evidence.iter().filter(|item| {
+        item.evidence.meeting_id == meeting_id && item.evidence.source_kind == "transcript"
+    }) {
+        add_range(
+            item.evidence.source_start_id.as_ref(),
+            item.evidence.source_end_id.as_ref(),
+        );
+        for alias in item
+            .evidence
+            .source_aliases
+            .iter()
+            .filter(|alias| alias.source_kind == "transcript")
+        {
+            add_range(alias.source_start_id.as_ref(), alias.source_end_id.as_ref());
+        }
+    }
+    let transcript_ids = transcript_ids.into_iter().collect::<Vec<_>>();
+    let transcript_ranges = transcript_ranges.into_iter().collect::<Vec<_>>();
+    let mut source = crate::database::repositories::retrieval::RetrievalRepository::
+        load_meeting_source_relevant_ranges_with_cancellation(
+            pool,
+            meeting_id,
+            &transcript_ids,
+            &transcript_ranges,
+            &cancel,
+        )
+        .await
+        .map_err(|error| format!("Failed to load meeting context: {}", error))?
+        .ok_or_else(|| "Meeting not found".to_string())?;
+    let mut included =
+        meeting_transcript_positions(&source, &ranked.ranking.evidence, chunk_limit as usize);
+    if included.is_empty() && !transcript_ids.is_empty() {
+        source = crate::database::repositories::retrieval::RetrievalRepository::
+            load_meeting_source_relevant_with_cancellation(pool, meeting_id, &[], &cancel)
+                .await
+                .map_err(|error| format!("Failed to load meeting context: {}", error))?
+                .ok_or_else(|| "Meeting not found".to_string())?;
+    }
+    if included.is_empty() {
+        included.extend(
+            source
+                .transcript_positions
+                .iter()
+                .take(chunk_limit as usize)
+                .copied(),
+        );
+    }
+    let transcripts = meeting_transcripts_for_positions(&source, &included);
+    let context = MeetingChatContext {
+        meeting_id: source.meeting_id,
+        meeting_title: source.title,
+        summary: source.latest_summary_markdown,
+        notes: source
+            .notes_markdown
+            .filter(|notes| !notes.trim().is_empty()),
+        transcripts,
+        total_transcript_segments: source.transcript_segments_total,
+    };
+    Ok((context, ranked.semantic_fallback))
+}
+
+fn meeting_transcript_positions(
+    source: &crate::database::repositories::retrieval::MeetingSource,
+    evidence: &[crate::retrieval::RankedEvidence],
+    limit: usize,
+) -> BTreeSet<usize> {
+    let positions: HashMap<&str, (usize, usize)> = source
+        .transcripts
+        .iter()
+        .zip(source.transcript_positions.iter().copied())
+        .enumerate()
+        .map(|(index, (segment, position))| (segment.id.as_str(), (position, index)))
+        .collect();
+    let range_for = |start_id: Option<&str>, end_id: Option<&str>| {
+        let start_id = start_id?;
+        let end_id = end_id.unwrap_or(start_id);
+        let &(start_position, start_index) = positions.get(start_id)?;
+        let &(end_position, end_index) = positions.get(end_id)?;
+        (start_position <= end_position && start_index <= end_index).then_some((
+            start_position,
+            end_position,
+            start_index,
+            end_index,
+        ))
+    };
+    let mut included = BTreeSet::new();
+    let mut anchors = 0;
+    for item in evidence.iter().filter(|item| {
+        item.evidence.meeting_id == source.meeting_id && item.evidence.source_kind == "transcript"
+    }) {
+        if anchors >= limit {
+            break;
+        }
+        let is_semantic = item
+            .evidence
+            .provenance
+            .iter()
+            .any(|provenance| provenance.channel == RetrievalChannel::Semantic);
+        let mut accepted = false;
+        if let Some((start, end, start_index, end_index)) = range_for(
+            item.evidence.source_start_id.as_deref(),
+            item.evidence.source_end_id.as_deref(),
+        ) {
+            let hash_matches = !is_semantic || {
+                let authoritative = source.transcripts[start_index..=end_index]
+                    .iter()
+                    .map(|segment| segment.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let expected = item.content_fingerprint.clone().unwrap_or_else(|| {
+                    sha2::Sha256::digest(item.evidence.text.as_bytes()).to_vec()
+                });
+                sha2::Sha256::digest(authoritative.as_bytes()).as_slice() == expected.as_slice()
+            };
+            if hash_matches {
+                accepted = true;
+                include_transcript_range(
+                    &mut included,
+                    start,
+                    end,
+                    source.transcript_segments_total,
+                );
+            }
+        }
+        for alias in &item.evidence.source_aliases {
+            if alias.source_kind != "transcript" {
+                continue;
+            }
+            if let Some((start, end, _, _)) = range_for(
+                alias.source_start_id.as_deref(),
+                alias.source_end_id.as_deref(),
+            ) {
+                accepted = true;
+                include_transcript_range(
+                    &mut included,
+                    start,
+                    end,
+                    source.transcript_segments_total,
+                );
+            }
+        }
+        if accepted {
+            anchors += 1;
+        }
+    }
+    included
+}
+
+fn include_transcript_range(
+    included: &mut BTreeSet<usize>,
+    start: usize,
+    end: usize,
+    total: usize,
+) {
+    if total == 0 {
+        return;
+    }
+    included.extend(start.saturating_sub(1)..=end.saturating_add(1).min(total - 1));
+}
+
+fn meeting_transcripts_for_positions(
+    source: &crate::database::repositories::retrieval::MeetingSource,
+    included: &BTreeSet<usize>,
+) -> Vec<crate::database::repositories::fts::FtsSearchResult> {
+    source
+        .transcripts
+        .iter()
+        .zip(source.transcript_positions.iter().copied())
+        .filter(|(_, position)| included.contains(position))
+        .map(
+            |(segment, _)| crate::database::repositories::fts::FtsSearchResult {
+                meeting_id: source.meeting_id.clone(),
+                meeting_title: source.title.clone(),
+                chunk_type: "transcript".to_string(),
+                chunk_id: segment.id.clone(),
+                snippet: segment.text.clone(),
+                speaker: segment.speaker.clone(),
+                timestamp_label: Some(segment.timestamp.clone()),
+                folder_id: None,
+                folder_name: source.folder_name.clone(),
+                rank: 0.0,
+            },
+        )
+        .collect()
 }
 
 async fn resolve_meeting_context(
@@ -2591,6 +2856,540 @@ mod tests {
         pool
     }
 
+    const HYBRID_MODEL_ID: &str = "chat-test-model";
+    const HYBRID_DIMENSIONS: usize = 4;
+    const HYBRID_BEFORE: &str = "Opening remarks.";
+    const HYBRID_TARGET: &str = "The budget was approved.";
+    const HYBRID_AFTER: &str = "Closing remarks.";
+
+    struct HybridTestEmbedder;
+
+    impl crate::retrieval::worker::DocumentEmbedder for HybridTestEmbedder {
+        fn model_id(&self) -> String {
+            HYBRID_MODEL_ID.to_string()
+        }
+
+        fn dimensions(&self) -> usize {
+            HYBRID_DIMENSIONS
+        }
+
+        fn count_tokens(&self, text: &str) -> usize {
+            text.split_whitespace().count()
+        }
+
+        fn embed_documents_blocking(
+            &self,
+            texts: &[String],
+            _cancel: &tokio_util::sync::CancellationToken,
+        ) -> Result<Vec<Vec<f32>>, crate::retrieval::model::RetrievalModelError> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0, 0.0]).collect())
+        }
+
+        fn embed_queries_blocking(
+            &self,
+            texts: &[String],
+            _cancel: &tokio_util::sync::CancellationToken,
+        ) -> Result<Vec<Vec<f32>>, crate::retrieval::model::RetrievalModelError> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0, 0.0]).collect())
+        }
+    }
+
+    fn hybrid_test_lifecycle() -> crate::retrieval::worker::RetrievalLifecycle {
+        let embedder: Arc<dyn crate::retrieval::worker::DocumentEmbedder> =
+            Arc::new(HybridTestEmbedder);
+        let loader: crate::retrieval::worker::EngineLoader =
+            Arc::new(move || Ok(Arc::clone(&embedder)));
+        crate::retrieval::worker::RetrievalLifecycle::new(
+            crate::retrieval::worker::LifecycleConfig::testing(Arc::new(|| false), loader),
+        )
+    }
+
+    fn semantic_unavailable_lifecycle() -> crate::retrieval::worker::RetrievalLifecycle {
+        crate::retrieval::worker::RetrievalLifecycle::new(
+            crate::retrieval::worker::LifecycleConfig::testing(
+                Arc::new(|| false),
+                Arc::new(|| Err("semantic unavailable".to_string())),
+            ),
+        )
+    }
+
+    async fn hybrid_test_pool() -> SqlitePool {
+        use std::str::FromStr;
+
+        let options = sqlx::sqlite::SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .foreign_keys(true);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    async fn configure_hybrid_chat(pool: &SqlitePool) {
+        sqlx::query(
+            "INSERT INTO settings (id, provider, model, whisperModel, chatProvider, chatModel) VALUES ('1', 'ollama', 'local', 'whisper', 'ollama', 'local')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn hybrid_transcript_text(index: usize) -> String {
+        match index {
+            0 => HYBRID_BEFORE.to_string(),
+            1 => HYBRID_TARGET.to_string(),
+            2 => HYBRID_AFTER.to_string(),
+            index => format!("Chronological filler {index:02}"),
+        }
+    }
+
+    async fn insert_hybrid_meeting(pool: &SqlitePool, transcript_count: usize) {
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at, saved_at) VALUES ('m2', 'Hybrid meeting', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO meeting_notes (meeting_id, notes_markdown, created_at, updated_at) VALUES ('m2', 'Current notes', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO summary_processes (meeting_id, template_id, status, created_at, updated_at, result) VALUES ('m2', 'summary', 'completed', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z', '{\"markdown\":\"Authoritative summary\"}')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        for index in 0..transcript_count {
+            let id = match index {
+                0 => "before".to_string(),
+                1 => "target".to_string(),
+                2 => "after".to_string(),
+                index => format!("filler-{index:02}"),
+            };
+            sqlx::query(
+                "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time) VALUES (?, 'm2', ?, '10:00', ?)",
+            )
+            .bind(id)
+            .bind(hybrid_transcript_text(index))
+            .bind(index as f64)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO meeting_fts (meeting_id, chunk_type, chunk_id, text) VALUES ('m2', 'transcript', 'target', ?)",
+        )
+        .bind(HYBRID_TARGET)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE search_source_state SET fts_indexed_revision = fts_projection_revision WHERE meeting_id = 'm2'",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn publish_hybrid_document(
+        pool: &SqlitePool,
+        lifecycle: &crate::retrieval::worker::RetrievalLifecycle,
+        meeting_id: &str,
+        document_id: &str,
+        start_id: &str,
+        end_id: &str,
+        content: &str,
+    ) {
+        use crate::database::repositories::retrieval::{
+            ModelSpec, ReplacementJob, ReplacementOutcome, RetrievalRepository, StagedDocument,
+            VectorEncoding,
+        };
+
+        assert!(RetrievalRepository::ensure_model(
+            pool,
+            &ModelSpec {
+                model_id: HYBRID_MODEL_ID.to_string(),
+                dimensions: HYBRID_DIMENSIONS as u32,
+                vector_encoding: VectorEncoding::Int8,
+                chunker_version: 1,
+                dequantization_scale: Some(1.0 / 127.0),
+                dequantization_zero_point: Some(0),
+            },
+        )
+        .await
+        .unwrap());
+        assert!(
+            RetrievalRepository::ensure_generation(pool, "gen-chat-hybrid", HYBRID_MODEL_ID,)
+                .await
+                .unwrap()
+        );
+        let revision = RetrievalRepository::current_source_revision(pool, meeting_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let job_id = format!("job-chat-hybrid-{meeting_id}");
+        RetrievalRepository::stage_documents(
+            pool,
+            &job_id,
+            "gen-chat-hybrid",
+            meeting_id,
+            revision,
+            &[StagedDocument {
+                document_id: document_id.to_string(),
+                source_kind: "transcript".to_string(),
+                source_start_id: Some(start_id.to_string()),
+                source_end_id: Some(end_id.to_string()),
+                source_template_id: None,
+                heading: None,
+                ordinal: 0,
+                content: content.to_string(),
+                content_hash: vec![0; 32],
+                dimensions: HYBRID_DIMENSIONS as i64,
+                vector_encoding: VectorEncoding::Int8,
+                vector: vec![127, 0, 0, 0],
+            }],
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            RetrievalRepository::replace_meeting_documents(
+                pool,
+                ReplacementJob {
+                    generation_id: "gen-chat-hybrid",
+                    meeting_id,
+                    expected_source_revision: revision,
+                    job_id: &job_id,
+                },
+            )
+            .await
+            .unwrap(),
+            ReplacementOutcome::Published { .. }
+        ));
+        lifecycle.index_service().set_loaded_model(HYBRID_MODEL_ID);
+        crate::retrieval::index::publish_tick(pool, lifecycle.index_service().as_ref())
+            .await
+            .unwrap();
+    }
+
+    async fn mark_hybrid_meeting_ready(pool: &SqlitePool, meeting_id: &str) {
+        use crate::database::repositories::retrieval::{
+            ReplacementJob, ReplacementOutcome, RetrievalRepository, StagedDocument,
+        };
+
+        let revision = RetrievalRepository::current_source_revision(pool, meeting_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let job_id = format!("job-chat-hybrid-empty-{meeting_id}");
+        RetrievalRepository::stage_documents(
+            pool,
+            &job_id,
+            "gen-chat-hybrid",
+            meeting_id,
+            revision,
+            &[] as &[StagedDocument],
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            RetrievalRepository::replace_meeting_documents(
+                pool,
+                ReplacementJob {
+                    generation_id: "gen-chat-hybrid",
+                    meeting_id,
+                    expected_source_revision: revision,
+                    job_id: &job_id,
+                },
+            )
+            .await
+            .unwrap(),
+            ReplacementOutcome::Published { .. }
+        ));
+    }
+
+    async fn hybrid_test_fixture(
+        semantic_target: bool,
+        transcript_count: usize,
+    ) -> (SqlitePool, crate::retrieval::worker::RetrievalLifecycle) {
+        let pool = hybrid_test_pool().await;
+        configure_hybrid_chat(&pool).await;
+        insert_hybrid_meeting(&pool, transcript_count).await;
+        let lifecycle = hybrid_test_lifecycle();
+        if semantic_target {
+            publish_hybrid_document(
+                &pool,
+                &lifecycle,
+                "m2",
+                "doc-m2-target",
+                "target",
+                "target",
+                HYBRID_TARGET,
+            )
+            .await;
+        } else {
+            sqlx::query(
+                "INSERT INTO meetings (id, title, created_at, updated_at, saved_at) VALUES ('m3', 'Other meeting', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO transcripts (id, meeting_id, transcript, timestamp) VALUES ('other-target', 'm3', 'Other meeting', '10:00')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            publish_hybrid_document(
+                &pool,
+                &lifecycle,
+                "m3",
+                "doc-m3-target",
+                "other-target",
+                "other-target",
+                "Other meeting",
+            )
+            .await;
+            mark_hybrid_meeting_ready(&pool, "m2").await;
+            crate::retrieval::index::publish_tick(&pool, lifecycle.index_service().as_ref())
+                .await
+                .unwrap();
+            assert!(lifecycle.index_service().active_snapshot().is_some());
+        }
+        (pool, lifecycle)
+    }
+
+    async fn semantic_range_hybrid_test_fixture(
+    ) -> (SqlitePool, crate::retrieval::worker::RetrievalLifecycle) {
+        let pool = hybrid_test_pool().await;
+        configure_hybrid_chat(&pool).await;
+        insert_hybrid_meeting(&pool, 12).await;
+        let lifecycle = hybrid_test_lifecycle();
+        let content = (4..=8)
+            .map(hybrid_transcript_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        publish_hybrid_document(
+            &pool,
+            &lifecycle,
+            "m2",
+            "doc-m2-range",
+            "filler-04",
+            "filler-08",
+            &content,
+        )
+        .await;
+        (pool, lifecycle)
+    }
+
+    async fn prepare_hybrid(
+        pool: &SqlitePool,
+        lifecycle: &crate::retrieval::worker::RetrievalLifecycle,
+        query: &str,
+    ) -> ChatInputs {
+        prepare_chat_inputs_for_scope(
+            pool,
+            None,
+            &reqwest::Client::new(),
+            query,
+            None,
+            ChatRetrievalScope::Meeting("m2".to_string()),
+            None,
+            Some(lifecycle.clone()),
+            None,
+            Some(ChatRetrievalMode::Fast),
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn assert_hybrid_sources(inputs: &ChatInputs, expected: &[String]) {
+        assert_eq!(
+            inputs
+                .sources
+                .iter()
+                .map(|source| source.snippet.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(inputs
+            .sources
+            .iter()
+            .all(|source| source.meeting_id == "m2" && source.chunk_type == "transcript"));
+        for snippet in expected {
+            assert!(inputs.user_prompt.contains(snippet));
+        }
+        assert!(inputs.user_prompt.contains("Authoritative summary"));
+        assert!(inputs.user_prompt.contains("Current notes"));
+    }
+
+    async fn long_hybrid_test_fixture() -> (SqlitePool, crate::retrieval::worker::RetrievalLifecycle)
+    {
+        let pool = hybrid_test_pool().await;
+        configure_hybrid_chat(&pool).await;
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at, saved_at) VALUES ('m2', 'Long meeting', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO meeting_notes (meeting_id, notes_markdown, created_at, updated_at) VALUES ('m2', 'Current notes', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO summary_processes (meeting_id, template_id, status, created_at, updated_at, result) VALUES ('m2', 'summary', 'completed', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z', '{\"markdown\":\"Authoritative summary\"}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            WITH RECURSIVE sequence(n) AS (
+                SELECT 0
+                UNION ALL
+                SELECT n + 1 FROM sequence WHERE n < 10000
+            )
+            INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time)
+            SELECT printf('long-%05d', n), 'm2',
+                   CASE WHEN n = 10000 THEN 'needle after cap'
+                        ELSE printf('Long filler %05d', n) END,
+                   '10:00', n
+            FROM sequence
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO meeting_fts (meeting_id, chunk_type, chunk_id, text) VALUES ('m2', 'transcript', 'long-10000', 'needle after cap')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE search_source_state SET fts_indexed_revision = fts_projection_revision WHERE meeting_id = 'm2'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        (pool, semantic_unavailable_lifecycle())
+    }
+
+    #[tokio::test]
+    async fn saved_meeting_hybrid_semantic_paraphrase_reaches_final_prompt() {
+        let (pool, lifecycle) = hybrid_test_fixture(true, 3).await;
+        let inputs = prepare_hybrid(&pool, &lifecycle, "funding outlook").await;
+        assert_eq!(
+            inputs.retrieval_diagnostic,
+            RetrievalPreparationDiagnostic::Hybrid
+        );
+        assert_hybrid_sources(
+            &inputs,
+            &vec![
+                HYBRID_BEFORE.to_string(),
+                HYBRID_TARGET.to_string(),
+                HYBRID_AFTER.to_string(),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_meeting_hybrid_semantic_range_reaches_final_prompt() {
+        let (pool, lifecycle) = semantic_range_hybrid_test_fixture().await;
+        let inputs = prepare_hybrid(&pool, &lifecycle, "funding outlook").await;
+        assert_eq!(
+            inputs.retrieval_diagnostic,
+            RetrievalPreparationDiagnostic::Hybrid
+        );
+        let expected = (3..=9).map(hybrid_transcript_text).collect::<Vec<_>>();
+        assert_hybrid_sources(&inputs, &expected);
+        assert!(inputs
+            .user_prompt
+            .contains("Partial transcript coverage: 7/12 segments"));
+    }
+
+    #[tokio::test]
+    async fn saved_meeting_hybrid_exact_query_preserves_final_sources() {
+        let (pool, lifecycle) = hybrid_test_fixture(true, 3).await;
+        let inputs = prepare_hybrid(&pool, &lifecycle, "budget approved").await;
+        assert_eq!(
+            inputs.retrieval_diagnostic,
+            RetrievalPreparationDiagnostic::Hybrid
+        );
+        assert_hybrid_sources(
+            &inputs,
+            &vec![
+                HYBRID_BEFORE.to_string(),
+                HYBRID_TARGET.to_string(),
+                HYBRID_AFTER.to_string(),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_meeting_hybrid_zero_hit_uses_chronological_head() {
+        let (pool, lifecycle) = hybrid_test_fixture(false, 12).await;
+        let inputs = prepare_hybrid(&pool, &lifecycle, "nothing matches").await;
+        assert_eq!(
+            inputs.retrieval_diagnostic,
+            RetrievalPreparationDiagnostic::Hybrid
+        );
+        let expected = (0..10).map(hybrid_transcript_text).collect::<Vec<_>>();
+        assert_hybrid_sources(&inputs, &expected);
+        assert!(inputs
+            .user_prompt
+            .contains("Partial transcript coverage: 10/12 segments"));
+    }
+
+    #[tokio::test]
+    async fn saved_meeting_hybrid_rehydrates_long_meeting_hits_with_true_coverage() {
+        let (pool, lifecycle) = long_hybrid_test_fixture().await;
+        let relevant = crate::database::repositories::retrieval::RetrievalRepository::
+            load_meeting_source_relevant(&pool, "m2", &["long-10000".to_string()])
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(relevant.transcript_segments_total, 10001);
+        assert!(relevant
+            .transcripts
+            .iter()
+            .any(|row| row.id == "long-10000"));
+        let hits =
+            FtsRepository::search_transcripts_with_mode(&pool, "needle", 10, "m2", MatchMode::And)
+                .await
+                .unwrap();
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.chunk_id.as_str())
+                .collect::<Vec<_>>(),
+            ["long-10000"]
+        );
+        let inputs = prepare_hybrid(&pool, &lifecycle, "needle").await;
+        assert_eq!(
+            inputs.retrieval_diagnostic,
+            RetrievalPreparationDiagnostic::SemanticFallback
+        );
+        assert_hybrid_sources(
+            &inputs,
+            &vec![
+                "Long filler 09999".to_string(),
+                "needle after cap".to_string(),
+            ],
+        );
+        assert!(inputs
+            .user_prompt
+            .contains("Partial transcript coverage: 2/10001 segments"));
+    }
+
     #[tokio::test]
     async fn scope_resolution_keeps_legacy_all_and_meeting_behavior() {
         let pool = scope_pool().await;
@@ -2714,6 +3513,145 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn hybrid_meeting_anchors_verify_semantic_ranges_and_ignore_metadata_limits() {
+        use sha2::Digest;
+
+        let source = crate::database::repositories::retrieval::MeetingSource {
+            meeting_id: "m2".to_string(),
+            title: "Child".to_string(),
+            folder_name: String::new(),
+            source_revision: None,
+            latest_summary_template_id: None,
+            latest_summary_markdown: None,
+            notes_markdown: None,
+            transcripts: [
+                ("first", "first"),
+                ("target", "semantic target"),
+                ("after", "semantic after"),
+                ("last", "last"),
+            ]
+            .into_iter()
+            .map(
+                |(id, text)| crate::database::repositories::retrieval::SourceTranscript {
+                    id: id.to_string(),
+                    text: text.to_string(),
+                    speaker: None,
+                    timestamp: "10:00".to_string(),
+                    audio_start_time: None,
+                    audio_end_time: None,
+                },
+            )
+            .collect(),
+            transcript_positions: vec![0, 1, 2, 3],
+            transcript_segments_total: 4,
+            complete: true,
+        };
+        let evidence =
+            |id: &str,
+             kind: &str,
+             start: Option<&str>,
+             end: Option<&str>,
+             text: &str,
+             provenance: Vec<crate::retrieval::EvidenceProvenance>,
+             fingerprint: Option<Vec<u8>>| crate::retrieval::RankedEvidence {
+                evidence: crate::retrieval::RetrievedEvidence {
+                    evidence_id: id.to_string(),
+                    meeting_id: "m2".to_string(),
+                    meeting_title: "Child".to_string(),
+                    source_kind: kind.to_string(),
+                    source_start_id: start.map(str::to_string),
+                    source_end_id: end.map(str::to_string),
+                    source_template_id: None,
+                    heading: None,
+                    ordinal: 0,
+                    text: text.to_string(),
+                    speaker: None,
+                    timestamp_label: None,
+                    provenance,
+                    source_aliases: Vec::new(),
+                },
+                content_fingerprint: fingerprint,
+                fused_rank: 1,
+                fused_score: 1.0,
+                reranker_score: None,
+            };
+        let semantic_text = "semantic target\nsemantic after";
+        let semantic = evidence(
+            "semantic-window",
+            "transcript",
+            Some("target"),
+            Some("after"),
+            semantic_text,
+            vec![crate::retrieval::EvidenceProvenance {
+                channel: crate::retrieval::RetrievalChannel::Semantic,
+                variant: crate::retrieval::QueryVariantKind::Original,
+                mode: None,
+                rank: 1,
+                query_slot: 0,
+            }],
+            Some(sha2::Sha256::digest(semantic_text.as_bytes()).to_vec()),
+        );
+        let summary = evidence(
+            "summary",
+            "summary",
+            None,
+            None,
+            "metadata",
+            Vec::new(),
+            None,
+        );
+        assert_eq!(
+            meeting_transcript_positions(&source, &[summary, semantic], 1)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+
+        let stale = evidence(
+            "stale-window",
+            "transcript",
+            Some("target"),
+            Some("after"),
+            semantic_text,
+            vec![crate::retrieval::EvidenceProvenance {
+                channel: crate::retrieval::RetrievalChannel::Semantic,
+                variant: crate::retrieval::QueryVariantKind::Original,
+                mode: None,
+                rank: 1,
+                query_slot: 0,
+            }],
+            Some(vec![0; 32]),
+        );
+        assert_eq!(
+            meeting_transcript_positions(&source, std::slice::from_ref(&stale), 1)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            Vec::<usize>::new()
+        );
+        let lexical = evidence(
+            "lexical-hit",
+            "transcript",
+            Some("target"),
+            None,
+            "semantic target",
+            vec![crate::retrieval::EvidenceProvenance {
+                channel: crate::retrieval::RetrievalChannel::Lexical,
+                variant: crate::retrieval::QueryVariantKind::Original,
+                mode: Some(crate::retrieval::LexicalMode::And),
+                rank: 1,
+                query_slot: 0,
+            }],
+            None,
+        );
+        assert_eq!(
+            meeting_transcript_positions(&source, &[stale, lexical], 1)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
     #[tokio::test]
     async fn meeting_fts_failure_is_not_converted_to_fallback() {
         let pool = scope_pool().await;
@@ -2784,6 +3722,12 @@ mod tests {
         }
         sqlx::query("INSERT INTO meeting_fts (meeting_id, chunk_type, chunk_id, text) VALUES ('m2', 'transcript', 'anchor', 'needle')")
             .execute(&pool).await.unwrap();
+        let lifecycle = crate::retrieval::worker::RetrievalLifecycle::new(
+            crate::retrieval::worker::LifecycleConfig::testing(
+                std::sync::Arc::new(|| false),
+                std::sync::Arc::new(|| Err("semantic unavailable".to_string())),
+            ),
+        );
 
         let inputs = prepare_chat_inputs_for_scope(
             &pool,
@@ -2793,13 +3737,17 @@ mod tests {
             None,
             ChatRetrievalScope::Meeting("m2".to_string()),
             None,
-            None,
+            Some(lifecycle),
             None,
             Some(ChatRetrievalMode::Deep),
             None,
         )
         .await
         .unwrap();
+        assert_eq!(
+            inputs.retrieval_diagnostic,
+            RetrievalPreparationDiagnostic::SemanticFallback
+        );
         assert!(inputs.user_prompt.contains("Authoritative summary"));
         assert!(inputs.user_prompt.contains("Current notes"));
         assert!(inputs.user_prompt.contains("Partial transcript coverage"));
