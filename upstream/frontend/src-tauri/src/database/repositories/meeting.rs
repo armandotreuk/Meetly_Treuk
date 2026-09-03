@@ -578,6 +578,19 @@ mod tests {
                 "malformed-with-target",
                 r#"not json at all "meetingId":"delete-me" broken"#,
             ),
+            // High surrogate followed by a syntactically complete NON-low
+            // code unit: rejected before arithmetic (no debug underflow), and
+            // the payload carries no real pair: preserved.
+            (
+                "high-surrogate-non-low-pair",
+                r#"broken {"meetingId":"\ud800\u0000"} tail"#,
+            ),
+            // High surrogate followed by a valid low surrogate: decodes to a
+            // non-identifier character: preserved.
+            (
+                "high-surrogate-valid-pair",
+                r#"broken {"meetingId":"\ud83e\udd80" tail"#,
+            ),
             // Malformed JSON with the ID in a longer ID: preserved.
             (
                 "malformed-longer-id",
@@ -695,6 +708,14 @@ mod tests {
 
         for (id, expected) in [
             ("malformed-with-target", None),
+            (
+                "high-surrogate-non-low-pair",
+                Some(r#"broken {"meetingId":"\ud800\u0000"} tail"#),
+            ),
+            (
+                "high-surrogate-valid-pair",
+                Some(r#"broken {"meetingId":"\ud83e\udd80" tail"#),
+            ),
             (
                 "malformed-longer-id",
                 Some(r#"broken "meetingId":"other-delete-me" payload"#),

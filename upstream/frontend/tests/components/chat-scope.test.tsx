@@ -246,6 +246,12 @@ describe("ChatHost scoped panel", () => {
         const streamId = mocks.invoke.mock.calls.find(([command]) => command === "api_chat_with_scoped_conversation_stream")![1].streamId;
         const progress = mocks.listeners.get("chat-preparation-progress")!;
 
+        // The agent announces initial retrieval twice: on entry with 0/0, then
+        // with the retained counts. Only the second form may claim completion
+        // — the first covers the longest silent phase of Deep preparation.
+        await act(async () => progress({ payload: { streamId, stage: "initial_retrieval", completed: 0, total: 0 } }));
+        expect(container.querySelector('[role="status"]')?.textContent).toContain("Searching your meetings");
+        expect(container.querySelector('[role="status"]')?.textContent).not.toContain("complete");
         await act(async () => progress({ payload: { streamId, stage: "initial_retrieval", completed: 2, total: 3 } }));
         expect(container.querySelector('[role="status"]')?.textContent).toContain("2 of 3");
         expect(container.querySelector('[role="status"]')?.textContent).not.toContain("question");
@@ -266,6 +272,156 @@ describe("ChatHost scoped panel", () => {
         await act(async () => (container.querySelector('[aria-label="Stop generating"]') as HTMLButtonElement).click());
         expect(mocks.invoke).toHaveBeenCalledWith("api_cancel_chat_stream", { streamId });
         expect(container.querySelector('[aria-label="Stop generating"]')).toBeNull();
+    });
+
+    it("clears rendered sources when a timeout-race deletion aborts before command completion", async () => {
+        const scope: ChatScope = { kind: "all", key: "all" };
+        let resolveStream!: () => void;
+        mocks.invoke.mockImplementation((command: string, args?: any) => {
+            if (command === "api_get_chat_model_config") return Promise.resolve({});
+            if (command === "api_chat_get_or_create_scoped_conversation") return Promise.resolve({ id: `conversation-${args.scope.key}` });
+            if (command === "api_chat_get_messages") return Promise.resolve([]);
+            if (command === "api_chat_with_scoped_conversation_stream") return new Promise<void>((resolve) => { resolveStream = resolve; });
+            return Promise.resolve();
+        });
+        await act(async () => root.render(<ChatHost><Launcher scope={scope} label="all" /></ChatHost>));
+        await act(async () => (container.querySelector("button") as HTMLButtonElement).click());
+        await flush();
+        const textarea = container.querySelector("textarea")!;
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, "question");
+            textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        await act(async () => (container.querySelector('[aria-label="Send message"]') as HTMLButtonElement).click());
+        await flush();
+        const streamId = mocks.invoke.mock.calls.find(([command]) => command === "api_chat_with_scoped_conversation_stream")![1].streamId;
+
+        // Sources render at start; a chunk makes the row streaming.
+        await act(async () => mocks.listeners.get("chat-stream-start")!({ payload: { streamId, sources: [{ meetingId: "deleted-1", meetingTitle: "Deleted", chunkType: "transcript", snippet: "private", folderName: "" }] } }));
+        await act(async () => mocks.listeners.get("chat-stream-chunk")!({ payload: { streamId, text: "partial answer" } }));
+        expect(container.textContent).toContain("partial answer");
+        expect(container.textContent).toContain("Deleted");
+        expect(container.querySelector('[aria-label="Stop generating"]')).not.toBeNull();
+
+        // The privacy-safe abort event (identity + reason only) scrubs the
+        // in-flight row and restores a usable send state.
+        await act(async () => mocks.listeners.get("chat-stream-abort")!({ payload: { streamId, reason: "referenced_meeting_deleted" } }));
+        expect(container.textContent).not.toContain("private");
+        expect(container.textContent).not.toContain("partial answer");
+        expect(container.querySelector('[aria-label="Stop generating"]')).toBeNull();
+        expect(container.querySelector('[aria-label="Stop generating"]'), "stop button must be gone").toBeNull();
+        expect(container.querySelector("textarea")?.disabled, "textarea must be enabled").toBe(false);
+        // A new send is possible: typing re-enables the send button.
+        const restoredTextarea = container.querySelector("textarea")!;
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(restoredTextarea, "follow-up");
+            restoredTextarea.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        const sendButton = container.querySelector('[aria-label="Send message"]') as HTMLButtonElement;
+        expect(sendButton, "send button must exist").not.toBeNull();
+        expect(sendButton.disabled, "send button must be enabled").toBe(false);
+        await act(async () => resolveStream());
+        expect(container.textContent).not.toContain("partial answer");
+        expect(mocks.invoke.mock.calls.some(([command, args]) => command === "api_chat_save_message" && args.role === "assistant")).toBe(false);
+        // A stale/replaced done for a DIFFERENT stream is suppressed by the
+        // identity fence (same-stream events cannot occur after abort: the
+        // backend suppresses every terminal publication and the listeners
+        // are unregistered).
+        await act(async () => mocks.listeners.get("chat-stream-done")!({ payload: { streamId: "replaced-stream", answer: "replaced answer", sources: [] } }));
+        expect(container.textContent).not.toContain("replaced answer");
+        expect(mocks.invoke.mock.calls.some(([command, args]) => command === "api_chat_save_message" && args.content === "replaced answer")).toBe(false);
+    });
+
+    it("scrubs the active row on a safe terminal revalidation error and ignores stale cleanup", async () => {
+        const scope: ChatScope = { kind: "all", key: "all" };
+        let resolveStream!: () => void;
+        mocks.invoke.mockImplementation((command: string, args?: any) => {
+            if (command === "api_get_chat_model_config") return Promise.resolve({});
+            if (command === "api_chat_get_or_create_scoped_conversation") return Promise.resolve({ id: `conversation-${args.scope.key}` });
+            if (command === "api_chat_get_messages") return Promise.resolve([]);
+            if (command === "api_chat_with_scoped_conversation_stream") return new Promise<void>((resolve) => { resolveStream = resolve; });
+            return Promise.resolve();
+        });
+        await act(async () => root.render(<ChatHost><Launcher scope={scope} label="all" /></ChatHost>));
+        await act(async () => (container.querySelector("button") as HTMLButtonElement).click());
+        await flush();
+        const textarea = container.querySelector("textarea")!;
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, "question");
+            textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        await act(async () => (container.querySelector('[aria-label="Send message"]') as HTMLButtonElement).click());
+        await flush();
+        const streamId = mocks.invoke.mock.calls.find(([command]) => command === "api_chat_with_scoped_conversation_stream")![1].streamId;
+
+        await act(async () => mocks.listeners.get("chat-stream-start")!({ payload: { streamId, sources: [{ meetingId: "meeting-1", meetingTitle: "Private meeting", chunkType: "transcript", snippet: "private source", folderName: "" }] } }));
+        await act(async () => mocks.listeners.get("chat-stream-chunk")!({ payload: { streamId, text: "private partial" } }));
+        await act(async () => mocks.listeners.get("chat-stream-error")!({ payload: { streamId: "replaced-stream", error: "database: private", safeCleanup: true } }));
+        expect(container.textContent).toContain("private partial");
+        expect(container.textContent).toContain("Private meeting");
+        expect(container.querySelector('[aria-label="Stop generating"]')).not.toBeNull();
+
+        await act(async () => mocks.listeners.get("chat-stream-error")!({ payload: { streamId, error: "The chat context could not be revalidated safely.", safeCleanup: true } }));
+        expect(container.textContent).not.toContain("Private meeting");
+        expect(container.textContent).not.toContain("private partial");
+        expect(container.querySelector('[aria-label="Stop generating"]')).toBeNull();
+        expect(container.querySelector("textarea")?.disabled).toBe(false);
+        const alert = container.querySelector('[role="alert"]') as HTMLElement;
+        expect(alert.textContent).toContain("The chat context could not be revalidated safely.");
+        expect(alert.textContent).not.toContain("database");
+        const saved = mocks.invoke.mock.calls.find(([command, args]) => command === "api_chat_save_message" && args.role === "assistant");
+        expect(saved?.[1]).toMatchObject({ sources: null, isError: true });
+        expect(document.activeElement).toBe(container.querySelector("textarea"));
+        await act(async () => resolveStream());
+        await flush();
+        expect(container.querySelectorAll('[role="alert"]')).toHaveLength(1);
+        expect(mocks.invoke.mock.calls.filter(([command, args]) => command === "api_chat_save_message" && args.role === "assistant")).toHaveLength(1);
+    });
+
+    it("restores the active panel when deletion aborts before stream start", async () => {
+        const scope: ChatScope = { kind: "all", key: "all" };
+        await act(async () => root.render(<ChatHost><Launcher scope={scope} label="all" /></ChatHost>));
+        await act(async () => (container.querySelector("button") as HTMLButtonElement).click());
+        await flush();
+        const textarea = container.querySelector("textarea")!;
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, "question");
+            textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        await act(async () => (container.querySelector('[aria-label="Send message"]') as HTMLButtonElement).click());
+        await flush();
+        const streamId = mocks.invoke.mock.calls.find(([command]) => command === "api_chat_with_scoped_conversation_stream")![1].streamId;
+
+        await act(async () => mocks.listeners.get("chat-stream-abort")!({ payload: { streamId, reason: "referenced_meeting_deleted" } }));
+        expect(container.querySelector('[aria-label="Stop generating"]')).toBeNull();
+        expect(container.querySelector("textarea")?.disabled).toBe(false);
+        expect(container.querySelectorAll('[aria-label="Meeting source"]').length).toBe(0);
+    });
+
+    it("ignores a stale source-less abort and clears the current source-less stream", async () => {
+        const scope: ChatScope = { kind: "all", key: "all" };
+        await act(async () => root.render(<ChatHost><Launcher scope={scope} label="all" /></ChatHost>));
+        await act(async () => (container.querySelector("button") as HTMLButtonElement).click());
+        await flush();
+        const textarea = container.querySelector("textarea")!;
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, "question");
+            textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        await act(async () => (container.querySelector('[aria-label="Send message"]') as HTMLButtonElement).click());
+        await flush();
+        const streamId = mocks.invoke.mock.calls.find(([command]) => command === "api_chat_with_scoped_conversation_stream")![1].streamId;
+
+        await act(async () => mocks.listeners.get("chat-stream-start")!({ payload: { streamId, sources: [] } }));
+        await act(async () => mocks.listeners.get("chat-stream-chunk")!({ payload: { streamId, text: "source-less partial" } }));
+        await act(async () => mocks.listeners.get("chat-stream-abort")!({ payload: { streamId: "replaced-stream", reason: "referenced_meeting_deleted" } }));
+        expect(container.textContent).toContain("source-less partial");
+        expect(container.querySelector('[aria-label="Stop generating"]')).not.toBeNull();
+
+        await act(async () => mocks.listeners.get("chat-stream-abort")!({ payload: { streamId, reason: "referenced_meeting_deleted" } }));
+        expect(container.textContent).not.toContain("source-less partial");
+        expect(container.querySelector('[aria-label="Stop generating"]')).toBeNull();
+        expect(container.querySelector("textarea")?.disabled).toBe(false);
     });
 
     it("promotes an open live host to the saved meeting without mixing scopes", async () => {

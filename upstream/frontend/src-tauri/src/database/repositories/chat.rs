@@ -839,6 +839,9 @@ fn scan_json_string(
                                     None => return ScanOutcome::failed(),
                                 };
                             }
+                            if !(0xDC00..0xE000).contains(&low) {
+                                return ScanOutcome::failed();
+                            }
                             0x10000 + (((value as u32) - 0xD800) << 10) + ((low as u32) - 0xDC00)
                         } else if (0xDC00..0xE000).contains(&value) {
                             return ScanOutcome::failed();

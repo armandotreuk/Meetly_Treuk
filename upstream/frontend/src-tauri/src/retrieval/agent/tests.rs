@@ -995,6 +995,148 @@ async fn per_call_deadline_cancels_the_child_and_discards_the_late_answer() {
     );
 }
 
+/// Hydration publishes at most `MAX_HYDRATED_MEETINGS` meetings per request,
+/// selected in ranked order, and planner-directed meetings are appended AFTER
+/// everything fusion ranked. With more matching meetings than that cap, an
+/// `openMeetingIds` action therefore starts outside the publication window:
+/// without a reserved slot it would cost a database load and a planner round
+/// and then contribute nothing to the final context or sources.
+#[tokio::test]
+async fn a_planner_open_reaches_the_final_context_past_the_hydration_meeting_cap() {
+    let seeds: Vec<(String, String, String)> = (0..MAX_HYDRATED_MEETINGS + 2)
+        .map(|index| {
+            (
+                format!("m-{index}"),
+                format!("Quarterly {index}"),
+                format!("zulu quarterly planning notes for team {index}"),
+            )
+        })
+        .collect();
+    let borrowed: Vec<(&str, &str, &str)> = seeds
+        .iter()
+        .map(|(id, title, text)| (id.as_str(), title.as_str(), text.as_str()))
+        .collect();
+    let pool = seeded_pool(&borrowed).await;
+
+    // Phase 1: learn the real fusion order from the exact initial pass the
+    // agent runs, then target the meeting fusion ranked LAST - guaranteed to
+    // sit outside the hydration cap.
+    let baseline_planner = FakePlanner::new(vec![Ok(finish_action())]);
+    let baseline = run_deep_preparation(deep_input(
+        &pool,
+        PersistedRetrievalScope::All,
+        "zulu planning",
+        &baseline_planner,
+        None,
+        &CancellationToken::new(),
+    ))
+    .await
+    .unwrap();
+    assert!(
+        baseline.ranked.ranking.meetings.len() > MAX_HYDRATED_MEETINGS,
+        "the fixture must rank more meetings than the hydration cap"
+    );
+    let target = baseline
+        .ranked
+        .ranking
+        .meetings
+        .last()
+        .expect("a ranked meeting")
+        .meeting_id
+        .clone();
+    assert!(
+        !meeting_ids(&baseline.hydrated).contains(&target),
+        "the target must start OUTSIDE the published set, or the test proves nothing"
+    );
+
+    // Phase 2: the planner opens exactly that meeting.
+    let planner = FakePlanner::new(vec![
+        Ok(search_more(&format!(",\"openMeetingIds\":[\"{target}\"]"))),
+        Ok(finish_action()),
+    ]);
+    let outcome = run_deep_preparation(deep_input(
+        &pool,
+        PersistedRetrievalScope::All,
+        "zulu planning",
+        &planner,
+        None,
+        &CancellationToken::new(),
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.additional_rounds, 1);
+    let published = meeting_ids(&outcome.hydrated);
+    assert!(
+        published.contains(&target),
+        "the opened meeting {target} must reach the final context; published: {published:?}"
+    );
+    // The reservation is bounded: it never widens hydration past its own cap.
+    assert!(published.len() <= MAX_HYDRATED_MEETINGS);
+}
+
+/// A planner open publishes at most `AUTHORITATIVE_SEGMENTS_PER_MEETING`
+/// head segments, so it must LOAD only that bounded head. The empty-target
+/// load it used to perform selects the whole meeting (up to
+/// `MAX_TRANSCRIPT_ROWS`), reading thousands of rows per open inside the
+/// 30-second Deep budget and discarding nearly all of them.
+#[tokio::test]
+async fn a_planner_open_loads_only_the_bounded_transcript_head() {
+    let pool = migrated_pool().await;
+    insert_meeting(&pool, "m-hit", "Alpha").await;
+    add_transcript(&pool, "t-hit", "m-hit", "zulu quarterly planning notes").await;
+    refresh_fts(&pool, "m-hit").await;
+
+    // A weak match makes `m-long` a planner CARD (open actions are restricted
+    // to the cards the round's prompt emitted), while its bulk is unrelated.
+    insert_meeting(&pool, "m-long", "Long Retrospective").await;
+    add_transcript(&pool, "t-long-000", "m-long", "zulu retrospective agenda").await;
+    let filler = AUTHORITATIVE_SEGMENTS_PER_MEETING * 5;
+    for index in 1..=filler {
+        add_transcript(
+            &pool,
+            &format!("t-long-{index:03}"),
+            "m-long",
+            &format!("unrelated retrospective paragraph {index}"),
+        )
+        .await;
+    }
+    refresh_fts(&pool, "m-long").await;
+
+    let planner = FakePlanner::new(vec![
+        Ok(search_more(",\"openMeetingIds\":[\"m-long\"]")),
+        Ok(finish_action()),
+    ]);
+    let outcome = run_deep_preparation(deep_input(
+        &pool,
+        PersistedRetrievalScope::All,
+        "zulu planning",
+        &planner,
+        None,
+        &CancellationToken::new(),
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.additional_rounds, 1);
+    let opened = outcome
+        .hydrated
+        .meetings
+        .iter()
+        .find(|meeting| meeting.meeting_id == "m-long")
+        .expect("the opened meeting must be published");
+    assert_eq!(opened.transcript_segments_total, filler + 1);
+    // Only the bounded head plus this meeting's own anchors reach retention:
+    // the open must not have pulled the whole meeting into the request.
+    assert!(
+        opened.transcript_segments_included <= AUTHORITATIVE_SEGMENTS_PER_MEETING + 3,
+        "an open retained {} of {} segments",
+        opened.transcript_segments_included,
+        opened.transcript_segments_total
+    );
+    assert!(opened.transcript_segments_included > 0);
+}
+
 #[tokio::test]
 async fn cancellation_during_additional_operations_is_typed_cancelled() {
     let pool = seeded_pool(&[

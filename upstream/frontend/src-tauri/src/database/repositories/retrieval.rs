@@ -1148,19 +1148,34 @@ impl RetrievalRepository {
         meeting_id: &str,
         cancel: &CancellationToken,
     ) -> Result<Option<MeetingSource>, SqlxError> {
+        Self::load_meeting_source_head_with_cancellation(pool, meeting_id, 1, cancel).await
+    }
+
+    /// Loads a meeting's authoritative summary/notes plus a BOUNDED
+    /// chronological transcript head: the first `head_segments` rows in the
+    /// canonical order, each expanded by the existing one-segment
+    /// neighborhood. Callers that only publish a handful of head segments
+    /// must use this instead of the empty-target load, which selects the
+    /// whole meeting up to [`MAX_TRANSCRIPT_ROWS`].
+    pub async fn load_meeting_source_head_with_cancellation(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        head_segments: usize,
+        cancel: &CancellationToken,
+    ) -> Result<Option<MeetingSource>, SqlxError> {
         check_source_cancellation(Some(cancel))?;
-        let head_id: Option<String> = sqlx::query_scalar(
+        let transcript_ids: Vec<String> = sqlx::query_scalar(
             "SELECT id FROM transcripts
              WHERE meeting_id = ? AND transcript IS NOT NULL AND transcript != ''
              ORDER BY CASE WHEN audio_start_time IS NULL THEN 1 ELSE 0 END,
                       audio_start_time ASC, timestamp ASC, id ASC
-             LIMIT 1",
+             LIMIT ?",
         )
         .bind(meeting_id)
-        .fetch_optional(pool)
+        .bind(head_segments.max(1) as i64)
+        .fetch_all(pool)
         .await?;
         check_source_cancellation(Some(cancel))?;
-        let transcript_ids = head_id.into_iter().collect::<Vec<_>>();
         Self::load_meeting_source_relevant_with_cancellation(
             pool,
             meeting_id,

@@ -267,13 +267,15 @@ pub(crate) async fn execute_chat_with_meetings(
         // meeting identities BEFORE the authoritative rechecks, so a meeting
         // deleted afterwards cancels this visible registration from the real
         // deletion transaction.
-        chat_requests.bind_request_meetings(
+        if !chat_requests.bind_request_meetings(
             ChatRequestSurface::Mcp,
             &request_id,
             &token,
-            &crate::api::chat::prepared_meeting_ids(&inputs.sources),
-        );
-        crate::api::chat::ensure_prepared_meetings_exist(pool, &inputs.sources).await?;
+            &inputs.prompt_meeting_ids,
+        ) {
+            return Err("Chat request was cancelled or superseded".to_string());
+        }
+        crate::api::chat::ensure_prompt_meetings_exist(pool, &inputs.prompt_meeting_ids).await?;
         let answer = generate_summary(
             client,
             &inputs.provider,
@@ -294,11 +296,12 @@ pub(crate) async fn execute_chat_with_meetings(
         // Terminal invalidation fence: a meeting deleted during generation
         // must abort the response instead of returning an answer whose
         // sources can no longer exist (source/context parity).
-        crate::api::chat::ensure_prepared_meetings_exist(pool, &inputs.sources).await?;
+        crate::api::chat::ensure_prompt_meetings_exist(pool, &inputs.prompt_meeting_ids).await?;
         let sources = serialize_chat_sources(&inputs.sources)?;
         Ok(serde_json::json!({ "answer": answer, "sources": sources }))
     };
     tokio::pin!(work);
+    let mut timed_out = false;
     let inner = tokio::select! {
         biased;
         _ = &mut deadline_sleep => {
@@ -306,7 +309,8 @@ pub(crate) async fn execute_chat_with_meetings(
             // future and any registry cleanup, so the outcome is
             // deterministically the cancelled one.
             token.cancel();
-            Err("Chat request timed out".to_string())
+            timed_out = true;
+            Err(MCP_CHAT_TIMEOUT_ERROR.to_string())
         }
         result = &mut work => result,
     };
@@ -320,8 +324,19 @@ pub(crate) async fn execute_chat_with_meetings(
         Ok(inner),
     );
     drop(guard);
-    outcome
+    // `finish_non_streaming_chat_request` only sees `Err(Elapsed)` for the
+    // Tauri commands' own `tokio::time::timeout`; this surface owns its
+    // deadline, cancels its own token, and would otherwise be reported as the
+    // generic cancellation the token now carries. Restore the real cause so an
+    // MCP client can tell a deadline from deletion invalidation.
+    match outcome {
+        Err(_) if timed_out => Err(MCP_CHAT_TIMEOUT_ERROR.to_string()),
+        other => other,
+    }
 }
+
+/// Stable error returned when an MCP chat request exceeds its own deadline.
+pub(crate) const MCP_CHAT_TIMEOUT_ERROR: &str = "Chat request timed out";
 
 async fn prepare_mcp_chat_inputs(
     pool: &SqlitePool,
@@ -793,13 +808,13 @@ mod tests {
             ChatRequestSurface::Mcp,
             &request_id,
             &token,
-            &crate::api::chat::prepared_meeting_ids(&inputs.sources),
+            &inputs.prompt_meeting_ids,
         ));
-        crate::api::chat::ensure_prepared_meetings_exist(&pool, &inputs.sources)
+        crate::api::chat::ensure_prompt_meetings_exist(&pool, &inputs.prompt_meeting_ids)
             .await
             .unwrap();
         // The terminal existence recheck PASSES here (the meeting exists).
-        crate::api::chat::ensure_prepared_meetings_exist(&pool, &inputs.sources)
+        crate::api::chat::ensure_prompt_meetings_exist(&pool, &inputs.prompt_meeting_ids)
             .await
             .unwrap();
 

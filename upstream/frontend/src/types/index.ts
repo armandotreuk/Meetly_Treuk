@@ -259,6 +259,15 @@ export interface ChatStreamDonePayload {
 export interface ChatStreamErrorPayload {
     streamId: string;
     error: string;
+    safeCleanup?: boolean;
+}
+
+/** Payload for `chat-stream-abort`: a privacy-safe invalidation event. It
+ * carries only the stable stream identity and a stable reason code — never
+ * meeting content or evidence text. */
+export interface ChatStreamAbortPayload {
+    streamId: string;
+    reason: "referenced_meeting_deleted";
 }
 
 export interface ChatSource {

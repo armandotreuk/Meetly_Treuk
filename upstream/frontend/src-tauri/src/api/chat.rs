@@ -272,6 +272,8 @@ const QUERY_REWRITE_SYSTEM_PROMPT: &str = "You are a search query rewriter. Give
 // FTS ranking while broad/no-hit fallback keeps deterministic per-meeting coverage.
 const SNAPSHOT_REHYDRATION_CHUNK_CAP: u32 = 100;
 pub(crate) const CHAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+const MEETING_LIST_HEADER: &str = "Bounded rendered meeting-list context for the current scope. Answer only with the titles shown below; do not say that meeting content was unavailable.\n";
+const CHAT_CONTEXT_REVALIDATION_ERROR: &str = "The chat context could not be revalidated safely.";
 
 /// Inputs shared by both the single-shot and the streaming chat commands.
 pub struct ChatInputs {
@@ -286,6 +288,12 @@ pub struct ChatInputs {
     pub custom_openai_top_p: Option<f32>,
     pub app_data_dir: Option<PathBuf>,
     pub user_prompt: String,
+    /// Every meeting whose data/metadata is retained anywhere in the final
+    /// prompt (sources, retained meeting context, meeting-list titles, or
+    /// temporal latest-meeting titles). Deletion invalidation
+    /// binds THIS set — not only the source IDs — so a meeting deleted after
+    /// preparation can never answer from or disclose its retained metadata.
+    pub prompt_meeting_ids: HashSet<String>,
     pub retrieval_diagnostic: RetrievalPreparationDiagnostic,
     pub retrieval_mode: ChatRetrievalMode,
     /// Provider round-trips made during preparation (follow-up query rewrite
@@ -317,8 +325,19 @@ struct LiveTranscriptAuthorization {
 
 #[derive(sqlx::FromRow)]
 struct LatestSavedMeeting {
+    id: String,
     title: String,
     saved_at: DateTime<Utc>,
+}
+
+struct TemporalPromptContext {
+    context: String,
+    meeting_id: Option<String>,
+}
+
+struct ListedMeeting {
+    id: String,
+    title: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -351,11 +370,14 @@ pub(crate) const MCP_CHAT_BUSY_ERROR: &str =
 /// whose evidence it prepared. Binding happens once after preparation, so the
 /// real meeting-deletion path can invalidate the request through this same
 /// registry — no second registry or tombstone store exists. Registrations are
-/// removed on replacement, cancellation, completion, and invalidation, so the
-/// registry holds only live requests.
+/// removed on replacement, cancellation, and completion. An invalidated
+/// stream remains only until its ownership-fenced abort is published.
 struct ChatRequestRegistration {
     token: ChatRequestToken,
     meetings: HashSet<String>,
+    retain_deletion_abort: bool,
+    deletion_invalidated: bool,
+    stream_started: bool,
 }
 
 struct ChatRequestRegistry {
@@ -449,6 +471,9 @@ impl ChatRequestState {
             ChatRequestRegistration {
                 token: token.clone(),
                 meetings: HashSet::new(),
+                retain_deletion_abort: false,
+                deletion_invalidated: false,
+                stream_started: false,
             },
         );
         Some(token)
@@ -480,7 +505,7 @@ impl ChatRequestState {
         surface: ChatRequestSurface,
         request_id: &str,
         token: &ChatRequestToken,
-        meetings: &[String],
+        meetings: &HashSet<String>,
     ) -> bool {
         let mut registry = self.0.lock().unwrap();
         if !Self::owns(&registry, surface, request_id, token) {
@@ -490,14 +515,34 @@ impl ChatRequestState {
             .requests
             .get_mut(&(surface, request_id.to_string()))
             .expect("ownership re-checked above");
-        registration.meetings = meetings.iter().cloned().collect();
+        registration.meetings = meetings.clone();
+        true
+    }
+
+    fn bind_chat_stream_meetings(
+        &self,
+        request_id: &str,
+        token: &ChatRequestToken,
+        meetings: &HashSet<String>,
+    ) -> bool {
+        let mut registry = self.0.lock().unwrap();
+        if !Self::owns(&registry, ChatRequestSurface::Chat, request_id, token) {
+            return false;
+        }
+        let registration = registry
+            .requests
+            .get_mut(&(ChatRequestSurface::Chat, request_id.to_string()))
+            .expect("ownership re-checked above");
+        registration.meetings = meetings.clone();
+        registration.retain_deletion_abort = true;
         true
     }
 
     /// Cancels and removes every registered request whose prepared evidence
     /// references `meeting_id`. Called from the real meeting-deletion
-    /// transaction before the meeting row disappears, so any later
-    /// publication observes a cancelled ownership token and suppresses.
+    /// transaction before the meeting row disappears. A retained current
+    /// stream atomically converts its next publication into an abort; every
+    /// other request suppresses normal publication.
     /// Surface-independent: cancels Chat, Sidebar, and every affected
     /// independent MCP request.
     pub(crate) fn invalidate_meeting(&self, meeting_id: &str) -> usize {
@@ -509,11 +554,22 @@ impl ChatRequestState {
             .map(|(key, _)| key.clone())
             .collect();
         for (surface, request_id) in &invalidated {
-            registry.active.remove(surface);
-            if let Some(registration) = registry
+            let key = (*surface, request_id.clone());
+            if registry
                 .requests
-                .remove(&(surface.clone(), request_id.clone()))
+                .get(&key)
+                .is_some_and(|registration| registration.retain_deletion_abort)
             {
+                let registration = registry
+                    .requests
+                    .get_mut(&key)
+                    .expect("registration was checked above");
+                registration.deletion_invalidated = true;
+                registration.token.cancel();
+                continue;
+            }
+            registry.active.remove(surface);
+            if let Some(registration) = registry.requests.remove(&key) {
                 registration.token.cancel();
             }
         }
@@ -582,9 +638,8 @@ impl ChatRequestState {
         self.0.lock().unwrap().requests.len()
     }
 
-    fn publish_if_owner<F: FnOnce(&str, serde_json::Value)>(
+    fn publish_chat_stream_event_if_current<F: FnOnce(&str, serde_json::Value)>(
         &self,
-        surface: ChatRequestSurface,
         request_id: &str,
         token: &ChatRequestToken,
         event: &str,
@@ -593,15 +648,135 @@ impl ChatRequestState {
         emit: F,
     ) -> bool {
         let mut registry = self.0.lock().unwrap();
-        if !Self::owns(&registry, surface, request_id, token) {
+        let key = (ChatRequestSurface::Chat, request_id.to_string());
+        let current = registry.requests.get(&key).is_some_and(|registration| {
+            Arc::ptr_eq(&registration.token, token)
+                && registry
+                    .active
+                    .get(&ChatRequestSurface::Chat)
+                    .map(String::as_str)
+                    == Some(request_id)
+        });
+        if !current {
             return false;
         }
-        let key = (surface, request_id.to_string());
+        if registry
+            .requests
+            .get(&key)
+            .is_some_and(|registration| registration.deletion_invalidated)
+        {
+            registry.active.remove(&ChatRequestSurface::Chat);
+            registry.requests.remove(&key);
+            emit(
+                "chat-stream-abort",
+                serde_json::json!({
+                    "streamId": request_id,
+                    "reason": "referenced_meeting_deleted",
+                }),
+            );
+            return false;
+        }
+        if token.is_cancelled() {
+            return false;
+        }
+        if event == "chat-stream-start" {
+            registry
+                .requests
+                .get_mut(&key)
+                .expect("ownership re-checked above")
+                .stream_started = true;
+        }
         if clear {
-            registry.active.remove(&surface);
+            registry.active.remove(&ChatRequestSurface::Chat);
             registry.requests.remove(&key);
         }
         emit(event, payload);
+        true
+    }
+
+    fn finish_chat_stream_if_current<F: FnOnce(&str, serde_json::Value)>(
+        &self,
+        request_id: &str,
+        token: &ChatRequestToken,
+        cancel: bool,
+        cleanup_event: Option<(&str, serde_json::Value)>,
+        emit: F,
+    ) -> bool {
+        let mut registry = self.0.lock().unwrap();
+        let key = (ChatRequestSurface::Chat, request_id.to_string());
+        let current = registry.requests.get(&key).is_some_and(|registration| {
+            Arc::ptr_eq(&registration.token, token)
+                && registry
+                    .active
+                    .get(&ChatRequestSurface::Chat)
+                    .map(String::as_str)
+                    == Some(request_id)
+        });
+        if !current {
+            return false;
+        }
+        let invalidated = registry
+            .requests
+            .get(&key)
+            .is_some_and(|registration| registration.deletion_invalidated);
+        let stream_started = registry
+            .requests
+            .get(&key)
+            .is_some_and(|registration| registration.stream_started);
+        if cancel {
+            token.cancel();
+        }
+        registry.active.remove(&ChatRequestSurface::Chat);
+        registry.requests.remove(&key);
+        if invalidated {
+            emit(
+                "chat-stream-abort",
+                serde_json::json!({
+                    "streamId": request_id,
+                    "reason": "referenced_meeting_deleted",
+                }),
+            );
+            return true;
+        }
+        if stream_started {
+            if let Some((event, payload)) = cleanup_event {
+                emit(event, payload);
+                return true;
+            }
+        }
+        false
+    }
+
+    #[cfg(test)]
+    fn publish_deletion_abort_if_current<F: FnOnce(&str, serde_json::Value)>(
+        &self,
+        request_id: &str,
+        token: &ChatRequestToken,
+        emit: F,
+    ) -> bool {
+        let mut registry = self.0.lock().unwrap();
+        let key = (ChatRequestSurface::Chat, request_id.to_string());
+        let invalidated = registry.requests.get(&key).is_some_and(|registration| {
+            Arc::ptr_eq(&registration.token, token)
+                && registration.deletion_invalidated
+                && registry
+                    .active
+                    .get(&ChatRequestSurface::Chat)
+                    .map(String::as_str)
+                    == Some(request_id)
+        });
+        if !invalidated {
+            return false;
+        }
+        registry.active.remove(&ChatRequestSurface::Chat);
+        registry.requests.remove(&key);
+        emit(
+            "chat-stream-abort",
+            serde_json::json!({
+                "streamId": request_id,
+                "reason": "referenced_meeting_deleted",
+            }),
+        );
         true
     }
 }
@@ -903,22 +1078,32 @@ async fn prepare_chat_inputs_for_scope(
         None
     };
     let broad_intent = requests_broad_retrieval(query) || requests_broad_retrieval(&search_query);
-    let meeting_list_context = if requests_meeting_list(query) {
-        Some(format_meeting_list_context(
-            &meeting_titles_for_scope(pool, &retrieval_scope, query, today_date).await?,
-        ))
-    } else {
-        None
-    };
-    let mut temporal_context = temporal_context_for_scope(pool, &retrieval_scope).await?;
-    if let Some(meeting_ids) = &today_meeting_ids {
-        temporal_context.push_str(&format!(
-            "Meeting context is filtered to today's meetings in this scope ({} found).\n",
-            meeting_ids.len()
-        ));
+    let today_context = today_meeting_ids
+        .as_ref()
+        .map(|_| "Meeting context is filtered to today's meetings in this scope.\n".to_string());
+    let temporal = temporal_context_for_scope(
+        pool,
+        &retrieval_scope,
+        temporal_context_budget(query, &search_query, &today_context, max_context_chars),
+    )
+    .await?;
+    let mut temporal_context = temporal.context;
+    if let Some(today_context) = today_context {
+        temporal_context.push_str(&today_context);
     }
     let persisted_context_budget =
         context_budget_for_prompt(query, &search_query, &temporal_context, max_context_chars);
+    let (meeting_list_context, mut prompt_meeting_ids) = meeting_list_context_for_scope(
+        pool,
+        &retrieval_scope,
+        query,
+        today_date,
+        persisted_context_budget,
+    )
+    .await?;
+    if let Some(meeting_id) = temporal.meeting_id {
+        prompt_meeting_ids.insert(meeting_id);
+    }
     let force_lexical = SettingsRepository::get_force_lexical_retrieval(pool)
         .await
         .map_err(|e| format!("Failed to get retrieval kill switch: {}", e))?;
@@ -937,16 +1122,18 @@ async fn prepare_chat_inputs_for_scope(
     } else {
         requested_retrieval_mode
     };
-    let (context, sources) = match retrieval_scope {
+    let (mut context, mut sources, context_meeting_ids) = match retrieval_scope {
         ChatRetrievalScope::LiveRecording(scope_key) => {
             ensure_live_scope_matches_active_recording(&scope_key)?;
             let snapshot = crate::audio::recording_commands::get_transcript_history().await?;
             ensure_not_cancelled(cancellation_token)?;
-            live_snapshot_context(&snapshot, &scope_key, max_context_chars)
+            let (context, sources) =
+                live_snapshot_context(&snapshot, &scope_key, persisted_context_budget);
+            (context, sources, HashSet::new())
         }
         scope => {
             if let Some(context) = meeting_list_context {
-                (context, Vec::new())
+                (context, Vec::new(), HashSet::new())
             } else if matches!(scope, ChatRetrievalScope::Meeting(_)) && today_meeting_ids.is_none()
             {
                 let ChatRetrievalScope::Meeting(meeting_id) = scope else {
@@ -1007,13 +1194,115 @@ async fn prepare_chat_inputs_for_scope(
                     .retained_transcript_ids
                     .into_iter()
                     .collect::<HashSet<_>>();
-                let sources = meeting
+                let sources: Vec<ChatSource> = meeting
                     .transcripts
                     .iter()
                     .filter(|transcript| retained.contains(&transcript.chunk_id))
                     .map(chat_source_from_result)
                     .collect();
-                (built.markdown, sources)
+                if deep_preparation_eligible(retrieval_mode)
+                    && !force_lexical
+                    && lifecycle.is_some()
+                {
+                    // Saved-meeting Deep: the authoritative one-pass anchors
+                    // above are the request's Fast baseline; the bounded
+                    // planner runs with a strict one-meeting allow-list so it
+                    // can only retrieve more of THIS meeting. The
+                    // authoritative summary/notes and R10 fallback above are
+                    // retained verbatim; planner rounds may only add
+                    // additional in-scope transcript evidence, which hydration
+                    // re-loads and re-fences under the same parity contracts.
+                    let lifecycle = lifecycle
+                        .as_ref()
+                        .ok_or_else(|| "Retrieval lifecycle unavailable".to_string())?;
+                    let request_cancellation = cancellation_token.cloned().unwrap_or_default();
+                    let planner = crate::retrieval::agent::SharedClientPlanner {
+                        client: client.clone(),
+                        provider: provider.clone(),
+                        model_name: model_name.clone(),
+                        api_key: api_key.clone(),
+                        ollama_endpoint: ollama_endpoint.clone(),
+                        custom_openai_endpoint: custom_openai_endpoint.clone(),
+                        app_data_dir: app_data_dir.clone(),
+                    };
+                    let deep = crate::retrieval::agent::run_deep_preparation(
+                        crate::retrieval::agent::DeepPreparationInput {
+                            pool,
+                            lifecycle: lifecycle.clone(),
+                            original_query: query,
+                            effective_query: &search_query,
+                            // Strict one-meeting allow-list: the planner can
+                            // search/open/expand only this meeting; opening
+                            // another meeting is outside the capability set.
+                            scope: crate::retrieval::service::PersistedRetrievalScope::
+                                AllowedMeetingIds(vec![meeting_id.clone()]),
+                            broad_intent: false,
+                            limits: RetrievalLimits {
+                                lexical_per_variant: chunk_limit as usize,
+                                vector_per_variant: chunk_limit as usize,
+                            },
+                            core_language: crate::retrieval::service::CoreTermLanguage::Unknown,
+                            context_budget: persisted_context_budget,
+                            cancellation: cancellation_token.unwrap_or(&request_cancellation),
+                            progress: deep_progress,
+                            planner: &planner,
+                            bounds: crate::retrieval::agent::DeepBounds::production(),
+                        },
+                    )
+                    .await
+                    .map_err(|error| match error {
+                        crate::retrieval::agent::DeepPreparationError::Cancelled => {
+                            "Chat preparation was cancelled".to_string()
+                        }
+                        crate::retrieval::agent::DeepPreparationError::BudgetExhausted => format!(
+                            "Deep preparation exceeded the {} second budget",
+                            crate::retrieval::agent::DEEP_PREPARATION_BUDGET.as_secs()
+                        ),
+                        crate::retrieval::agent::DeepPreparationError::InitialRetrieval(error) => {
+                            format!("Retrieval failed: {}", error)
+                        }
+                        crate::retrieval::agent::DeepPreparationError::FinalValidation(error) => {
+                            format!("Deep final validation failed: {}", error)
+                        }
+                    })?;
+                    provider_round_trips += deep.planner_round_trips;
+                    log::info!(
+                        "Chat saved-meeting Deep preparation: additional_rounds={} planner_calls={} round_trips_before_generation={}",
+                        deep.additional_rounds,
+                        deep.planner_round_trips,
+                        provider_round_trips
+                    );
+                    if deep.semantic_fallback.is_some() {
+                        retrieval_diagnostic = RetrievalPreparationDiagnostic::SemanticFallback;
+                    }
+                    // Merge planner-added evidence INTO the authoritative
+                    // builder output: mandatory summary/notes and R10
+                    // transcript anchors stay first; only bounded in-meeting
+                    // evidence whose text is NOT already retained in the
+                    // authoritative context is appended (its snippet comes
+                    // from the fenced hydration and is guaranteed to appear
+                    // verbatim in the markdown once appended), keeping exact
+                    // prompt/source parity.
+                    let deep_sources = deep
+                        .hydrated
+                        .sources
+                        .iter()
+                        .map(chat_source_from_hydrated)
+                        .collect::<Vec<_>>();
+                    let (markdown, merged_sources) = merge_saved_meeting_deep_context(
+                        built.markdown,
+                        sources,
+                        deep_sources,
+                        persisted_context_budget,
+                    );
+                    (
+                        markdown,
+                        merged_sources,
+                        HashSet::from([meeting.meeting_id]),
+                    )
+                } else {
+                    (built.markdown, sources, HashSet::from([meeting.meeting_id]))
+                }
             } else if !force_lexical
                 && lifecycle.is_some()
                 && matches!(
@@ -1028,8 +1317,7 @@ async fn prepare_chat_inputs_for_scope(
                 // Saved meetings use shared hybrid anchors without the planner;
                 // persisted broad scopes use the planner only after their
                 // authoritative allow-list is resolved.
-                let deep_eligible =
-                    deep_preparation_eligible(retrieval_mode, today_meeting_ids.as_ref());
+                let deep_eligible = deep_preparation_eligible(retrieval_mode);
                 let persisted_scope = match &scope {
                     ChatRetrievalScope::All => PersistedRetrievalScope::All,
                     ChatRetrievalScope::Folder(folder_id) => {
@@ -1107,7 +1395,7 @@ async fn prepare_chat_inputs_for_scope(
                         .iter()
                         .map(chat_source_from_hydrated)
                         .collect();
-                    (deep.hydrated.markdown, sources)
+                    (deep.hydrated.markdown, sources, HashSet::new())
                 } else {
                     let request = RetrievalRequest {
                         original_query: query.to_string(),
@@ -1151,7 +1439,7 @@ async fn prepare_chat_inputs_for_scope(
                         .iter()
                         .map(chat_source_from_hydrated)
                         .collect();
-                    (hydrated.markdown, sources)
+                    (hydrated.markdown, sources, HashSet::new())
                 }
             } else {
                 log::info!("Chat retrieval preparation mode: {retrieval_diagnostic:?}");
@@ -1174,7 +1462,7 @@ async fn prepare_chat_inputs_for_scope(
                             .iter()
                             .map(chat_source_from_hydrated)
                             .collect();
-                        (hydrated.markdown, sources)
+                        (hydrated.markdown, sources, HashSet::new())
                     } else {
                         let results = resolve_scope_results(
                             pool,
@@ -1197,7 +1485,7 @@ async fn prepare_chat_inputs_for_scope(
                             .filter(|result| retained.contains(&lexical_evidence_id(result)))
                             .map(chat_source_from_result)
                             .collect();
-                        (built.markdown, sources)
+                        (built.markdown, sources, HashSet::new())
                     }
                 } else {
                     let results = resolve_scope_results(
@@ -1221,18 +1509,32 @@ async fn prepare_chat_inputs_for_scope(
                         .filter(|result| retained.contains(&lexical_evidence_id(result)))
                         .map(chat_source_from_result)
                         .collect();
-                    (built.markdown, sources)
+                    (built.markdown, sources, HashSet::new())
                 }
             }
         }
     };
 
-    // Deletion privacy fence at the shared preparation boundary: a meeting
-    // deleted while this request was being prepared aborts the request
-    // instead of answering from evidence whose source can no longer be
-    // published — retained context and sources keep exact parity.
-    ensure_prepared_meetings_exist(pool, &sources).await?;
-
+    // Every context builder above is already bounded by
+    // `persisted_context_budget`, so this is an assertion in debug and a
+    // fail-closed backstop in release: if a builder ever overshoots, the
+    // context is cut AND every source whose snippet no longer appears in it is
+    // dropped, so a published source can never reference text the model did
+    // not receive. Silently truncating while keeping the sources would break
+    // exactly the prompt/source parity the scope contracts rely on.
+    debug_assert!(
+        context.chars().count() <= persisted_context_budget,
+        "assembled chat context exceeded the persisted context budget"
+    );
+    if context.chars().count() > persisted_context_budget {
+        log::warn!(
+            "Chat context exceeded its budget ({} > {}); truncating and reconciling sources",
+            context.chars().count(),
+            persisted_context_budget
+        );
+        context = truncate_at_char_boundary(&context, persisted_context_budget).to_string();
+        sources.retain(|source| context.contains(&source.snippet));
+    }
     let user_prompt = assemble_prompt(
         &context,
         history.map_or(&[], Vec::as_slice),
@@ -1241,6 +1543,14 @@ async fn prepare_chat_inputs_for_scope(
         &temporal_context,
         max_context_chars,
     );
+
+    if !context.is_empty() {
+        prompt_meeting_ids.extend(context_meeting_ids);
+    }
+    for source in &sources {
+        prompt_meeting_ids.insert(source.meeting_id.clone());
+    }
+    ensure_prompt_meetings_exist(pool, &prompt_meeting_ids).await?;
 
     Ok(ChatInputs {
         sources,
@@ -1254,6 +1564,7 @@ async fn prepare_chat_inputs_for_scope(
         custom_openai_top_p,
         app_data_dir,
         user_prompt,
+        prompt_meeting_ids,
         retrieval_diagnostic,
         retrieval_mode,
         provider_round_trips,
@@ -1263,42 +1574,53 @@ async fn prepare_chat_inputs_for_scope(
 async fn temporal_context_for_scope(
     pool: &SqlitePool,
     scope: &ChatRetrievalScope,
-) -> Result<String, String> {
-    let latest = match scope {
-        ChatRetrievalScope::All => {
-            sqlx::query_as::<_, LatestSavedMeeting>(
-                "SELECT title, saved_at FROM meetings ORDER BY saved_at DESC, id DESC LIMIT 1",
+    max_context_chars: usize,
+) -> Result<TemporalPromptContext, String> {
+    let latest =
+        match scope {
+            ChatRetrievalScope::All => sqlx::query_as::<_, LatestSavedMeeting>(
+                "SELECT id, title, saved_at FROM meetings ORDER BY saved_at DESC, id DESC LIMIT 1",
             )
             .fetch_optional(pool)
-            .await
+            .await,
+            ChatRetrievalScope::Meeting(meeting_id) => {
+                sqlx::query_as::<_, LatestSavedMeeting>(
+                    "SELECT id, title, saved_at FROM meetings WHERE id = ? LIMIT 1",
+                )
+                .bind(meeting_id)
+                .fetch_optional(pool)
+                .await
+            }
+            ChatRetrievalScope::Folder(folder_id) => {
+                latest_saved_meeting_in_folder(pool, folder_id).await
+            }
+            ChatRetrievalScope::SearchSnapshot(meeting_ids) => {
+                latest_saved_meeting_in_ids(pool, "id", meeting_ids).await
+            }
+            ChatRetrievalScope::LiveRecording(_) => Ok(None),
         }
-        ChatRetrievalScope::Meeting(meeting_id) => {
-            sqlx::query_as::<_, LatestSavedMeeting>(
-                "SELECT title, saved_at FROM meetings WHERE id = ? LIMIT 1",
-            )
-            .bind(meeting_id)
-            .fetch_optional(pool)
-            .await
-        }
-        ChatRetrievalScope::Folder(folder_id) => {
-            latest_saved_meeting_in_folder(pool, folder_id).await
-        }
-        ChatRetrievalScope::SearchSnapshot(meeting_ids) => {
-            latest_saved_meeting_in_ids(pool, "id", meeting_ids).await
-        }
-        ChatRetrievalScope::LiveRecording(_) => Ok(None),
-    }
-    .map_err(|error| format!("Failed to resolve temporal meeting context: {}", error))?;
+        .map_err(|error| format!("Failed to resolve temporal meeting context: {}", error))?;
 
-    let latest = if matches!(scope, ChatRetrievalScope::Meeting(_)) {
-        latest.map(|mut meeting| {
-            meeting.title = truncate_meeting_title(&meeting.title);
-            meeting
+    let latest = latest.map(|mut meeting| {
+        meeting.title = truncate_meeting_title(&meeting.title);
+        meeting
+    });
+    let context = format_temporal_context(Local::now(), latest.as_ref());
+    if context.chars().count() <= max_context_chars {
+        Ok(TemporalPromptContext {
+            context,
+            meeting_id: latest.map(|meeting| meeting.id),
         })
     } else {
-        latest
-    };
-    Ok(format_temporal_context(Local::now(), latest.as_ref()))
+        Ok(TemporalPromptContext {
+            context: truncate_at_char_boundary(
+                &format_temporal_context(Local::now(), None),
+                max_context_chars,
+            )
+            .to_string(),
+            meeting_id: None,
+        })
+    }
 }
 
 fn truncate_meeting_title(title: &str) -> String {
@@ -1324,7 +1646,7 @@ async fn latest_saved_meeting_in_ids(
     if ids.is_empty() {
         return Ok(None);
     }
-    let mut query = QueryBuilder::<Sqlite>::new("SELECT title, saved_at FROM meetings WHERE ");
+    let mut query = QueryBuilder::<Sqlite>::new("SELECT id, title, saved_at FROM meetings WHERE ");
     query.push(column);
     query.push(" IN (");
     let mut values = query.separated(", ");
@@ -1347,7 +1669,7 @@ async fn latest_saved_meeting_in_folder(
             UNION ALL
             SELECT f.id FROM meeting_folders f JOIN folder_scope s ON f.parent_id = s.id
         )
-        SELECT m.title, m.saved_at
+        SELECT m.id, m.title, m.saved_at
         FROM meetings m
         WHERE m.folder_id IN (SELECT id FROM folder_scope)
         ORDER BY m.saved_at DESC, m.id DESC
@@ -1461,7 +1783,7 @@ async fn meeting_titles_for_scope(
     scope: &ChatRetrievalScope,
     query_text: &str,
     local_date: Option<NaiveDate>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<ListedMeeting>, String> {
     if matches!(scope, ChatRetrievalScope::LiveRecording(_)) {
         return Ok(Vec::new());
     }
@@ -1490,10 +1812,10 @@ async fn meeting_titles_for_scope(
             .push("WITH RECURSIVE folder_scope(id) AS (SELECT id FROM meeting_folders WHERE id = ");
         query.push_bind(folder_id);
         query.push(
-            " UNION ALL SELECT f.id FROM meeting_folders f JOIN folder_scope s ON f.parent_id = s.id) SELECT title FROM meetings WHERE folder_id IN (SELECT id FROM folder_scope)",
+            " UNION ALL SELECT f.id FROM meeting_folders f JOIN folder_scope s ON f.parent_id = s.id) SELECT id, title FROM meetings WHERE folder_id IN (SELECT id FROM folder_scope)",
         );
     } else {
-        query.push("SELECT title FROM meetings");
+        query.push("SELECT id, title FROM meetings");
     }
     match scope {
         ChatRetrievalScope::All | ChatRetrievalScope::Folder(_) => {}
@@ -1527,23 +1849,54 @@ async fn meeting_titles_for_scope(
     }
     query.push(" ORDER BY datetime(created_at), id");
     query
-        .build_query_scalar()
+        .build_query_as()
         .fetch_all(pool)
         .await
+        .map(|rows: Vec<(String, String)>| {
+            rows.into_iter()
+                .map(|(id, title)| ListedMeeting { id, title })
+                .collect()
+        })
         .map_err(|error| format!("Failed to list meetings in this scope: {}", error))
 }
 
-fn format_meeting_list_context(titles: &[String]) -> String {
-    let mut context = format!(
-        "Authoritative meeting list for the current scope ({} total). Answer with every title below; do not say that meeting content was unavailable.\n",
-        titles.len()
-    );
-    for title in titles {
-        context.push_str("- ");
-        context.push_str(&truncate_meeting_title(title));
-        context.push('\n');
+async fn meeting_list_context_for_scope(
+    pool: &SqlitePool,
+    scope: &ChatRetrievalScope,
+    query_text: &str,
+    today_date: Option<NaiveDate>,
+    context_budget: usize,
+) -> Result<(Option<String>, HashSet<String>), String> {
+    if requests_meeting_list(query_text) {
+        let meetings = meeting_titles_for_scope(pool, scope, query_text, today_date).await?;
+        let (context, ids) = format_meeting_list_context(&meetings, context_budget);
+        Ok((Some(context), ids))
+    } else {
+        Ok((None, HashSet::new()))
     }
-    context
+}
+
+fn format_meeting_list_context(
+    meetings: &[ListedMeeting],
+    max_context_chars: usize,
+) -> (String, HashSet<String>) {
+    let mut context = MEETING_LIST_HEADER.to_string();
+    if context.chars().count() > max_context_chars {
+        return (
+            truncate_at_char_boundary(&context, max_context_chars).to_string(),
+            HashSet::new(),
+        );
+    }
+    let mut ids = HashSet::new();
+    for meeting in meetings {
+        let line = format!("- {}\n", truncate_meeting_title(&meeting.title));
+        if context.chars().count() + line.chars().count() > max_context_chars {
+            break;
+        }
+        context.push_str(&line);
+        ids.insert(meeting.id.clone());
+    }
+    (context, ids)
 }
 
 async fn meeting_ids_for_local_date(
@@ -2273,12 +2626,13 @@ async fn resolve_scope_results(
     Ok(results)
 }
 
-/// Deep runs only for persisted scopes whose authoritative membership is
-/// resolved before preparation; live and saved-meeting paths stay separate.
-fn deep_preparation_eligible(
-    retrieval_mode: ChatRetrievalMode,
-    _today_meeting_ids: Option<&Vec<String>>,
-) -> bool {
+/// Whether this request runs the bounded Deep planner. The surface-level
+/// refusals happen earlier, where `retrieval_mode` is resolved: forced-lexical,
+/// an unavailable retrieval lifecycle, and live-recording scope all downgrade
+/// to Fast before this is consulted, and MCP rejects Deep before preparation.
+/// Every remaining persisted scope resolves its authoritative membership
+/// before preparation, so the mode is the only thing left to decide.
+fn deep_preparation_eligible(retrieval_mode: ChatRetrievalMode) -> bool {
     retrieval_mode == ChatRetrievalMode::Deep
 }
 
@@ -2330,6 +2684,48 @@ fn context_budget_for_prompt(
             .chars()
             .count(),
     )
+}
+
+fn temporal_context_budget(
+    query: &str,
+    search_query: &str,
+    today_context: &Option<String>,
+    max_context_chars: usize,
+) -> usize {
+    max_context_chars.saturating_sub(
+        "\n\nMeeting context:\n".chars().count()
+            + today_context.as_deref().unwrap_or_default().chars().count()
+            + format!(
+                "\nUser question: {}\nSearch query: {}\n",
+                query, search_query
+            )
+            .chars()
+            .count(),
+    )
+}
+
+fn merge_saved_meeting_deep_context(
+    mut markdown: String,
+    mut sources: Vec<ChatSource>,
+    deep_sources: Vec<ChatSource>,
+    context_budget: usize,
+) -> (String, Vec<ChatSource>) {
+    for source in deep_sources {
+        if markdown.contains(&source.snippet)
+            || sources
+                .iter()
+                .any(|existing| existing.snippet == source.snippet)
+        {
+            continue;
+        }
+        let addition = format!("\n\n### Additional retrieved context\n{}", source.snippet);
+        if markdown.chars().count() + addition.chars().count() > context_budget {
+            continue;
+        }
+        markdown.push_str(&addition);
+        sources.push(source);
+    }
+    (markdown, sources)
 }
 
 fn assemble_prompt(
@@ -2435,13 +2831,15 @@ pub async fn api_chat_with_meetings<R: Runtime>(
         .await?;
         // Deletion fence: bind prepared evidence identities, then recheck
         // existence before spending the final provider call.
-        request_state.bind_request_meetings(
+        if !request_state.bind_request_meetings(
             ChatRequestSurface::Chat,
             &request_id,
             &token,
-            &prepared_meeting_ids(&inputs.sources),
-        );
-        ensure_prepared_meetings_exist(&pool, &inputs.sources).await?;
+            &inputs.prompt_meeting_ids,
+        ) {
+            return Err("Chat request was cancelled or superseded".to_string());
+        }
+        ensure_prompt_meetings_exist(&pool, &inputs.prompt_meeting_ids).await?;
         let answer = generate_summary(
             &client,
             &inputs.provider,
@@ -2465,7 +2863,7 @@ pub async fn api_chat_with_meetings<R: Runtime>(
         // Terminal invalidation fence: a deletion during generation
         // invalidated this request through the registry; recheck existence
         // before returning any final answer/source payload.
-        ensure_prepared_meetings_exist(&pool, &inputs.sources).await?;
+        ensure_prompt_meetings_exist(&pool, &inputs.prompt_meeting_ids).await?;
 
         info!(
             "Chat completed: {} sources, {} answer chars, {} provider round trips including final generation",
@@ -2540,13 +2938,15 @@ pub async fn api_chat_with_scoped_conversation<R: Runtime>(
         .await?;
         // Deletion fence: bind prepared evidence identities, then recheck
         // existence before spending the final provider call.
-        request_state.bind_request_meetings(
+        if !request_state.bind_request_meetings(
             ChatRequestSurface::Chat,
             &request_id,
             &token,
-            &prepared_meeting_ids(&inputs.sources),
-        );
-        ensure_prepared_meetings_exist(&pool, &inputs.sources).await?;
+            &inputs.prompt_meeting_ids,
+        ) {
+            return Err("Chat request was cancelled or superseded".to_string());
+        }
+        ensure_prompt_meetings_exist(&pool, &inputs.prompt_meeting_ids).await?;
         let answer = generate_summary(
             &client,
             &inputs.provider,
@@ -2565,7 +2965,7 @@ pub async fn api_chat_with_scoped_conversation<R: Runtime>(
         .await
         .map_err(|e| format!("LLM error: {}", e))?;
         // Terminal invalidation fence before any final answer/source payload.
-        ensure_prepared_meetings_exist(&pool, &inputs.sources).await?;
+        ensure_prompt_meetings_exist(&pool, &inputs.prompt_meeting_ids).await?;
 
         Ok(ChatResponse {
             answer,
@@ -2602,49 +3002,49 @@ pub async fn api_chat_with_meetings_stream<R: Runtime>(
     let request_stream_id = stream_id.clone();
     let client = reqwest::Client::new();
     let progress_sink = deep_progress_sink(&request_state, &app, &stream_id, &token);
-    let result = tokio::time::timeout(CHAT_REQUEST_TIMEOUT, async {
-        let inputs = match prepare_chat_inputs_with_lifecycle(
-            state.db_manager.pool(),
-            app.path().app_data_dir().ok(),
-            &client,
-            &query,
-            history.as_ref(),
-            meeting_id.clone(),
-            retrieval.inner().clone(),
-            Some(token.as_ref()),
-            mode,
-            Some(&progress_sink),
-        )
-        .await
-        {
-            Ok(inputs) => inputs,
-            Err(error) => {
-                if suppress_chat_preparation_error(&request_state, &stream_id, &token) {
-                    return Ok(());
+    let timeout_sink = AppEventSink(app.clone());
+    await_chat_stream_with_timeout(
+        CHAT_REQUEST_TIMEOUT,
+        &request_state,
+        &timeout_sink,
+        &request_stream_id,
+        &token,
+        async {
+            let inputs = match prepare_chat_inputs_with_lifecycle(
+                state.db_manager.pool(),
+                app.path().app_data_dir().ok(),
+                &client,
+                &query,
+                history.as_ref(),
+                meeting_id.clone(),
+                retrieval.inner().clone(),
+                Some(token.as_ref()),
+                mode,
+                Some(&progress_sink),
+            )
+            .await
+            {
+                Ok(inputs) => inputs,
+                Err(error) => {
+                    if suppress_chat_preparation_error(&request_state, &stream_id, &token) {
+                        return Ok(());
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
-        };
-        stream_chat(
-            state.db_manager.pool().clone(),
-            AppEventSink(app.clone()),
-            request_state.clone(),
-            inputs,
-            stream_id,
-            meeting_id,
-            token.clone(),
-        )
-        .await
-    })
-    .await;
-    match result {
-        Ok(result) => result,
-        Err(_) => {
-            token.cancel();
-            request_state.clear_if_owner(ChatRequestSurface::Chat, &request_stream_id, &token);
-            Err("Chat request timed out".to_string())
-        }
-    }
+            };
+            stream_chat(
+                state.db_manager.pool().clone(),
+                AppEventSink(app.clone()),
+                request_state.clone(),
+                inputs,
+                stream_id,
+                meeting_id,
+                token.clone(),
+            )
+            .await
+        },
+    )
+    .await
 }
 
 #[tauri::command]
@@ -2667,54 +3067,54 @@ pub async fn api_chat_with_scoped_conversation_stream<R: Runtime>(
     let request_stream_id = stream_id.clone();
     let client = reqwest::Client::new();
     let progress_sink = deep_progress_sink(&request_state, &app, &stream_id, &token);
-    let result = tokio::time::timeout(CHAT_REQUEST_TIMEOUT, async {
-        let inputs = match prepare_scoped_chat_inputs_with_authorization(
-            state.db_manager.pool(),
-            app.path().app_data_dir().ok(),
-            &client,
-            &query,
-            history.as_ref(),
-            &conversation_id,
-            LiveTranscriptAuthorization {
-                active_scope_key:
-                    crate::audio::recording_commands::active_live_transcript_scope_key(),
-                consent: live_transcript_consent,
-            },
-            Some(token.as_ref()),
-            Some(retrieval.inner().clone()),
-            mode,
-            Some(&progress_sink),
-        )
-        .await
-        {
-            Ok(inputs) => inputs,
-            Err(error) => {
-                if suppress_chat_preparation_error(&request_state, &stream_id, &token) {
-                    return Ok(());
+    let timeout_sink = AppEventSink(app.clone());
+    await_chat_stream_with_timeout(
+        CHAT_REQUEST_TIMEOUT,
+        &request_state,
+        &timeout_sink,
+        &request_stream_id,
+        &token,
+        async {
+            let inputs = match prepare_scoped_chat_inputs_with_authorization(
+                state.db_manager.pool(),
+                app.path().app_data_dir().ok(),
+                &client,
+                &query,
+                history.as_ref(),
+                &conversation_id,
+                LiveTranscriptAuthorization {
+                    active_scope_key:
+                        crate::audio::recording_commands::active_live_transcript_scope_key(),
+                    consent: live_transcript_consent,
+                },
+                Some(token.as_ref()),
+                Some(retrieval.inner().clone()),
+                mode,
+                Some(&progress_sink),
+            )
+            .await
+            {
+                Ok(inputs) => inputs,
+                Err(error) => {
+                    if suppress_chat_preparation_error(&request_state, &stream_id, &token) {
+                        return Ok(());
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
-        };
-        stream_chat(
-            state.db_manager.pool().clone(),
-            AppEventSink(app.clone()),
-            request_state.clone(),
-            inputs,
-            stream_id,
-            None,
-            token.clone(),
-        )
-        .await
-    })
-    .await;
-    match result {
-        Ok(result) => result,
-        Err(_) => {
-            token.cancel();
-            request_state.clear_if_owner(ChatRequestSurface::Chat, &request_stream_id, &token);
-            Err("Chat request timed out".to_string())
-        }
-    }
+            };
+            stream_chat(
+                state.db_manager.pool().clone(),
+                AppEventSink(app.clone()),
+                request_state.clone(),
+                inputs,
+                stream_id,
+                None,
+                token.clone(),
+            )
+            .await
+        },
+    )
+    .await
 }
 
 /// Emits chat stream events. Production wraps the Tauri app handle; tests
@@ -2757,20 +3157,15 @@ async fn stream_chat<S: ChatEventSink>(
         return Ok(());
     }
 
-    // Deletion privacy fence, in this exact order: bind the prepared
-    // evidence's meeting identities to the shared ownership registry FIRST,
-    // then recheck existence. A deletion that commits after binding
-    // invalidates this visible registration from the real deletion
-    // transaction, so every later publication observes the cancelled token; a
-    // deletion that committed before the recheck fails it here. Either way a
-    // deleted meeting can be neither answered from nor published.
-    stream_state.bind_request_meetings(
-        ChatRequestSurface::Chat,
-        &stream_id,
-        &token,
-        &prepared_meeting_ids(&sources),
-    );
-    if let Err(error) = ensure_prepared_meetings_exist(&pool, &sources).await {
+    // Deletion privacy fence, in this exact order: atomically bind the prepared
+    // evidence identities and retain an abort marker, then recheck existence.
+    // A deletion that commits afterwards leaves a durable marker for the next
+    // publication; one that committed before the recheck fails here.
+    if !stream_state.bind_chat_stream_meetings(&stream_id, &token, &inputs.prompt_meeting_ids) {
+        clear_chat_stream_if_owner(&stream_state, &stream_id, &token).await;
+        return Ok(());
+    }
+    if let Err(error) = ensure_prompt_meetings_exist(&pool, &inputs.prompt_meeting_ids).await {
         clear_chat_stream_if_owner(&stream_state, &stream_id, &token).await;
         return Err(error);
     }
@@ -2836,28 +3231,27 @@ async fn stream_chat<S: ChatEventSink>(
     )
     .await;
 
-    // Terminal invalidation fence: a meeting deleted while the answer was
-    // streaming invalidated this request through the registry, cancelling the
-    // in-flight generation token; the explicit existence recheck closes the
-    // remaining window before any final publication. On either signal the
-    // stream is cleared with NO final source/done/error publication and no
-    // delayed save — parity is preserved by publishing nothing.
-    if ensure_prepared_meetings_exist(&pool, &sources)
-        .await
-        .is_err()
-    {
-        clear_chat_stream_if_owner(&stream_state, &stream_id, &token).await;
+    let terminal_fence = ensure_prompt_meetings_exist(&pool, &inputs.prompt_meeting_ids).await;
+    if terminal_fence.is_err() {
+        stream_state.finish_chat_stream_if_current(
+            &stream_id,
+            &token,
+            false,
+            Some((
+                "chat-stream-error",
+                serde_json::json!({
+                    "streamId": stream_id,
+                    "error": CHAT_CONTEXT_REVALIDATION_ERROR,
+                    "safeCleanup": true,
+                }),
+            )),
+            |event, payload| sink.emit(event, payload),
+        );
         return Ok(());
     }
 
     match stream_result {
         Ok(answer) => {
-            let Some(payload) =
-                completed_chat_stream_payload(token.as_ref(), &stream_id, &answer, &sources)
-            else {
-                clear_chat_stream_if_owner(&stream_state, &stream_id, &token).await;
-                return Ok(());
-            };
             info!(
                 "Chat stream completed: {} sources, {} answer chars, {} provider round trips including final generation",
                 sources.len(),
@@ -2870,15 +3264,31 @@ async fn stream_chat<S: ChatEventSink>(
                 &stream_id,
                 &token,
                 "chat-stream-done",
-                payload,
+                completed_chat_stream_payload(&stream_id, &answer, &sources),
                 true,
             );
             Ok(())
         }
-        Err(e) if e.to_lowercase().contains("cancelled") => {
+        // Cancellation is decided by the request's OWN token, never by the
+        // provider's message text: `generate_summary_stream` embeds the raw
+        // provider body verbatim, so an upstream error that merely contains
+        // "cancelled" used to take this arm, publish no terminal event, and
+        // leave a started stream's row rendering forever. Anything the token
+        // does not confirm as cancelled falls through to the error arm below,
+        // which always publishes a terminal event.
+        Err(error) if token.is_cancelled() => {
             let answer = partial_text.lock().unwrap().clone();
-            tracing::info!("Chat stream cancelled after {} chars", answer.len());
-            clear_chat_stream_if_owner(&stream_state, &stream_id, &token).await;
+            tracing::info!(
+                "Chat stream cancelled after {} chars ({error})",
+                answer.len()
+            );
+            stream_state.finish_chat_stream_if_current(
+                &stream_id,
+                &token,
+                false,
+                None,
+                |event, payload| sink.emit(event, payload),
+            );
             Ok(())
         }
         Err(e) => {
@@ -2917,34 +3327,16 @@ async fn stream_chat<S: ChatEventSink>(
 pub(crate) const DELETED_MEETING_EVIDENCE_ERROR: &str =
     "Chat was aborted because a referenced meeting was deleted";
 
-/// The meeting identities a prepared request would publish as sources.
-/// Live-recording sources carry a live scope key, not a meeting id, and are
-/// exempt from existence checks and deletion invalidation.
-pub(crate) fn prepared_meeting_ids(sources: &[ChatSource]) -> Vec<String> {
-    sources
-        .iter()
-        .filter(|source| source.source_kind.as_deref() != Some("live_recording"))
-        .map(|source| source.meeting_id.clone())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect()
-}
-
-/// Fails the request when any prepared-evidence meeting no longer exists, so
-/// a meeting deleted during preparation can be neither answered from nor
-/// published as a source. Fail-closed: an existence check that cannot run
-/// also aborts, because unverifiable evidence must not be published.
-pub(crate) async fn ensure_prepared_meetings_exist(
+pub(crate) async fn ensure_prompt_meetings_exist(
     pool: &SqlitePool,
-    sources: &[ChatSource],
+    meeting_ids: &HashSet<String>,
 ) -> Result<(), String> {
-    let meeting_ids = prepared_meeting_ids(sources);
     if meeting_ids.is_empty() {
         return Ok(());
     }
     let mut query = QueryBuilder::<Sqlite>::new("SELECT id FROM meetings WHERE id IN (");
     let mut ids = query.separated(", ");
-    for meeting_id in &meeting_ids {
+    for meeting_id in meeting_ids {
         ids.push_bind(meeting_id);
     }
     drop(ids);
@@ -2952,18 +3344,23 @@ pub(crate) async fn ensure_prepared_meetings_exist(
     match query.build_query_scalar::<String>().fetch_all(pool).await {
         Ok(existing) if existing.len() == meeting_ids.len() => Ok(()),
         Ok(_) => Err(DELETED_MEETING_EVIDENCE_ERROR.to_string()),
-        Err(error) => Err(format!("Chat source existence check failed: {error}")),
+        Err(error) => {
+            // Fail closed WITHOUT disclosing database internals: the raw error
+            // is logged, the caller (and through it the UI) receives the same
+            // stable, content-free revalidation message the post-start
+            // terminal paths already publish.
+            tracing::error!("Chat prompt existence check failed: {error}");
+            Err(CHAT_CONTEXT_REVALIDATION_ERROR.to_string())
+        }
     }
 }
 
 fn completed_chat_stream_payload(
-    token: &CancellationToken,
     stream_id: &str,
     answer: &str,
     sources: &[ChatSource],
-) -> Option<serde_json::Value> {
-    (!token.is_cancelled())
-        .then(|| serde_json::json!({ "streamId": stream_id, "answer": answer, "sources": sources }))
+) -> serde_json::Value {
+    serde_json::json!({ "streamId": stream_id, "answer": answer, "sources": sources })
 }
 
 async fn claim_chat_stream(state: &ChatRequestState, stream_id: &str) -> ChatRequestToken {
@@ -3016,6 +3413,45 @@ fn emit_chat_stream_event_if_owner<R: Runtime>(
             if let Err(error) = app.emit(event, payload) {
                 tracing::error!("Failed to emit {}: {}", event, error);
             }
+        },
+    )
+}
+
+async fn await_chat_stream_with_timeout<S: ChatEventSink>(
+    timeout: Duration,
+    state: &ChatRequestState,
+    sink: &S,
+    stream_id: &str,
+    token: &ChatRequestToken,
+    stream: impl std::future::Future<Output = Result<(), String>>,
+) -> Result<(), String> {
+    match tokio::time::timeout(timeout, stream).await {
+        Ok(result) => result,
+        Err(_) if finish_timed_out_chat_stream(state, sink, stream_id, token) => Ok(()),
+        Err(_) => Err("Chat request timed out".to_string()),
+    }
+}
+
+fn finish_timed_out_chat_stream<S: ChatEventSink>(
+    state: &ChatRequestState,
+    sink: &S,
+    stream_id: &str,
+    token: &ChatRequestToken,
+) -> bool {
+    state.finish_chat_stream_if_current(
+        stream_id,
+        token,
+        true,
+        Some((
+            "chat-stream-error",
+            serde_json::json!({
+                "streamId": stream_id,
+                "error": CHAT_CONTEXT_REVALIDATION_ERROR,
+                "safeCleanup": true,
+            }),
+        )),
+        |event, payload| {
+            sink.emit(event, payload);
         },
     )
 }
@@ -3109,15 +3545,7 @@ fn publish_chat_stream_event_if_owner<F: FnOnce(&str, serde_json::Value)>(
     clear: bool,
     emit: F,
 ) -> bool {
-    state.publish_if_owner(
-        ChatRequestSurface::Chat,
-        stream_id,
-        token,
-        event,
-        payload,
-        clear,
-        emit,
-    )
+    state.publish_chat_stream_event_if_current(stream_id, token, event, payload, clear, emit)
 }
 
 /// Cancels an active chat stream. `stream_id: None` cancels any active stream;
@@ -4700,12 +5128,19 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(titles, vec!["Root", "Child"]);
-        let context = format_meeting_list_context(&titles);
-        assert!(context.contains("2 total"));
+        assert_eq!(
+            titles
+                .iter()
+                .map(|meeting| meeting.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Root", "Child"]
+        );
+        let (context, ids) = format_meeting_list_context(&titles, 64_000);
+        assert!(!context.contains("total"));
         assert!(context.contains("- Root"));
         assert!(context.contains("- Child"));
         assert!(!context.contains("Other"));
+        assert_eq!(ids, HashSet::from(["m1".to_string(), "m2".to_string()]));
         assert!(requests_meeting_list(
             "listar reuniões existentes nesta pasta",
         ));
@@ -4728,7 +5163,120 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(titles, vec!["Child"]);
+        assert_eq!(
+            titles
+                .iter()
+                .map(|meeting| meeting.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Child"]
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_titles_bind_only_the_rendered_scope_rows() {
+        let pool = scope_pool().await;
+        sqlx::query("UPDATE meetings SET title = 'Duplicate' WHERE id IN ('m2', 'm3')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let (context, prompt_meeting_ids) = meeting_list_context_for_scope(
+            &pool,
+            &ChatRetrievalScope::Folder("root".to_string()),
+            "list the meetings",
+            None,
+            64_000,
+        )
+        .await
+        .unwrap();
+
+        assert!(context.unwrap().contains("- Duplicate"));
+        assert!(prompt_meeting_ids.contains("m1"));
+        assert!(prompt_meeting_ids.contains("m2"));
+        assert!(!prompt_meeting_ids.contains("m3"));
+    }
+
+    #[tokio::test]
+    async fn truncated_meeting_list_binds_only_retained_titles_without_an_aggregate() {
+        use crate::database::repositories::meeting::MeetingsRepository;
+
+        let pool = hybrid_test_pool().await;
+        for (id, parent_id) in [("root", None), ("child", Some("root")), ("other", None)] {
+            sqlx::query(
+                "INSERT INTO meeting_folders (id, name, parent_id, created_at) VALUES (?, ?, ?, '2026-09-02T00:00:00Z')",
+            )
+            .bind(id)
+            .bind(id)
+            .bind(parent_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for (id, folder_id) in [("m1", "root"), ("m2", "child"), ("m3", "other")] {
+            sqlx::query(
+                "INSERT INTO meetings (id, title, folder_id, created_at, updated_at, saved_at) VALUES (?, 'Duplicate', ?, '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')",
+            )
+            .bind(id)
+            .bind(folder_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            meeting_titles_for_scope(
+                &pool,
+                &ChatRetrievalScope::Folder("root".to_string()),
+                "list the meetings",
+                None,
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|meeting| meeting.id)
+            .collect::<Vec<_>>(),
+            vec!["m1", "m2"]
+        );
+        let context_budget = MEETING_LIST_HEADER.chars().count() + "- Duplicate\n".chars().count();
+        let (context, prompt_meeting_ids) = meeting_list_context_for_scope(
+            &pool,
+            &ChatRetrievalScope::Folder("root".to_string()),
+            "list the meetings",
+            None,
+            context_budget,
+        )
+        .await
+        .unwrap();
+        let context = context.unwrap();
+
+        assert_eq!(context, format!("{MEETING_LIST_HEADER}- Duplicate\n"));
+        assert!(context.starts_with("Bounded rendered meeting-list context"));
+        assert!(!context.contains("Authoritative meeting list"));
+        assert!(!context.contains("total"));
+        assert_eq!(prompt_meeting_ids, HashSet::from(["m1".to_string()]));
+
+        let request_state = ChatRequestState::new();
+        let token = request_state.claim_superseding_request(ChatRequestSurface::Chat, "short-list");
+        assert!(request_state.bind_request_meetings(
+            ChatRequestSurface::Chat,
+            "short-list",
+            &token,
+            &prompt_meeting_ids,
+        ));
+        let invalidated = request_state.clone();
+        assert!(
+            MeetingsRepository::delete_meeting(&pool, "m2", |meeting_id| {
+                invalidated.invalidate_meeting(meeting_id);
+            })
+            .await
+            .unwrap()
+        );
+
+        assert!(!token.is_cancelled());
+        ensure_prompt_meetings_exist(&pool, &prompt_meeting_ids)
+            .await
+            .unwrap();
+        assert!(!prompt_meeting_ids.contains("m3"));
+        request_state.clear_if_owner(ChatRequestSurface::Chat, "short-list", &token);
     }
 
     #[test]
@@ -5432,8 +5980,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn saved_meeting_deep_request_keeps_authoritative_anchors_without_planner() {
+    async fn saved_meeting_deep_runs_bounded_planner_and_keeps_authoritative_anchors() {
         let (pool, lifecycle) = hybrid_test_fixture(true, 3).await;
+        let endpoint = serve_saved_meeting_deep_two_rounds().await;
+        sqlx::query("UPDATE settings SET chatOllamaEndpoint = ?")
+            .bind(endpoint)
+            .execute(&pool)
+            .await
+            .unwrap();
         let fast = prepare_chat_inputs_for_scope(
             &pool,
             None,
@@ -5473,18 +6027,130 @@ mod tests {
         .await
         .unwrap();
 
-        // A Deep request in the saved-meeting scope is scope-safe: identical
-        // authoritative anchors and prompt, no planner, no progress events.
-        assert_eq!(fast.user_prompt, deep.user_prompt);
-        assert_eq!(
-            serde_json::to_value(&fast.sources).unwrap(),
-            serde_json::to_value(&deep.sources).unwrap()
-        );
+        // Deep actually runs: the planner is invoked (two provider round
+        // trips), stage-level progress is emitted, and the authoritative
+        // mandatory summary/notes anchors are retained verbatim.
         assert_eq!(deep.retrieval_mode, ChatRetrievalMode::Deep);
-        assert_eq!(deep.provider_round_trips, 0);
+        assert_eq!(deep.provider_round_trips, 2);
+        assert!(!progress.lock().unwrap().is_empty());
+        assert!(deep.user_prompt.contains("Authoritative summary"));
+        assert!(deep.user_prompt.contains("Current notes"));
+        assert!(deep.user_prompt.contains(HYBRID_TARGET));
+        // Fast remains one-pass with no planner.
+        assert_eq!(fast.provider_round_trips, 0);
+        // Final sources keep transcript parity for the saved meeting.
         assert!(!deep.sources.is_empty());
         assert!(deep.sources.iter().all(|source| source.meeting_id == "m2"));
-        assert!(progress.lock().unwrap().is_empty());
+        // Every published source's snippet is present in the final prompt.
+        assert!(deep
+            .sources
+            .iter()
+            .all(|source| deep.user_prompt.contains(&source.snippet)));
+    }
+
+    #[test]
+    fn saved_meeting_deep_merge_drops_evidence_that_cannot_survive_the_final_budget() {
+        let mut transcript = make_search_result("m2", "Saved", "transcript", HYBRID_TARGET);
+        transcript.chunk_id = "anchor".to_string();
+        let built = build_meeting_context_markdown(
+            "m2",
+            "Saved",
+            Some("Authoritative summary"),
+            Some("Current notes"),
+            &[transcript],
+            1,
+            4_000,
+        );
+        let authoritative = ChatSource {
+            meeting_id: "m2".to_string(),
+            meeting_title: "Saved".to_string(),
+            chunk_type: "transcript".to_string(),
+            snippet: HYBRID_TARGET.to_string(),
+            folder_name: String::new(),
+            source_kind: Some("transcript".to_string()),
+        };
+        let omitted = ChatSource {
+            meeting_id: "m2".to_string(),
+            meeting_title: "Saved".to_string(),
+            chunk_type: "transcript".to_string(),
+            snippet: "planner evidence that exceeds the remaining saved-meeting context budget"
+                .to_string(),
+            folder_name: String::new(),
+            source_kind: Some("transcript".to_string()),
+        };
+        let budget = built.markdown.chars().count();
+        let (context, sources) = merge_saved_meeting_deep_context(
+            built.markdown,
+            vec![authoritative],
+            vec![omitted.clone()],
+            budget,
+        );
+        let prompt = assemble_prompt(
+            &context,
+            &[],
+            "question",
+            "question",
+            "",
+            budget + "\n\nMeeting context:\n".chars().count() + 64,
+        );
+
+        assert!(context.contains("Authoritative summary"));
+        assert!(context.contains("Current notes"));
+        assert!(context.contains(HYBRID_TARGET));
+        assert!(!context.contains(&omitted.snippet));
+        assert!(!sources
+            .iter()
+            .any(|source| source.snippet == omitted.snippet));
+        assert!(sources
+            .iter()
+            .all(|source| prompt.contains(&source.snippet)));
+    }
+
+    #[tokio::test]
+    async fn saved_meeting_deep_cannot_open_another_meeting() {
+        // Fixture where "m3" holds a matching document but is NOT the
+        // requested meeting: the planner's card set is one-meeting, so an
+        // open/search action can never pull "m3" content into the prompt or
+        // sources.
+        let (pool, lifecycle) = hybrid_test_fixture(false, 3).await;
+        let endpoint = serve_saved_meeting_deep_two_rounds().await;
+        sqlx::query("UPDATE settings SET chatOllamaEndpoint = ?")
+            .bind(endpoint)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let progress: Arc<Mutex<Vec<crate::retrieval::agent::DeepProgressEvent>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let sink_events = Arc::clone(&progress);
+            move |event: crate::retrieval::agent::DeepProgressEvent| {
+                sink_events.lock().unwrap().push(event);
+            }
+        };
+        let deep = prepare_chat_inputs_for_scope(
+            &pool,
+            None,
+            &reqwest::Client::new(),
+            "approved budget",
+            None,
+            ChatRetrievalScope::Meeting("m2".to_string()),
+            None,
+            Some(lifecycle),
+            None,
+            Some(ChatRetrievalMode::Deep),
+            Some(&sink),
+        )
+        .await
+        .unwrap();
+
+        // The planner ran, but no cross-meeting action escaped: sources and
+        // retained context are strictly within the one-meeting allow-list.
+        assert_eq!(deep.retrieval_mode, ChatRetrievalMode::Deep);
+        assert_eq!(deep.provider_round_trips, 2);
+        assert!(deep.sources.iter().all(|source| source.meeting_id == "m2"));
+        assert!(!deep.user_prompt.contains("Other meeting"));
+        assert!(deep.user_prompt.contains("Authoritative summary"));
+        assert!(deep.user_prompt.contains("Current notes"));
     }
 
     #[tokio::test]
@@ -5611,25 +6277,8 @@ mod tests {
             .await
             .unwrap();
         }
-        let prepared = vec![
-            ChatSource {
-                meeting_id: "gone".to_string(),
-                meeting_title: "Deleted".to_string(),
-                chunk_type: "transcript".to_string(),
-                snippet: "private deleted snippet".to_string(),
-                folder_name: String::new(),
-                source_kind: Some("meeting".to_string()),
-            },
-            ChatSource {
-                meeting_id: "kept".to_string(),
-                meeting_title: "Survivor".to_string(),
-                chunk_type: "note".to_string(),
-                snippet: "keep".to_string(),
-                folder_name: String::new(),
-                source_kind: Some("meeting".to_string()),
-            },
-        ];
-        ensure_prepared_meetings_exist(&pool, &prepared)
+        let prepared_ids = HashSet::from(["gone".to_string(), "kept".to_string()]);
+        ensure_prompt_meetings_exist(&pool, &prepared_ids)
             .await
             .unwrap();
 
@@ -5641,26 +6290,18 @@ mod tests {
         // Abort (typed), never a filtered partial response: publishing a
         // source-less answer over retained deleted evidence would break
         // source/context parity.
-        let error = ensure_prepared_meetings_exist(&pool, &prepared)
+        let error = ensure_prompt_meetings_exist(&pool, &prepared_ids)
             .await
             .unwrap_err();
         assert_eq!(error, DELETED_MEETING_EVIDENCE_ERROR);
         // A surviving meeting's sources still pass.
-        ensure_prepared_meetings_exist(&pool, &prepared[1..])
+        ensure_prompt_meetings_exist(&pool, &HashSet::from(["kept".to_string()]))
             .await
             .unwrap();
 
         // Live-recording sources carry a scope key, not a meeting id, and are
         // exempt from the meeting existence check.
-        let live_only = vec![ChatSource {
-            meeting_id: "live-scope".to_string(),
-            meeting_title: "Live recording".to_string(),
-            chunk_type: "live_transcript".to_string(),
-            snippet: "live text".to_string(),
-            folder_name: String::new(),
-            source_kind: Some("live_recording".to_string()),
-        }];
-        ensure_prepared_meetings_exist(&pool, &live_only)
+        ensure_prompt_meetings_exist(&pool, &HashSet::new())
             .await
             .unwrap();
     }
@@ -5886,9 +6527,27 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(all_titles, vec!["Root", "Child"]);
-        assert_eq!(folder_titles, vec!["Root", "Child"]);
-        assert_eq!(snapshot_titles, vec!["Child"]);
+        assert_eq!(
+            all_titles
+                .iter()
+                .map(|meeting| meeting.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Root", "Child"]
+        );
+        assert_eq!(
+            folder_titles
+                .iter()
+                .map(|meeting| meeting.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Root", "Child"]
+        );
+        assert_eq!(
+            snapshot_titles
+                .iter()
+                .map(|meeting| meeting.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Child"]
+        );
 
         sqlx::query(
             "UPDATE meeting_fts SET text = CASE meeting_id WHEN 'm1' THEN 'budget decision' WHEN 'm2' THEN 'roadmap decision' ELSE 'budget decision' END",
@@ -6079,17 +6738,10 @@ mod tests {
 
     #[test]
     fn deep_preparation_eligibility_requires_deep_mode() {
-        assert!(deep_preparation_eligible(ChatRetrievalMode::Deep, None));
-        assert!(deep_preparation_eligible(
-            ChatRetrievalMode::Deep,
-            Some(&vec!["m1".to_string()])
-        ));
-        assert!(!deep_preparation_eligible(ChatRetrievalMode::Fast, None));
+        assert!(deep_preparation_eligible(ChatRetrievalMode::Deep));
+        assert!(!deep_preparation_eligible(ChatRetrievalMode::Fast));
         // Omitted mode resolves to Fast.
-        assert!(!deep_preparation_eligible(
-            ChatRetrievalMode::default(),
-            None
-        ));
+        assert!(!deep_preparation_eligible(ChatRetrievalMode::default()));
     }
 
     #[tokio::test]
@@ -6191,23 +6843,30 @@ mod tests {
                 .unwrap();
         }
 
-        let all = temporal_context_for_scope(&pool, &ChatRetrievalScope::All)
+        let all = temporal_context_for_scope(&pool, &ChatRetrievalScope::All, 64_000)
             .await
             .unwrap();
-        let folder =
-            temporal_context_for_scope(&pool, &ChatRetrievalScope::Folder("root".to_string()))
-                .await
-                .unwrap();
+        let folder = temporal_context_for_scope(
+            &pool,
+            &ChatRetrievalScope::Folder("root".to_string()),
+            64_000,
+        )
+        .await
+        .unwrap();
         let snapshot = temporal_context_for_scope(
             &pool,
             &ChatRetrievalScope::SearchSnapshot(vec!["m1".to_string(), "m3".to_string()]),
+            64_000,
         )
         .await
         .unwrap();
 
-        assert!(all.contains("Child"));
-        assert!(folder.contains("Child"));
-        assert!(snapshot.contains("Other"));
+        assert!(all.context.contains("Child"));
+        assert_eq!(all.meeting_id.as_deref(), Some("m2"));
+        assert!(folder.context.contains("Child"));
+        assert_eq!(folder.meeting_id.as_deref(), Some("m2"));
+        assert!(snapshot.context.contains("Other"));
+        assert_eq!(snapshot.meeting_id.as_deref(), Some("m3"));
     }
 
     #[test]
@@ -6216,6 +6875,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Local);
         let latest = LatestSavedMeeting {
+            id: "imported-notes".to_string(),
             title: "Imported notes".to_string(),
             saved_at: DateTime::parse_from_rfc3339("2026-08-18T12:00:00Z")
                 .unwrap()
@@ -6721,7 +7381,7 @@ mod tests {
                 ChatRequestSurface::Mcp,
                 &format!("mcp-{index}"),
                 token,
-                &["m1".to_string()]
+                &HashSet::from(["m1".to_string()])
             ));
         }
         let freed = state.invalidate_meeting("m1");
@@ -6984,9 +7644,15 @@ mod tests {
             .unwrap();
         // Deterministic timeout result: the deadline cancelled the token
         // BEFORE the request future was dropped and before registry cleanup,
-        // so the surfaced error is exactly the cancelled outcome — never an
-        // Elapsed/cancelled race.
-        assert_eq!(result.unwrap_err(), "Chat request was cancelled");
+        // so the outcome is never an Elapsed/cancelled race. The surfaced
+        // cause is the deadline itself — the token cancellation is HOW the
+        // deadline stops the work, not a separate condition an MCP client
+        // should have to guess at (it cannot tell a deadline from deletion
+        // invalidation otherwise).
+        assert_eq!(
+            result.unwrap_err(),
+            crate::mcp::server::MCP_CHAT_TIMEOUT_ERROR
+        );
         // No provider/generation connection was ever attempted.
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(300), called_rx.recv())
@@ -7138,7 +7804,7 @@ mod tests {
             let Ok((mut socket, _)) = listener.accept().await else {
                 return;
             };
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::io::AsyncReadExt;
             let mut request = vec![0_u8; 64 * 1024];
             let _ = socket.read(&mut request).await;
             let _ = called_tx.send(()).await;
@@ -7235,13 +7901,13 @@ mod tests {
             ChatRequestSurface::Mcp,
             "mcp-1",
             &first,
-            &["m1".to_string()]
+            &HashSet::from(["m1".to_string()])
         ));
         assert!(state.bind_request_meetings(
             ChatRequestSurface::Mcp,
             "mcp-2",
             &second,
-            &["m2".to_string()]
+            &HashSet::from(["m2".to_string()])
         ));
 
         // A concurrent MCP claim does not cancel or replace the other.
@@ -7268,7 +7934,7 @@ mod tests {
             ChatRequestSurface::Mcp,
             "mcp-3",
             &third,
-            &["m2".to_string()]
+            &HashSet::from(["m2".to_string()])
         ));
         assert_eq!(state.invalidate_meeting("m2"), 2);
         assert!(second.is_cancelled());
@@ -7315,13 +7981,13 @@ mod tests {
             ChatRequestSurface::Chat,
             "chat-1",
             &old_chat,
-            &["m9".to_string()]
+            &HashSet::from(["m9".to_string()])
         ));
         assert!(state.bind_request_meetings(
             ChatRequestSurface::Mcp,
             "mcp-1",
             &mcp,
-            &["m9".to_string()]
+            &HashSet::from(["m9".to_string()])
         ));
     }
 
@@ -7335,13 +8001,13 @@ mod tests {
             ChatRequestSurface::Chat,
             "chat-1",
             &chat_token,
-            &["m1".to_string()]
+            &HashSet::from(["m1".to_string()])
         ));
         assert!(state.bind_request_meetings(
             ChatRequestSurface::Sidebar,
             "sidebar-1",
             &sidebar_token,
-            &["m1".to_string(), "m2".to_string()]
+            &HashSet::from(["m1".to_string(), "m2".to_string()])
         ));
         // A newer request supersedes the chat request and removes its
         // registration; binding for it must fail afterward.
@@ -7351,14 +8017,14 @@ mod tests {
             ChatRequestSurface::Chat,
             "chat-1",
             &chat_token,
-            &["m9".to_string()]
+            &HashSet::from(["m9".to_string()])
         ));
         // Binding guards: wrong token and cancelled tokens fail.
         assert!(!state.bind_request_meetings(
             ChatRequestSurface::Chat,
             "chat-2",
             &sidebar_token,
-            &["m9".to_string()]
+            &HashSet::from(["m9".to_string()])
         ));
 
         // Only the registered request whose prepared evidence references the
@@ -7462,6 +8128,27 @@ mod tests {
             custom_openai_top_p: None,
             app_data_dir: None,
             user_prompt: "Meeting context:\nprivate deleted snippet\n".to_string(),
+            prompt_meeting_ids: HashSet::from(["m1".to_string()]),
+            retrieval_diagnostic: RetrievalPreparationDiagnostic::Hybrid,
+            retrieval_mode: ChatRetrievalMode::Fast,
+            provider_round_trips: 0,
+        }
+    }
+
+    fn source_less_stream_race_inputs(endpoint: &str, meeting_id: &str) -> ChatInputs {
+        ChatInputs {
+            sources: Vec::new(),
+            provider: LLMProvider::Ollama,
+            model_name: "local".to_string(),
+            api_key: String::new(),
+            ollama_endpoint: Some(endpoint.to_string()),
+            custom_openai_endpoint: None,
+            custom_openai_max_tokens: None,
+            custom_openai_temperature: None,
+            custom_openai_top_p: None,
+            app_data_dir: None,
+            user_prompt: "Authoritative meeting card: Deleted\nMost recently saved/imported meeting in this scope: Deleted.\n".to_string(),
+            prompt_meeting_ids: HashSet::from([meeting_id.to_string()]),
             retrieval_diagnostic: RetrievalPreparationDiagnostic::Hybrid,
             retrieval_mode: ChatRetrievalMode::Fast,
             provider_round_trips: 0,
@@ -7540,6 +8227,14 @@ mod tests {
         );
         assert!(!names.contains(&"chat-stream-done".to_string()));
         assert!(!names.contains(&"chat-stream-error".to_string()));
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == "chat-stream-abort")
+                .count(),
+            1,
+            "an invalidated started stream must publish one safe abort"
+        );
         // Terminal cleanup: the invalidated registration was removed.
         assert_eq!(stream_state.request_count(), 0);
 
@@ -7576,6 +8271,683 @@ mod tests {
             .unwrap(),
             None
         );
+    }
+
+    /// Post-start deletion UI contract: sources are rendered at
+    /// `chat-stream-start`, the meeting is then deleted (real transaction),
+    /// and `stream_chat` publishes a privacy-safe abort event carrying only
+    /// the stream identity and stable reason — no source/done/error payload,
+    /// no delayed save.
+    #[tokio::test]
+    async fn post_start_deletion_publishes_privacy_safe_abort_event() {
+        let pool = hybrid_test_pool().await;
+        configure_hybrid_chat(&pool).await;
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at, saved_at) VALUES ('m1', 'Deleted', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (endpoint, release_tx) = serve_streaming_chunks_with_barrier().await;
+        let stream_state = ChatRequestState::new();
+        let token =
+            stream_state.claim_superseding_request(ChatRequestSurface::Chat, "stream-abort");
+        let sink = CapturingSink::default();
+        let task = tokio::spawn(stream_chat(
+            pool.clone(),
+            sink.clone(),
+            stream_state.clone(),
+            stream_race_inputs(&endpoint),
+            "stream-abort".to_string(),
+            None,
+            token.clone(),
+        ));
+        sink.wait_for_event("chat-stream-chunk").await;
+
+        // Real deletion path while the stream is open after start.
+        let invalidated = stream_state.clone();
+        let deleted = crate::database::repositories::meeting::MeetingsRepository::delete_meeting(
+            &pool,
+            "m1",
+            |meeting_id| {
+                invalidated.invalidate_meeting(meeting_id);
+            },
+        )
+        .await
+        .unwrap();
+        assert!(deleted);
+        assert!(token.is_cancelled());
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        // The abort event carries ONLY stable identity + reason.
+        let names = sink.names();
+        assert!(names.contains(&"chat-stream-abort".to_string()));
+        let abort = sink
+            .events()
+            .into_iter()
+            .find(|(name, _)| name == "chat-stream-abort")
+            .unwrap();
+        assert_eq!(abort.1["streamId"], "stream-abort");
+        assert_eq!(abort.1["reason"], "referenced_meeting_deleted");
+        let abort_text = abort.1.to_string();
+        assert!(!abort_text.contains("private deleted snippet"));
+        assert!(!abort_text.contains("Deleted"));
+        // No terminal source/done/error publication.
+        assert!(!names.contains(&"chat-stream-done".to_string()));
+        assert!(!names.contains(&"chat-stream-error".to_string()));
+        assert_eq!(stream_state.request_count(), 0);
+        // The delayed save cannot re-persist the deleted snippet.
+        let conversation = ChatRepository::get_or_create_scoped_conversation(
+            &pool,
+            &ChatScope {
+                kind: ChatScopeKind::All,
+                key: "all".to_string(),
+                data: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        ChatRepository::save_message(
+            &pool,
+            &conversation.id,
+            "assistant",
+            "delayed answer",
+            Some(r#"[{"meetingId":"m1","meetingTitle":"Deleted","chunkType":"transcript","snippet":"private deleted snippet","folderName":"General","sourceKind":"transcript"}]"#),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT sources_json FROM chat_messages WHERE content = 'delayed answer'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn source_less_prompt_deletion_before_stream_binding_publishes_nothing() {
+        let pool = hybrid_test_pool().await;
+        configure_hybrid_chat(&pool).await;
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at, saved_at) VALUES ('m1', 'Deleted', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let stream_state = ChatRequestState::new();
+        let token = stream_state
+            .claim_superseding_request(ChatRequestSurface::Chat, "source-less-before-bind");
+        let invalidated = stream_state.clone();
+        assert!(
+            crate::database::repositories::meeting::MeetingsRepository::delete_meeting(
+                &pool,
+                "m1",
+                |meeting_id| {
+                    invalidated.invalidate_meeting(meeting_id);
+                },
+            )
+            .await
+            .unwrap()
+        );
+        assert!(!token.is_cancelled());
+
+        let sink = CapturingSink::default();
+        let result = stream_chat(
+            pool,
+            sink.clone(),
+            stream_state.clone(),
+            source_less_stream_race_inputs("http://127.0.0.1:9", "m1"),
+            "source-less-before-bind".to_string(),
+            None,
+            token,
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err(), DELETED_MEETING_EVIDENCE_ERROR);
+        assert!(sink.events().is_empty());
+        assert_eq!(stream_state.request_count(), 0);
+    }
+
+    /// Serves one non-2xx response whose body contains the word "cancelled",
+    /// exactly as a proxying provider reports an aborted upstream request.
+    /// `generate_summary_stream` embeds that body verbatim in its error.
+    async fn serve_upstream_cancelled_error() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = vec![0_u8; 64 * 1024];
+            let _ = socket.read(&mut request).await;
+            let body = r#"{"error":{"message":"Upstream request was cancelled by the gateway"}}"#;
+            let _ = socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await;
+            let _ = socket.flush().await;
+        });
+        format!("http://{}", address)
+    }
+
+    /// A started stream must ALWAYS receive exactly one terminal event.
+    /// Classifying cancellation by substring-matching the provider's message
+    /// let an upstream body containing "cancelled" take the cancellation arm,
+    /// which publishes nothing: the panel kept an assistant row rendering its
+    /// sources forever. Cancellation is now decided by the request's own
+    /// token, so an uncancelled provider failure falls through to the error
+    /// arm and terminates the stream.
+    #[tokio::test]
+    async fn provider_error_naming_cancellation_still_terminates_a_started_stream() {
+        let pool = hybrid_test_pool().await;
+        configure_hybrid_chat(&pool).await;
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at, saved_at) VALUES ('m1', 'Kept', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let endpoint = serve_upstream_cancelled_error().await;
+        let stream_state = ChatRequestState::new();
+        let token =
+            stream_state.claim_superseding_request(ChatRequestSurface::Chat, "upstream-cancelled");
+        let sink = CapturingSink::default();
+
+        let result = stream_chat(
+            pool,
+            sink.clone(),
+            stream_state.clone(),
+            source_less_stream_race_inputs(&endpoint, "m1"),
+            "upstream-cancelled".to_string(),
+            None,
+            token.clone(),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        // The request itself was never cancelled: only the provider's text
+        // said so.
+        assert!(!token.is_cancelled());
+        let events = sink.events();
+        let names: Vec<&str> = events.iter().map(|(event, _)| event.as_str()).collect();
+        assert_eq!(names, vec!["chat-stream-start", "chat-stream-error"]);
+        // Exactly one terminal event, and ownership is released so the panel
+        // is not left waiting on a stream that can never finish.
+        assert_eq!(stream_state.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn source_less_prompt_deletion_after_start_emits_only_the_abort() {
+        let pool = hybrid_test_pool().await;
+        configure_hybrid_chat(&pool).await;
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at, saved_at) VALUES ('m1', 'Deleted', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (endpoint, release_tx) = serve_streaming_chunks_with_barrier().await;
+        let stream_state = ChatRequestState::new();
+        let token = stream_state
+            .claim_superseding_request(ChatRequestSurface::Chat, "source-less-after-start");
+        let sink = CapturingSink::default();
+        let task = tokio::spawn(stream_chat(
+            pool.clone(),
+            sink.clone(),
+            stream_state.clone(),
+            source_less_stream_race_inputs(&endpoint, "m1"),
+            "source-less-after-start".to_string(),
+            None,
+            token.clone(),
+        ));
+        sink.wait_for_event("chat-stream-chunk").await;
+        let start = sink
+            .events()
+            .into_iter()
+            .find(|(name, _)| name == "chat-stream-start")
+            .unwrap();
+        assert_eq!(start.1["sources"], serde_json::json!([]));
+
+        let invalidated = stream_state.clone();
+        assert!(
+            crate::database::repositories::meeting::MeetingsRepository::delete_meeting(
+                &pool,
+                "m1",
+                |meeting_id| {
+                    invalidated.invalidate_meeting(meeting_id);
+                },
+            )
+            .await
+            .unwrap()
+        );
+        assert!(token.is_cancelled());
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let events = sink.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(name, _)| name == "chat-stream-abort")
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|(name, payload)| {
+            name == "chat-stream-abort"
+                && payload["streamId"] == "source-less-after-start"
+                && payload["reason"] == "referenced_meeting_deleted"
+        }));
+        assert!(!events.iter().any(|(name, _)| {
+            matches!(name.as_str(), "chat-stream-done" | "chat-stream-error")
+        }));
+        assert_eq!(stream_state.request_count(), 0);
+    }
+
+    #[test]
+    fn replaced_stream_cannot_publish_a_stale_deletion_abort() {
+        let state = ChatRequestState::new();
+        let old = state.claim_superseding_request(ChatRequestSurface::Chat, "old");
+        assert!(state.bind_chat_stream_meetings("old", &old, &HashSet::from(["m1".to_string()]),));
+        let _new = state.claim_superseding_request(ChatRequestSurface::Chat, "new");
+        state.invalidate_meeting("m1");
+
+        assert!(
+            !state.publish_deletion_abort_if_current("old", &old, |_, _| {
+                panic!("a replaced stream must not publish an abort")
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn deletion_between_post_bind_fence_and_start_publishes_exactly_one_abort() {
+        let pool = hybrid_test_pool().await;
+        configure_hybrid_chat(&pool).await;
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at, saved_at) VALUES ('m1', 'Deleted', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = ChatRequestState::new();
+        let token = state.claim_superseding_request(ChatRequestSurface::Chat, "start-race");
+        let meeting_ids = HashSet::from(["m1".to_string()]);
+        assert!(state.bind_chat_stream_meetings("start-race", &token, &meeting_ids));
+        ensure_prompt_meetings_exist(&pool, &meeting_ids)
+            .await
+            .unwrap();
+
+        let invalidated = state.clone();
+        assert!(
+            crate::database::repositories::meeting::MeetingsRepository::delete_meeting(
+                &pool,
+                "m1",
+                |meeting_id| {
+                    invalidated.invalidate_meeting(meeting_id);
+                },
+            )
+            .await
+            .unwrap()
+        );
+
+        let sink = CapturingSink::default();
+        assert!(!emit_chat_stream_event_if_sink(
+            &state,
+            &sink,
+            "start-race",
+            &token,
+            "chat-stream-start",
+            serde_json::json!({ "streamId": "start-race", "sources": [] }),
+            false,
+        ));
+        let events = sink.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "chat-stream-abort");
+        assert_eq!(events[0].1["streamId"], "start-race");
+        assert_eq!(events[0].1["reason"], "referenced_meeting_deleted");
+        assert_eq!(state.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn deletion_between_terminal_fence_and_done_publishes_exactly_one_abort() {
+        let pool = hybrid_test_pool().await;
+        configure_hybrid_chat(&pool).await;
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at, saved_at) VALUES ('m1', 'Deleted', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = ChatRequestState::new();
+        let token = state.claim_superseding_request(ChatRequestSurface::Chat, "terminal-race");
+        let meeting_ids = HashSet::from(["m1".to_string()]);
+        assert!(state.bind_chat_stream_meetings("terminal-race", &token, &meeting_ids));
+        let sink = CapturingSink::default();
+        assert!(emit_chat_stream_event_if_sink(
+            &state,
+            &sink,
+            "terminal-race",
+            &token,
+            "chat-stream-start",
+            serde_json::json!({ "streamId": "terminal-race", "sources": [] }),
+            false,
+        ));
+        ensure_prompt_meetings_exist(&pool, &meeting_ids)
+            .await
+            .unwrap();
+
+        let invalidated = state.clone();
+        assert!(
+            crate::database::repositories::meeting::MeetingsRepository::delete_meeting(
+                &pool,
+                "m1",
+                |meeting_id| {
+                    invalidated.invalidate_meeting(meeting_id);
+                },
+            )
+            .await
+            .unwrap()
+        );
+
+        assert!(!emit_chat_stream_event_if_sink(
+            &state,
+            &sink,
+            "terminal-race",
+            &token,
+            "chat-stream-done",
+            serde_json::json!({ "streamId": "terminal-race", "answer": "deleted", "sources": [] }),
+            true,
+        ));
+        let events = sink.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(event, _)| event == "chat-stream-start")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(event, _)| event == "chat-stream-abort")
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|(event, _)| event == "chat-stream-done"));
+        assert_eq!(state.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn deletion_between_timeout_observation_and_cleanup_publishes_exactly_one_abort() {
+        let pool = hybrid_test_pool().await;
+        configure_hybrid_chat(&pool).await;
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at, saved_at) VALUES ('m1', 'Deleted', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = ChatRequestState::new();
+        let token = state.claim_superseding_request(ChatRequestSurface::Chat, "timeout-race");
+        let meeting_ids = HashSet::from(["m1".to_string()]);
+        assert!(state.bind_chat_stream_meetings("timeout-race", &token, &meeting_ids));
+        let sink = CapturingSink::default();
+        assert!(emit_chat_stream_event_if_sink(
+            &state,
+            &sink,
+            "timeout-race",
+            &token,
+            "chat-stream-start",
+            serde_json::json!({ "streamId": "timeout-race", "sources": [] }),
+            false,
+        ));
+
+        assert!(
+            !state.publish_deletion_abort_if_current("timeout-race", &token, |_, _| {
+                panic!("the timeout observation precedes deletion")
+            })
+        );
+        let invalidated = state.clone();
+        assert!(
+            crate::database::repositories::meeting::MeetingsRepository::delete_meeting(
+                &pool,
+                "m1",
+                |meeting_id| {
+                    invalidated.invalidate_meeting(meeting_id);
+                },
+            )
+            .await
+            .unwrap()
+        );
+
+        assert!(state.finish_chat_stream_if_current(
+            "timeout-race",
+            &token,
+            true,
+            Some((
+                "chat-stream-error",
+                serde_json::json!({
+                    "streamId": "timeout-race",
+                    "error": CHAT_CONTEXT_REVALIDATION_ERROR,
+                    "safeCleanup": true,
+                }),
+            )),
+            |event, payload| { sink.emit(event, payload) }
+        ));
+        let events = sink.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(event, _)| event == "chat-stream-abort")
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|(event, payload)| {
+            event == "chat-stream-abort"
+                && payload
+                    == &serde_json::json!({
+                        "streamId": "timeout-race",
+                        "reason": "referenced_meeting_deleted",
+                    })
+        }));
+        assert!(!events.iter().any(|(event, _)| {
+            matches!(event.as_str(), "chat-stream-done" | "chat-stream-error")
+        }));
+        assert!(token.is_cancelled());
+        assert_eq!(state.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_revalidation_timeout_publishes_one_safe_cleanup_error() {
+        let pool = hybrid_test_pool().await;
+        configure_hybrid_chat(&pool).await;
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at, saved_at) VALUES ('m1', 'Deleted', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (endpoint, release_tx) = serve_streaming_chunks_with_barrier().await;
+        let state = ChatRequestState::new();
+        let token =
+            state.claim_superseding_request(ChatRequestSurface::Chat, "revalidation-timeout");
+        let sink = CapturingSink::default();
+        let task = tokio::spawn({
+            let task_pool = pool.clone();
+            let task_sink = sink.clone();
+            let task_state = state.clone();
+            let task_token = token.clone();
+            async move {
+                await_chat_stream_with_timeout(
+                    Duration::from_secs(1),
+                    &task_state,
+                    &task_sink,
+                    "revalidation-timeout",
+                    &task_token,
+                    stream_chat(
+                        task_pool,
+                        task_sink.clone(),
+                        task_state.clone(),
+                        stream_race_inputs(&endpoint),
+                        "revalidation-timeout".to_string(),
+                        None,
+                        task_token.clone(),
+                    ),
+                )
+                .await
+            }
+        });
+        sink.wait_for_event("chat-stream-chunk").await;
+        let connection = pool.acquire().await.unwrap();
+        release_tx.send(()).unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            Ok(())
+        );
+        drop(connection);
+
+        let events = sink.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(event, _)| event == "chat-stream-error")
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|(event, _)| {
+            matches!(event.as_str(), "chat-stream-abort" | "chat-stream-done")
+        }));
+        let cleanup = events
+            .into_iter()
+            .find(|(event, _)| event == "chat-stream-error")
+            .unwrap();
+        assert_eq!(
+            cleanup.1,
+            serde_json::json!({
+                "streamId": "revalidation-timeout",
+                "error": CHAT_CONTEXT_REVALIDATION_ERROR,
+                "safeCleanup": true,
+            })
+        );
+        assert!(token.is_cancelled());
+        assert_eq!(state.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_revalidation_db_error_publishes_one_safe_cleanup_error() {
+        let pool = hybrid_test_pool().await;
+        configure_hybrid_chat(&pool).await;
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at, saved_at) VALUES ('m1', 'Deleted', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (endpoint, release_tx) = serve_streaming_chunks_with_barrier().await;
+        let state = ChatRequestState::new();
+        let token = state.claim_superseding_request(ChatRequestSurface::Chat, "revalidation-error");
+        let sink = CapturingSink::default();
+        let task = tokio::spawn(stream_chat(
+            pool.clone(),
+            sink.clone(),
+            state.clone(),
+            stream_race_inputs(&endpoint),
+            "revalidation-error".to_string(),
+            None,
+            token,
+        ));
+        sink.wait_for_event("chat-stream-chunk").await;
+        pool.close().await;
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let events = sink.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(event, _)| event == "chat-stream-error")
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|(event, _)| {
+            matches!(event.as_str(), "chat-stream-abort" | "chat-stream-done")
+        }));
+        let cleanup = events
+            .into_iter()
+            .find(|(event, _)| event == "chat-stream-error")
+            .unwrap();
+        assert_eq!(
+            cleanup.1,
+            serde_json::json!({
+                "streamId": "revalidation-error",
+                "error": CHAT_CONTEXT_REVALIDATION_ERROR,
+                "safeCleanup": true,
+            })
+        );
+        assert_eq!(state.request_count(), 0);
+    }
+
+    #[test]
+    fn replaced_stream_cannot_publish_a_stale_revalidation_cleanup() {
+        let state = ChatRequestState::new();
+        let old = state.claim_superseding_request(ChatRequestSurface::Chat, "old");
+        let _new = state.claim_superseding_request(ChatRequestSurface::Chat, "new");
+        let sink = CapturingSink::default();
+
+        assert!(!state.finish_chat_stream_if_current(
+            "old",
+            &old,
+            false,
+            Some((
+                "chat-stream-error",
+                serde_json::json!({
+                    "streamId": "old",
+                    "error": CHAT_CONTEXT_REVALIDATION_ERROR,
+                    "safeCleanup": true,
+                }),
+            )),
+            |event, payload| sink.emit(event, payload),
+        ));
+        assert!(sink.events().is_empty());
+        assert_eq!(state.request_count(), 1);
     }
 
     /// Deletion during Deep preparation: evidence captured before the
@@ -7681,6 +9053,46 @@ mod tests {
         (format!("http://{}", address), called_rx, release_tx)
     }
 
+    /// Serves a two-round Deep planner for the saved-meeting scope: round one
+    /// requests an additional same-meeting search, round two finishes. The
+    /// extra retrieval is bounded to the one-meeting allow-list.
+    async fn serve_saved_meeting_deep_two_rounds() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = vec![0_u8; 128 * 1024];
+            let _ = socket.read(&mut request).await;
+            let round_one = r#"{"choices":[{"message":{"content":"{\"schemaVersion\":1,\"status\":\"search_more\",\"queries\":[\"approved budget details\"]}"}}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                round_one.len(),
+                round_one
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.flush().await;
+            // Round two: finish.
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = vec![0_u8; 128 * 1024];
+            let _ = socket.read(&mut request).await;
+            let body = r#"{"choices":[{"message":{"content":"{\"schemaVersion\":1,\"status\":\"finish\"}"}}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.flush().await;
+        });
+        format!("http://{}", address)
+    }
+
     /// The non-streaming terminal fence through the real deletion path: the
     /// deletion transaction invalidates the bound request, the ownership
     /// mechanism refuses the final payload, and the existence fence aborts.
@@ -7711,7 +9123,7 @@ mod tests {
             ChatRequestSurface::Chat,
             "request-1",
             &token,
-            &prepared_meeting_ids(&sources)
+            &HashSet::from(["m1".to_string()])
         ));
 
         let invalidated = request_state.clone();
@@ -7774,5 +9186,139 @@ mod tests {
             .unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn meeting_list_deletion_between_preparation_and_binding_is_fenced() {
+        use crate::database::repositories::meeting::MeetingsRepository;
+
+        let pool = hybrid_test_pool().await;
+        configure_hybrid_chat(&pool).await;
+        for (id, title) in [("m1", "Root"), ("m2", "Child"), ("m3", "Other")] {
+            sqlx::query(
+                "INSERT INTO meetings (id, title, created_at, updated_at, saved_at) VALUES (?, ?, '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')",
+            )
+            .bind(id)
+            .bind(title)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let request_state = ChatRequestState::new();
+        let token =
+            request_state.claim_superseding_request(ChatRequestSurface::Chat, "list-request");
+        let inputs = prepare_chat_inputs_for_scope(
+            &pool,
+            None,
+            &reqwest::Client::new(),
+            "list the meetings",
+            None,
+            ChatRetrievalScope::All,
+            None,
+            None,
+            None,
+            Some(ChatRetrievalMode::Fast),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The listed titles entered the prompt without producing sources.
+        assert!(inputs.sources.is_empty());
+        assert!(inputs.user_prompt.contains("Root"));
+        assert!(inputs.user_prompt.contains("Child"));
+        assert!(inputs.user_prompt.contains("Other"));
+        assert!(inputs.prompt_meeting_ids.contains("m1"));
+        assert!(inputs.prompt_meeting_ids.contains("m2"));
+        assert!(inputs.prompt_meeting_ids.contains("m3"));
+
+        let invalidated = request_state.clone();
+        assert!(
+            MeetingsRepository::delete_meeting(&pool, "m2", |meeting_id| {
+                invalidated.invalidate_meeting(meeting_id);
+            })
+            .await
+            .unwrap()
+        );
+        assert!(!token.is_cancelled());
+        let sink = CapturingSink::default();
+        let err = stream_chat(
+            pool,
+            sink.clone(),
+            request_state.clone(),
+            inputs,
+            "list-request".to_string(),
+            None,
+            token,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, DELETED_MEETING_EVIDENCE_ERROR);
+        assert!(sink.events().is_empty());
+        assert_eq!(request_state.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn temporal_latest_deletion_at_terminal_fence_aborts_a_source_less_request() {
+        use crate::database::repositories::meeting::MeetingsRepository;
+
+        let (pool, _lifecycle) = hybrid_test_fixture(true, 3).await;
+        let inputs = prepare_chat_inputs_for_scope(
+            &pool,
+            None,
+            &reqwest::Client::new(),
+            "what did we discuss",
+            None,
+            ChatRetrievalScope::SearchSnapshot(vec!["m2".to_string()]),
+            None,
+            Some(crate::retrieval::worker::RetrievalLifecycle::new(
+                crate::retrieval::worker::LifecycleConfig::production(None),
+            )),
+            None,
+            Some(ChatRetrievalMode::Fast),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The temporal latest-meeting metadata (here: m2) entered the prompt.
+        assert!(inputs.user_prompt.contains("Most recently saved"));
+        assert!(
+            inputs.prompt_meeting_ids.contains("m2"),
+            "the temporal latest meeting must be bound"
+        );
+
+        let request_state = ChatRequestState::new();
+        let token =
+            request_state.claim_superseding_request(ChatRequestSurface::Chat, "temporal-request");
+        assert!(request_state.bind_request_meetings(
+            ChatRequestSurface::Chat,
+            "temporal-request",
+            &token,
+            &inputs.prompt_meeting_ids
+        ));
+        let invalidated = request_state.clone();
+        assert!(
+            MeetingsRepository::delete_meeting(&pool, "m2", |meeting_id| {
+                invalidated.invalidate_meeting(meeting_id);
+            })
+            .await
+            .unwrap()
+        );
+        assert!(token.is_cancelled());
+        let terminal_error = ensure_prompt_meetings_exist(&pool, &inputs.prompt_meeting_ids)
+            .await
+            .unwrap_err();
+        assert_eq!(terminal_error, DELETED_MEETING_EVIDENCE_ERROR);
+        let err = finish_non_streaming_chat_request(
+            &request_state,
+            ChatRequestSurface::Chat,
+            "temporal-request",
+            &token,
+            Ok(Err::<ChatResponse, _>(terminal_error)),
+        )
+        .unwrap_err();
+        assert!(err.contains("superseded"));
+        assert_eq!(request_state.request_count(), 0);
     }
 }

@@ -14,6 +14,7 @@ import type {
     ChatStreamChunkPayload,
     ChatStreamDonePayload,
     ChatStreamErrorPayload,
+    ChatStreamAbortPayload,
     ChatConversation,
     ChatMessageRow,
     ChatSource,
@@ -378,6 +379,9 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
                     saveMessage(streamConversationId, errorMessage);
                     setMessages((prev) => {
                         const last = prev[prev.length - 1];
+                        if (event.payload.safeCleanup && last && last.role === "assistant" && last.isStreaming) {
+                            return [...prev.slice(0, -1), errorMessage];
+                        }
                         if (last && last.role === "assistant" && last.isStreaming && last.content) {
                             // Finalize the partial answer that already reached the user.
                             const updated: ChatMessageType = {
@@ -396,6 +400,37 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
                 return;
             }
             unlisteners.push(unlistenError);
+
+            // Deletion invalidation: the backend suppressed every terminal
+            // source/done/error publication; this privacy-safe abort event
+            // (stable identity + reason only) tells the panel to scrub the
+            // rendered source chips / partial answer and restore a usable
+            // send state.
+            const unlistenAbort = await listen<ChatStreamAbortPayload>(
+                "chat-stream-abort",
+                (event) => {
+                    if (!isCurrentRequest() || event.payload.streamId !== streamId) return;
+                    setIsLoading(false);
+                    setIsStreaming(false);
+                    setPreparationProgress(null);
+                    cleanupListeners();
+                    setMessages((prev) => {
+                        const last = prev[prev.length - 1];
+                        if (last && last.role === "assistant" && last.isStreaming) {
+                            // Remove the in-flight assistant row entirely: its
+                            // sources/partial text may quote deleted content.
+                            return prev.slice(0, -1);
+                        }
+                        return prev;
+                    });
+                    inputRef.current?.focus();
+                }
+            );
+            if (!isCurrentRequest()) {
+                unlistenAbort();
+                return;
+            }
+            unlisteners.push(unlistenAbort);
 
             if (!isCurrentRequest()) return;
             await invoke("api_chat_with_scoped_conversation_stream", {
@@ -664,10 +699,18 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
                         </div>
                         <div className="ml-2 bg-gray-100 rounded-lg px-3 py-2 text-sm text-gray-500">
                             {preparationProgress?.stage === "initial_retrieval"
-                                ? t("chat.preparation.initialRetrieval", {
-                                      completed: preparationProgress.completed,
-                                      total: preparationProgress.total,
-                                  })
+                                ? // The agent announces this stage twice: once
+                                  // on entry with 0/0, then again with the
+                                  // retained source counts. Only the second
+                                  // form may claim completion - the first
+                                  // covers the longest silent phase of Deep
+                                  // preparation.
+                                  preparationProgress.total === 0
+                                    ? t("chat.preparation.initialRetrievalStarted")
+                                    : t("chat.preparation.initialRetrieval", {
+                                          completed: preparationProgress.completed,
+                                          total: preparationProgress.total,
+                                      })
                                 : preparationProgress?.stage === "planner_round"
                                   ? t("chat.preparation.plannerRound", {
                                         completed: preparationProgress.completed,

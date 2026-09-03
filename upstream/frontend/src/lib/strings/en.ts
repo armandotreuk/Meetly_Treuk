@@ -56,6 +56,7 @@ export const en: Record<string, string> = {
     "chat.message.sources": "Sources:",
     "chat.message.openMeetingAria": "Open meeting {title}",
     "chat.message.liveSourceAria": "Live recording transcript source",
+    "chat.preparation.initialRetrievalStarted": "Searching your meetings for relevant evidence...",
     "chat.preparation.initialRetrieval": "Initial retrieval complete: {completed} of {total}.",
     "chat.preparation.plannerRound": "Reviewing meetings for more evidence: round {completed} of {total}.",
     "chat.preparation.additionalSearch": "Additional search: {completed} of {total}.",

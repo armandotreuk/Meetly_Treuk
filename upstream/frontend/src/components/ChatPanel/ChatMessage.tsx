@@ -44,6 +44,7 @@ export function ChatMessage({ role, content, sources, isStreaming, isError, onSo
                 </div>
             )}
             <div
+                role={isError ? "alert" : undefined}
                 className={`relative max-w-[85%] rounded-lg px-3 py-2 text-sm ${
                     isUser
                         ? "bg-blue-600 text-white"

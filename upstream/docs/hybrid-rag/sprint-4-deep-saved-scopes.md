@@ -796,11 +796,375 @@ no Fast/Deep result or task-local check may substitute for a missing gate.
 
 ### Code Review
 
-**Reviewer:** Pending
-**Verdict:** Pending
-**Findings:** Pending
-**Required follow-ups:** Pending
+**Reviewer:** `claude-opus-5` (full Sprint 4 code review, re-run 2026-09-03 after
+Tasks HR-4.5.R63-R68)
+**Scope:** branch `sprint-2/durable-local-index`, reviewed implementation
+commits `d3376ba..9098a8b` (Tasks 4.1-4.5) **plus the current uncommitted
+working tree** carrying remediations R63, R64, R65, R66, R67 and R68. Excluded
+by orchestrator instruction and not inspected: `retrieval_evaluation*`,
+`evaluation_policy*`, corpus V1-V10/independent fixtures, `tests/debug_mt.rs`,
+`.opencode`.
+**Verdict:** `changes-requested`
+**Sprint status:** **Blocked** (not Complete). Independent of the findings
+below, Sprint 4 cannot close: the valid independently authored Portuguese
+corpus, production-path quality and final provider-answer evidence, native
+Windows/R13 hermetic session evidence, and exact-head GitHub Actions evidence
+are all absent. Tasks 4.2/4.3/4.4 and every R-round record `cargo test --test
+retrieval_evaluation` as intentionally not run, so no Fast/Deep quality,
+answer-stage forbidden-fact, Deep p95, or quality-delta measurement exists. No
+rejected corpus or corpus-free diagnostic was accepted as evidence here.
 
+**Closed since the previous review round (verified in the working tree, not
+re-reported):**
+
+- Saved-meeting Deep prompt/source parity. `merge_saved_meeting_deep_context`
+  (`frontend/src-tauri/src/api/chat.rs:2688-2711`) now admits a Deep source
+  only when heading plus snippet still fit `persisted_context_budget`
+  (`:1292-1297`), so nothing published as a source can be truncated out of the
+  prompt by `assemble_prompt`.
+- Duplicate-title deletion binding. `meeting_titles_for_scope` returns
+  `ListedMeeting { id, title }` from the scoped query
+  (`frontend/src-tauri/src/api/chat.rs:1763-1862`) and
+  `format_meeting_list_context` binds exactly the IDs of the rendered rows, so
+  meetings sharing a title are all bound and the per-title N+1 lookup is gone.
+- `bind_request_meetings`' documented abort return is now honoured at all four
+  production call sites (`frontend/src-tauri/src/api/chat.rs:2815`, `:2922`,
+  `:3145` via `bind_chat_stream_meetings`, and
+  `frontend/src-tauri/src/mcp/server.rs:270-277`).
+
+**Findings (severity order):**
+
+1. **High - `openMeetingIds` is a no-op whenever five meetings are already
+   ranked.** (Unchanged since the previous round;
+   `frontend/src-tauri/src/retrieval/` was not touched by R63-R68.)
+   `append_authoritative_evidence`
+   (`frontend/src-tauri/src/retrieval/agent.rs:1244-1256`) appends a
+   newly-opened meeting at `ranking.meetings.len() + 1`, but `hydrate`
+   (`frontend/src-tauri/src/retrieval/hydration.rs:728-734`) selects only the
+   first `MAX_HYDRATED_MEETINGS = 5` ranked meetings with citable evidence. In
+   All/Folder scope - the scopes Deep ships for - fusion routinely ranks five
+   or more meetings, so the planner's open costs a DB load and a round and then
+   contributes nothing to context or sources. Task 4.2's acceptance criterion
+   "a fixture requiring a second meeting open succeeds without scope widening"
+   holds only below that cap. Give planner-opened meetings a reserved share of
+   the hydration cap, or rank them into the selection rather than appending
+   behind it.
+
+2. **Medium - `expandEvidenceIds` bypasses the planner open budget.**
+   `expand_neighborhood_targets`
+   (`frontend/src-tauri/src/retrieval/agent.rs:1029-1065`) yields an empty
+   `segment_ids` vector for summary/notes evidence (both `source_start_id` and
+   `source_end_id` are `None`). The loop at
+   `frontend/src-tauri/src/retrieval/agent.rs:764-803` then calls
+   `load_meeting_source_relevant_with_cancellation(pool, meeting_id, &[], ..)`,
+   whose empty-target branch
+   (`frontend/src-tauri/src/database/repositories/retrieval.rs:1366-1387`)
+   loads the whole meeting and publishes its head evidence - an implicit "open"
+   counted against neither `PLANNER_MAX_OPENS_PER_ROUND` (5) nor
+   `PLANNER_MAX_OPENS_TOTAL` (8). A planner returning ten summary evidence IDs
+   from ten distinct meetings per round reaches twenty effectively-opened
+   meetings per request. Scope is not widened (every ID is retained in-scope
+   evidence), but the recorded architecture limit is not the enforced one.
+
+3. **Medium - a started stream can end with no terminal event, leaving a
+   permanently "streaming" row with rendered sources.** `stream_chat`
+   classifies generation failures by substring
+   (`frontend/src-tauri/src/api/chat.rs:3251`,
+   `Err(e) if e.to_lowercase().contains("cancelled")`) and that arm calls
+   `finish_chat_stream_if_current` with `cancel: false` and
+   `cleanup_event: None` (`:3252-3259`), which emits nothing unless a deletion
+   marker is set. `generate_summary_stream` embeds the raw provider body
+   verbatim (`frontend/src-tauri/src/summary/llm_client.rs:811-817`,
+   `LLM API request failed: {error_body}`), so an upstream body containing the
+   word "cancelled" - common for proxied or aborted upstream requests - takes
+   that arm although the token was never cancelled and no deletion occurred.
+   The registration is removed, `stream_chat` returns `Ok(())`, and the command
+   resolves successfully, so ChatPanel never receives done, error, or abort:
+   the assistant row created by `chat-stream-start`
+   (`frontend/src/components/ChatPanel/index.tsx:270-286`) stays
+   `isStreaming: true` with its source chips rendered until the user presses
+   Stop. This defeats the "every started stream receives exactly one terminal
+   signal" invariant R65-R68 were built to establish. Classify cancellation
+   from the token or a typed error rather than the provider's message text, and
+   treat an unclassifiable post-start failure as the existing content-free
+   `safeCleanup` terminal event.
+
+4. **Medium - planner opens load the entire meeting transcript to publish eight
+   segments.** `frontend/src-tauri/src/retrieval/agent.rs:741-747` passes
+   `&[]`, which takes the whole-meeting branch capped at
+   `MAX_TRANSCRIPT_ROWS = 10_000` rows, while `append_authoritative_evidence`
+   keeps only `AUTHORITATIVE_SEGMENTS_PER_MEETING = 8`. The purpose-built
+   `load_meeting_source_compact_with_cancellation`
+   (`frontend/src-tauri/src/database/repositories/retrieval.rs:1146-1170`),
+   already used by broad hydration
+   (`frontend/src-tauri/src/retrieval/hydration.rs:211`), loads exactly the
+   head. With up to eight opens per Deep turn this is up to 80,000 discarded
+   transcript rows inside the 30-second budget, and the module doc's "bounded
+   transcript head" claim does not match the code.
+
+5. **Medium - Deep progress copy reports completion at stage start.** The agent
+   emits `InitialRetrieval { completed: 0, total: 0 }` before initial retrieval
+   (`frontend/src-tauri/src/retrieval/agent.rs:481-488`) and the panel renders
+   it as `chat.preparation.initialRetrieval` = "Initial retrieval complete:
+   {completed} of {total}." (`frontend/src/lib/strings/en.ts:59`,
+   `frontend/src/components/ChatPanel/index.tsx:663-668`). The user, and the
+   `aria-live` region, therefore read "Initial retrieval complete: 0 of 0." for
+   the whole of the longest silent phase - the "silent preparation reads as a
+   hang" failure that stage-level progress exists to prevent. Suppress the
+   zero/zero start event or give start and completion distinct strings.
+
+6. **Low - raw database error text still reaches the UI on the pre-start
+   paths.** R67/R68 correctly reduced every post-start terminal signal to the
+   fixed `CHAT_STREAM_REVALIDATION_ERROR`, but `ensure_prompt_meetings_exist`
+   still formats the SQLite error into its message
+   (`frontend/src-tauri/src/api/chat.rs:3315-3318`, `Chat prompt existence
+   check failed: {error}`), and that string is returned through the
+   command-rejection channel from preparation
+   (`frontend/src-tauri/src/api/chat.rs:1535`), the pre-start stream fence
+   (`:3149-3152`), and the non-streaming/MCP fences. ChatPanel's invocation
+   catch renders it verbatim through `t("chat.error.message", { message })`
+   (`frontend/src/components/ChatPanel/index.tsx:445-460`). No meeting content
+   leaks, but database internals do, inconsistently with the sanitation
+   contract the same sprint established.
+
+7. **Low - MCP chat never reports its own timeout.**
+   `frontend/src-tauri/src/mcp/server.rs:283-300` cancels the token on the
+   deadline and passes `Ok(Err("Chat request timed out"))` into
+   `finish_non_streaming_chat_request`
+   (`frontend/src-tauri/src/api/chat.rs:2712-2733`), which sees
+   `timed_out == false` (the outer `Result` is `Ok`), then observes the
+   cancelled token and returns "Chat request was cancelled". Localhost MCP
+   clients cannot distinguish a 300-second timeout from deletion invalidation.
+   Pass the timeout through the `Err(Elapsed)` channel the function handles.
+
+8. **Low - `deep_preparation_eligible` carries a dead parameter and a stale
+   contract comment.** `frontend/src-tauri/src/api/chat.rs:2609-2618` ignores
+   `_today_meeting_ids` entirely and both call sites (`:1194`, `:1400`) pass an
+   argument that cannot affect the result. The doc comment still says "live and
+   saved-meeting paths stay separate" although R63 added a saved-meeting Deep
+   branch immediately above the first call site. Drop the parameter and restate
+   the real rule (Deep is refused earlier, at `:1122-1130`, for forced-lexical,
+   lifecycle-unavailable, and live scopes).
+
+9. **Low - the blanket context truncation can break parity silently if any
+   builder ever exceeds its budget.** `frontend/src-tauri/src/api/chat.rs:1519`
+   unconditionally applies
+   `truncate_at_char_boundary(&context, persisted_context_budget)` to every
+   scope's assembled context without reconciling `sources`. Today every
+   producing path (authoritative meeting build, `hydrate_context`,
+   `hydrate_broad_scope`, `build_context_markdown_with_limit`,
+   `live_snapshot_context`, `merge_saved_meeting_deep_context`) is already
+   bounded by the same value, so the call is a no-op - which is precisely why a
+   future regression would pass silently instead of failing. Make it a
+   `debug_assert!` plus a source-side reconcile, or drop it.
+
+10. **Low - the planner truncation notice under-reports what was dropped.** In
+    `build_planner_prompt`
+    (`frontend/src-tauri/src/retrieval/agent.rs:1519-1566`) `offerable` is
+    incremented inside the loop that `break`s on the first block that does not
+    fit, so it never counts the evidence after the break. The notice always
+    reads "N of N+1 items shown" regardless of how much ranked evidence the cap
+    actually excluded, which misinforms the planner's finish/search decision.
+
+**Assessed as correct (no finding):** mode compatibility and defaulting
+(omitted -> Fast, explicit unknown rejected by the serde enum, live forced to
+Fast in backend and UI); MCP Fast-only enforcement through shared preparation
+plus the atomic `MAX_CONCURRENT_MCP_REQUESTS` admission invariant; the single
+`ChatRequestState` registry with per-entry bounded lifetime, Chat/Sidebar
+supersession, MCP independence, and the `OwnershipGuard` backstop; the R65-R68
+atomic terminal transitions - `publish_chat_stream_event_if_current` and
+`finish_chat_stream_if_current` resolve ownership, deletion precedence,
+cancellation, event choice, and registry removal under one lock, so a
+deletion-invalidated stream emits exactly one identity-only
+`chat-stream-abort`, a started stream whose terminal revalidation fails or
+times out emits exactly one source-free `safeCleanup` error, and a replaced or
+unstarted request emits neither; the R64 exact prompt-ID transport
+(`ListedMeeting`, `TemporalPromptContext`, budgeted rendering, and
+`ensure_prompt_meetings_exist` fences after preparation, after binding, and at
+terminal publication on every surface); the R67 bounded-list wording kept
+separate from actual scope resolution; the strict whole-payload
+`deny_unknown_fields` planner schema, per-round capability tokens derived from
+the emitted prompt, `safe_identifier` echo-safety, and `<evidence>`
+untrusted-data delimiting; the fail-closed final hydration fence and
+`BudgetExhausted`/`Cancelled` typing; the truthful BuiltInAI UNSUPPORTED
+capability record and its pre-startup refusal; `db_error`'s typed
+`RetrievalError::Cancelled` mapping; transcript-only lexical/semantic filters
+for `Meeting` scope; range-aware authoritative hydration with fingerprint
+validation; snapshot/today allow-list handling with deleted-member tolerance
+and the 100-member bound; and the deletion-transaction source scrub, including
+R63's low-surrogate range check before the arithmetic
+(`frontend/src-tauri/src/database/repositories/chat.rs:842-844`).
+
+**Required follow-ups:**
+- Fix findings 1-5 before Task 4.5 acceptance; 6-10 may be batched.
+- Add an All-scope Deep regression with six or more ranked meetings proving an
+  opened meeting reaches the final context (finding 1).
+- Add a post-start regression whose provider stream error text contains
+  "cancelled" while the token is alive, proving exactly one terminal event and
+  a cleared panel row (finding 3).
+- Re-run the full Task 4.5 verification block, including
+  `cargo test --test retrieval_evaluation`, after the excluded evaluation
+  artifacts are replaced by the valid independently authored corpus. No
+  Fast/Deep result may substitute for the four inherited Sprint 3 gates.
+
+**Tests assessed:** not executed in this review (review-only mandate, and the
+evaluation harness is excluded from this task). The R63-R68 records report
+`cargo test --lib` 831 passed / 0 failed / 2 ignored, `cargo check` with only
+the pre-existing `Sidebar` dead-code warning, `pnpm typecheck` clean, `vitest`
+105 passed across 20 files, touched-file `rustfmt --check` clean, and
+`git diff --check` clean apart from the known `types/index.ts` CRLF notice.
+Those are corpus-free suites and do not establish release quality.
+
+**Residual risks:** Deep p50/p95, provider round-trip cost, and the Fast/Deep
+quality delta are unmeasured, so the recorded Deep-as-default decision cannot be
+revisited at sprint close as the PRD requires; up-to-100 authoritative broad
+loads remain sequential (accepted in R51) and untimed against the 30-second
+budget; `hydrate_broad_scope` performs two membership/revision queries per
+meeting, so a 100-member snapshot issues roughly 300 sequential round trips
+inside preparation; repository-wide `cargo fmt --check` still fails on the
+rejected V10 fixture whitespace, so the sprint has no clean formatting gate;
+and all R63-R68 work remains uncommitted, so none of it is covered by the
+reviewed commit range.
+
+
+### Post-Remediation Code Review (R71)
+
+**Reviewer:** `claude-opus-5` (post-remediation review of Task HR-4.5.R70,
+2026-09-03)
+**Scope:** the R70 remediation on top of the R63-R68 working tree
+(`frontend/src-tauri/src/retrieval/agent.rs` + `agent/tests.rs`,
+`database/repositories/retrieval.rs`, `api/chat.rs`, `mcp/server.rs`,
+`frontend/src/components/ChatPanel/index.tsx`,
+`frontend/src/lib/strings/en.ts`,
+`frontend/tests/components/chat-scope.test.tsx`). Same exclusions as R70:
+`retrieval_evaluation*`, `evaluation_policy*`, corpus V1-V10/independent
+fixtures, `tests/debug_mt.rs`, `.opencode` were not inspected.
+**Verdict:** `approve-with-nits`
+**Sprint status:** **Blocked** (unchanged). The four inherited Sprint 3 gates
+are still absent and no corpus, quality, latency, or native evidence was
+produced; nothing here is a release claim.
+
+**R70 findings — outcome:**
+
+| # | Finding | Outcome |
+|---|---|---|
+| 1 | `openMeetingIds` no-op past the hydration meeting cap | Fixed — `reserve_planner_hydration_slots` |
+| 2 | `expandEvidenceIds` bypassed the open budget | Fixed — range-free expansions charged and deduped |
+| 3 | Started stream could end with no terminal event | Fixed — cancellation decided by the request token |
+| 4 | Opens loaded whole transcripts to publish eight segments | Fixed — `load_meeting_source_head_with_cancellation` |
+| 5 | Progress claimed completion at stage start | Fixed — `chat.preparation.initialRetrievalStarted` |
+| 6 | Raw database error text reached the UI pre-start | Fixed — logged, stable message returned |
+| 7 | MCP timeout reported as cancellation | Fixed — `MCP_CHAT_TIMEOUT_ERROR` restored after the gate |
+| 8 | `deep_preparation_eligible` dead parameter | Fixed — parameter removed, doc restated |
+| 9 | Blanket truncation could break parity silently | Fixed — `debug_assert!` + source reconciliation |
+| 10 | Planner truncation notice under-reported | Fixed — counted over the whole ranked list |
+
+**Verification of the fixes:**
+
+- **Reservation arithmetic is sound.** `promote` is bounded by
+  `PLANNER_HYDRATED_MEETING_RESERVE.min(MAX_HYDRATED_MEETINGS)` = 2, so
+  `keep = MAX_HYDRATED_MEETINGS - promoted.len()` cannot underflow; removals
+  run back-to-front so the recorded positions stay valid, and after removal the
+  vector length is at least `keep`, so every `insert` index is in range. The
+  early return when `ranking.meetings.len() <= MAX_HYDRATED_MEETINGS` or when
+  no planner meeting sits outside the cap means the common case is untouched.
+  Hydration filters to meetings with citable evidence before applying its cap,
+  and filtering only moves entries earlier, so a raw position inside the cap is
+  always inside the filtered window too - the promotion can never be defeated
+  by that filter.
+- **The reservation cannot be abused.** Only the top
+  `MAX_HYDRATED_MEETINGS - promoted.len()` (3 or 4) fusion meetings can be
+  displaced-none of the top three-and publication is still capped at
+  `MAX_HYDRATED_MEETINGS`, which the new regression asserts.
+- **Open-budget accounting is now single-sourced.** Range-free expansions test
+  `PLANNER_MAX_OPENS_TOTAL` and insert into the same `opened_meetings` set that
+  `admit_round_actions` uses, so a later explicit open of the same meeting
+  dedupes rather than re-loading, and the total budget is shared across both
+  action kinds.
+- **The head loader is a true reuse, not a parallel path.**
+  `load_meeting_source_compact_with_cancellation` is now
+  `load_meeting_source_head_with_cancellation(.., 1, ..)`, so broad hydration's
+  behaviour is byte-identical; `head_segments.max(1)` keeps a zero request
+  harmless, and a meeting with no transcripts still returns its authoritative
+  summary/notes.
+- **Cancellation classification is now authoritative.** Deletion invalidation,
+  user cancel, and the outer timeout all cancel the request token, so the token
+  is the complete signal; a provider failure the token does not confirm falls
+  through to the error arm, which always publishes. Deletion precedence is
+  unchanged - `finish_chat_stream_if_current` still consumes the marker first.
+  The new regression proves start + error and a drained registry with the token
+  still alive.
+- **The parity backstop fails closed.** It asserts in debug and, in release,
+  truncates *and* drops every source whose snippet no longer appears, so the
+  no-op path stays a no-op while a future overshoot cannot publish a source the
+  model never saw.
+
+**Nits (no blocker, no follow-up task required):**
+
+1. **`CHAT_STREAM_REVALIDATION_ERROR` is no longer stream-only.**
+   `frontend/src-tauri/src/api/chat.rs:276` now also serves the non-streaming
+   and MCP existence fences (`:3353`). The message itself is correct and
+   content-free; only the constant's name still says "stream". Rename to
+   `CHAT_CONTEXT_REVALIDATION_ERROR` when the R67/R68 tests that reference it
+   are next touched.
+2. **A skipped range-free expansion still emits its progress tick.**
+   `frontend/src-tauri/src/retrieval/agent.rs` emits the `AdditionalSearch`
+   event before the open-budget check, so an expansion refused by the budget
+   contributes to `planned_ops` but never to `executed_ops`. The counters stay
+   monotonic and bounded; only the final tick can under-report by the number of
+   refused expansions.
+3. **Opens beyond the reserve are still dropped by design.** Three or more
+   planner meetings ranked outside the cap yield at most two promotions. This
+   is the deliberate bound documented on `PLANNER_HYDRATED_MEETING_RESERVE`,
+   not a defect, but it means `openMeetingIds`' per-round allowance (5) is
+   larger than what one round can actually publish.
+
+**Tests assessed (run in this session):**
+
+- `cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib` - **834
+  passed / 0 failed / 2 ignored**.
+- Focused: `a_planner_open_reaches_the_final_context_past_the_hydration_meeting_cap`,
+  `a_planner_open_loads_only_the_bounded_transcript_head`,
+  `provider_error_naming_cancellation_still_terminates_a_started_stream`,
+  `mcp_timeout_cancellation_reaches_gated_preparation_and_stops_before_generation`
+  - all pass.
+- `cargo check --manifest-path "frontend/src-tauri/Cargo.toml"` - passes with
+  only the documented pre-existing `variant Sidebar is never constructed`
+  warning.
+- `pnpm --dir "frontend" run typecheck` - passes.
+  `pnpm --dir "frontend" exec vitest run` - **105 passed / 20 files** (existing
+  React `act(...)` stderr only).
+- `rustfmt --edition 2021 --check` on all five touched Rust files - clean.
+  `git diff --check` on the touched trees - clean apart from the pre-existing
+  `frontend/src/types/index.ts` CRLF notice.
+- `cargo test --test retrieval_evaluation` - **not run** (excluded harness and
+  rejected corpus; it cannot be evidence).
+
+**Residual risks:**
+
+- **2026-09-03 decision closure:** provider error bodies still reach the UI
+  verbatim on the generic `chat-stream-error` path (`LLM API request failed:
+  {body}`; `frontend/src-tauri/src/api/chat.rs`). The user confirmed this
+  reviewer's assessment: it stays as-is, deliberately. Users need
+  "model not found"/rate-limit/auth diagnostics to fix their own provider
+  configuration, and unlike the meeting-content and database-internal leaks
+  R63-R70 closed, a provider's own error text about ITS OWN request carries no
+  user meeting data. It remains the one unfiltered remote string in the Chat
+  surface, by design, not by omission. No code changed.
+- Deep p50/p95, provider round-trips, and the Fast/Deep quality delta remain
+  unmeasured, so the recorded Deep-as-default decision still cannot be revisited
+  at sprint close.
+- Up-to-100 authoritative broad loads remain sequential and untimed;
+  `hydrate_broad_scope` still issues roughly three sequential round trips per
+  member.
+- Repository-wide `cargo fmt --check` still fails on the rejected V10 fixture
+  whitespace, so the sprint has no clean formatting gate.
+- All of R63-R70 remains uncommitted, so none of it is covered by the reviewed
+  commit range `d3376ba..9098a8b`.
+- **Sprint 4 close remains blocked** on the valid independently authored
+  Portuguese corpus, production-path quality and final provider-answer
+  evidence, native Windows/R13 hermetic session evidence, and exact-head GitHub
+  Actions evidence. No result in this round substitutes for any of them.
 ### Architecture Review
 
 **Required because:** Additional LLM orchestration, prompt-injection boundary,
