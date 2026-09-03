@@ -200,12 +200,29 @@ impl ChatRepository {
         scope: &ChatScope,
         title: Option<&str>,
     ) -> Result<ChatConversation> {
+        // Meeting scopes for a deleted meeting are a failed lookup, not a
+        // foreign-key jargon error: the disclosure tells the user the thread
+        // is gone and that earlier answers may still quote deleted content.
+        if scope.kind == ChatScopeKind::Meeting {
+            let exists: i64 =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM meetings WHERE id = ?)")
+                    .bind(&scope.key)
+                    .fetch_one(pool)
+                    .await?;
+            if exists == 0 {
+                bail!(
+                    "{}|{}",
+                    DELETED_MEETING_THREAD_CODE,
+                    DELETED_MEETING_THREAD_ERROR
+                );
+            }
+        }
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         let scope_data = scope.data.as_ref().map(serde_json::to_string).transpose()?;
         let (meeting_id, origin) = scope.lineage();
 
-        Ok(sqlx::query_as::<_, ChatConversation>(
+        let inserted = sqlx::query_as::<_, ChatConversation>(
             "INSERT INTO chat_conversations (id, meeting_id, title, origin, scope_kind, scope_key, scope_data, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8) ON CONFLICT(scope_kind, scope_key, COALESCE(scope_data, '')) DO UPDATE SET id = chat_conversations.id RETURNING *",
         )
         .bind(&id)
@@ -217,7 +234,32 @@ impl ChatRepository {
         .bind(&scope_data)
         .bind(&now)
         .fetch_one(pool)
-        .await?)
+        .await;
+        match inserted {
+            Ok(conversation) => Ok(conversation),
+            Err(error) => {
+                // The existence pre-check above can lose a race with a
+                // concurrent deletion: the foreign-key failure then means the
+                // meeting disappeared, so surface the same typed disclosure
+                // instead of raw database jargon.
+                if scope.kind == ChatScopeKind::Meeting {
+                    let exists: i64 =
+                        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM meetings WHERE id = ?)")
+                            .bind(&scope.key)
+                            .fetch_one(pool)
+                            .await
+                            .unwrap_or(0);
+                    if exists == 0 {
+                        bail!(
+                            "{}|{}",
+                            DELETED_MEETING_THREAD_CODE,
+                            DELETED_MEETING_THREAD_ERROR
+                        );
+                    }
+                }
+                Err(error.into())
+            }
+        }
     }
 
     pub async fn get_latest_conversation(
@@ -467,18 +509,30 @@ impl ChatRepository {
         .await?;
 
         for (message_id, sources_json) in messages {
-            let Ok(mut sources) = serde_json::from_str::<serde_json::Value>(&sources_json) else {
-                sqlx::query("UPDATE chat_messages SET sources_json = NULL WHERE id = $1")
-                    .bind(&message_id)
-                    .execute(&mut *connection)
-                    .await?;
-                continue;
+            let mut sources = match serde_json::from_str::<serde_json::Value>(&sources_json) {
+                Ok(sources) => sources,
+                // Malformed legacy payload: clear it only when the raw text
+                // actually carries the deleted meeting as a meetingId value;
+                // an unrelated malformed payload is preserved verbatim.
+                Err(_) => {
+                    if raw_sources_reference_meeting(&sources_json, meeting_id) {
+                        sqlx::query("UPDATE chat_messages SET sources_json = NULL WHERE id = $1")
+                            .bind(&message_id)
+                            .execute(&mut *connection)
+                            .await?;
+                    }
+                    continue;
+                }
             };
             let Some(items) = sources.as_array_mut() else {
-                sqlx::query("UPDATE chat_messages SET sources_json = NULL WHERE id = $1")
-                    .bind(&message_id)
-                    .execute(&mut *connection)
-                    .await?;
+                // Non-array payload: same containment rule as malformed JSON,
+                // decided structurally over the parsed value.
+                if value_references_meeting(&sources, meeting_id) {
+                    sqlx::query("UPDATE chat_messages SET sources_json = NULL WHERE id = $1")
+                        .bind(&message_id)
+                        .execute(&mut *connection)
+                        .await?;
+                }
                 continue;
             };
             let original_len = items.len();
@@ -502,6 +556,432 @@ impl ChatRepository {
         }
 
         Ok(())
+    }
+}
+
+/// Stable machine-readable condition code surfaced for a deleted-meeting chat
+/// thread. The frontend maps the condition by exact code equality, not
+/// substring; the human disclosure follows the separator.
+pub const DELETED_MEETING_THREAD_CODE: &str = "deleted_meeting_thread";
+
+/// Human-readable part of the typed deleted-meeting condition; carries no
+/// meeting content.
+pub const DELETED_MEETING_THREAD_ERROR: &str = "This meeting's chat thread is no longer available because the meeting was deleted. Earlier answers may still quote deleted content.";
+
+/// Advances past JSON whitespace (space, tab, CR, LF) from a byte index,
+/// metering EVERY probed byte — whitespace bytes and the terminating
+/// non-whitespace probe — against the shared budget. Returns `None` only when
+/// the budget is exhausted (the caller fails closed); end of input and
+/// non-whitespace bytes return the index.
+fn skip_json_whitespace(raw: &str, mut index: usize, budget: &mut ScanBudget) -> Option<usize> {
+    loop {
+        // The whitespace skip has no per-token cap (it is not inside a
+        // token); the global budget is the only bound here.
+        match probe_byte(raw, index, 0, usize::MAX, budget) {
+            Probe::Byte(byte) if matches!(byte, b' ' | b'\t' | b'\r' | b'\n') => index += 1,
+            Probe::Byte(_) => return Some(index),
+            Probe::Absent => return Some(index),
+            Probe::OverTokenCap => return None,
+            Probe::Exhausted => return None,
+        }
+    }
+}
+
+fn hex_digit_value(byte: u8) -> Option<u16> {
+    match byte {
+        b'0'..=b'9' => Some((byte - b'0') as u16),
+        b'a'..=b'f' => Some((byte - b'a') as u16 + 10),
+        b'A'..=b'F' => Some((byte - b'A') as u16 + 10),
+        _ => None,
+    }
+}
+
+fn push_utf8(decoded: &mut Vec<u8>, code: u32) {
+    let mut buffer = [0u8; 4];
+    decoded.extend_from_slice(
+        char::from_u32(code)
+            .unwrap_or('\u{FFFD}')
+            .encode_utf8(&mut buffer)
+            .as_bytes(),
+    );
+}
+
+/// One attempted string-token scan: the decoded result (token text and byte
+/// index just past the closing quote) when valid, and whether the shared work
+/// budget ran out during the scan (the caller fails closed in that case).
+struct ScanOutcome {
+    token: Option<(String, usize)>,
+    budget_exhausted: bool,
+}
+
+impl ScanOutcome {
+    fn failed() -> Self {
+        Self {
+            token: None,
+            budget_exhausted: false,
+        }
+    }
+
+    fn exhausted() -> Self {
+        Self {
+            token: None,
+            budget_exhausted: true,
+        }
+    }
+}
+
+/// Meters every inspected byte of a malformed-payload scan BEFORE it is read:
+/// traversal stops immediately when the budget is spent, so no path can walk
+/// unbounded and charge afterwards. One byte per `take`; exhausted means the
+/// caller must fail closed (clear) before any additional traversal.
+pub(crate) struct ScanBudget {
+    remaining: usize,
+}
+
+impl ScanBudget {
+    pub(crate) fn new() -> Self {
+        Self {
+            remaining: MAX_SCAN_WORK_BYTES,
+        }
+    }
+
+    pub(crate) fn exhausted(&self) -> bool {
+        self.remaining == 0
+    }
+
+    /// Reserves one byte of budget. Always paired with exactly one byte read
+    /// (bounds pre-checked separately), so the charge equals actual reads.
+    fn take(&mut self) {
+        self.remaining -= 1;
+    }
+}
+
+/// One metered byte probe: the byte is read only after the budget is checked
+/// and charged. `Absent` is end-of-input (nothing read, nothing charged);
+/// `Exhausted` means the budget was spent before the probe (the caller fails
+/// closed). Every direct byte inspection in the scanner routes through here,
+/// so no probe can bypass the budget.
+enum Probe {
+    Byte(u8),
+    Absent,
+    /// The per-token cap (max_bytes after the opening quote) fired before
+    /// this probe: the token is over-long and must be rejected, while the
+    /// global budget remains unspent by this probe.
+    OverTokenCap,
+    Exhausted,
+}
+
+/// One metered, capped byte probe: EVERY direct byte inspection in the
+/// scanner routes through here, so no probe can bypass the budget or the
+/// per-token cap. The byte is read only after both limits are checked and
+/// the budget charged. Absent is end-of-input (nothing read, nothing
+/// charged); OverCap means the probe would be past after-opening byte
+/// max_bytes (the token is over-long: the caller fails the token, scans
+/// on); Exhausted means the budget was spent before the probe (the caller
+/// fails closed).
+fn probe_byte(
+    raw: &str,
+    index: usize,
+    quote_pos: usize,
+    max_bytes: usize,
+    budget: &mut ScanBudget,
+) -> Probe {
+    if index >= raw.len() {
+        return Probe::Absent;
+    }
+    if index - quote_pos > max_bytes {
+        return Probe::OverTokenCap;
+    }
+    if budget.exhausted() {
+        return Probe::Exhausted;
+    }
+    budget.take();
+    Probe::Byte(raw.as_bytes()[index])
+}
+/// Decodes one JSON string token beginning at the opening quote `quote_pos`
+/// (a byte index into `raw`). Returns the decoded text and the byte index just
+/// past the closing quote, or `None` when the token is not a valid JSON
+/// string. All escape forms are decoded (\" \\ \/ \b \f \n \r \t \uXXXX with
+/// uppercase/lowercase hex and surrogate pairs), so decoded-equivalent
+/// `meetingId` keys/values compare exactly. A token longer than `max_bytes`
+/// cannot be a target key/value (real meeting ids are <= 512 bytes and
+/// escapes only expand the raw form) and is rejected, keeping every scan
+/// bounded. Single forward pass, no recursion, no panic.
+///
+/// Accounting and bounding are centralized: EVERY byte read — the opening
+/// quote, content, escape bytes, `\u` digits, surrogate lookahead, and the
+/// closing quote — goes through [`probe_byte`], so each probe is metered
+/// against the shared budget before it reads, and budget exhaustion is
+/// reported as `budget_exhausted` (the caller fails closed).
+fn scan_json_string(
+    raw: &str,
+    quote_pos: usize,
+    max_bytes: usize,
+    budget: &mut ScanBudget,
+) -> ScanOutcome {
+    match probe_byte(raw, quote_pos, quote_pos, max_bytes, budget) {
+        Probe::Byte(b'"') => {}
+        Probe::Byte(_) | Probe::Absent | Probe::OverTokenCap => return ScanOutcome::failed(),
+        Probe::Exhausted => return ScanOutcome::exhausted(),
+    }
+    let mut decoded: Vec<u8> = Vec::new();
+    let mut index = quote_pos + 1;
+    loop {
+        // Meter BEFORE the read: token cap, bounds, then budget. The token
+        // cap is DERIVED from the probe position, so it counts EVERY probed
+        // raw token byte by construction: bytes AFTER the opening quote
+        // (the closing quote included, the opening quote excluded),
+        // including the escape code byte, all `\u` digits, and surrogate
+        // lookahead. Raw probed bytes, not decoded size: a fully escaped
+        // token probes more raw bytes than it decodes, while a real meeting
+        // id (<= 512 decoded bytes, <= ~3074 fully escaped) always fits.
+        // After-opening byte #4097 is refused before it is read.
+        let byte = match probe_byte(raw, index, quote_pos, max_bytes, budget) {
+            Probe::Byte(byte) => byte,
+            Probe::OverTokenCap | Probe::Absent => return ScanOutcome::failed(),
+            Probe::Exhausted => return ScanOutcome::exhausted(),
+        };
+        index += 1;
+        match byte {
+            b'"' => {
+                let token = String::from_utf8(decoded).ok().map(|text| (text, index));
+                return ScanOutcome {
+                    token,
+                    budget_exhausted: false,
+                };
+            }
+            b'\\' => {
+                // Escape character: same meter-before-read, capped probe.
+                let escape = match probe_byte(raw, index, quote_pos, max_bytes, budget) {
+                    Probe::Byte(escape) => escape,
+                    Probe::OverTokenCap | Probe::Absent => return ScanOutcome::failed(),
+                    Probe::Exhausted => return ScanOutcome::exhausted(),
+                };
+                index += 1;
+
+                match escape {
+                    b'"' | b'\\' | b'/' => decoded.push(escape),
+                    b'b' => decoded.push(0x08),
+                    b'f' => decoded.push(0x0C),
+                    b'n' => decoded.push(b'\n'),
+                    b'r' => decoded.push(b'\r'),
+                    b't' => decoded.push(b'\t'),
+                    b'u' => {
+                        let mut value: u16 = 0;
+                        for _ in 0..4 {
+                            let digit = match probe_byte(raw, index, quote_pos, max_bytes, budget) {
+                                Probe::Byte(byte) => match hex_digit_value(byte) {
+                                    Some(digit) => digit,
+                                    None => return ScanOutcome::failed(),
+                                },
+                                Probe::OverTokenCap | Probe::Absent => {
+                                    return ScanOutcome::failed()
+                                }
+                                Probe::Exhausted => return ScanOutcome::exhausted(),
+                            };
+                            index += 1;
+                            value = match value
+                                .checked_mul(16)
+                                .and_then(|current| current.checked_add(digit))
+                            {
+                                Some(current) => current,
+                                None => return ScanOutcome::failed(),
+                            };
+                        }
+                        let code = if (0xD800..0xDC00).contains(&value) {
+                            // High surrogate: the low surrogate escape must
+                            // follow immediately; both lookahead bytes are
+                            // metered and charged when present.
+                            let first = match probe_byte(raw, index, quote_pos, max_bytes, budget) {
+                                Probe::Byte(byte) => byte,
+                                Probe::OverTokenCap | Probe::Absent => {
+                                    return ScanOutcome::failed()
+                                }
+                                Probe::Exhausted => return ScanOutcome::exhausted(),
+                            };
+                            index += 1;
+
+                            if first != b'\\' {
+                                return ScanOutcome::failed();
+                            }
+                            let second = match probe_byte(raw, index, quote_pos, max_bytes, budget)
+                            {
+                                Probe::Byte(byte) => byte,
+                                Probe::OverTokenCap | Probe::Absent => {
+                                    return ScanOutcome::failed()
+                                }
+                                Probe::Exhausted => return ScanOutcome::exhausted(),
+                            };
+                            index += 1;
+
+                            if second != b'u' {
+                                return ScanOutcome::failed();
+                            }
+                            let mut low: u16 = 0;
+                            for _ in 0..4 {
+                                let digit =
+                                    match probe_byte(raw, index, quote_pos, max_bytes, budget) {
+                                        Probe::Byte(byte) => match hex_digit_value(byte) {
+                                            Some(digit) => digit,
+                                            None => return ScanOutcome::failed(),
+                                        },
+                                        Probe::OverTokenCap | Probe::Absent => {
+                                            return ScanOutcome::failed()
+                                        }
+                                        Probe::Exhausted => return ScanOutcome::exhausted(),
+                                    };
+                                index += 1;
+                                low = match low
+                                    .checked_mul(16)
+                                    .and_then(|current| current.checked_add(digit))
+                                {
+                                    Some(current) => current,
+                                    None => return ScanOutcome::failed(),
+                                };
+                            }
+                            0x10000 + (((value as u32) - 0xD800) << 10) + ((low as u32) - 0xDC00)
+                        } else if (0xDC00..0xE000).contains(&value) {
+                            return ScanOutcome::failed();
+                        } else {
+                            value as u32
+                        };
+                        push_utf8(&mut decoded, code);
+                    }
+                    _ => return ScanOutcome::failed(),
+                }
+            }
+            _ => {
+                if byte < 0x20 {
+                    // Raw control characters must be escaped in JSON.
+                    return ScanOutcome::failed();
+                }
+                decoded.push(byte);
+            }
+        }
+    }
+}
+/// Upper bound for one scanned string token, counted in PROBED RAW bytes
+/// read AFTER the opening quote: the opening quote is EXCLUDED; every
+/// content byte, the escape code byte, all `\u` hex digits, surrogate
+/// lookahead bytes, and the closing quote are INCLUDED — so the cap is on
+/// raw in-token bytes read, not the decoded size (decoded length is always
+/// <= probed length, and a real meeting id of <= 512 decoded bytes
+/// serializes to at most ~3074 fully escaped raw bytes, so a real target
+/// always fits while an over-cap target-like string cannot alter scan
+/// behavior or evade the scrub).
+const MAX_SCAN_TOKEN_BYTES: usize = 4096;
+
+/// Explicit total-work budget for one malformed-payload scan. EVERY byte
+/// traversal — quote search (including the tail after the last quote), token
+/// walks on every failure path, whitespace/inter-token gaps, and nested value
+/// scans — is METERED against this budget before the byte is read, and
+/// traversal stops immediately when it is spent. A genuinely oversized or
+/// adversarial payload that exhausts the budget is treated as source-bearing
+/// (fail-closed): the whole payload is cleared rather than silently
+/// preserved, so unscanned deleted source metadata cannot survive. The
+/// deliberate data-preservation tradeoff — an unrelated oversized malformed
+/// payload is also cleared — is accepted because real persisted
+/// `sources_json` serializations are far smaller than the budget.
+pub(crate) const MAX_SCAN_WORK_BYTES: usize = 1024 * 1024;
+
+/// Decides whether an UNPARSABLE legacy `sources_json` payload carries the
+/// deleted meeting in a source-bearing form: a decoded-equivalent string key
+/// `meetingId` (any JSON escape form), a real colon, and a decoded string
+/// value exactly equal to the deleted ID. Whole-document corruption is
+/// tolerated, but the pair structure is required — a missing colon, an
+/// unquoted value, a longer ID, or a bare-ID mention inside snippet text is
+/// never treated as a source field. Only such payloads are cleared; other
+/// malformed payloads within the work budget are preserved.
+///
+/// Recovery is bounded and fully accounted: every quote position is tried
+/// exactly once as a token start (a failed or non-key token never consumes
+/// later bytes, so an unmatched prefix cannot hide a later target pair), and
+/// every byte traversal — quote search including the tail after the last
+/// quote, token-failure paths, whitespace gaps, and nested value scans — is
+/// metered before it reads against [`MAX_SCAN_WORK_BYTES`]; exhausting the
+/// budget fails closed (clear) before any additional traversal.
+fn raw_sources_reference_meeting(raw: &str, meeting_id: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let mut budget = ScanBudget::new();
+    let mut cursor = 0usize;
+    while cursor < raw.len() {
+        // Meter BEFORE the read: budget exhaustion fails closed immediately,
+        // before any additional traversal.
+        if budget.exhausted() {
+            return true;
+        }
+        budget.take();
+        let is_quote = bytes[cursor] == b'"';
+        cursor += 1;
+        if !is_quote {
+            continue;
+        }
+        let ScanOutcome {
+            token,
+            budget_exhausted,
+            ..
+        } = scan_json_string(raw, cursor - 1, MAX_SCAN_TOKEN_BYTES, &mut budget);
+        if budget_exhausted {
+            // Fail closed before any additional traversal.
+            return true;
+        }
+        let Some((key, after_key)) = token else {
+            continue;
+        };
+        if key == "meetingId" {
+            let Some(after_whitespace) = skip_json_whitespace(raw, after_key, &mut budget) else {
+                return true;
+            };
+            // Metered colon probe (the whitespace skip already probed and
+            // charged the terminator byte; this re-probe is a second actual
+            // read and is charged as such).
+            match probe_byte(raw, after_whitespace, 0, usize::MAX, &mut budget) {
+                Probe::Byte(b':') => {}
+                Probe::Byte(_) | Probe::Absent => continue,
+                Probe::OverTokenCap | Probe::Exhausted => return true,
+            }
+            let after_colon = after_whitespace + 1;
+            let Some(after_colon_ws) = skip_json_whitespace(raw, after_colon, &mut budget) else {
+                return true;
+            };
+            // Metered value opening-quote probe.
+            match probe_byte(raw, after_colon_ws, 0, usize::MAX, &mut budget) {
+                Probe::Byte(b'"') => {}
+                Probe::Byte(_) | Probe::Absent => continue,
+                Probe::OverTokenCap | Probe::Exhausted => return true,
+            }
+            let ScanOutcome {
+                token: value_token,
+                budget_exhausted,
+                ..
+            } = scan_json_string(raw, after_colon_ws, MAX_SCAN_TOKEN_BYTES, &mut budget);
+            if budget_exhausted {
+                return true;
+            }
+            if let Some((value, _)) = value_token {
+                if value == meeting_id {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Structural containment for a parseable but non-array payload: true when
+/// any object in the value carries `meetingId == meeting_id`.
+fn value_references_meeting(value: &serde_json::Value, meeting_id: &str) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.get("meetingId").and_then(|value| value.as_str()) == Some(meeting_id)
+                || map
+                    .values()
+                    .any(|value| value_references_meeting(value, meeting_id))
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|value| value_references_meeting(value, meeting_id)),
+        _ => false,
     }
 }
 
@@ -612,6 +1092,132 @@ mod tests {
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::fs;
     use std::str::FromStr;
+
+    /// Exact per-form accounting: every present byte probe is metered against
+    /// the budget, so a failure path cannot under-report the work the caller
+    /// budgeted. Verified as the budget delta (the authoritative meter).
+    #[test]
+    fn scan_json_string_meters_every_probe_against_the_budget() {
+        let consumed = |raw: &str, max: usize| {
+            let mut budget = ScanBudget::new();
+            let outcome = scan_json_string(raw, 0, max, &mut budget);
+            (
+                outcome.token.is_some(),
+                outcome.budget_exhausted,
+                MAX_SCAN_WORK_BYTES - budget.remaining,
+            )
+        };
+        // Successes: opening quote + content + closing quote probes.
+        assert_eq!(consumed(r#""""#, 4096), (true, false, 2));
+        assert_eq!(consumed(r#""ab""#, 4096), (true, false, 4));
+        assert_eq!(consumed(r#""\u0041""#, 4096), (true, false, 8));
+        // Surrogate pair success: quote + \u + 4 + \u + 4 + close = 14 probes.
+        assert_eq!(consumed(r#""\ud83e\udd80""#, 4096), (true, false, 14));
+        // Trailing backslash: the backslash itself is metered.
+        assert_eq!(consumed(r#""abc\"#, 4096), (false, false, 5));
+        // Invalid escape: quote + backslash + escape char.
+        assert_eq!(consumed(r#""\q x"#, 4096), (false, false, 3));
+        // Truncated \u digits: quote + backslash + u + present digits.
+        assert_eq!(consumed(r#""\u12"#, 4096), (false, false, 5));
+        // Invalid hex digit: metered through the failing byte.
+        assert_eq!(consumed(r#""\uZZZZ""#, 4096), (false, false, 4));
+        // High surrogate without a low escape: the lookahead byte is metered.
+        assert_eq!(consumed(r#""\ud800""#, 4096), (false, false, 8));
+        assert_eq!(consumed(r#""\ud800x""#, 4096), (false, false, 8));
+        // Low surrogate digits truncated inside the pair: metered so far.
+        assert_eq!(consumed(r#""\ud800\u12"#, 4096), (false, false, 11));
+        // Lone low surrogate: rejected after the four digits.
+        assert_eq!(consumed(r#""\udc00"#, 4096), (false, false, 7));
+        // Raw control byte: rejected immediately after being read.
+        assert_eq!(consumed("\"\u{1}x", 4096), (false, false, 2));
+        // Per-token cap (strict): every raw token byte read AFTER the
+        // opening quote counts (closing quote included, opening quote
+        // excluded); byte #4097 after the opening quote is refused before it
+        // is read, so a token is accepted iff its raw length <= 4097.
+        assert_eq!(consumed(r#""abcde"#, 4), (false, false, 5));
+    }
+
+    /// The per-token cap counts PROBED RAW bytes (escape code bytes, all
+    /// `\u` digits, surrogate lookahead included), not decoded size.
+    /// Boundary regressions with fully escaped content: below/at the cap the
+    /// token is valid and decodes exactly; above the cap the scan fails
+    /// without altering behavior or letting an over-cap target-like string
+    /// act as a source field.
+    #[test]
+    fn token_cap_counts_probed_raw_bytes_of_fully_escaped_tokens() {
+        let probe = |raw: &str| {
+            let mut budget = ScanBudget::new();
+            let outcome = scan_json_string(raw, 0, MAX_SCAN_TOKEN_BYTES, &mut budget);
+            (
+                outcome.token.is_some(),
+                outcome.budget_exhausted,
+                MAX_SCAN_WORK_BYTES - budget.remaining,
+            )
+        };
+        let escaped_a = |count: usize, extra: usize| {
+            format!(r#""{}{}""#, r#"\u0041"#.repeat(count), "a".repeat(extra))
+        };
+        // Each `\u0041` is 6 probed bytes decoding to one 'A'. Token raw
+        // Raw length T = 1 + 6*count + extra + 1. The cap counts every raw
+        // token byte read AFTER the opening quote (closing quote included,
+        // opening quote excluded): accepted iff after-opening bytes <= 4096
+        // (T <= 4097); after-opening byte #4097 is refused before it is
+        // read.
+        // Below/at cap: T = 4094 -> valid, exact decode; T = 4097 -> the
+        // maximum valid token (its close is after-opening byte #4096).
+        let (valid, exhausted, probed) = probe(&escaped_a(682, 0));
+        assert!(valid && !exhausted && probed == 4094);
+        let decoded = scan_json_string(
+            &escaped_a(682, 0),
+            0,
+            MAX_SCAN_TOKEN_BYTES,
+            &mut ScanBudget::new(),
+        );
+        assert_eq!(
+            decoded.token.as_ref().map(|(text, _)| text.clone()),
+            Some("A".repeat(682))
+        );
+        let (valid, exhausted, probed) = probe(&escaped_a(682, 2));
+        assert!(valid && !exhausted && probed == 4096);
+        let (valid, exhausted, probed) = probe(&escaped_a(682, 3));
+        assert!(valid && !exhausted && probed == 4097);
+        // Above cap: T = 4098 (the close would be after-opening byte #4097)
+        // -> failed; byte #4097 is refused before it is read (4097 probes
+        // charged: opening + 4096 after-opening bytes).
+        let (valid, exhausted, probed) = probe(&escaped_a(682, 4));
+        assert!(!valid && !exhausted && probed == 4097);
+        // Surrogate pattern: each `\ud83e\udd80` pair is 12 probed bytes
+        // decoding to one astral char; T = 4094 -> below cap and exactly
+        // decoded; T = 4106 -> over cap -> failed.
+        let surrogate_token = |count: usize| format!(r#""{}""#, r#"\ud83e\udd80"#.repeat(count));
+        let (valid, exhausted, probed) = probe(&surrogate_token(341));
+        assert!(valid && !exhausted && probed == 4094);
+        let decoded = scan_json_string(
+            &surrogate_token(341),
+            0,
+            MAX_SCAN_TOKEN_BYTES,
+            &mut ScanBudget::new(),
+        );
+        assert_eq!(
+            decoded.token.as_ref().map(|(text, _)| text.chars().count()),
+            Some(341)
+        );
+        let (valid, exhausted, probed) = probe(&surrogate_token(342));
+        assert!(!valid && !exhausted && probed == 4097);
+    }
+
+    /// The budget meters exactly the documented cap and reports exhaustion at
+    /// it, so traversal is bounded before any read.
+    #[test]
+    fn scan_budget_meters_exactly_to_the_documented_cap() {
+        let mut budget = ScanBudget::new();
+        assert_eq!(MAX_SCAN_WORK_BYTES, 1024 * 1024);
+        assert!(!budget.exhausted());
+        for _ in 0..MAX_SCAN_WORK_BYTES {
+            budget.take();
+        }
+        assert!(budget.exhausted());
+    }
 
     async fn test_pool() -> SqlitePool {
         let options = SqliteConnectOptions::from_str("sqlite::memory:")
@@ -796,6 +1402,55 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn meeting_scope_for_a_deleted_meeting_is_rejected_with_disclosure() {
+        let pool = test_pool().await;
+        sqlx::query("INSERT INTO meetings (id) VALUES (?)")
+            .bind("meeting-1")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let meeting = ChatRepository::get_or_create_scoped_conversation(
+            &pool,
+            &ChatScope {
+                kind: ChatScopeKind::Meeting,
+                key: "meeting-1".into(),
+                data: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(meeting.scope_kind, "meeting");
+
+        let error = ChatRepository::get_or_create_scoped_conversation(
+            &pool,
+            &ChatScope {
+                kind: ChatScopeKind::Meeting,
+                key: "deleted-meeting".into(),
+                data: None,
+            },
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        // The typed condition: exact machine code first, human disclosure
+        // after the separator (the frontend matches the code by equality).
+        assert!(
+            error.starts_with(&format!("{DELETED_MEETING_THREAD_CODE}|")),
+            "unexpected condition format: {error}"
+        );
+        assert!(error.contains("no longer available"));
+        assert!(error.contains("may still quote deleted content"));
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM chat_conversations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]

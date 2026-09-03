@@ -17,6 +17,9 @@ export const en: Record<string, string> = {
     "chat.scope.folderNamed": "Folder: {name}",
     "chat.scope.searchResults": "Search results",
     "chat.scope.liveRecording": "Live recording",
+    "chat.orphan.disclosure":
+        "This meeting was deleted. Its chat thread is no longer available, and earlier answers may still quote deleted content.",
+    "chat.load.failed": "Chat could not be loaded. Check your model configuration and try again.",
     "chat.mode.label": "Retrieval depth",
     "chat.mode.fast": "Fast",
     "chat.mode.deep": "Deep",

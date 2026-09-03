@@ -66,6 +66,7 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
     const [preparationProgress, setPreparationProgress] =
         useState<ChatPreparationProgressPayload | null>(null);
     const [conversationId, setConversationId] = useState<string | null>(null);
+    const [loadError, setLoadError] = useState<string | null>(null);
     const conversationIdRef = useRef<string | null>(null);
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -133,6 +134,7 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
         setIsStreaming(false);
         setRetrievalMode("deep");
         setPreparationProgress(null);
+        setLoadError(null);
         conversationIdRef.current = null;
         setConversationId(null);
         setMessages([]);
@@ -160,6 +162,20 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
                 );
             } catch (error) {
                 logger.error("Failed to load chat conversation:", error);
+                // Map to the typed deleted-meeting condition by EXACT code
+                // equality (the backend emits "deleted_meeting_thread|<text>"),
+                // with a privacy-safe localized fallback for everything else.
+                // Raw backend/database error text is never rendered.
+                if (!cancelled && generation === scopeGenerationRef.current) {
+                    const message = error instanceof Error ? error.message : String(error);
+                    const separator = message.indexOf("|");
+                    const code = separator === -1 ? message : message.slice(0, separator);
+                    setLoadError(
+                        code === "deleted_meeting_thread"
+                            ? t("chat.orphan.disclosure")
+                            : t("chat.load.failed")
+                    );
+                }
             }
         };
 
@@ -594,6 +610,15 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
 
             {/* Messages */}
             <div className="flex-1 overflow-y-auto p-4 space-y-4">
+                {loadError && (
+                    <div
+                        role="status"
+                        aria-live="polite"
+                        className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800"
+                    >
+                        {loadError}
+                    </div>
+                )}
                 {messages.length === 0 && (
                     <div className="text-center text-gray-400 text-sm py-8">
                         {t("chat.empty.description")}

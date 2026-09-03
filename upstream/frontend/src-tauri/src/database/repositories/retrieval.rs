@@ -3450,7 +3450,7 @@ mod tests {
         // Deleting a meeting cascades its canonical rows away outside any
         // replacement transaction; the decrement happens in the same delete
         // transaction so the counter never learns to drift.
-        assert!(MeetingsRepository::delete_meeting(&pool, "m2")
+        assert!(MeetingsRepository::delete_meeting(&pool, "m2", |_| {})
             .await
             .unwrap());
         assert_eq!(stored("gen-dc", &pool).await, 1);
@@ -4180,7 +4180,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(MeetingsRepository::delete_meeting(&pool, "doomed")
+        assert!(MeetingsRepository::delete_meeting(&pool, "doomed", |_| {})
             .await
             .unwrap());
 
@@ -4380,7 +4380,7 @@ mod tests {
         RetrievalRepository::set_generation_state(&pool, "gen", "retired")
             .await
             .unwrap();
-        assert!(MeetingsRepository::delete_meeting(&pool, "m")
+        assert!(MeetingsRepository::delete_meeting(&pool, "m", |_| {})
             .await
             .unwrap());
         assert_eq!(

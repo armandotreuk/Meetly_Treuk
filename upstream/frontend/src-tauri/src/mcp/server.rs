@@ -7,7 +7,10 @@ use sqlx::SqlitePool;
 use tokio::net::TcpListener;
 use tracing::info;
 
-use crate::api::chat::{prepare_chat_inputs_with_lifecycle, ChatRetrievalMode, SYSTEM_PROMPT};
+use crate::api::chat::{
+    finish_non_streaming_chat_request, prepare_chat_inputs_with_lifecycle, ChatRequestSurface,
+    ChatRetrievalMode, CHAT_REQUEST_TIMEOUT, SYSTEM_PROMPT,
+};
 use crate::database::repositories::{folder::FolderRepository, fts::FtsRepository};
 use crate::export::build_context_markdown;
 use crate::summary::llm_client::generate_summary;
@@ -32,6 +35,9 @@ pub struct McpState {
     /// Clone of the process-wide retrieval lifecycle. MCP shares the Tauri
     /// runtime instead of constructing duplicate workers or model sessions.
     pub retrieval: crate::retrieval::worker::RetrievalLifecycle,
+    /// Clone of the ONE shared chat request registry, so MCP chat requests
+    /// participate in deletion invalidation and ownership cleanup.
+    pub chat_requests: crate::api::chat::ChatRequestState,
 }
 
 // ---------- JSON-RPC request/response ----------
@@ -184,33 +190,137 @@ async fn execute_build_context(
     }))
 }
 
-async fn execute_chat_with_meetings(
+/// Releases one request's registry entry when dropped unless ownership was
+/// already released (idempotent): a panic or abort of the request future
+/// cannot leak an admitted slot.
+struct OwnershipGuard<'a> {
+    state: &'a crate::api::chat::ChatRequestState,
+    surface: ChatRequestSurface,
+    request_id: &'a str,
+    token: &'a crate::api::chat::ChatRequestToken,
+}
+
+impl Drop for OwnershipGuard<'_> {
+    fn drop(&mut self) {
+        // Cancel BEFORE clearing: pending detached work (spawn_blocking
+        // retrieval/ONNX holding a cloned token) must observe cancellation
+        // before the slot can be reclaimed and reused. Idempotent on every
+        // path — finish already cleared and cancelled where appropriate.
+        self.token.cancel();
+        self.state
+            .clear_if_owner(self.surface, self.request_id, self.token);
+    }
+}
+
+pub(crate) async fn execute_chat_with_meetings(
     pool: &SqlitePool,
     params: &serde_json::Value,
     app_data_dir: &Option<std::path::PathBuf>,
     client: &reqwest::Client,
     retrieval: crate::retrieval::worker::RetrievalLifecycle,
+    chat_requests: &crate::api::chat::ChatRequestState,
+    deadline: std::time::Duration,
 ) -> Result<serde_json::Value, String> {
-    let (inputs, sources) =
-        prepare_mcp_chat_inputs(pool, params, app_data_dir, client, retrieval).await?;
-    let answer = generate_summary(
-        client,
-        &inputs.provider,
-        &inputs.model_name,
-        &inputs.api_key,
-        SYSTEM_PROMPT,
-        &inputs.user_prompt,
-        inputs.ollama_endpoint.as_deref(),
-        inputs.custom_openai_endpoint.as_deref(),
-        inputs.custom_openai_max_tokens,
-        inputs.custom_openai_temperature,
-        inputs.custom_openai_top_p,
-        app_data_dir.as_ref(),
-        None,
-    )
-    .await
-    .map_err(|e| format!("LLM call failed: {}", e))?;
-    Ok(serde_json::json!({ "answer": answer, "sources": sources }))
+    // Each MCP chat request owns one internal identity + token through the
+    // SAME shared registry/mechanism as Chat: admission is capped
+    // (MAX_CONCURRENT_MCP_REQUESTS, checked atomically before ANY work — a
+    // rejected request never starts preparation or generation), deletion
+    // invalidation cancels admitted requests, and every return/error/timeout
+    // path releases ownership through `finish_non_streaming_chat_request`
+    // (the final publication gate, which also closes the check-to-return
+    // race). No public MCP cancel API exists.
+    let request_id = format!("mcp-{}", uuid::Uuid::new_v4());
+    let Some(token) = chat_requests.try_claim_request(ChatRequestSurface::Mcp, &request_id) else {
+        return Err(crate::api::chat::MCP_CHAT_BUSY_ERROR.to_string());
+    };
+    // Releases this request's registry entry on EVERY exit — timeout, error,
+    // deletion cancellation, and even a panic/abort of the request future —
+    // idempotent after finish's own release.
+    let guard = OwnershipGuard {
+        state: chat_requests,
+        surface: ChatRequestSurface::Mcp,
+        request_id: &request_id,
+        token: &token,
+    };
+    // One owned deadline lifecycle: the deadline sleep is driven inside the
+    // same future as the request work, so expiry cancels the token BEFORE the
+    // request future is dropped and BEFORE registry cleanup — there is no
+    // detached watchdog task and the outcome is deterministic (biased polling
+    // makes the deadline win an equal-deadline tie). Deletion invalidation
+    // cancels the same token through the shared registry.
+    let deadline_sleep = tokio::time::sleep(deadline);
+    tokio::pin!(deadline_sleep);
+    let work = async {
+        // The SAME request token is passed through ALL shared preparation
+        // work — retrieval, scheduler/ONNX queueing, and Deep eligibility —
+        // so timeout or deletion cancellation stops it before generation.
+        let (inputs, _sources) = prepare_mcp_chat_inputs(
+            pool,
+            params,
+            app_data_dir,
+            client,
+            retrieval,
+            Some(token.as_ref()),
+        )
+        .await?;
+        // Deletion fence, in this exact order: bind the prepared evidence's
+        // meeting identities BEFORE the authoritative rechecks, so a meeting
+        // deleted afterwards cancels this visible registration from the real
+        // deletion transaction.
+        chat_requests.bind_request_meetings(
+            ChatRequestSurface::Mcp,
+            &request_id,
+            &token,
+            &crate::api::chat::prepared_meeting_ids(&inputs.sources),
+        );
+        crate::api::chat::ensure_prepared_meetings_exist(pool, &inputs.sources).await?;
+        let answer = generate_summary(
+            client,
+            &inputs.provider,
+            &inputs.model_name,
+            &inputs.api_key,
+            SYSTEM_PROMPT,
+            &inputs.user_prompt,
+            inputs.ollama_endpoint.as_deref(),
+            inputs.custom_openai_endpoint.as_deref(),
+            inputs.custom_openai_max_tokens,
+            inputs.custom_openai_temperature,
+            inputs.custom_openai_top_p,
+            app_data_dir.as_ref(),
+            Some(token.as_ref()),
+        )
+        .await
+        .map_err(|e| format!("LLM call failed: {}", e))?;
+        // Terminal invalidation fence: a meeting deleted during generation
+        // must abort the response instead of returning an answer whose
+        // sources can no longer exist (source/context parity).
+        crate::api::chat::ensure_prepared_meetings_exist(pool, &inputs.sources).await?;
+        let sources = serialize_chat_sources(&inputs.sources)?;
+        Ok(serde_json::json!({ "answer": answer, "sources": sources }))
+    };
+    tokio::pin!(work);
+    let inner = tokio::select! {
+        biased;
+        _ = &mut deadline_sleep => {
+            // Deadline first: cancellation precedes dropping the request
+            // future and any registry cleanup, so the outcome is
+            // deterministically the cancelled one.
+            token.cancel();
+            Err("Chat request timed out".to_string())
+        }
+        result = &mut work => result,
+    };
+    // The final publication/ownership gate; the guard below is the backstop
+    // for any path that bypassed it and is idempotent with this release.
+    let outcome = finish_non_streaming_chat_request(
+        chat_requests,
+        ChatRequestSurface::Mcp,
+        &request_id,
+        &token,
+        Ok(inner),
+    );
+    drop(guard);
+    outcome
 }
 
 async fn prepare_mcp_chat_inputs(
@@ -219,6 +329,7 @@ async fn prepare_mcp_chat_inputs(
     app_data_dir: &Option<std::path::PathBuf>,
     client: &reqwest::Client,
     retrieval: crate::retrieval::worker::RetrievalLifecycle,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<(crate::api::chat::ChatInputs, Vec<serde_json::Value>), String> {
     let query = params["query"]
         .as_str()
@@ -244,7 +355,7 @@ async fn prepare_mcp_chat_inputs(
         None,
         meeting_id,
         retrieval,
-        None,
+        cancellation,
         mode,
         None,
     )
@@ -328,6 +439,8 @@ async fn handle_jsonrpc(
                         &state.app_data_dir,
                         &state.client,
                         state.retrieval.clone(),
+                        &state.chat_requests,
+                        CHAT_REQUEST_TIMEOUT,
                     )
                     .await
                 }
@@ -387,10 +500,14 @@ pub fn spawn_from_app<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         let retrieval = app
             .try_state::<crate::retrieval::worker::RetrievalLifecycle>()
             .map(|lifecycle| lifecycle.inner().clone());
+        let chat_requests = app
+            .try_state::<crate::api::chat::ChatRequestState>()
+            .map(|requests| requests.inner().clone())
+            .unwrap_or_else(crate::api::chat::ChatRequestState::new);
         let app_data_dir = app.path().app_data_dir().ok();
         if let Some(retrieval) = retrieval {
             tauri::async_runtime::spawn(async move {
-                start_server(pool, app_data_dir, None, retrieval).await;
+                start_server(pool, app_data_dir, None, retrieval, chat_requests).await;
             });
         } else {
             tracing::error!("RetrievalLifecycle not available, MCP server not started");
@@ -405,6 +522,7 @@ pub async fn start_server(
     app_data_dir: Option<std::path::PathBuf>,
     port: Option<u16>,
     retrieval: crate::retrieval::worker::RetrievalLifecycle,
+    chat_requests: crate::api::chat::ChatRequestState,
 ) {
     let port = port.unwrap_or(DEFAULT_PORT);
     let state = McpState {
@@ -412,6 +530,7 @@ pub async fn start_server(
         app_data_dir,
         client: reqwest::Client::new(),
         retrieval,
+        chat_requests,
     };
 
     let listener = match TcpListener::bind(format!("127.0.0.1:{}", port)).await {
@@ -504,6 +623,7 @@ mod tests {
             &None,
             &reqwest::Client::new(),
             lifecycle.clone(),
+            None,
         )
         .await
         .unwrap();
@@ -522,6 +642,7 @@ mod tests {
             &None,
             &reqwest::Client::new(),
             lifecycle.clone(),
+            None,
         )
         .await
         {
@@ -536,6 +657,7 @@ mod tests {
             &None,
             &reqwest::Client::new(),
             lifecycle,
+            None,
         )
         .await
         {
@@ -543,6 +665,395 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("Invalid chat retrieval mode"));
+    }
+
+    /// The MCP terminal fence end to end: a meeting deleted (through the real
+    /// deletion transaction with the real invalidation hook) while the answer
+    /// is being generated cancels the MCP request's ownership token and
+    /// aborts the response instead of returning an answer whose sources can
+    /// no longer exist. Ownership is released on the abort path.
+    #[tokio::test]
+    async fn deleted_meeting_cancels_the_mcp_request_and_aborts_the_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let pool = chat_pool(false).await;
+        let chat_requests = crate::api::chat::ChatRequestState::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (generation_called_tx, generation_called_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = vec![0_u8; 64 * 1024];
+            let _ = socket.read(&mut request).await;
+            let _ = generation_called_tx.send(());
+            let _ = release_rx.await;
+            let body = r#"{"choices":[{"message":{"content":"answer"}}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.flush().await;
+        });
+        sqlx::query("UPDATE settings SET chatOllamaEndpoint = ?")
+            .bind(format!("http://{}", address))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let task_pool = pool.clone();
+        let task_requests = chat_requests.clone();
+        let task = tokio::spawn(async move {
+            execute_chat_with_meetings(
+                &task_pool,
+                &json!({"query": "alpha", "meetingId": "m1"}),
+                &None,
+                &reqwest::Client::new(),
+                crate::retrieval::worker::RetrievalLifecycle::new(
+                    crate::retrieval::worker::LifecycleConfig::production(None),
+                ),
+                &task_requests,
+                CHAT_REQUEST_TIMEOUT,
+            )
+            .await
+        });
+
+        // The answer generation is in flight when the meeting is deleted
+        // through the real deletion transaction with the real hook: the MCP
+        // request's bound registration is invalidated and its token cancelled.
+        tokio::time::timeout(std::time::Duration::from_secs(10), generation_called_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let invalidated = chat_requests.clone();
+        let deleted = crate::database::repositories::meeting::MeetingsRepository::delete_meeting(
+            &pool,
+            "m1",
+            |meeting_id| {
+                invalidated.invalidate_meeting(meeting_id);
+            },
+        )
+        .await
+        .unwrap();
+        assert!(deleted);
+        let _ = release_tx.send(());
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        // Fail-closed abort: no answer/source payload can be returned.
+        let error = match result {
+            Ok(_) => panic!("deleted meeting must not return an MCP answer"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("cancelled or superseded")
+                || error.contains("referenced meeting was deleted"),
+            "unexpected abort error: {error}"
+        );
+        // Cleanup proof: the invalidated MCP registration was removed.
+        assert_eq!(chat_requests.request_count(), 0);
+    }
+
+    /// The check-to-return race, closed by the ownership gate: the terminal
+    /// existence recheck PASSES while the meeting exists, the meeting is then
+    /// deleted through the real deletion transaction (invalidating the bound
+    /// request inside the transaction, before commit), and the final
+    /// publication gate refuses the already-built answer/source payload.
+    #[tokio::test]
+    async fn deletion_after_the_terminal_recheck_cannot_return_the_mcp_response() {
+        let pool = chat_pool(false).await;
+        let chat_requests = crate::api::chat::ChatRequestState::new();
+        let lifecycle = crate::retrieval::worker::RetrievalLifecycle::new(
+            crate::retrieval::worker::LifecycleConfig::production(None),
+        );
+        let (inputs, _sources) = prepare_mcp_chat_inputs(
+            &pool,
+            &json!({"query": "alpha", "meetingId": "m1"}),
+            &None,
+            &reqwest::Client::new(),
+            lifecycle,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Production ordering: bind the prepared evidence identities, then
+        // recheck existence.
+        let request_id = "mcp-check-to-return".to_string();
+        let token = chat_requests
+            .try_claim_request(ChatRequestSurface::Mcp, &request_id)
+            .expect("below the admission cap");
+        assert!(chat_requests.bind_request_meetings(
+            ChatRequestSurface::Mcp,
+            &request_id,
+            &token,
+            &crate::api::chat::prepared_meeting_ids(&inputs.sources),
+        ));
+        crate::api::chat::ensure_prepared_meetings_exist(&pool, &inputs.sources)
+            .await
+            .unwrap();
+        // The terminal existence recheck PASSES here (the meeting exists).
+        crate::api::chat::ensure_prepared_meetings_exist(&pool, &inputs.sources)
+            .await
+            .unwrap();
+
+        // Deletion commits strictly AFTER the passing terminal recheck and
+        // strictly BEFORE the return/publication gate, with the real
+        // invalidation hook inside the real transaction.
+        let invalidated = chat_requests.clone();
+        let deleted = crate::database::repositories::meeting::MeetingsRepository::delete_meeting(
+            &pool,
+            "m1",
+            |meeting_id| {
+                invalidated.invalidate_meeting(meeting_id);
+            },
+        )
+        .await
+        .unwrap();
+        assert!(deleted);
+        assert!(token.is_cancelled());
+
+        // The publication gate refuses the already-built answer/source
+        // payload and releases ownership.
+        let err = finish_non_streaming_chat_request(
+            &chat_requests,
+            ChatRequestSurface::Mcp,
+            &request_id,
+            &token,
+            Ok(Ok(json!({
+                "answer": "answer quoting deleted evidence",
+                "sources": [{"meetingId": "m1"}],
+            }))),
+        )
+        .unwrap_err();
+        assert!(err.contains("superseded"));
+        assert_eq!(chat_requests.request_count(), 0);
+    }
+
+    /// Two concurrent MCP chats are independent: neither claim supersedes the
+    /// other, both are in flight simultaneously, both publish normally, and
+    /// both release their own ownership entries.
+    #[tokio::test]
+    async fn concurrent_mcp_chats_coexist_without_superseding_each_other() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::mpsc;
+
+        let pool = chat_pool(false).await;
+        let chat_requests = crate::api::chat::ChatRequestState::new();
+        // One endpoint serves both requests; every connection is barriered
+        // until the test has proven both requests are in flight together.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (called_tx, mut called_rx) = mpsc::channel(4);
+        let (release_one_tx, release_one_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_two_tx, release_two_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            // Accept BOTH connections up front and handle them concurrently,
+            // so the second request's generation is not blocked behind the
+            // first one's barrier.
+            for release_rx in [release_one_rx, release_two_rx] {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let called_tx = called_tx.clone();
+                tokio::spawn(async move {
+                    let mut request = vec![0_u8; 64 * 1024];
+                    let _ = socket.read(&mut request).await;
+                    let _ = called_tx.send(()).await;
+                    let _ = release_rx.await;
+                    let body = r#"{"choices":[{"message":{"content":"answer"}}]}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.flush().await;
+                });
+            }
+        });
+        sqlx::query("UPDATE settings SET chatOllamaEndpoint = ?")
+            .bind(format!("http://{}", address))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let spawn_request = |chat_requests: crate::api::chat::ChatRequestState| {
+            let task_pool = pool.clone();
+            tokio::spawn(async move {
+                execute_chat_with_meetings(
+                    &task_pool,
+                    &json!({"query": "alpha", "meetingId": "m1"}),
+                    &None,
+                    &reqwest::Client::new(),
+                    crate::retrieval::worker::RetrievalLifecycle::new(
+                        crate::retrieval::worker::LifecycleConfig::production(None),
+                    ),
+                    &chat_requests,
+                    CHAT_REQUEST_TIMEOUT,
+                )
+                .await
+            })
+        };
+        let requests_one = chat_requests.clone();
+        let requests_two = chat_requests.clone();
+        let task_one = spawn_request(requests_one);
+        let task_two = spawn_request(requests_two);
+
+        // Both requests reach generation concurrently: neither superseded
+        // the other, so both registrations are alive at once.
+        tokio::time::timeout(std::time::Duration::from_secs(10), called_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), called_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(chat_requests.request_count(), 2);
+
+        let _ = release_one_tx.send(());
+        let _ = release_two_tx.send(());
+        let result_one = tokio::time::timeout(std::time::Duration::from_secs(10), task_one)
+            .await
+            .unwrap()
+            .unwrap();
+        let result_two = tokio::time::timeout(std::time::Duration::from_secs(10), task_two)
+            .await
+            .unwrap()
+            .unwrap();
+        // Both publish normally and release their own entries.
+        assert!(result_one.is_ok());
+        assert!(result_two.is_ok());
+        assert_eq!(chat_requests.request_count(), 0);
+    }
+
+    /// The MCP admission cap: with the shared registry saturated, an excess
+    /// MCP chat request is rejected with the stable busy error BEFORE any
+    /// provider work (no generation connection is ever attempted), admitted
+    /// requests are untouched, and reclaimed capacity admits a new request.
+    #[tokio::test]
+    async fn saturated_mcp_admission_rejects_before_generation_and_reclaims() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::mpsc;
+
+        let pool = chat_pool(false).await;
+        let chat_requests = crate::api::chat::ChatRequestState::new();
+        // Simulate admitted in-flight requests saturating the cap.
+        let mut admitted = Vec::new();
+        for index in 0..crate::api::chat::MAX_CONCURRENT_MCP_REQUESTS {
+            let token = chat_requests
+                .try_claim_request(ChatRequestSurface::Mcp, &format!("mcp-admitted-{index}"))
+                .unwrap();
+            admitted.push(token);
+        }
+
+        // One fake provider: if the rejected request were to start
+        // generation, a connection would arrive; the test proves none does.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (called_tx, mut called_rx) = mpsc::channel(4);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = vec![0_u8; 64 * 1024];
+            let _ = socket.read(&mut request).await;
+            let _ = called_tx.send(()).await;
+            let _ = release_rx.await;
+            let body = r#"{"choices":[{"message":{"content":"answer"}}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.flush().await;
+        });
+        sqlx::query("UPDATE settings SET chatOllamaEndpoint = ?")
+            .bind(format!("http://{}", address))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let task_pool = pool.clone();
+        let result = execute_chat_with_meetings(
+            &task_pool,
+            &json!({"query": "alpha", "meetingId": "m1"}),
+            &None,
+            &reqwest::Client::new(),
+            crate::retrieval::worker::RetrievalLifecycle::new(
+                crate::retrieval::worker::LifecycleConfig::production(None),
+            ),
+            &chat_requests,
+            CHAT_REQUEST_TIMEOUT,
+        )
+        .await;
+        // Rejected with the stable busy error before any work.
+        match result {
+            Ok(_) => panic!("saturated MCP admission must reject the request"),
+            Err(error) => assert_eq!(error, crate::api::chat::MCP_CHAT_BUSY_ERROR),
+        }
+        // No generation connection was attempted.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), called_rx.recv())
+                .await
+                .is_err(),
+            "a capped request must never start generation"
+        );
+        // Admitted requests are untouched and capacity is still saturated.
+        for (index, token) in admitted.iter().enumerate() {
+            assert!(
+                !token.is_cancelled(),
+                "admitted request {index} was disturbed"
+            );
+        }
+        assert_eq!(
+            chat_requests.request_count(),
+            crate::api::chat::MAX_CONCURRENT_MCP_REQUESTS
+        );
+
+        // Reclaim: one admitted request completes (success cleanup), and the
+        // freed capacity admits a new request that reaches generation.
+        chat_requests.clear_if_owner(ChatRequestSurface::Mcp, "mcp-admitted-0", &admitted[0]);
+        let task_pool = pool.clone();
+        let task = tokio::spawn(async move {
+            execute_chat_with_meetings(
+                &task_pool,
+                &json!({"query": "alpha", "meetingId": "m1"}),
+                &None,
+                &reqwest::Client::new(),
+                crate::retrieval::worker::RetrievalLifecycle::new(
+                    crate::retrieval::worker::LifecycleConfig::production(None),
+                ),
+                &chat_requests,
+                CHAT_REQUEST_TIMEOUT,
+            )
+            .await
+        });
+        let _ = release_tx.send(());
+        let admitted_result = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            admitted_result.is_ok(),
+            "reclaimed capacity must be admittable"
+        );
+        // The new request started generation (the connection arrived).
+        let generation_ran =
+            tokio::time::timeout(std::time::Duration::from_secs(10), called_rx.recv())
+                .await
+                .unwrap()
+                .is_some();
+        assert!(generation_ran, "the admitted request must reach generation");
     }
 
     #[tokio::test]
@@ -559,6 +1070,7 @@ mod tests {
             &None,
             &reqwest::Client::new(),
             lifecycle.clone(),
+            None,
         )
         .await
         .unwrap();
@@ -578,6 +1090,7 @@ mod tests {
             &None,
             &reqwest::Client::new(),
             lifecycle,
+            None,
         )
         .await
         .unwrap();
@@ -597,6 +1110,10 @@ mod tests {
             CREATE TABLE search_source_state (meeting_id TEXT PRIMARY KEY, source_revision INTEGER);
             CREATE TABLE settings (id TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL, whisperModel TEXT NOT NULL, groqApiKey TEXT, openaiApiKey TEXT, anthropicApiKey TEXT, ollamaApiKey TEXT, openRouterApiKey TEXT, ollamaEndpoint TEXT, customOpenAIConfig TEXT, customVocabulary TEXT, chatProvider TEXT, chatModel TEXT, chatOllamaEndpoint TEXT, force_lexical_retrieval BOOLEAN NOT NULL DEFAULT FALSE);
             CREATE VIRTUAL TABLE meeting_fts USING fts5(meeting_id UNINDEXED, chunk_type UNINDEXED, chunk_id UNINDEXED, text, speaker UNINDEXED, timestamp_label UNINDEXED, folder_id UNINDEXED, folder_name);
+            CREATE TABLE transcript_chunks (meeting_id TEXT);
+            CREATE TABLE retrieval_generations (generation_id TEXT PRIMARY KEY NOT NULL, model_id TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'building', document_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT '');
+            CREATE TABLE retrieval_documents (id INTEGER PRIMARY KEY AUTOINCREMENT, generation_id TEXT NOT NULL REFERENCES retrieval_generations(generation_id) ON DELETE CASCADE, document_id TEXT NOT NULL, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, source_kind TEXT NOT NULL DEFAULT '', ordinal INTEGER NOT NULL DEFAULT 0, content TEXT NOT NULL DEFAULT '', content_hash BLOB NOT NULL DEFAULT x'', dimensions INTEGER NOT NULL DEFAULT 2 CHECK (dimensions > 0), vector_encoding TEXT NOT NULL DEFAULT 'int8', vector BLOB NOT NULL DEFAULT x'', source_revision INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT '', UNIQUE (generation_id, document_id));
+            CREATE TABLE chat_messages (id TEXT PRIMARY KEY NOT NULL, conversation_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, sources_json TEXT, is_error INTEGER DEFAULT 0, created_at TEXT NOT NULL);
             INSERT INTO meetings (id, title, created_at, saved_at) VALUES ('m1', 'Title', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z');
             INSERT INTO settings (id, provider, model, whisperModel, chatProvider, chatModel, force_lexical_retrieval) VALUES ('1', 'ollama', 'local', 'whisper', 'ollama', 'local', ?);
             INSERT INTO transcripts (id, meeting_id, transcript, timestamp) VALUES ('t1', 'm1', 'alpha', '10:00');

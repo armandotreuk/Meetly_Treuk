@@ -285,6 +285,62 @@ describe("ChatHost scoped panel", () => {
         expect(mocks.invoke).toHaveBeenCalledWith("api_cancel_chat_stream", { streamId: null });
     });
 
+    it("discloses an orphaned meeting thread only for the exact typed condition", async () => {
+        const backendDisclosure = "This meeting's chat thread is no longer available because the meeting was deleted. Earlier answers may still quote deleted content.";
+        mocks.invoke.mockImplementation((command: string, args?: any) => {
+            if (command === "api_get_chat_model_config") return Promise.resolve({});
+            if (command === "api_chat_get_or_create_scoped_conversation" && args.scope.kind === "meeting")
+                return Promise.reject(new Error(`deleted_meeting_thread|${backendDisclosure}`));
+            return Promise.resolve();
+        });
+        await act(async () => root.render(<ChatHost><Launcher scope={{ kind: "meeting", key: "deleted-1" }} label="deleted" /></ChatHost>));
+        await act(async () => (Array.from(container.querySelectorAll("button")).find((button) => button.textContent === "deleted") as HTMLButtonElement).click());
+        await flush();
+        const banner = container.querySelector('[role="status"]') as HTMLElement;
+        // The typed deleted-meeting condition maps to the localized orphan
+        // disclosure, not the raw backend error text.
+        expect(banner.textContent).toContain("This meeting was deleted.");
+        expect(banner.textContent).toContain("may still quote deleted content");
+        expect(banner.textContent).not.toContain(backendDisclosure);
+        // Without a conversation the panel stays read-only instead of failing silently.
+        expect(container.querySelector("textarea")?.disabled).toBe(true);
+    });
+
+    it("keeps near-collision errors on the privacy-safe generic fallback", async () => {
+        mocks.invoke.mockImplementation((command: string, args?: any) => {
+            if (command === "api_get_chat_model_config") return Promise.resolve({});
+            if (command === "api_chat_get_or_create_scoped_conversation")
+                return Promise.reject(new Error("a meeting was deleted by another process: internal row 0xdeadbeef"));
+            return Promise.resolve();
+        });
+        await act(async () => root.render(<ChatHost><Launcher scope={{ kind: "meeting", key: "meeting-1" }} label="meeting" /></ChatHost>));
+        await act(async () => (Array.from(container.querySelectorAll("button")).find((button) => button.textContent === "meeting") as HTMLButtonElement).click());
+        await flush();
+        const banner = container.querySelector('[role="status"]') as HTMLElement;
+        // A near-collision message must NOT be classified as the orphan
+        // condition: the code segment differs from the stable constant.
+        expect(banner.textContent).toContain("Chat could not be loaded");
+        expect(banner.textContent).toContain("Check your model configuration");
+        expect(banner.textContent).not.toContain("This meeting was deleted.");
+        expect(banner.textContent).not.toContain("0xdeadbeef");
+    });
+
+    it("shows a privacy-safe generic failure for arbitrary load errors", async () => {
+        mocks.invoke.mockImplementation((command: string, args?: any) => {
+            if (command === "api_get_chat_model_config") return Promise.resolve({});
+            if (command === "api_chat_get_or_create_scoped_conversation")
+                return Promise.reject(new Error("database is locked: internal row 0xdeadbeef"));
+            return Promise.resolve();
+        });
+        await act(async () => root.render(<ChatHost><Launcher scope={{ kind: "all", key: "all" }} label="all" /></ChatHost>));
+        await act(async () => (Array.from(container.querySelectorAll("button")).find((button) => button.textContent === "all") as HTMLButtonElement).click());
+        await flush();
+        const banner = container.querySelector('[role="status"]') as HTMLElement;
+        expect(banner.textContent).toContain("Chat could not be loaded");
+        expect(banner.textContent).not.toContain("0xdeadbeef");
+        expect(banner.textContent).not.toContain("database is locked");
+    });
+
     it("renders live sources without meeting navigation and keeps stored sources navigable", async () => {
         await act(async () => root.render(<><ChatMessage role="assistant" content="live" sources={[{ meetingId: "live-1", meetingTitle: "Live recording", chunkType: "live_transcript", snippet: "now", folderName: "", sourceKind: "live_recording" }]} onSourceClick={mocks.routerPush} /><ChatMessage role="assistant" content="saved" sources={[{ meetingId: "meeting-1", meetingTitle: "Planning", chunkType: "transcript", snippet: "then", folderName: "" }]} onSourceClick={mocks.routerPush} /></>));
         const liveSource = container.querySelector('[aria-label="Live recording transcript source"]') as HTMLElement;

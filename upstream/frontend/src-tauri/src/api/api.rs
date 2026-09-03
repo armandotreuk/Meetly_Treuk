@@ -910,6 +910,7 @@ pub async fn api_delete_meeting<R: Runtime>(
     _app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
     retrieval: tauri::State<'_, crate::retrieval::worker::RetrievalLifecycle>,
+    chat_requests: tauri::State<'_, crate::api::chat::ChatRequestState>,
     meeting_id: String,
     auth_token: Option<String>,
 ) -> Result<serde_json::Value, String> {
@@ -924,7 +925,16 @@ pub async fn api_delete_meeting<R: Runtime>(
     let index = retrieval.index_service();
     let active_generation = index.active_generation();
     let stale_epoch = index.mark_stale();
-    match MeetingsRepository::delete_meeting(pool, &meeting_id).await {
+    // The invalidation hook runs inside the deletion transaction, before the
+    // meeting row disappears: active chat requests whose prepared evidence
+    // references this meeting are cancelled through the one shared request
+    // registry, so no later chunk/source/done publication can occur.
+    let chat_requests = chat_requests.inner().clone();
+    match MeetingsRepository::delete_meeting(pool, &meeting_id, |deleted_meeting_id| {
+        chat_requests.invalidate_meeting(deleted_meeting_id);
+    })
+    .await
+    {
         Ok(true) => {
             match active_generation {
                 Some(generation_id) => {

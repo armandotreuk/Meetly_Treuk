@@ -913,7 +913,7 @@ async fn terminal_tombstone_repair_migrates_populated_databases_without_acknowle
 
     // The old trigger appends a delete tail to all four index states. The
     // normal meeting deletion path still owns the primary-data transaction.
-    assert!(MeetingsRepository::delete_meeting(&pool, "doomed")
+    assert!(MeetingsRepository::delete_meeting(&pool, "doomed", |_| {})
         .await
         .unwrap());
     assert_eq!(
@@ -988,7 +988,7 @@ async fn terminal_tombstone_repair_migrates_populated_databases_without_acknowle
     .execute(&pool)
     .await
     .unwrap();
-    assert!(MeetingsRepository::delete_meeting(&pool, "future")
+    assert!(MeetingsRepository::delete_meeting(&pool, "future", |_| {})
         .await
         .unwrap());
     for generation_id in ["gen-ready", "gen-building"] {
