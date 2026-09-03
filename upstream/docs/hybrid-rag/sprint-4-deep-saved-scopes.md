@@ -736,6 +736,37 @@ no Fast/Deep result or task-local check may substitute for a missing gate.
 
 **2026-09-02 R48 remediation addendum:** Relevant saved-meeting loading now accepts semantic endpoint pairs and selects each complete authoritative inclusive range plus its existing adjacent rows, while point anchors retain endpoint-neighborhood behavior. Fingerprint validation still hashes the full authoritative range and rejects missing, reversed, or stale spans. A production-path multi-segment semantic-range regression reaches final prompt/source publication and verifies parity. Focused checks passed; targeted touched-file rustfmt passed; repository fmt remains blocked only by rejected V10 fixture whitespace; retrieval evaluation remains intentionally prohibited. No prior Task 4.3, R47, or R48 record was rewritten.
 
+### Task 4.4 - Query-aware snapshot and today retrieval [M]
+
+**Status:** Complete
+**Owner:** `worker-m` (`openai/gpt-5.6-luna`)
+**Completed:** 2026-09-02
+**Implemented:**
+- SearchSnapshot and today Chat retrieval now use query-aware lexical/hybrid candidates inside authoritative meeting-ID allow-lists, while deterministic broad summary/compare/list requests retain bounded per-meeting coverage.
+- Deep initial retrieval receives the same broad-intent signal after the snapshot/today allow-list is resolved; existing planner/action limits and authoritative final hydration remain in force.
+**Implementation:**
+- Files: `frontend/src-tauri/src/api/chat.rs`, `frontend/src-tauri/src/retrieval/agent.rs`, `frontend/src-tauri/src/retrieval/agent/tests.rs`, `frontend/src-tauri/src/retrieval/service.rs`, `frontend/src-tauri/src/retrieval/tests.rs`, this doc, `../docs/notes-chat-improvement-execution.md`
+- Approach: Stored snapshot membership and current local-date today membership become `AllowedMeetingIds` at the shared Chat preparation boundary. Factual requests run effective/original FTS AND→OR attempts within those IDs, deduplicate results, and interleave attempts deterministically; broad intent is detected by deterministic English/Portuguese summary, comparison, and list terms, then one lexical fallback candidate per allowed meeting is added and re-ranked through the existing fusion/hydration pipeline. The explicit `get_by_meeting_ids` fallback preserves deleted-member tolerance and the existing 100-meeting bound without rerunning a snapshot's source query.
+**Not implemented:**
+- Task 4.5 cross-scope deletion/source hardening, provider/native/evaluation qualification, and inherited Sprint 3 release-gate closure.
+**Why not implemented:**
+- Those checks and changes are outside Task 4.4; rejected corpus/evaluation/debug artifacts are contaminated and prohibited as evidence for this task.
+**Verification:**
+- `pnpm run typecheck` - pass.
+- `npx vitest run` - pass (98 tests, 20 files).
+- `cargo test --manifest-path src-tauri/Cargo.toml --lib` - pass (778 passed, 2 ignored).
+- `$env:CARGO_TARGET_DIR="C:\Users\arman\cargo-target"; cargo check --manifest-path src-tauri/Cargo.toml` - pass; one pre-existing `Sidebar` dead-code warning.
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check` - blocked only by pre-existing rejected V10 fixture trailing whitespace; touched Rust files pass targeted formatting.
+- `git diff --check` - pass.
+**Rollback:**
+- Restore snapshot/today preparation to deterministic `FtsRepository::get_by_meeting_ids` resolution and remove the broad-intent signal/coverage method; no data rollback is required.
+**Decisions and follow-ups:**
+- Membership remains authoritative and bounded: deleted snapshot members are skipped, current today IDs are date-derived, and no outside meeting can reach candidate/context/source publication. Task 4.4 acceptance/review, Task 4.5, and all inherited Sprint 3 release gates remain open; no release claim is made.
+
+**2026-09-02 R50 remediation addendum:** Broad allow-list preparation now bypasses the ordinary five-meeting publication cap only for `AllowedMeetingIds`, deduplicates and caps the authoritative member list at 100, gives each live member an equal final-context share, and rechecks membership/source revision before publication. Ranked hybrid and Deep paths add one bounded coverage candidate per allowed member; lexical/lifecycle fallback uses the same authoritative compact loader. English `resume` no longer triggers Portuguese `resum*` broad intent. Production-boundary Chat regressions cover snapshot and today factual queries, snapshot/today broad fallback, deleted snapshot members, six-member hybrid coverage, the 100-member bounded ordered prompt, and Deep preparation. Final checks passed: typecheck, Vitest (98 tests/20 files), Cargo lib (785 passed/2 ignored), Cargo check, touched-file rustfmt, and scoped diff check. Repository-wide fmt remains blocked only by the pre-existing rejected V10 fixture whitespace; Task 4.4 acceptance/review and inherited Sprint 3 release gates remain open. No prior Task 4.4 record was rewritten.
+
+**2026-09-02 R51 remediation addendum:** Broad ranked hydration now preserves semantic endpoint ranges through the range-aware authoritative loader, validates complete current ranges with the existing fingerprint contract, keeps chronology/adjacency, and publishes separate contiguous sources rather than sparse endpoint unions. Bounded broad headers and per-member equal shares ensure every live allow-listed member's accepted block fits the final context budget; invalid/stale/oversized ranked ranges fall back compactly without stale evidence credit. Production-boundary regressions cover active multi-segment semantic broad evidence, 100 valid 512-byte IDs, available/unavailable lifecycle factual English `resume`, and Deep today preparation. Up-to-100 authoritative loads remain sequential as a documented residual performance risk; no latency/p95 claim is made. Final verification is recorded in the execution log; no prior R50/R51 review or historical entry was rewritten.
+
 ### Task Entry Template
 
 ```markdown

@@ -191,6 +191,7 @@ fn deep_input<'a>(
         original_query: query,
         effective_query: query,
         scope,
+        broad_intent: false,
         limits: RetrievalLimits::chat_default(),
         core_language: CoreTermLanguage::English,
         context_budget: 20_000,
@@ -199,6 +200,19 @@ fn deep_input<'a>(
         planner,
         bounds: DeepBounds::production(),
     }
+}
+
+fn broad_deep_input<'a>(
+    pool: &'a SqlitePool,
+    scope: PersistedRetrievalScope,
+    query: &'a str,
+    planner: &'a dyn PlannerGeneration,
+    progress: Option<DeepProgressCallback<'a>>,
+    cancellation: &'a CancellationToken,
+) -> DeepPreparationInput<'a> {
+    let mut input = deep_input(pool, scope, query, planner, progress, cancellation);
+    input.broad_intent = true;
+    input
 }
 
 fn meeting_ids(hydrated: &HydratedContext) -> HashSet<String> {
@@ -233,6 +247,32 @@ async fn first_retained_evidence_id(pool: &SqlitePool, query: &str) -> String {
 }
 
 // -- Functional loop ------------------------------------------------------------
+
+#[tokio::test]
+async fn broad_deep_initial_retrieval_covers_every_allowed_meeting() {
+    let pool = seeded_pool(&[
+        ("m-a", "Alpha", "zulu quarterly planning notes"),
+        ("m-b", "Beta", "yankee deployment runbook details"),
+    ])
+    .await;
+    let planner = FakePlanner::new(vec![Ok(finish_action())]);
+    let outcome = run_deep_preparation(broad_deep_input(
+        &pool,
+        PersistedRetrievalScope::AllowedMeetingIds(vec!["m-a".to_string(), "m-b".to_string()]),
+        "zulu planning",
+        &planner,
+        None,
+        &CancellationToken::new(),
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(
+        meeting_ids(&outcome.hydrated),
+        HashSet::from(["m-a".to_string(), "m-b".to_string()])
+    );
+    assert_eq!(outcome.additional_rounds, 0);
+}
 
 #[tokio::test]
 async fn additional_search_finds_missing_evidence_with_source_parity() {

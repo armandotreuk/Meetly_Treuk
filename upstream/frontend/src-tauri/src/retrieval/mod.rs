@@ -34,7 +34,10 @@ pub use agent::{
     PLANNER_MAX_ROUNDS, PLANNER_SCHEMA_VERSION,
 };
 pub use chunking::{chunk_meeting, ChunkerConfig, SemanticDocument, TokenizerPolicy};
-pub use hydration::{hydrate_context, HydratedContext, HydratedMeeting, HydratedSource};
+pub use hydration::{
+    hydrate_broad_scope_context, hydrate_context, hydrate_context_with_broad_coverage,
+    HydratedContext, HydratedMeeting, HydratedSource,
+};
 pub use index::{QueryIndexService, ScopeFilter, SearchFailure, VectorHit};
 pub use model::{get_or_load, RetrievalModelError, RetrievalModels};
 pub use ranking::{

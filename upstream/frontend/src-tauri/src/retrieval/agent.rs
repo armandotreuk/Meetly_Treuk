@@ -39,7 +39,7 @@ use serde::Deserialize;
 use sqlx::SqlitePool;
 use tokio_util::sync::CancellationToken;
 
-use super::hydration::{hydrate_context, HydratedContext};
+use super::hydration::{hydrate_context, hydrate_context_with_broad_coverage, HydratedContext};
 use super::ranking::{
     rank_with_mode, RankedEvidence, RankedMeeting, RankingConfig, RankingMode, RankingOutcome,
 };
@@ -315,9 +315,10 @@ pub struct DeepPreparationInput<'a> {
     pub lifecycle: RetrievalLifecycle,
     pub original_query: &'a str,
     pub effective_query: &'a str,
-    /// The original authorized persisted scope; Deep supports All/Folder in
-    /// this release. Never widened by planner actions.
+    /// The original authorized persisted scope. Never widened by planner
+    /// actions.
     pub scope: PersistedRetrievalScope,
+    pub broad_intent: bool,
     pub limits: RetrievalLimits,
     pub core_language: CoreTermLanguage,
     pub context_budget: usize,
@@ -494,7 +495,13 @@ pub async fn run_deep_preparation(
         core_language: input.core_language,
         cancellation: Some(budget.clone()),
     };
-    let initial = service.retrieve_ranked(input.pool, request).await;
+    let initial = if input.broad_intent {
+        service
+            .retrieve_ranked_with_broad_coverage(input.pool, request)
+            .await
+    } else {
+        service.retrieve_ranked(input.pool, request).await
+    };
     let mut ranked = match initial {
         Ok(ranked) => ranked,
         Err(error) => return Err(initial_failure(parent, &budget, error)),
@@ -511,11 +518,20 @@ pub async fn run_deep_preparation(
     // never downgrades healthy semantic candidates and a later healthy
     // semantic search restores Hybrid.
     let mut first_fallback = ranked.semantic_fallback.clone();
-    let mut hydrated =
-        match hydrate_context(input.pool, &ranked, input.context_budget, Some(&budget)).await {
-            Ok(hydrated) => hydrated,
-            Err(error) => return Err(initial_failure(parent, &budget, error)),
-        };
+    let mut hydrated = match if input.broad_intent {
+        hydrate_context_with_broad_coverage(
+            input.pool,
+            &ranked,
+            input.context_budget,
+            Some(&budget),
+        )
+        .await
+    } else {
+        hydrate_context(input.pool, &ranked, input.context_budget, Some(&budget)).await
+    } {
+        Ok(hydrated) => hydrated,
+        Err(error) => return Err(initial_failure(parent, &budget, error)),
+    };
     emit_progress(
         input.progress,
         DeepProgressEvent {
@@ -839,9 +855,17 @@ pub async fn run_deep_preparation(
                     ranking,
                     semantic_fallback: round_fallback,
                 };
-                match hydrate_context(input.pool, &merged, input.context_budget, Some(&budget))
+                match if input.broad_intent {
+                    hydrate_context_with_broad_coverage(
+                        input.pool,
+                        &merged,
+                        input.context_budget,
+                        Some(&budget),
+                    )
                     .await
-                {
+                } else {
+                    hydrate_context(input.pool, &merged, input.context_budget, Some(&budget)).await
+                } {
                     Ok(round_hydrated) => {
                         ranked = merged;
                         hydrated = round_hydrated;
@@ -883,7 +907,17 @@ pub async fn run_deep_preparation(
     // hydration suppresses publication entirely; stale evidence is never
     // retained past its validation.
     ensure_alive(parent)?;
-    match hydrate_context(input.pool, &ranked, input.context_budget, Some(&budget)).await {
+    match if input.broad_intent {
+        hydrate_context_with_broad_coverage(
+            input.pool,
+            &ranked,
+            input.context_budget,
+            Some(&budget),
+        )
+        .await
+    } else {
+        hydrate_context(input.pool, &ranked, input.context_budget, Some(&budget)).await
+    } {
         Ok(final_hydrated) => hydrated = final_hydrated,
         Err(error) => {
             if parent.is_cancelled() {

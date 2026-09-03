@@ -478,6 +478,83 @@ impl RetrievalService {
         })
     }
 
+    pub(crate) async fn retrieve_ranked_with_broad_coverage(
+        &self,
+        pool: &SqlitePool,
+        request: RetrievalRequest,
+    ) -> Result<RankedRetrieval, RetrievalError> {
+        let cancel = request.cancellation.clone().unwrap_or_default();
+        let mut ranked = self.retrieve_ranked(pool, request).await?;
+        let allowed_ids = match &ranked.scope.scope {
+            PersistedRetrievalScope::AllowedMeetingIds(ids) => {
+                let mut unique = Vec::with_capacity(ids.len());
+                let mut seen = HashSet::new();
+                for id in ids {
+                    if seen.insert(id) {
+                        unique.push(id.clone());
+                    }
+                }
+                unique
+            }
+            _ => return Ok(ranked),
+        };
+        if allowed_ids.is_empty() {
+            return Ok(ranked);
+        }
+
+        ensure_not_cancelled(&cancel)?;
+        let coverage =
+            FtsRepository::get_by_meeting_ids(pool, &allowed_ids, 1, allowed_ids.len() as u32)
+                .await
+                .map_err(db_error)?;
+        ensure_not_cancelled(&cancel)?;
+
+        let mut candidates: Vec<RetrievedEvidence> = ranked
+            .ranking
+            .evidence
+            .iter()
+            .map(|entry| entry.evidence.clone())
+            .collect();
+        let mut seen = candidates
+            .iter()
+            .map(|candidate| candidate.evidence_id.clone())
+            .collect::<HashSet<_>>();
+        for result in coverage {
+            let mut evidence = lexical_evidence(result);
+            evidence.provenance.push(EvidenceProvenance {
+                channel: RetrievalChannel::Lexical,
+                variant: QueryVariantKind::Original,
+                mode: Some(LexicalMode::Or),
+                rank: MAX_CANDIDATES_PER_VARIANT,
+                query_slot: 0,
+            });
+            if seen.insert(evidence.evidence_id.clone()) {
+                candidates.push(evidence);
+            }
+        }
+        if candidates.len() == ranked.ranking.evidence.len() {
+            return Ok(ranked);
+        }
+
+        let ranking_mode = if ranked.semantic_fallback.is_some() {
+            crate::retrieval::ranking::RankingMode::LexicalOnly
+        } else {
+            crate::retrieval::ranking::RankingMode::Hybrid
+        };
+        ranked.ranking = crate::retrieval::ranking::rank_with_mode(
+            &self.lifecycle,
+            pool,
+            candidates,
+            &ranked.ranking.effective_query,
+            ranked.ranking.core_terms.clone(),
+            &crate::retrieval::ranking::RankingConfig::chat(),
+            ranking_mode,
+            &cancel,
+        )
+        .await?;
+        Ok(ranked)
+    }
+
     /// Revalidates the ORIGINAL authoritative scope's current membership and
     /// returns the supplied meeting IDs still inside it (input order kept).
     /// Deep retrieval rounds call this after every planner round as an early

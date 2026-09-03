@@ -13,7 +13,8 @@ use uuid::Uuid;
 
 use crate::retrieval::worker::RetrievalLifecycle;
 use crate::retrieval::{
-    agent::DeepProgressCallback, hydrate_context, PersistedRetrievalScope, RetrievalChannel,
+    agent::DeepProgressCallback, hydrate_broad_scope_context, hydrate_context,
+    hydrate_context_with_broad_coverage, PersistedRetrievalScope, RetrievalChannel,
     RetrievalLimits, RetrievalPurpose, RetrievalRequest, RetrievalService, SemanticFallbackReason,
 };
 use crate::{
@@ -267,9 +268,8 @@ pub const SYSTEM_PROMPT: &str = "You are a helpful meeting assistant. Answer the
 const QUERY_REWRITE_SYSTEM_PROMPT: &str = "You are a search query rewriter. Given a follow-up question and conversation history, rewrite it into a single standalone search query that would find relevant information in a meeting transcript database. Return ONLY the search query, nothing else. Keep it under 10 words. Do not add quotes or explanation.";
 
 // ponytail: snapshot rehydration total cap mirrors the 100-meeting snapshot ceiling
-// (repositories/chat.rs MAX_SEARCH_SNAPSHOT_RESULTS); per-meeting chunks are capped
-// by chunk_limit in prepare_chat_inputs_for_scope. Upgrade: relevance-ranked chunk
-// selection instead of the deterministic chunk_id order.
+// (repositories/chat.rs MAX_SEARCH_SNAPSHOT_RESULTS); query-aware paths use bounded
+// FTS ranking while broad/no-hit fallback keeps deterministic per-meeting coverage.
 const SNAPSHOT_REHYDRATION_CHUNK_CAP: u32 = 100;
 const CHAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -759,6 +759,7 @@ async fn prepare_chat_inputs_for_scope(
     } else {
         None
     };
+    let broad_intent = requests_broad_retrieval(query) || requests_broad_retrieval(&search_query);
     let meeting_list_context = if requests_meeting_list(query) {
         Some(format_meeting_list_context(
             &meeting_titles_for_scope(pool, &retrieval_scope, query, today_date).await?,
@@ -874,15 +875,16 @@ async fn prepare_chat_inputs_for_scope(
                 && lifecycle.is_some()
                 && matches!(
                     scope,
-                    ChatRetrievalScope::All | ChatRetrievalScope::Folder(_)
+                    ChatRetrievalScope::All
+                        | ChatRetrievalScope::Folder(_)
+                        | ChatRetrievalScope::SearchSnapshot(_)
                 )
             {
                 let lifecycle =
                     lifecycle.ok_or_else(|| "Retrieval lifecycle unavailable".to_string())?;
-                // Task 4.2 keeps the Deep planner scoped to persisted All/Folder
-                // paths; saved meetings use shared hybrid anchors without the
-                // planner, while today's allow-list, snapshots, and live scopes
-                // remain Fast until later scope work.
+                // Saved meetings use shared hybrid anchors without the planner;
+                // persisted broad scopes use the planner only after their
+                // authoritative allow-list is resolved.
                 let deep_eligible =
                     deep_preparation_eligible(retrieval_mode, today_meeting_ids.as_ref());
                 let persisted_scope = match &scope {
@@ -890,16 +892,15 @@ async fn prepare_chat_inputs_for_scope(
                     ChatRetrievalScope::Folder(folder_id) => {
                         PersistedRetrievalScope::Folder(folder_id.clone())
                     }
+                    ChatRetrievalScope::SearchSnapshot(meeting_ids) => {
+                        PersistedRetrievalScope::AllowedMeetingIds(meeting_ids.clone())
+                    }
                     _ => unreachable!(),
                 };
-                let persisted_scope = if deep_eligible {
-                    persisted_scope
-                } else {
-                    today_meeting_ids
-                        .as_ref()
-                        .map(|ids| PersistedRetrievalScope::AllowedMeetingIds(ids.clone()))
-                        .unwrap_or(persisted_scope)
-                };
+                let persisted_scope = today_meeting_ids
+                    .as_ref()
+                    .map(|ids| PersistedRetrievalScope::AllowedMeetingIds(ids.clone()))
+                    .unwrap_or(persisted_scope);
                 if deep_eligible {
                     let request_cancellation = cancellation_token.cloned().unwrap_or_default();
                     let planner = crate::retrieval::agent::SharedClientPlanner {
@@ -918,6 +919,7 @@ async fn prepare_chat_inputs_for_scope(
                             original_query: query,
                             effective_query: &search_query,
                             scope: persisted_scope,
+                            broad_intent,
                             limits: RetrievalLimits {
                                 lexical_per_variant: chunk_limit as usize,
                                 vector_per_variant: chunk_limit as usize,
@@ -964,34 +966,42 @@ async fn prepare_chat_inputs_for_scope(
                         .collect();
                     (deep.hydrated.markdown, sources)
                 } else {
-                    let ranked = RetrievalService::new(lifecycle)
-                        .retrieve_ranked(
-                            pool,
-                            RetrievalRequest {
-                                original_query: query.to_string(),
-                                rewritten_query: Some(search_query.clone()),
-                                scope: persisted_scope,
-                                purpose: RetrievalPurpose::Chat,
-                                limits: RetrievalLimits {
-                                    lexical_per_variant: chunk_limit as usize,
-                                    vector_per_variant: chunk_limit as usize,
-                                },
-                                core_language: crate::retrieval::service::CoreTermLanguage::Unknown,
-                                cancellation: cancellation_token.cloned(),
-                            },
-                        )
-                        .await
-                        .map_err(|e| format!("Retrieval failed: {}", e))?;
+                    let request = RetrievalRequest {
+                        original_query: query.to_string(),
+                        rewritten_query: Some(search_query.clone()),
+                        scope: persisted_scope,
+                        purpose: RetrievalPurpose::Chat,
+                        limits: RetrievalLimits {
+                            lexical_per_variant: chunk_limit as usize,
+                            vector_per_variant: chunk_limit as usize,
+                        },
+                        core_language: crate::retrieval::service::CoreTermLanguage::Unknown,
+                        cancellation: cancellation_token.cloned(),
+                    };
+                    let service = RetrievalService::new(lifecycle);
+                    let ranked = if broad_intent {
+                        service
+                            .retrieve_ranked_with_broad_coverage(pool, request)
+                            .await
+                    } else {
+                        service.retrieve_ranked(pool, request).await
+                    }
+                    .map_err(|e| format!("Retrieval failed: {}", e))?;
                     if ranked.semantic_fallback.is_some() {
                         retrieval_diagnostic = RetrievalPreparationDiagnostic::SemanticFallback;
                     }
-                    let hydrated = hydrate_context(
-                        pool,
-                        &ranked,
-                        persisted_context_budget,
-                        cancellation_token,
-                    )
-                    .await
+                    let hydrated = if broad_intent {
+                        hydrate_context_with_broad_coverage(
+                            pool,
+                            &ranked,
+                            persisted_context_budget,
+                            cancellation_token,
+                        )
+                        .await
+                    } else {
+                        hydrate_context(pool, &ranked, persisted_context_budget, cancellation_token)
+                            .await
+                    }
                     .map_err(|e| format!("Retrieval hydration failed: {}", e))?;
                     let sources = hydrated
                         .sources
@@ -1002,27 +1012,74 @@ async fn prepare_chat_inputs_for_scope(
                 }
             } else {
                 log::info!("Chat retrieval preparation mode: {retrieval_diagnostic:?}");
-                let results = resolve_scope_results(
-                    pool,
-                    &search_query,
-                    query,
-                    chunk_limit,
-                    scope,
-                    today_meeting_ids.as_deref(),
-                )
-                .await?;
-                ensure_not_cancelled(cancellation_token)?;
-                let built = build_context_markdown_with_limit(&results, persisted_context_budget);
-                let retained = built
-                    .retained_evidence_ids
-                    .into_iter()
-                    .collect::<HashSet<_>>();
-                let sources = results
-                    .iter()
-                    .filter(|result| retained.contains(&lexical_evidence_id(result)))
-                    .map(chat_source_from_result)
-                    .collect();
-                (built.markdown, sources)
+                let broad_scope_ids = today_meeting_ids.as_deref().or_else(|| match &scope {
+                    ChatRetrievalScope::SearchSnapshot(meeting_ids) => Some(meeting_ids.as_slice()),
+                    _ => None,
+                });
+                if broad_intent {
+                    if let Some(meeting_ids) = broad_scope_ids {
+                        let hydrated = hydrate_broad_scope_context(
+                            pool,
+                            &PersistedRetrievalScope::AllowedMeetingIds(meeting_ids.to_vec()),
+                            persisted_context_budget,
+                            cancellation_token,
+                        )
+                        .await
+                        .map_err(|e| format!("Retrieval hydration failed: {}", e))?;
+                        let sources = hydrated
+                            .sources
+                            .iter()
+                            .map(chat_source_from_hydrated)
+                            .collect();
+                        (hydrated.markdown, sources)
+                    } else {
+                        let results = resolve_scope_results(
+                            pool,
+                            &search_query,
+                            query,
+                            chunk_limit,
+                            scope,
+                            today_meeting_ids.as_deref(),
+                        )
+                        .await?;
+                        ensure_not_cancelled(cancellation_token)?;
+                        let built =
+                            build_context_markdown_with_limit(&results, persisted_context_budget);
+                        let retained = built
+                            .retained_evidence_ids
+                            .into_iter()
+                            .collect::<HashSet<_>>();
+                        let sources = results
+                            .iter()
+                            .filter(|result| retained.contains(&lexical_evidence_id(result)))
+                            .map(chat_source_from_result)
+                            .collect();
+                        (built.markdown, sources)
+                    }
+                } else {
+                    let results = resolve_scope_results(
+                        pool,
+                        &search_query,
+                        query,
+                        chunk_limit,
+                        scope,
+                        today_meeting_ids.as_deref(),
+                    )
+                    .await?;
+                    ensure_not_cancelled(cancellation_token)?;
+                    let built =
+                        build_context_markdown_with_limit(&results, persisted_context_budget);
+                    let retained = built
+                        .retained_evidence_ids
+                        .into_iter()
+                        .collect::<HashSet<_>>();
+                    let sources = results
+                        .iter()
+                        .filter(|result| retained.contains(&lexical_evidence_id(result)))
+                        .map(chat_source_from_result)
+                        .collect();
+                    (built.markdown, sources)
+                }
             }
         }
     };
@@ -1180,6 +1237,31 @@ fn requests_todays_meetings(query: &str) -> bool {
             .any(|term| term == "meeting" || term == "meetings")
 }
 
+fn requests_broad_retrieval(query: &str) -> bool {
+    let terms = query
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>();
+    terms.iter().any(|term| {
+        term.starts_with("summar")
+            || (term.starts_with("resum") && !term.starts_with("resume"))
+            || term.starts_with("compar")
+            || term.starts_with("differ")
+            || term.starts_with("contrast")
+            || matches!(
+                term.as_str(),
+                "overview"
+                    | "recap"
+                    | "sintese"
+                    | "síntese"
+                    | "panorama"
+                    | "consolidate"
+                    | "consolidar"
+            )
+    }) || requests_meeting_list(query)
+}
+
 fn requests_meeting_list(query: &str) -> bool {
     let normalized = query.to_lowercase();
     let has_meeting_term = normalized.contains("meeting") || normalized.contains("reuni");
@@ -1309,7 +1391,7 @@ fn format_meeting_list_context(titles: &[String]) -> String {
     );
     for title in titles {
         context.push_str("- ");
-        context.push_str(title);
+        context.push_str(&truncate_meeting_title(title));
         context.push('\n');
     }
     context
@@ -1901,21 +1983,86 @@ async fn resolve_scope_results(
     scope: ChatRetrievalScope,
     meeting_ids_override: Option<&[String]>,
 ) -> Result<Vec<crate::database::repositories::fts::FtsSearchResult>, String> {
-    if let Some(meeting_ids) = meeting_ids_override {
-        return FtsRepository::get_by_meeting_ids(
-            pool,
-            meeting_ids,
-            chunk_limit,
-            SNAPSHOT_REHYDRATION_CHUNK_CAP,
-        )
-        .await
-        .map_err(|error| {
-            tracing::error!("FTS search failed for chat: {}", error);
-            format!("Search failed: {}", error)
-        });
+    let allowed_ids = meeting_ids_override.or_else(|| match &scope {
+        ChatRetrievalScope::SearchSnapshot(meeting_ids) => Some(meeting_ids.as_slice()),
+        _ => None,
+    });
+    if let Some(meeting_ids) = allowed_ids {
+        if requests_broad_retrieval(search_query) || requests_broad_retrieval(original_query) {
+            return FtsRepository::get_by_meeting_ids(
+                pool,
+                meeting_ids,
+                1,
+                SNAPSHOT_REHYDRATION_CHUNK_CAP,
+            )
+            .await
+            .map_err(|error| {
+                tracing::error!("FTS search failed for chat: {}", error);
+                format!("Search failed: {}", error)
+            });
+        }
     }
 
-    if let ChatRetrievalScope::SearchSnapshot(meeting_ids) = &scope {
+    if let Some(meeting_ids) = allowed_ids {
+        let mut attempts = vec![
+            (search_query, MatchMode::And),
+            (search_query, MatchMode::Or),
+        ];
+        if search_query != original_query {
+            attempts.extend([
+                (original_query, MatchMode::And),
+                (original_query, MatchMode::Or),
+            ]);
+        }
+
+        let mut attempt_results = Vec::with_capacity(attempts.len());
+        let mut claimed = HashSet::new();
+        for (index, (query, mode)) in attempts.into_iter().enumerate() {
+            let attempt_limit = chunk_limit.saturating_mul(index as u32 + 1);
+            let results = FtsRepository::search_with_meeting_ids(
+                pool,
+                query,
+                attempt_limit,
+                meeting_ids,
+                mode,
+            )
+            .await
+            .map_err(|error| {
+                tracing::error!("FTS search failed for chat: {}", error);
+                format!("Search failed: {}", error)
+            })?;
+            let unique_results = results
+                .into_iter()
+                .filter(|result| {
+                    claimed.insert((
+                        result.meeting_id.clone(),
+                        result.chunk_type.clone(),
+                        result.chunk_id.clone(),
+                    ))
+                })
+                .take(chunk_limit as usize)
+                .collect::<Vec<_>>();
+            attempt_results.push(unique_results.into_iter());
+        }
+
+        let mut results = Vec::new();
+        while results.len() < chunk_limit as usize {
+            let before = results.len();
+            for attempt in &mut attempt_results {
+                if let Some(result) = attempt.next() {
+                    results.push(result);
+                }
+                if results.len() >= chunk_limit as usize {
+                    break;
+                }
+            }
+            if results.len() == before {
+                break;
+            }
+        }
+        if !results.is_empty() {
+            return Ok(results);
+        }
         return FtsRepository::get_by_meeting_ids(
             pool,
             meeting_ids,
@@ -1977,14 +2124,13 @@ async fn resolve_scope_results(
     Ok(results)
 }
 
-/// Deep runs only for the supported persisted All/Folder scopes in this
-/// release: a derived today allow-list (snapshot/today/saved-meeting members)
-/// keeps the request Fast until Tasks 4.3/4.4 extend the lifecycle.
+/// Deep runs only for persisted scopes whose authoritative membership is
+/// resolved before preparation; live and saved-meeting paths stay separate.
 fn deep_preparation_eligible(
     retrieval_mode: ChatRetrievalMode,
-    today_meeting_ids: Option<&Vec<String>>,
+    _today_meeting_ids: Option<&Vec<String>>,
 ) -> bool {
-    retrieval_mode == ChatRetrievalMode::Deep && today_meeting_ids.is_none()
+    retrieval_mode == ChatRetrievalMode::Deep
 }
 
 fn should_rewrite_query(history: Option<&Vec<ChatMessage>>, query: &str) -> bool {
@@ -2856,6 +3002,61 @@ mod tests {
         pool
     }
 
+    async fn configure_scope_chat(
+        pool: &SqlitePool,
+        force_lexical: bool,
+        ollama_endpoint: Option<&str>,
+    ) {
+        sqlx::query("CREATE TABLE settings (id TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL, whisperModel TEXT NOT NULL, groqApiKey TEXT, openaiApiKey TEXT, anthropicApiKey TEXT, ollamaApiKey TEXT, openRouterApiKey TEXT, ollamaEndpoint TEXT, customOpenAIConfig TEXT, customVocabulary TEXT, chatProvider TEXT, chatModel TEXT, chatOllamaEndpoint TEXT, force_lexical_retrieval BOOLEAN NOT NULL DEFAULT FALSE)")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO settings (id, provider, model, whisperModel, chatProvider, chatModel, chatOllamaEndpoint, force_lexical_retrieval) VALUES ('1', 'ollama', 'local', 'whisper', 'ollama', 'local', ?, ?)")
+            .bind(ollama_endpoint)
+            .bind(force_lexical)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE meetings SET saved_at = '2026-09-01T00:00:00Z'")
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn set_scope_note(pool: &SqlitePool, meeting_id: &str, text: &str) {
+        sqlx::query(
+            "INSERT OR REPLACE INTO meeting_notes (meeting_id, notes_markdown) VALUES (?, ?)",
+        )
+        .bind(meeting_id)
+        .bind(text)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn serve_deep_finish() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = vec![0_u8; 64 * 1024];
+            let _ = socket.read(&mut request).await;
+            let body = r#"{"choices":[{"message":{"content":"{\"schemaVersion\":1,\"status\":\"finish\"}"}}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.flush().await;
+        });
+        format!("http://{}", address)
+    }
+
     const HYBRID_MODEL_ID: &str = "chat-test-model";
     const HYBRID_DIMENSIONS: usize = 4;
     const HYBRID_BEFORE: &str = "Opening remarks.";
@@ -3187,6 +3388,114 @@ mod tests {
         (pool, lifecycle)
     }
 
+    async fn resume_scope_hybrid_test_fixture(
+    ) -> (SqlitePool, crate::retrieval::worker::RetrievalLifecycle) {
+        let pool = hybrid_test_pool().await;
+        configure_hybrid_chat(&pool).await;
+        for (meeting_id, title, transcript) in [
+            (
+                "resume-meeting",
+                "Resume discussion",
+                "resume parsing decision",
+            ),
+            ("roadmap-meeting", "Roadmap discussion", "roadmap planning"),
+        ] {
+            sqlx::query(
+                "INSERT INTO meetings (id, title, created_at, updated_at, saved_at) VALUES (?, ?, '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')",
+            )
+            .bind(meeting_id)
+            .bind(title)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time) VALUES (?, ?, ?, '10:00', 1.0)",
+            )
+            .bind(format!("{meeting_id}-transcript"))
+            .bind(meeting_id)
+            .bind(transcript)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO meeting_fts (meeting_id, chunk_type, chunk_id, text) VALUES (?, 'transcript', ?, ?)",
+            )
+            .bind(meeting_id)
+            .bind(format!("{meeting_id}-transcript"))
+            .bind(transcript)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "UPDATE search_source_state SET fts_indexed_revision = fts_projection_revision",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let lifecycle = hybrid_test_lifecycle();
+        publish_hybrid_document(
+            &pool,
+            &lifecycle,
+            "resume-meeting",
+            "doc-resume-meeting",
+            "resume-meeting-transcript",
+            "resume-meeting-transcript",
+            "resume parsing decision",
+        )
+        .await;
+        (pool, lifecycle)
+    }
+
+    async fn today_deep_test_fixture() -> (SqlitePool, crate::retrieval::worker::RetrievalLifecycle)
+    {
+        let pool = hybrid_test_pool().await;
+        configure_hybrid_chat(&pool).await;
+        let today = Local::now().format("%Y-%m-%dT12:00:00").to_string();
+        for (meeting_id, created_at) in [
+            ("today-one", today.clone()),
+            ("today-two", today),
+            ("old-meeting", "2020-01-01T12:00:00".to_string()),
+        ] {
+            sqlx::query(
+                "INSERT INTO meetings (id, title, created_at, updated_at, saved_at) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(meeting_id)
+            .bind(format!("Meeting {meeting_id}"))
+            .bind(&created_at)
+            .bind(&created_at)
+            .bind(&created_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO meeting_notes (meeting_id, notes_markdown, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            )
+            .bind(meeting_id)
+            .bind(format!("Authoritative notes for {meeting_id}"))
+            .bind(&created_at)
+            .bind(&created_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO meeting_fts (meeting_id, chunk_type, chunk_id, text) VALUES (?, 'note', ?, 'agenda')",
+            )
+            .bind(meeting_id)
+            .bind(format!("note-{meeting_id}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "UPDATE search_source_state SET fts_indexed_revision = fts_projection_revision",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        (pool, semantic_unavailable_lifecycle())
+    }
+
     async fn prepare_hybrid(
         pool: &SqlitePool,
         lifecycle: &crate::retrieval::worker::RetrievalLifecycle,
@@ -3315,6 +3624,48 @@ mod tests {
         assert!(inputs
             .user_prompt
             .contains("Partial transcript coverage: 7/12 segments"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_broad_active_semantic_range_reaches_final_prompt() {
+        let (pool, lifecycle) = semantic_range_hybrid_test_fixture().await;
+        let inputs = prepare_chat_inputs_for_scope(
+            &pool,
+            None,
+            &reqwest::Client::new(),
+            "Summarize these meetings",
+            None,
+            ChatRetrievalScope::SearchSnapshot(vec!["m2".to_string()]),
+            None,
+            Some(lifecycle),
+            None,
+            Some(ChatRetrievalMode::Fast),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            inputs.retrieval_diagnostic,
+            RetrievalPreparationDiagnostic::Hybrid
+        );
+        let transcript = inputs
+            .sources
+            .iter()
+            .find(|source| source.chunk_type == "transcript")
+            .expect("semantic transcript source");
+        for index in 3..=9 {
+            assert!(transcript.snippet.contains(&hybrid_transcript_text(index)));
+        }
+        for source in &inputs.sources {
+            for line in source
+                .snippet
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+            {
+                assert!(inputs.user_prompt.contains(line));
+            }
+        }
     }
 
     #[tokio::test]
@@ -4035,6 +4386,599 @@ mod tests {
         assert_eq!(titles, vec!["Child"]);
     }
 
+    #[test]
+    fn broad_retrieval_intent_covers_summary_compare_and_list_requests() {
+        assert!(requests_broad_retrieval("Summarize all meetings"));
+        assert!(requests_broad_retrieval("Compare the decisions"));
+        assert!(requests_broad_retrieval("Síntese das reuniões"));
+        assert!(requests_broad_retrieval("list today's meetings"));
+        assert!(!requests_broad_retrieval(
+            "Which meeting discussed retention?"
+        ));
+        assert!(!requests_broad_retrieval(
+            "Which meeting discussed resume parsing?"
+        ));
+    }
+
+    #[tokio::test]
+    async fn snapshot_factual_resume_query_reaches_final_prompt_and_sources() {
+        let pool = scope_pool().await;
+        configure_scope_chat(&pool, true, None).await;
+        sqlx::query(
+            "UPDATE meeting_fts SET text = CASE meeting_id WHEN 'm1' THEN 'resume parsing decision' WHEN 'm2' THEN 'roadmap planning' ELSE 'unrelated' END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let inputs = prepare_chat_inputs_for_scope(
+            &pool,
+            None,
+            &reqwest::Client::new(),
+            "Which meeting discussed resume parsing?",
+            None,
+            ChatRetrievalScope::SearchSnapshot(vec!["m2".to_string(), "m1".to_string()]),
+            None,
+            None,
+            None,
+            Some(ChatRetrievalMode::Fast),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            inputs.retrieval_diagnostic,
+            RetrievalPreparationDiagnostic::ForcedLexical
+        );
+        assert_eq!(
+            inputs
+                .sources
+                .iter()
+                .map(|source| source.meeting_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m1"]
+        );
+        assert!(inputs.sources[0].snippet.contains("resume"));
+        assert!(inputs.user_prompt.contains(&inputs.sources[0].snippet));
+        assert!(!inputs.user_prompt.contains("roadmap planning"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_factual_resume_query_with_available_lifecycle_stays_relevant() {
+        let (pool, lifecycle) = resume_scope_hybrid_test_fixture().await;
+        let inputs = prepare_chat_inputs_for_scope(
+            &pool,
+            None,
+            &reqwest::Client::new(),
+            "Which meeting discussed resume parsing?",
+            None,
+            ChatRetrievalScope::SearchSnapshot(vec![
+                "roadmap-meeting".to_string(),
+                "resume-meeting".to_string(),
+            ]),
+            None,
+            Some(lifecycle),
+            None,
+            Some(ChatRetrievalMode::Fast),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(
+            inputs.retrieval_diagnostic,
+            RetrievalPreparationDiagnostic::LifecycleUnavailable
+        );
+        assert_eq!(
+            inputs
+                .sources
+                .iter()
+                .map(|source| source.meeting_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["resume-meeting"]
+        );
+        assert!(inputs.sources[0].snippet.contains("resume"));
+        assert!(inputs.sources[0].snippet.contains("parsing"));
+        assert!(inputs.user_prompt.contains(&inputs.sources[0].snippet));
+        assert!(!inputs.user_prompt.contains("roadmap planning"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_factual_resume_query_with_unavailable_lifecycle_stays_relevant() {
+        let (pool, _) = resume_scope_hybrid_test_fixture().await;
+        let inputs = prepare_chat_inputs_for_scope(
+            &pool,
+            None,
+            &reqwest::Client::new(),
+            "Which meeting discussed resume parsing?",
+            None,
+            ChatRetrievalScope::SearchSnapshot(vec![
+                "roadmap-meeting".to_string(),
+                "resume-meeting".to_string(),
+            ]),
+            None,
+            None,
+            None,
+            Some(ChatRetrievalMode::Fast),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            inputs.retrieval_diagnostic,
+            RetrievalPreparationDiagnostic::LifecycleUnavailable
+        );
+        assert_eq!(
+            inputs
+                .sources
+                .iter()
+                .map(|source| source.meeting_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["resume-meeting"]
+        );
+        assert!(inputs.sources[0].snippet.contains("resume"));
+        assert!(inputs.sources[0].snippet.contains("parsing"));
+        assert!(inputs.user_prompt.contains(&inputs.sources[0].snippet));
+        assert!(!inputs.user_prompt.contains("roadmap planning"));
+    }
+
+    #[tokio::test]
+    async fn today_factual_resume_query_reaches_only_relevant_today_member() {
+        let pool = scope_pool().await;
+        configure_scope_chat(&pool, true, None).await;
+        let now = Utc::now();
+        for (meeting_id, created_at) in [
+            ("m1", now),
+            ("m2", now),
+            ("m3", now - chrono::Duration::days(2)),
+        ] {
+            sqlx::query("UPDATE meetings SET created_at = ? WHERE id = ?")
+                .bind(created_at)
+                .bind(meeting_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "UPDATE meeting_fts SET text = CASE meeting_id WHEN 'm1' THEN 'resume parsing decision' WHEN 'm2' THEN 'roadmap planning' ELSE 'resume parsing old' END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let inputs = prepare_chat_inputs_for_scope(
+            &pool,
+            None,
+            &reqwest::Client::new(),
+            "Which meeting discussed resume parsing today?",
+            None,
+            ChatRetrievalScope::All,
+            None,
+            None,
+            None,
+            Some(ChatRetrievalMode::Fast),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            inputs
+                .sources
+                .iter()
+                .map(|source| source.meeting_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m1"]
+        );
+        assert!(inputs.sources[0].snippet.contains("resume"));
+        assert!(inputs.user_prompt.contains(&inputs.sources[0].snippet));
+        assert!(!inputs
+            .sources
+            .iter()
+            .any(|source| source.snippet.contains("old")));
+        assert!(inputs.user_prompt.contains("Current local date:"));
+    }
+
+    #[tokio::test]
+    async fn today_broad_lifecycle_unavailable_reaches_all_live_today_members() {
+        let pool = scope_pool().await;
+        configure_scope_chat(&pool, false, None).await;
+        let now = Utc::now();
+        for (meeting_id, created_at) in [
+            ("m1", now),
+            ("m2", now),
+            ("m3", now - chrono::Duration::days(2)),
+        ] {
+            sqlx::query("UPDATE meetings SET created_at = ? WHERE id = ?")
+                .bind(created_at)
+                .bind(meeting_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            set_scope_note(
+                &pool,
+                meeting_id,
+                &format!("Authoritative notes for {meeting_id}"),
+            )
+            .await;
+        }
+
+        let inputs = prepare_chat_inputs_for_scope(
+            &pool,
+            None,
+            &reqwest::Client::new(),
+            "Summarize today's meetings",
+            None,
+            ChatRetrievalScope::All,
+            None,
+            None,
+            None,
+            Some(ChatRetrievalMode::Fast),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            inputs.retrieval_diagnostic,
+            RetrievalPreparationDiagnostic::LifecycleUnavailable
+        );
+        assert_eq!(
+            inputs
+                .sources
+                .iter()
+                .map(|source| source.meeting_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["m1", "m2"])
+        );
+        assert!(inputs
+            .sources
+            .iter()
+            .all(|source| inputs.user_prompt.contains(&source.snippet)));
+        assert!(!inputs.user_prompt.contains("Authoritative notes for m3"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_broad_lifecycle_unavailable_reaches_all_live_members() {
+        let pool = scope_pool().await;
+        configure_scope_chat(&pool, false, None).await;
+        for meeting_id in ["m1", "m2", "m3"] {
+            set_scope_note(
+                &pool,
+                meeting_id,
+                &format!("Authoritative notes for {meeting_id}"),
+            )
+            .await;
+        }
+        sqlx::query("DELETE FROM meetings WHERE id = 'm2'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let inputs = prepare_chat_inputs_for_scope(
+            &pool,
+            None,
+            &reqwest::Client::new(),
+            "Summarize these meetings",
+            None,
+            ChatRetrievalScope::SearchSnapshot(vec![
+                "m1".to_string(),
+                "m2".to_string(),
+                "m3".to_string(),
+            ]),
+            None,
+            None,
+            None,
+            Some(ChatRetrievalMode::Fast),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            inputs.retrieval_diagnostic,
+            RetrievalPreparationDiagnostic::LifecycleUnavailable
+        );
+        assert_eq!(
+            inputs
+                .sources
+                .iter()
+                .map(|source| source.meeting_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m1", "m3"]
+        );
+        assert!(inputs
+            .sources
+            .iter()
+            .all(|source| inputs.user_prompt.contains(&source.snippet)));
+        assert!(!inputs.user_prompt.contains("m2"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_broad_hybrid_reaches_six_members_after_ranked_retrieval() {
+        let pool = scope_pool().await;
+        configure_scope_chat(&pool, false, None).await;
+        let mut meeting_ids = vec!["m1".to_string(), "m2".to_string(), "m3".to_string()];
+        for index in 4..=6 {
+            let meeting_id = format!("m{index}");
+            sqlx::query(
+                "INSERT INTO meetings (id, title, saved_at) VALUES (?, ?, '2026-09-01T00:00:00Z')",
+            )
+            .bind(&meeting_id)
+            .bind(format!("Meeting {meeting_id}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO meeting_fts (meeting_id, chunk_type, chunk_id, text) VALUES (?, 'note', ?, 'alpha')",
+            )
+            .bind(&meeting_id)
+            .bind(format!("note-{meeting_id}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+            set_scope_note(
+                &pool,
+                &meeting_id,
+                &format!("Authoritative notes for {meeting_id}"),
+            )
+            .await;
+            meeting_ids.push(meeting_id);
+        }
+        for meeting_id in ["m1", "m2", "m3"] {
+            set_scope_note(
+                &pool,
+                meeting_id,
+                &format!("Authoritative notes for {meeting_id}"),
+            )
+            .await;
+        }
+
+        let inputs = prepare_chat_inputs_for_scope(
+            &pool,
+            None,
+            &reqwest::Client::new(),
+            "Summarize these meetings",
+            None,
+            ChatRetrievalScope::SearchSnapshot(meeting_ids.clone()),
+            None,
+            Some(semantic_unavailable_lifecycle()),
+            None,
+            Some(ChatRetrievalMode::Fast),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(inputs.provider_round_trips, 0);
+        assert_eq!(
+            inputs
+                .sources
+                .iter()
+                .map(|source| source.meeting_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            meeting_ids.iter().map(String::as_str).collect()
+        );
+        assert!(inputs
+            .sources
+            .iter()
+            .all(|source| inputs.user_prompt.contains(&source.snippet)));
+    }
+
+    #[tokio::test]
+    async fn snapshot_broad_hundred_member_scope_stays_bounded_and_ordered() {
+        let pool = scope_pool().await;
+        configure_scope_chat(&pool, false, None).await;
+        let meeting_ids = (0..100)
+            .map(|index| format!("r50-member-{index:03}"))
+            .collect::<Vec<_>>();
+        for meeting_id in &meeting_ids {
+            sqlx::query(
+                "INSERT INTO meetings (id, title, created_at, saved_at) VALUES (?, ?, '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')",
+            )
+            .bind(meeting_id)
+            .bind(format!("Meeting {meeting_id}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+            set_scope_note(
+                &pool,
+                meeting_id,
+                &format!("Authoritative notes for {meeting_id}"),
+            )
+            .await;
+        }
+
+        let inputs = prepare_chat_inputs_for_scope(
+            &pool,
+            None,
+            &reqwest::Client::new(),
+            "Summarize all meetings",
+            None,
+            ChatRetrievalScope::SearchSnapshot(meeting_ids.clone()),
+            None,
+            None,
+            None,
+            Some(ChatRetrievalMode::Fast),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(inputs.sources.len(), 100);
+        assert_eq!(
+            inputs
+                .sources
+                .iter()
+                .map(|source| source.meeting_id.clone())
+                .collect::<Vec<_>>(),
+            meeting_ids
+        );
+        assert!(inputs.user_prompt.chars().count() <= 64_000);
+        assert!(inputs
+            .sources
+            .iter()
+            .all(|source| inputs.user_prompt.contains(&source.snippet)));
+    }
+
+    #[tokio::test]
+    async fn snapshot_broad_max_length_ids_stay_within_prompt_and_source_budget() {
+        let pool = scope_pool().await;
+        configure_scope_chat(&pool, false, None).await;
+        let meeting_ids = (0..100)
+            .map(|index| {
+                let prefix = format!("r51-member-{index:03}-");
+                format!("{prefix}{}", "x".repeat(512 - prefix.len()))
+            })
+            .collect::<Vec<_>>();
+        assert!(meeting_ids.iter().all(|meeting_id| meeting_id.len() == 512));
+        ChatScope {
+            kind: ChatScopeKind::SearchSnapshot,
+            key: "r51".to_string(),
+            data: Some(ChatScopeData {
+                result_ids: meeting_ids.clone(),
+            }),
+        }
+        .validate()
+        .unwrap();
+        for (index, meeting_id) in meeting_ids.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO meetings (id, title, created_at, saved_at) VALUES (?, ?, '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')",
+            )
+            .bind(meeting_id)
+            .bind(format!("Meeting {index}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+            set_scope_note(
+                &pool,
+                meeting_id,
+                &format!("Authoritative notes for {index}"),
+            )
+            .await;
+        }
+
+        let inputs = prepare_chat_inputs_for_scope(
+            &pool,
+            None,
+            &reqwest::Client::new(),
+            "Summarize all meetings",
+            None,
+            ChatRetrievalScope::SearchSnapshot(meeting_ids.clone()),
+            None,
+            None,
+            None,
+            Some(ChatRetrievalMode::Fast),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(inputs.sources.len(), 100);
+        assert_eq!(
+            inputs
+                .sources
+                .iter()
+                .map(|source| source.meeting_id.clone())
+                .collect::<Vec<_>>(),
+            meeting_ids
+        );
+        assert!(inputs.user_prompt.chars().count() <= 64_000);
+        assert!(inputs
+            .sources
+            .iter()
+            .all(|source| inputs.user_prompt.contains(&source.snippet)));
+    }
+
+    #[tokio::test]
+    async fn snapshot_broad_deep_supported_path_reaches_final_prompt_and_sources() {
+        let pool = scope_pool().await;
+        let endpoint = serve_deep_finish().await;
+        configure_scope_chat(&pool, false, Some(&endpoint)).await;
+        set_scope_note(&pool, "m1", "Authoritative notes for m1").await;
+        set_scope_note(&pool, "m2", "Authoritative notes for m2").await;
+
+        let inputs = prepare_chat_inputs_for_scope(
+            &pool,
+            None,
+            &reqwest::Client::new(),
+            "Summarize these meetings",
+            None,
+            ChatRetrievalScope::SearchSnapshot(vec!["m1".to_string(), "m2".to_string()]),
+            None,
+            Some(semantic_unavailable_lifecycle()),
+            None,
+            Some(ChatRetrievalMode::Deep),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(inputs.retrieval_mode, ChatRetrievalMode::Deep);
+        assert_eq!(
+            inputs.retrieval_diagnostic,
+            RetrievalPreparationDiagnostic::SemanticFallback
+        );
+        assert_eq!(inputs.provider_round_trips, 1);
+        assert_eq!(
+            inputs
+                .sources
+                .iter()
+                .map(|source| source.meeting_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["m1", "m2"])
+        );
+        assert!(inputs
+            .sources
+            .iter()
+            .all(|source| inputs.user_prompt.contains(&source.snippet)));
+    }
+
+    #[tokio::test]
+    async fn today_deep_preparation_reaches_final_prompt_for_today_members() {
+        let (pool, lifecycle) = today_deep_test_fixture().await;
+        let endpoint = serve_deep_finish().await;
+        sqlx::query("UPDATE settings SET chatOllamaEndpoint = ?")
+            .bind(endpoint)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let inputs = prepare_chat_inputs_for_scope(
+            &pool,
+            None,
+            &reqwest::Client::new(),
+            "Summarize today's meetings",
+            None,
+            ChatRetrievalScope::All,
+            None,
+            Some(lifecycle),
+            None,
+            Some(ChatRetrievalMode::Deep),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(inputs.retrieval_mode, ChatRetrievalMode::Deep);
+        assert_eq!(inputs.provider_round_trips, 1);
+        assert_eq!(
+            inputs
+                .sources
+                .iter()
+                .map(|source| source.meeting_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["today-one", "today-two"])
+        );
+        assert!(inputs
+            .sources
+            .iter()
+            .all(|source| inputs.user_prompt.contains(&source.snippet)));
+        assert!(!inputs.user_prompt.contains("old-meeting"));
+    }
+
     #[tokio::test]
     async fn frozen_snapshot_rehydrates_displayed_meetings_without_searching_query() {
         let pool = scope_pool().await;
@@ -4051,6 +4995,54 @@ mod tests {
 
         assert_eq!(
             results
+                .iter()
+                .map(|result| result.meeting_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m2", "m1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_factual_query_is_relevant_and_stays_inside_membership() {
+        let pool = scope_pool().await;
+        sqlx::query(
+            "UPDATE meeting_fts SET text = CASE meeting_id WHEN 'm1' THEN 'budget approved' WHEN 'm2' THEN 'roadmap planned' ELSE 'budget outside' END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let results = resolve_scope_results(
+            &pool,
+            "budget",
+            "budget",
+            10,
+            ChatRetrievalScope::SearchSnapshot(vec!["m2".to_string(), "m1".to_string()]),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.meeting_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m1"]
+        );
+        assert!(results.iter().all(|result| result.meeting_id != "m3"));
+
+        let fallback = resolve_scope_results(
+            &pool,
+            "unmatched",
+            "unmatched",
+            10,
+            ChatRetrievalScope::SearchSnapshot(vec!["m2".to_string(), "m1".to_string()]),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fallback
                 .iter()
                 .map(|result| result.meeting_id.as_str())
                 .collect::<Vec<_>>(),
@@ -4211,6 +5203,31 @@ mod tests {
         assert_eq!(all_titles, vec!["Root", "Child"]);
         assert_eq!(folder_titles, vec!["Root", "Child"]);
         assert_eq!(snapshot_titles, vec!["Child"]);
+
+        sqlx::query(
+            "UPDATE meeting_fts SET text = CASE meeting_id WHEN 'm1' THEN 'budget decision' WHEN 'm2' THEN 'roadmap decision' ELSE 'budget decision' END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let relevant = resolve_scope_results(
+            &pool,
+            "budget",
+            "budget",
+            10,
+            ChatRetrievalScope::All,
+            Some(&all_ids),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            relevant
+                .iter()
+                .map(|result| result.meeting_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m1"]
+        );
+        assert!(relevant.iter().all(|result| result.meeting_id != "m3"));
 
         let results = resolve_scope_results(
             &pool,
@@ -4375,11 +5392,9 @@ mod tests {
     }
 
     #[test]
-    fn deep_preparation_eligibility_requires_deep_mode_and_no_today_allow_list() {
+    fn deep_preparation_eligibility_requires_deep_mode() {
         assert!(deep_preparation_eligible(ChatRetrievalMode::Deep, None));
-        // A derived today allow-list (snapshot/today/saved-meeting members)
-        // stays Fast until Tasks 4.3/4.4 extend the Deep lifecycle.
-        assert!(!deep_preparation_eligible(
+        assert!(deep_preparation_eligible(
             ChatRetrievalMode::Deep,
             Some(&vec!["m1".to_string()])
         ));

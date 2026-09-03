@@ -763,6 +763,71 @@ async fn allowed_ids_scope_deduplicates_and_intersects_current_meetings() {
     assert_eq!(meetings, BTreeSet::from(["m-a".to_string()]));
 }
 
+#[tokio::test]
+async fn broad_allowed_ids_retrieval_adds_one_lexical_candidate_per_meeting() {
+    let pool = migrated_pool().await;
+    for (meeting_id, text) in [
+        ("m-a", "alpha target evidence"),
+        ("m-b", "beta background evidence"),
+        ("m-c", "gamma background evidence"),
+    ] {
+        insert_meeting(&pool, meeting_id, meeting_id).await;
+        add_transcript(&pool, &format!("t-{meeting_id}"), meeting_id, text).await;
+        crate::database::repositories::fts::FtsRepository::refresh_meeting(&pool, meeting_id)
+            .await
+            .unwrap();
+    }
+
+    let service = RetrievalService::new(query_lifecycle(&ServiceEmbedder::new()));
+    let ranked = service
+        .retrieve_ranked_with_broad_coverage(
+            &pool,
+            request(
+                "alpha",
+                PersistedRetrievalScope::AllowedMeetingIds(vec![
+                    "m-a".to_string(),
+                    "m-b".to_string(),
+                    "m-c".to_string(),
+                    "ghost".to_string(),
+                ]),
+                RetrievalLimits::default(),
+                CoreTermLanguage::English,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ranked.semantic_fallback,
+        Some(SemanticFallbackReason::NoActiveGeneration)
+    );
+    let meetings: BTreeSet<String> = ranked
+        .ranking
+        .evidence
+        .iter()
+        .map(|entry| entry.evidence.meeting_id.clone())
+        .collect();
+    assert_eq!(
+        meetings,
+        BTreeSet::from(["m-a".to_string(), "m-b".to_string(), "m-c".to_string()])
+    );
+    for meeting_id in ["m-b", "m-c"] {
+        assert!(ranked.ranking.evidence.iter().any(|entry| {
+            entry.evidence.meeting_id == meeting_id
+                && entry.evidence.provenance.iter().any(|provenance| {
+                    provenance.channel == RetrievalChannel::Lexical
+                        && provenance.rank == super::index::MAX_QUERY_LIMIT
+                })
+        }));
+    }
+    assert!(ranked
+        .ranking
+        .evidence
+        .iter()
+        .all(|entry| entry.evidence.meeting_id != "ghost"));
+}
+
 // -- Scope validation ----------------------------------------------------------
 
 #[tokio::test]

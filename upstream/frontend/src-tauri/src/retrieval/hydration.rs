@@ -33,16 +33,23 @@ use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use tokio_util::sync::CancellationToken;
 
 use crate::database::repositories::fts::FtsSearchResult;
-use crate::database::repositories::retrieval::{MeetingSource, RetrievalRepository};
+use crate::database::repositories::retrieval::{
+    MeetingSource, RetrievalRepository, SourceTranscript,
+};
 use crate::export::context::build_meeting_sections;
 
 use super::ranking::{RankedEvidence, RankedMeeting};
-use super::service::{PersistedRetrievalScope, RankedRetrieval, RetrievalError};
+use super::service::{PersistedRetrievalScope, RankedRetrieval, RetrievalChannel, RetrievalError};
 
 /// Meetings hydrated per request: the evaluation corpus's fixed retention
 /// semantics (the admissibility protocol's hydration cap) applied so the
 /// guaranteed minimum can actually cover every selected meeting.
 pub(crate) const MAX_HYDRATED_MEETINGS: usize = 5;
+pub(crate) const MAX_BROAD_HYDRATED_MEETINGS: usize = 100;
+const BROAD_ID_CHARS: usize = 128;
+const BROAD_TITLE_CHARS: usize = 160;
+const BROAD_FOLDER_CHARS: usize = 64;
+const BROAD_NO_EVIDENCE: &str = "### Content\nNo authoritative meeting content available.\n";
 /// Guaranteed per-meeting minimum: `1 / MIN_SHARE_DIVISOR` of the final
 /// budget is reserved as a floor and split EVENLY across the selected
 /// meetings, so each is guaranteed `budget / (MIN_SHARE_DIVISOR * count)` -
@@ -107,6 +114,518 @@ pub async fn hydrate_context(
     return hydrate(pool, ranked, max_context_chars, cancellation, None).await;
     #[cfg(not(test))]
     return hydrate(pool, ranked, max_context_chars, cancellation).await;
+}
+
+pub async fn hydrate_context_with_broad_coverage(
+    pool: &SqlitePool,
+    ranked: &RankedRetrieval,
+    max_context_chars: usize,
+    cancellation: Option<&CancellationToken>,
+) -> Result<HydratedContext, RetrievalError> {
+    if matches!(
+        &ranked.scope.scope,
+        PersistedRetrievalScope::AllowedMeetingIds(_)
+    ) {
+        hydrate_broad_scope(
+            pool,
+            &ranked.scope.scope,
+            max_context_chars,
+            cancellation,
+            Some(ranked),
+        )
+        .await
+    } else {
+        hydrate_context(pool, ranked, max_context_chars, cancellation).await
+    }
+}
+
+pub async fn hydrate_broad_scope_context(
+    pool: &SqlitePool,
+    scope: &PersistedRetrievalScope,
+    max_context_chars: usize,
+    cancellation: Option<&CancellationToken>,
+) -> Result<HydratedContext, RetrievalError> {
+    hydrate_broad_scope(pool, scope, max_context_chars, cancellation, None).await
+}
+
+async fn hydrate_broad_scope(
+    pool: &SqlitePool,
+    scope: &PersistedRetrievalScope,
+    max_context_chars: usize,
+    cancellation: Option<&CancellationToken>,
+    ranked: Option<&RankedRetrieval>,
+) -> Result<HydratedContext, RetrievalError> {
+    let PersistedRetrievalScope::AllowedMeetingIds(allowed_ids) = scope else {
+        return Ok(empty_context(max_context_chars));
+    };
+    let cancel = cancellation.cloned().unwrap_or_default();
+    ensure_not_cancelled(&cancel)?;
+
+    let mut requested_ids = Vec::with_capacity(allowed_ids.len().min(MAX_BROAD_HYDRATED_MEETINGS));
+    let mut seen = HashSet::new();
+    for meeting_id in allowed_ids {
+        if requested_ids.len() == MAX_BROAD_HYDRATED_MEETINGS {
+            break;
+        }
+        if seen.insert(meeting_id) {
+            requested_ids.push(meeting_id.clone());
+        }
+    }
+    let alive = current_scope_members(pool, scope, &requested_ids, &cancel).await?;
+    let meeting_ids = requested_ids
+        .into_iter()
+        .filter(|meeting_id| alive.contains(meeting_id))
+        .collect::<Vec<_>>();
+    if meeting_ids.is_empty() {
+        return Ok(empty_context(max_context_chars));
+    }
+
+    const GLOBAL_PREFIX: &str = "# Meeting Context\n\n";
+    let body_budget = max_context_chars.saturating_sub(GLOBAL_PREFIX.chars().count());
+    let share = body_budget / meeting_ids.len();
+    if share == 0 {
+        return Ok(empty_context(max_context_chars));
+    }
+    let rank_by_meeting = ranked
+        .map(|ranked| {
+            ranked
+                .ranking
+                .meetings
+                .iter()
+                .map(|meeting| (meeting.meeting_id.clone(), meeting.rank))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+
+    let mut markdown = String::from(GLOBAL_PREFIX);
+    let mut retained_evidence_ids = Vec::new();
+    let mut retained_evidence = HashSet::new();
+    let mut sources = Vec::new();
+    let mut meetings = Vec::new();
+    let mut omitted = 0usize;
+
+    for meeting_id in meeting_ids {
+        ensure_not_cancelled(&cancel)?;
+        let (transcript_ids, transcript_ranges) = broad_transcript_targets(ranked, &meeting_id);
+        let source = if transcript_ids.is_empty() && transcript_ranges.is_empty() {
+            RetrievalRepository::load_meeting_source_compact_with_cancellation(
+                pool,
+                &meeting_id,
+                &cancel,
+            )
+            .await
+        } else {
+            RetrievalRepository::load_meeting_source_relevant_ranges_with_cancellation(
+                pool,
+                &meeting_id,
+                &transcript_ids,
+                &transcript_ranges,
+                &cancel,
+            )
+            .await
+        }
+        .map_err(db_error)?;
+        let Some(mut source) = source else {
+            omitted += 1;
+            continue;
+        };
+        if !current_scope_and_revision(pool, scope, &meeting_id, source.source_revision, &cancel)
+            .await?
+        {
+            omitted += 1;
+            continue;
+        }
+
+        let ordinal = meetings.len() + 1;
+        let ranked_items = ranked.map(|ranked| {
+            ranked
+                .ranking
+                .evidence
+                .iter()
+                .filter(|item| item.evidence.meeting_id == source.meeting_id)
+                .collect::<Vec<_>>()
+        });
+        let use_ranked = ranked_items
+            .as_deref()
+            .is_some_and(|items| !items.is_empty());
+        let mut publication = if use_ranked {
+            ranked_items
+                .as_deref()
+                .and_then(|items| broad_ranked_publication(&source, items, ordinal, share))
+        } else {
+            broad_compact_publication(&source, ordinal, share)
+        };
+        if publication.is_none() && use_ranked {
+            let Some(fallback_source) =
+                RetrievalRepository::load_meeting_source_compact_with_cancellation(
+                    pool,
+                    &meeting_id,
+                    &cancel,
+                )
+                .await
+                .map_err(db_error)?
+            else {
+                omitted += 1;
+                continue;
+            };
+            if !current_scope_and_revision(
+                pool,
+                scope,
+                &meeting_id,
+                fallback_source.source_revision,
+                &cancel,
+            )
+            .await?
+            {
+                omitted += 1;
+                continue;
+            }
+            source = fallback_source;
+            publication = broad_compact_publication(&source, ordinal, share);
+        }
+        let Some(publication) = publication else {
+            omitted += 1;
+            continue;
+        };
+        ensure_not_cancelled(&cancel)?;
+        let meeting_retained_evidence_ids = publication.retained_evidence_ids.clone();
+        markdown.push_str(&publication.markdown);
+        for evidence_id in &publication.retained_evidence_ids {
+            if retained_evidence.insert(evidence_id.clone()) {
+                retained_evidence_ids.push(evidence_id.clone());
+            }
+        }
+        sources.extend(publication.sources);
+        meetings.push(HydratedMeeting {
+            meeting_id: source.meeting_id,
+            rank: rank_by_meeting.get(&meeting_id).copied().unwrap_or(ordinal),
+            retained_evidence_ids: meeting_retained_evidence_ids,
+            transcript_segments_included: publication.transcript_segments_included,
+            transcript_segments_total: source.transcript_segments_total,
+        });
+    }
+
+    if meetings.is_empty() {
+        return Ok(empty_context(max_context_chars));
+    }
+    log::info!(
+        "Broad hydration: meetings={} sources={} retained={} omitted={} scope_tag={}",
+        meetings.len(),
+        sources.len(),
+        retained_evidence_ids.len(),
+        omitted,
+        scope_tag(scope)
+    );
+    ensure_not_cancelled(&cancel)?;
+    Ok(HydratedContext {
+        markdown,
+        retained_evidence_ids,
+        sources,
+        meetings,
+    })
+}
+
+struct BroadMeetingPublication {
+    markdown: String,
+    retained_evidence_ids: Vec<String>,
+    sources: Vec<HydratedSource>,
+    transcript_segments_included: usize,
+}
+
+fn broad_ranked_publication(
+    source: &MeetingSource,
+    items: &[&RankedEvidence],
+    ordinal: usize,
+    share: usize,
+) -> Option<BroadMeetingPublication> {
+    let plan = plan_meeting_evidence(source, items);
+    let header = broad_meeting_header(source, ordinal, share);
+    let sections = build_meeting_sections(
+        source.latest_summary_markdown.as_deref(),
+        source.notes_markdown.as_deref(),
+        &plan.segments,
+        source.transcript_segments_total,
+        share,
+        header.chars().count(),
+    );
+    let retained_segments = sections
+        .retained_transcript_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let summary_retained = blank(sections.summary.as_deref()).is_some();
+    let note_retained = blank(sections.notes.as_deref()).is_some();
+    let mut sources = Vec::new();
+    if let Some(snippet) = blank(sections.summary.as_deref()) {
+        sources.push(HydratedSource {
+            meeting_id: source.meeting_id.clone(),
+            meeting_title: source.title.clone(),
+            folder_name: source.folder_name.clone(),
+            source_kind: "summary".to_string(),
+            snippet: snippet.to_string(),
+            source_start_id: None,
+            source_end_id: None,
+            source_template_id: source.latest_summary_template_id.clone(),
+            evidence_ids: plan.retained_summary_ids(),
+        });
+    }
+    if let Some(snippet) = blank(sections.notes.as_deref()) {
+        sources.push(HydratedSource {
+            meeting_id: source.meeting_id.clone(),
+            meeting_title: source.title.clone(),
+            folder_name: source.folder_name.clone(),
+            source_kind: "notes".to_string(),
+            snippet: snippet.to_string(),
+            source_start_id: None,
+            source_end_id: None,
+            source_template_id: None,
+            evidence_ids: plan.retained_note_ids(),
+        });
+    }
+    for group in plan.retained_groups(&retained_segments) {
+        sources.push(HydratedSource {
+            meeting_id: source.meeting_id.clone(),
+            meeting_title: source.title.clone(),
+            folder_name: source.folder_name.clone(),
+            source_kind: "transcript".to_string(),
+            snippet: group.snippet,
+            source_start_id: Some(group.start_id),
+            source_end_id: Some(group.end_id),
+            source_template_id: None,
+            evidence_ids: group.evidence_ids,
+        });
+    }
+    if sources.is_empty() {
+        return None;
+    }
+    let markdown = format!("{}{}", header, sections.markdown);
+    if markdown.chars().count() > share {
+        return None;
+    }
+    Some(BroadMeetingPublication {
+        markdown,
+        retained_evidence_ids: plan.retained_evidence_ids(
+            summary_retained,
+            note_retained,
+            &retained_segments,
+        ),
+        sources,
+        transcript_segments_included: sections.retained_transcript_ids.len(),
+    })
+}
+
+fn broad_compact_publication(
+    source: &MeetingSource,
+    ordinal: usize,
+    share: usize,
+) -> Option<BroadMeetingPublication> {
+    let header = broad_meeting_header(source, ordinal, share);
+    let transcripts = source
+        .transcripts
+        .iter()
+        .map(|transcript| broad_transcript_result(source, transcript))
+        .collect::<Vec<_>>();
+    let sections = build_meeting_sections(
+        source.latest_summary_markdown.as_deref(),
+        source.notes_markdown.as_deref(),
+        &transcripts,
+        source.transcript_segments_total,
+        share,
+        header.chars().count(),
+    );
+    let mut sources = Vec::new();
+    if let Some(snippet) = blank(sections.summary.as_deref()) {
+        sources.push(HydratedSource {
+            meeting_id: source.meeting_id.clone(),
+            meeting_title: source.title.clone(),
+            folder_name: source.folder_name.clone(),
+            source_kind: "summary".to_string(),
+            snippet: snippet.to_string(),
+            source_start_id: None,
+            source_end_id: None,
+            source_template_id: source.latest_summary_template_id.clone(),
+            evidence_ids: Vec::new(),
+        });
+    }
+    if let Some(snippet) = blank(sections.notes.as_deref()) {
+        sources.push(HydratedSource {
+            meeting_id: source.meeting_id.clone(),
+            meeting_title: source.title.clone(),
+            folder_name: source.folder_name.clone(),
+            source_kind: "notes".to_string(),
+            snippet: snippet.to_string(),
+            source_start_id: None,
+            source_end_id: None,
+            source_template_id: None,
+            evidence_ids: Vec::new(),
+        });
+    }
+    let retained_transcripts = source
+        .transcripts
+        .iter()
+        .filter(|transcript| {
+            sections
+                .retained_transcript_ids
+                .iter()
+                .any(|id| id == &transcript.id)
+        })
+        .collect::<Vec<_>>();
+    if let (Some(first), Some(last)) = (retained_transcripts.first(), retained_transcripts.last()) {
+        sources.push(HydratedSource {
+            meeting_id: source.meeting_id.clone(),
+            meeting_title: source.title.clone(),
+            folder_name: source.folder_name.clone(),
+            source_kind: "transcript".to_string(),
+            snippet: retained_transcripts
+                .iter()
+                .map(|transcript| transcript.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            source_start_id: Some(first.id.clone()),
+            source_end_id: Some(last.id.clone()),
+            source_template_id: None,
+            evidence_ids: Vec::new(),
+        });
+    }
+    let mut markdown = format!("{}{}", header, sections.markdown);
+    if sources.is_empty() {
+        let remaining = share.saturating_sub(markdown.chars().count());
+        markdown.push_str(&truncate_chars(BROAD_NO_EVIDENCE, remaining));
+    }
+    if markdown.chars().count() > share {
+        return None;
+    }
+    Some(BroadMeetingPublication {
+        markdown,
+        retained_evidence_ids: Vec::new(),
+        sources,
+        transcript_segments_included: sections.retained_transcript_ids.len(),
+    })
+}
+
+fn broad_meeting_header(source: &MeetingSource, ordinal: usize, max_chars: usize) -> String {
+    let folder = truncate_chars(&source.folder_name, BROAD_FOLDER_CHARS);
+    let title = truncate_chars(&source.title, BROAD_TITLE_CHARS);
+    let mut header = format!(
+        "## Meeting {} — {}\n\n**ID:** `{}`\n",
+        ordinal,
+        title,
+        truncate_chars(&source.meeting_id, BROAD_ID_CHARS)
+    );
+    if !folder.is_empty() {
+        header.push_str(&format!("**Folder:** {}\n", folder));
+    }
+    header.push('\n');
+    truncate_chars(&header, max_chars)
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let marker = "… [truncated]";
+    if max_chars <= marker.chars().count() {
+        return marker.chars().take(max_chars).collect();
+    }
+    format!(
+        "{}{}",
+        value
+            .chars()
+            .take(max_chars - marker.chars().count())
+            .collect::<String>(),
+        marker
+    )
+}
+
+fn broad_transcript_result(
+    source: &MeetingSource,
+    transcript: &SourceTranscript,
+) -> FtsSearchResult {
+    FtsSearchResult {
+        meeting_id: source.meeting_id.clone(),
+        meeting_title: source.title.clone(),
+        chunk_type: "transcript".to_string(),
+        chunk_id: transcript.id.clone(),
+        snippet: transcript.text.clone(),
+        speaker: transcript.speaker.clone(),
+        timestamp_label: Some(transcript.timestamp.clone()),
+        folder_id: None,
+        folder_name: source.folder_name.clone(),
+        rank: 0.0,
+    }
+}
+
+fn broad_transcript_targets(
+    ranked: Option<&RankedRetrieval>,
+    meeting_id: &str,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let Some(ranked) = ranked else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut ids = Vec::new();
+    let mut ranges = Vec::new();
+    let mut seen = HashSet::new();
+    let mut seen_ranges = HashSet::new();
+    for entry in &ranked.ranking.evidence {
+        let evidence = &entry.evidence;
+        if evidence.meeting_id != meeting_id || evidence.source_kind != "transcript" {
+            continue;
+        }
+        broad_transcript_target(
+            &mut ids,
+            &mut ranges,
+            &mut seen,
+            &mut seen_ranges,
+            &evidence.source_start_id,
+            &evidence.source_end_id,
+            is_semantic(evidence) || evidence.source_end_id.is_some(),
+        );
+        for alias in &evidence.source_aliases {
+            if alias.source_kind == "transcript" {
+                broad_transcript_target(
+                    &mut ids,
+                    &mut ranges,
+                    &mut seen,
+                    &mut seen_ranges,
+                    &alias.source_start_id,
+                    &alias.source_end_id,
+                    alias.source_end_id.is_some(),
+                );
+            }
+        }
+    }
+    (ids, ranges)
+}
+
+fn broad_transcript_target(
+    ids: &mut Vec<String>,
+    ranges: &mut Vec<(String, String)>,
+    seen: &mut HashSet<String>,
+    seen_ranges: &mut HashSet<(String, String)>,
+    start: &Option<String>,
+    end: &Option<String>,
+    is_range: bool,
+) {
+    let Some(start) = start else {
+        return;
+    };
+    if is_range {
+        let Some(end) = end else {
+            return;
+        };
+        if seen_ranges.insert((start.clone(), end.clone())) {
+            ranges.push((start.clone(), end.clone()));
+        }
+    } else if seen.insert(start.clone()) {
+        ids.push(start.clone());
+    }
+}
+
+fn is_semantic(evidence: &super::service::RetrievedEvidence) -> bool {
+    evidence
+        .provenance
+        .iter()
+        .any(|provenance| provenance.channel == RetrievalChannel::Semantic)
 }
 
 #[cfg(test)]
@@ -675,16 +1194,15 @@ impl MeetingPlan {
     ) -> Vec<String> {
         let mut ids = Vec::new();
         for item in &self.items {
-            if !item.valid {
-                continue;
-            }
-            match item.kind.as_str() {
-                "summary" if summary_retained => ids.push(item.evidence_id.clone()),
-                "note" | "notes" if note_retained => ids.push(item.evidence_id.clone()),
-                "transcript" if grounded(&item.segment_ids, retained_segments) => {
-                    ids.push(item.evidence_id.clone());
+            if item.valid {
+                match item.kind.as_str() {
+                    "summary" if summary_retained => ids.push(item.evidence_id.clone()),
+                    "note" | "notes" if note_retained => ids.push(item.evidence_id.clone()),
+                    "transcript" if grounded(&item.segment_ids, retained_segments) => {
+                        ids.push(item.evidence_id.clone());
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
             for (alias_id, alias_segments) in &item.aliases {
                 if grounded(alias_segments, retained_segments) {
@@ -724,12 +1242,12 @@ impl MeetingPlan {
         }
         let mut evidence_ids: Vec<Vec<String>> = vec![Vec::new(); runs.len()];
         for item in &self.items {
-            if !item.valid || item.kind != "transcript" {
-                continue;
+            if item.valid && item.kind == "transcript" {
+                if let Some(index) = grounded_run(&item.segment_ids, &run_of) {
+                    evidence_ids[index].push(item.evidence_id.clone());
+                }
             }
-            let identities = std::iter::once((&item.evidence_id, &item.segment_ids))
-                .chain(item.aliases.iter().map(|(id, segments)| (id, segments)));
-            for (evidence_id, segment_ids) in identities {
+            for (evidence_id, segment_ids) in &item.aliases {
                 if let Some(index) = grounded_run(segment_ids, &run_of) {
                     evidence_ids[index].push(evidence_id.clone());
                 }
@@ -767,7 +1285,6 @@ fn plan_meeting_evidence(source: &MeetingSource, items: &[&RankedEvidence]) -> M
     // neighborhood.
     let mut included: HashSet<usize> = HashSet::new();
     let mut planned: Vec<PlannedItem> = Vec::with_capacity(items.len());
-    let total = source.transcripts.len();
     for item in items {
         let evidence = &item.evidence;
         let mut plan = PlannedItem {
@@ -794,22 +1311,24 @@ fn plan_meeting_evidence(source: &MeetingSource, items: &[&RankedEvidence]) -> M
                         .or(evidence.source_start_id.as_deref()),
                     &positions,
                 ) {
-                    let authoritative = source.transcripts[start..=end]
-                        .iter()
-                        .map(|segment| segment.text.as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    // Semantic identities are content-bound at ranking time;
-                    // an ID surviving a source edit is not sufficient.
-                    plan.valid = evidence.evidence_id.starts_with("fts:")
-                        || item.content_fingerprint.is_none()
-                        || item.content_fingerprint.as_deref()
-                            == Some(sha2::Sha256::digest(authoritative.as_bytes()).as_slice());
-                    plan.segment_ids = source.transcripts[start..=end]
-                        .iter()
-                        .map(|segment| segment.id.clone())
-                        .collect();
-                    mark_neighborhood(&mut included, start, end, total);
+                    if let Some((start_index, end_index)) = local_span(source, start, end) {
+                        let authoritative = source.transcripts[start_index..=end_index]
+                            .iter()
+                            .map(|segment| segment.text.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        // Semantic identities are content-bound at ranking time;
+                        // an ID surviving a source edit is not sufficient.
+                        plan.valid = evidence.evidence_id.starts_with("fts:")
+                            || item.content_fingerprint.is_none()
+                            || item.content_fingerprint.as_deref()
+                                == Some(sha2::Sha256::digest(authoritative.as_bytes()).as_slice());
+                        plan.segment_ids = source.transcripts[start_index..=end_index]
+                            .iter()
+                            .map(|segment| segment.id.clone())
+                            .collect();
+                        mark_neighborhood(&mut included, &source.transcript_positions, start, end);
+                    }
                 }
             }
             _ => {}
@@ -827,14 +1346,16 @@ fn plan_meeting_evidence(source: &MeetingSource, items: &[&RankedEvidence]) -> M
                         .or(alias.source_start_id.as_deref()),
                     &positions,
                 ) {
-                    plan.aliases.push((
-                        alias.evidence_id.clone(),
-                        source.transcripts[start..=end]
-                            .iter()
-                            .map(|segment| segment.id.clone())
-                            .collect(),
-                    ));
-                    mark_neighborhood(&mut included, start, end, total);
+                    if let Some((start_index, end_index)) = local_span(source, start, end) {
+                        plan.aliases.push((
+                            alias.evidence_id.clone(),
+                            source.transcripts[start_index..=end_index]
+                                .iter()
+                                .map(|segment| segment.id.clone())
+                                .collect(),
+                        ));
+                        mark_neighborhood(&mut included, &source.transcript_positions, start, end);
+                    }
                 }
             }
         }
@@ -842,11 +1363,11 @@ fn plan_meeting_evidence(source: &MeetingSource, items: &[&RankedEvidence]) -> M
     }
     let mut segments = Vec::new();
     let mut positions = Vec::new();
-    for (position, segment) in source.transcripts.iter().enumerate() {
-        if !included.contains(&position) {
+    for (index, segment) in source.transcripts.iter().enumerate() {
+        if !included.contains(&index) {
             continue;
         }
-        positions.push(position);
+        positions.push(source.transcript_positions[index]);
         segments.push(FtsSearchResult {
             meeting_id: source.meeting_id.clone(),
             meeting_title: source.title.clone(),
@@ -884,11 +1405,26 @@ fn resolve_span(
     Some((*start_position, *end_position))
 }
 
+fn local_span(source: &MeetingSource, start: usize, end: usize) -> Option<(usize, usize)> {
+    let start_index = source
+        .transcript_positions
+        .iter()
+        .position(|position| *position == start)?;
+    let end_index = source
+        .transcript_positions
+        .iter()
+        .position(|position| *position == end)?;
+    (end_index >= start_index && end_index - start_index + 1 == end.saturating_sub(start) + 1)
+        .then_some((start_index, end_index))
+}
+
 /// The approved adjacent neighborhood: one segment on each side of a matched
 /// range, clamped to the current transcript list.
-fn mark_neighborhood(included: &mut HashSet<usize>, start: usize, end: usize, total: usize) {
-    for position in start.saturating_sub(1)..=(end + 1).min(total.saturating_sub(1)) {
-        included.insert(position);
+fn mark_neighborhood(included: &mut HashSet<usize>, positions: &[usize], start: usize, end: usize) {
+    for (index, position) in positions.iter().enumerate() {
+        if *position >= start.saturating_sub(1) && *position <= end.saturating_add(1) {
+            included.insert(index);
+        }
     }
 }
 

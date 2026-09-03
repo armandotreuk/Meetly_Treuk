@@ -1143,6 +1143,33 @@ impl RetrievalRepository {
         Self::load_meeting_source_inner(pool, meeting_id, Some(cancel)).await
     }
 
+    pub async fn load_meeting_source_compact_with_cancellation(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Option<MeetingSource>, SqlxError> {
+        check_source_cancellation(Some(cancel))?;
+        let head_id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM transcripts
+             WHERE meeting_id = ? AND transcript IS NOT NULL AND transcript != ''
+             ORDER BY CASE WHEN audio_start_time IS NULL THEN 1 ELSE 0 END,
+                      audio_start_time ASC, timestamp ASC, id ASC
+             LIMIT 1",
+        )
+        .bind(meeting_id)
+        .fetch_optional(pool)
+        .await?;
+        check_source_cancellation(Some(cancel))?;
+        let transcript_ids = head_id.into_iter().collect::<Vec<_>>();
+        Self::load_meeting_source_relevant_with_cancellation(
+            pool,
+            meeting_id,
+            &transcript_ids,
+            cancel,
+        )
+        .await
+    }
+
     async fn load_meeting_source_inner(
         pool: &SqlitePool,
         meeting_id: &str,
