@@ -8,10 +8,13 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
+use axum::{extract::State as AxumState, response::IntoResponse, Json};
+use serde_json::{json, Value};
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::SqlitePool;
 use tokio_util::sync::CancellationToken;
 
+use super::contracts::HybridScope;
 use super::model::RetrievalModelError;
 use super::service::{
     CoreTermLanguage, LexicalMode, PersistedRetrievalScope, QueryVariantKind, RetrievalChannel,
@@ -19,10 +22,16 @@ use super::service::{
     SemanticFallbackReason,
 };
 use super::worker::{quantize_int8, DocumentEmbedder, LifecycleConfig, RetrievalLifecycle};
+use crate::api::api::{
+    execute_hybrid_context, execute_hybrid_search, set_hybrid_publication_gate,
+    with_hybrid_request, HybridPublicationGate,
+};
+use crate::api::chat::{ChatRequestState, ChatRequestSurface};
 use crate::database::repositories::retrieval::{
     ModelSpec, ReplacementJob, ReplacementOutcome, RetrievalRepository, StagedDocument,
     VectorEncoding,
 };
+use crate::mcp::server::{handle_jsonrpc, JsonRpcRequest, McpState};
 
 const MODEL_ID: &str = "test-e5-int8";
 const DIMS: usize = 4;
@@ -178,6 +187,7 @@ async fn publish_meeting(pool: &SqlitePool, generation: &str, meeting: &str, tex
 struct ServiceEmbedder {
     fail_queries: StdMutex<bool>,
     entered: Arc<std::sync::atomic::AtomicBool>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
     park_until: StdMutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
@@ -186,6 +196,7 @@ impl ServiceEmbedder {
         Arc::new(Self {
             fail_queries: StdMutex::new(false),
             entered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             park_until: StdMutex::new(None),
         })
     }
@@ -228,6 +239,7 @@ impl DocumentEmbedder for ServiceEmbedder {
         if let Some(receiver) = self.park_until.lock().unwrap().take() {
             loop {
                 if cancel.is_cancelled() {
+                    self.cancelled.store(true, Ordering::SeqCst);
                     return Err(RetrievalModelError::Cancelled);
                 }
                 match receiver.recv_timeout(Duration::from_millis(20)) {
@@ -259,6 +271,70 @@ pub(crate) fn failing_lifecycle() -> RetrievalLifecycle {
         Arc::new(|| false),
         Arc::new(|| Err("simulated bundle unavailability".to_string())),
     ))
+}
+
+async fn active_test_retrieval(
+    meeting_id: &str,
+) -> (SqlitePool, RetrievalLifecycle, Arc<ServiceEmbedder>) {
+    let pool = migrated_pool().await;
+    insert_meeting(&pool, meeting_id, "Hybrid meeting").await;
+    add_transcript(
+        &pool,
+        &format!("transcript-{meeting_id}"),
+        meeting_id,
+        "needle text",
+    )
+    .await;
+    crate::database::repositories::fts::FtsRepository::refresh_meeting(&pool, meeting_id)
+        .await
+        .unwrap();
+    register_test_model(&pool).await;
+    let generation = format!("generation-{meeting_id}");
+    RetrievalRepository::ensure_generation(&pool, &generation, MODEL_ID)
+        .await
+        .unwrap();
+    publish_meeting(&pool, &generation, meeting_id, &["needle text"]).await;
+    let embedder = ServiceEmbedder::new();
+    let lifecycle = query_lifecycle(&embedder);
+    install_snapshot(&pool, &lifecycle, MODEL_ID).await;
+    (pool, lifecycle, embedder)
+}
+
+fn mcp_state(
+    pool: &SqlitePool,
+    retrieval: &RetrievalLifecycle,
+    chat_requests: &ChatRequestState,
+) -> McpState {
+    McpState {
+        pool: pool.clone(),
+        app_data_dir: None,
+        client: reqwest::Client::new(),
+        retrieval: retrieval.clone(),
+        chat_requests: chat_requests.clone(),
+    }
+}
+
+async fn call_mcp_tool(state: McpState, name: &str, arguments: Value) -> Value {
+    let response = handle_jsonrpc(
+        AxumState(state),
+        Json(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "tools/call".to_string(),
+            params: json!({"name": name, "arguments": arguments}),
+        }),
+    )
+    .await
+    .into_response();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+fn assert_mcp_error(response: &Value, message: &str) {
+    assert_eq!(response["result"]["isError"], true);
+    assert_eq!(response["result"]["content"][0]["text"], message);
 }
 
 /// Installs the active snapshot for the seeded generation through the exact
@@ -354,6 +430,52 @@ async fn all_scope_returns_current_persisted_meetings_only() {
         .map(|candidate| candidate.meeting_id.clone())
         .collect();
     assert_eq!(meeting_ids, BTreeSet::from(["m-keep".to_string()]));
+}
+
+#[tokio::test]
+async fn terminal_scope_revalidation_checks_current_existence_and_membership() {
+    let pool = migrated_pool().await;
+    insert_folder(&pool, "folder-a", "A", None).await;
+    insert_folder(&pool, "folder-b", "B", None).await;
+    insert_meeting(&pool, "m-a", "A").await;
+    insert_meeting(&pool, "m-b", "B").await;
+    set_meeting_folder(&pool, "m-a", Some("folder-a")).await;
+    set_meeting_folder(&pool, "m-b", Some("folder-b")).await;
+    let service = RetrievalService::new(failing_lifecycle());
+    let cancel = CancellationToken::new();
+    let ids = vec!["m-a".to_string(), "m-b".to_string(), "missing".to_string()];
+
+    assert_eq!(
+        service
+            .revalidate_ids_in_scope(&pool, &PersistedRetrievalScope::All, &ids, &cancel,)
+            .await
+            .unwrap(),
+        ["m-a".to_string(), "m-b".to_string()]
+    );
+    assert_eq!(
+        service
+            .revalidate_ids_in_scope(
+                &pool,
+                &PersistedRetrievalScope::Folder("folder-a".to_string()),
+                &ids,
+                &cancel,
+            )
+            .await
+            .unwrap(),
+        ["m-a".to_string()]
+    );
+
+    sqlx::query("DELETE FROM meetings WHERE id = 'm-a'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        service
+            .revalidate_ids_in_scope(&pool, &PersistedRetrievalScope::All, &ids, &cancel,)
+            .await
+            .unwrap(),
+        ["m-b".to_string()]
+    );
 }
 
 #[tokio::test]
@@ -926,19 +1048,21 @@ async fn conflicting_scope_combinations_are_rejected() {
 }
 
 #[tokio::test]
-async fn non_chat_purposes_fail_closed() {
+async fn search_and_context_purposes_use_the_shared_service() {
     let pool = migrated_pool().await;
     let service = RetrievalService::new(query_lifecycle(&ServiceEmbedder::new()));
-    let mut retrieval = request(
-        "needle",
-        PersistedRetrievalScope::All,
-        RetrievalLimits::default(),
-        CoreTermLanguage::English,
-        None,
-    );
-    retrieval.purpose = RetrievalPurpose::Search;
-    let error = service.retrieve(&pool, retrieval).await.unwrap_err();
-    assert!(matches!(error, RetrievalError::UnsupportedPurpose(_)));
+    for purpose in [RetrievalPurpose::Search, RetrievalPurpose::Context] {
+        let mut retrieval = request(
+            "needle",
+            PersistedRetrievalScope::All,
+            RetrievalLimits::default(),
+            CoreTermLanguage::English,
+            None,
+        );
+        retrieval.purpose = purpose;
+        let result = service.retrieve(&pool, retrieval).await.unwrap();
+        assert!(result.candidates.is_empty());
+    }
 }
 
 #[tokio::test]
@@ -1406,37 +1530,51 @@ async fn cancellation_during_query_embedding_propagates_without_lexical_fallback
     let embedder = ServiceEmbedder::new();
     let (sender, receiver) = std::sync::mpsc::channel::<()>();
     *embedder.park_until.lock().unwrap() = Some(receiver);
-    let cancel = CancellationToken::new();
     let lifecycle = query_lifecycle(&embedder);
     install_snapshot(&pool, &lifecycle, MODEL_ID).await;
 
+    let state = ChatRequestState::new();
     let service = RetrievalService::new(lifecycle);
     let handle = tokio::spawn({
         let pool = pool.clone();
-        let cancel = cancel.clone();
+        let task_state = state.clone();
         async move {
-            service
-                .retrieve(
-                    &pool,
-                    request(
-                        "needle",
-                        PersistedRetrievalScope::All,
-                        RetrievalLimits::default(),
-                        CoreTermLanguage::English,
-                        Some(cancel),
-                    ),
-                )
-                .await
+            with_hybrid_request(
+                &task_state,
+                ChatRequestSurface::Sidebar,
+                "hybrid-running-id".to_string(),
+                Duration::from_secs(30),
+                move |token| async move {
+                    service
+                        .retrieve(
+                            &pool,
+                            request(
+                                "needle",
+                                PersistedRetrievalScope::All,
+                                RetrievalLimits::default(),
+                                CoreTermLanguage::English,
+                                Some(token.as_ref().clone()),
+                            ),
+                        )
+                        .await
+                        .map_err(|error| error.to_string())
+                },
+            )
+            .await
         }
     });
     wait_until(async || embedder.entered.load(Ordering::SeqCst)).await;
-    cancel.cancel();
+    assert!(state.cancel_request(ChatRequestSurface::Sidebar, Some("hybrid-running-id")));
     drop(sender);
     let result = tokio::time::timeout(Duration::from_secs(5), handle)
         .await
         .expect("cancelled preparation must not hang")
         .unwrap();
-    assert!(matches!(result, Err(RetrievalError::Cancelled)));
+    assert!(matches!(
+        result,
+        Err(error) if error == "Hybrid request was cancelled or superseded"
+    ));
+    assert_eq!(state.request_count(), 0);
 }
 
 // -- Bounds ------------------------------------------------------------------------
@@ -1916,6 +2054,306 @@ async fn request_cancelled_while_queued_is_removed_immediately() {
     assert_eq!(scheduler.queued_interactive(), 0);
     // The permit was never released by the service; the holder still owns it.
     drop(held);
+}
+
+#[tokio::test]
+async fn hybrid_request_id_cancellation_reaches_queued_retrieval() {
+    let pool = migrated_pool().await;
+    insert_meeting(&pool, "m-hybrid-queued", "Queued").await;
+    add_transcript(&pool, "t-hybrid-queued", "m-hybrid-queued", "needle text").await;
+    register_test_model(&pool).await;
+    RetrievalRepository::ensure_generation(&pool, "gen-hybrid-queued", MODEL_ID)
+        .await
+        .unwrap();
+    publish_meeting(&pool, "gen-hybrid-queued", "m-hybrid-queued", &["needle"]).await;
+    let embedder = ServiceEmbedder::new();
+    let lifecycle = query_lifecycle(&embedder);
+    install_snapshot(&pool, &lifecycle, MODEL_ID).await;
+    let held = lifecycle
+        .scheduler()
+        .enqueue_interactive()
+        .unwrap()
+        .wait_for_permit()
+        .await
+        .unwrap();
+    let scheduler = lifecycle.scheduler();
+    let state = ChatRequestState::new();
+    let service = RetrievalService::new(lifecycle);
+    let task = tokio::spawn({
+        let task_pool = pool.clone();
+        let task_state = state.clone();
+        async move {
+            with_hybrid_request(
+                &task_state,
+                ChatRequestSurface::Sidebar,
+                "hybrid-queued-id".to_string(),
+                Duration::from_secs(30),
+                move |token| async move {
+                    service
+                        .retrieve(
+                            &task_pool,
+                            request(
+                                "needle",
+                                PersistedRetrievalScope::All,
+                                RetrievalLimits::default(),
+                                CoreTermLanguage::English,
+                                Some(token.as_ref().clone()),
+                            ),
+                        )
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                },
+            )
+            .await
+        }
+    });
+    wait_until(async || scheduler.queued_interactive() == 1).await;
+    assert!(state.cancel_request(ChatRequestSurface::Sidebar, Some("hybrid-queued-id")));
+    let result = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("cancelled hybrid request must not wait for the permit")
+        .unwrap();
+    assert_eq!(
+        result,
+        Err("Hybrid request was cancelled or superseded".to_string())
+    );
+    assert_eq!(scheduler.queued_interactive(), 0);
+    assert_eq!(state.request_count(), 0);
+    drop(held);
+}
+
+#[tokio::test]
+async fn hybrid_tauri_deletion_after_terminal_recheck_suppresses_search_and_context() {
+    for (meeting_id, context) in [("m-tauri-search", false), ("m-tauri-context", true)] {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, meeting_id, "Hybrid meeting").await;
+        add_transcript(
+            &pool,
+            &format!("transcript-{meeting_id}"),
+            meeting_id,
+            "needle text",
+        )
+        .await;
+        crate::database::repositories::fts::FtsRepository::refresh_meeting(&pool, meeting_id)
+            .await
+            .unwrap();
+        let request_state = ChatRequestState::new();
+        let request_id = format!("r2-tauri-{}", if context { "context" } else { "search" });
+        let gate = HybridPublicationGate::new();
+        set_hybrid_publication_gate(&request_id, Some(gate.clone()));
+        let task_pool = pool.clone();
+        let task_state = request_state.clone();
+        let task_request_id = request_id.clone();
+        let task = tokio::spawn(async move {
+            let result = if context {
+                execute_hybrid_context(
+                    &task_pool,
+                    failing_lifecycle(),
+                    &task_state,
+                    ChatRequestSurface::Sidebar,
+                    task_request_id,
+                    "needle".to_string(),
+                    HybridScope::All {},
+                    Some(1_000),
+                    Duration::from_secs(30),
+                )
+                .await
+                .map(|_| ())
+            } else {
+                execute_hybrid_search(
+                    &task_pool,
+                    failing_lifecycle(),
+                    &task_state,
+                    ChatRequestSurface::Sidebar,
+                    task_request_id,
+                    "needle".to_string(),
+                    HybridScope::All {},
+                    Some(1),
+                    Duration::from_secs(30),
+                )
+                .await
+                .map(|_| ())
+            };
+            result
+        });
+        gate.wait().await;
+        let invalidated = request_state.clone();
+        let deleted = crate::database::repositories::meeting::MeetingsRepository::delete_meeting(
+            &pool,
+            meeting_id,
+            |deleted_meeting_id| {
+                invalidated.invalidate_meeting(deleted_meeting_id);
+            },
+        )
+        .await
+        .unwrap();
+        assert!(deleted);
+        gate.release();
+        let result = task.await.unwrap();
+        set_hybrid_publication_gate(&request_id, None);
+        assert_eq!(
+            result,
+            Err("Hybrid request was cancelled or superseded".to_string())
+        );
+        assert_eq!(request_state.request_count(), 0);
+        let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM meetings WHERE id = ?")
+            .bind(meeting_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+}
+
+#[tokio::test]
+async fn hybrid_mcp_tools_execute_through_jsonrpc_with_fallback_and_errors() {
+    let pool = migrated_pool().await;
+    for index in 1..=6 {
+        let meeting_id = format!("mcp-jsonrpc-{index}");
+        insert_meeting(&pool, &meeting_id, "Hybrid meeting").await;
+        add_transcript(
+            &pool,
+            &format!("{meeting_id}-transcript"),
+            &meeting_id,
+            "needle text",
+        )
+        .await;
+        crate::database::repositories::fts::FtsRepository::refresh_meeting(&pool, &meeting_id)
+            .await
+            .unwrap();
+    }
+    let chat_requests = ChatRequestState::new();
+    let state = mcp_state(&pool, &failing_lifecycle(), &chat_requests);
+
+    let search = call_mcp_tool(
+        state.clone(),
+        "search_meetings_hybrid_v1",
+        json!({"query": "needle", "scope": {"kind": "all"}, "limit": 6}),
+    )
+    .await;
+    assert_eq!(search["jsonrpc"], "2.0");
+    assert_eq!(search["id"], 1);
+    assert_eq!(search["result"]["isError"], false);
+    let search_body: Value =
+        serde_json::from_str(search["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(search_body["version"], "v1");
+    assert_eq!(search_body["retrievalStatus"], "lexical_fallback");
+    assert_eq!(search_body["scope"]["kind"], "all");
+    assert_eq!(search_body["results"].as_array().unwrap().len(), 6);
+    assert_eq!(
+        search_body["results"][0]["provenance"][0]["evidenceId"],
+        search_body["results"][0]["sources"][0]["evidenceIds"][0]
+    );
+
+    let context = call_mcp_tool(
+        state.clone(),
+        "build_context_hybrid_v1",
+        json!({"query": "needle", "scope": {"kind": "all"}, "max_chars": 10_000}),
+    )
+    .await;
+    assert_eq!(context["result"]["isError"], false);
+    let context_body: Value =
+        serde_json::from_str(context["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(context_body["version"], "v1");
+    assert_eq!(context_body["retrievalStatus"], "lexical_fallback");
+    assert!(context_body["context"].as_str().unwrap().contains("needle"));
+    assert_eq!(context_body["sources"].as_array().unwrap().len(), 5);
+
+    let scope_error = call_mcp_tool(
+        state.clone(),
+        "search_meetings_hybrid_v1",
+        json!({"query": "needle", "scope": {"kind": "all", "meetingId": "mcp-jsonrpc-1"}}),
+    )
+    .await;
+    assert_mcp_error(&scope_error, "Invalid hybrid scope");
+    let limit_error = call_mcp_tool(
+        state,
+        "search_meetings_hybrid_v1",
+        json!({"query": "needle", "scope": {"kind": "all"}, "limit": 51}),
+    )
+    .await;
+    assert_mcp_error(&limit_error, "Invalid hybrid result limit");
+}
+
+#[tokio::test]
+async fn hybrid_mcp_jsonrpc_deadline_cancels_queued_retrieval_and_reclaims_capacity() {
+    let (pool, lifecycle, _) = active_test_retrieval("mcp-queued-timeout").await;
+    let held = lifecycle
+        .scheduler()
+        .enqueue_interactive()
+        .unwrap()
+        .wait_for_permit()
+        .await
+        .unwrap();
+    let scheduler = lifecycle.scheduler();
+    let chat_requests = ChatRequestState::new();
+    let state = mcp_state(&pool, &lifecycle, &chat_requests);
+    let task = tokio::spawn(call_mcp_tool(
+        state,
+        "search_meetings_hybrid_v1",
+        json!({"query": "needle", "scope": {"kind": "all"}, "limit": 1}),
+    ));
+    for _ in 0..1_000 {
+        if scheduler.queued_interactive() == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(scheduler.queued_interactive(), 1);
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    let response = task.await.unwrap();
+    assert_mcp_error(&response, "Hybrid request timed out");
+    for _ in 0..1_000 {
+        if scheduler.queued_interactive() == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(scheduler.queued_interactive(), 0);
+    assert_eq!(chat_requests.request_count(), 0);
+    drop(held);
+    let request_id = "mcp-queued-reclaimed";
+    let token = chat_requests
+        .try_claim_request(ChatRequestSurface::Mcp, request_id)
+        .expect("timeout must reclaim MCP ownership");
+    assert!(chat_requests.clear_if_owner(ChatRequestSurface::Mcp, request_id, &token));
+}
+
+#[tokio::test]
+async fn hybrid_mcp_jsonrpc_deadline_cancels_running_retrieval_and_reclaims_capacity() {
+    let (pool, lifecycle, embedder) = active_test_retrieval("mcp-running-timeout").await;
+    let (release_tx, receiver) = std::sync::mpsc::channel();
+    *embedder.park_until.lock().unwrap() = Some(receiver);
+    let chat_requests = ChatRequestState::new();
+    let state = mcp_state(&pool, &lifecycle, &chat_requests);
+    let task = tokio::spawn(call_mcp_tool(
+        state,
+        "build_context_hybrid_v1",
+        json!({"query": "needle", "scope": {"kind": "all"}, "max_chars": 1_000}),
+    ));
+    for _ in 0..1_000 {
+        if embedder.entered.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(embedder.entered.load(Ordering::SeqCst));
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    let response = task.await.unwrap();
+    assert_mcp_error(&response, "Hybrid request timed out");
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(embedder.cancelled.load(Ordering::SeqCst));
+    assert_eq!(chat_requests.request_count(), 0);
+    let lease = lifecycle
+        .scheduler()
+        .enqueue_interactive()
+        .unwrap()
+        .wait_for_permit()
+        .await
+        .unwrap();
+    drop(lease);
+    drop(release_tx);
 }
 
 // -- Pinned generation (R16 finding 3) ---------------------------------------------

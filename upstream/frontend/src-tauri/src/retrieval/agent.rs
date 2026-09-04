@@ -772,7 +772,12 @@ pub async fn run_deep_preparation(
                     // fusion of independent searches never collapses every
                     // query into one rewritten rank namespace.
                     for candidate in &mut query_candidates {
-                        for provenance in &mut candidate.provenance {
+                        for provenance in candidate.provenance.iter_mut().chain(
+                            candidate
+                                .source_aliases
+                                .iter_mut()
+                                .flat_map(|alias| alias.provenance.iter_mut()),
+                        ) {
                             provenance.query_slot = planner_query_slot;
                         }
                     }
@@ -1161,6 +1166,12 @@ fn accumulated_semantics(
         candidate
             .provenance
             .iter()
+            .chain(
+                candidate
+                    .source_aliases
+                    .iter()
+                    .flat_map(|alias| alias.provenance.iter()),
+            )
             .any(|provenance| provenance.channel == RetrievalChannel::Semantic)
     });
     if semantic_present {
@@ -1569,6 +1580,21 @@ fn merge_candidates(pool: &mut Vec<RetrievedEvidence>, additional: Vec<Retrieved
                 for provenance in candidate.provenance {
                     if !existing.provenance.contains(&provenance) {
                         existing.provenance.push(provenance);
+                    }
+                }
+                for alias in candidate.source_aliases {
+                    if let Some(existing_alias) = existing
+                        .source_aliases
+                        .iter_mut()
+                        .find(|existing_alias| existing_alias.evidence_id == alias.evidence_id)
+                    {
+                        for provenance in alias.provenance {
+                            if !existing_alias.provenance.contains(&provenance) {
+                                existing_alias.provenance.push(provenance);
+                            }
+                        }
+                    } else {
+                        existing.source_aliases.push(alias);
                     }
                 }
             }

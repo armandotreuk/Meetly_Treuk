@@ -96,6 +96,7 @@ pub const CONCEPT_DELTA: f64 = 1.0;
 /// inputs always select identical depth and ordering, and wall-clock time is
 /// never consulted.
 pub const CHAT_RERANK_DEPTH: usize = 50;
+pub const SEARCH_RERANK_DEPTH: usize = 25;
 
 /// Authoritative-corroboration credit per additional document class
 /// (transcript / summary / notes) whose evidence the request surfaced for a
@@ -172,6 +173,21 @@ impl RankingConfig {
             support_cap: SUPPORT_CAP,
             support_window: SUPPORT_WINDOW,
             rerank_depth: CHAT_RERANK_DEPTH,
+        }
+    }
+
+    pub const fn search() -> Self {
+        Self {
+            rerank_depth: SEARCH_RERANK_DEPTH,
+            ..Self::chat()
+        }
+    }
+
+    pub const fn for_purpose(purpose: crate::retrieval::service::RetrievalPurpose) -> Self {
+        match purpose {
+            crate::retrieval::service::RetrievalPurpose::Search => Self::search(),
+            crate::retrieval::service::RetrievalPurpose::Chat
+            | crate::retrieval::service::RetrievalPurpose::Context => Self::chat(),
         }
     }
 }
@@ -383,7 +399,6 @@ pub fn dedupe_candidates(
 
     // Absorption decisions for transcript lexical candidates only; every
     // other lexical candidate is retained separately.
-    let mut merged_provenance: HashMap<String, Vec<EvidenceProvenance>> = HashMap::new();
     let mut merged_aliases: HashMap<String, Vec<SourceAlias>> = HashMap::new();
     let mut output: Vec<RetrievedEvidence> = Vec::new();
     for candidate in candidates.into_iter() {
@@ -397,10 +412,6 @@ pub fn dedupe_candidates(
             if let Some(target_id) =
                 target_id.filter(|id| Some(id.as_str()) != Some(candidate.evidence_id.as_str()))
             {
-                merged_provenance
-                    .entry(target_id.to_string())
-                    .or_default()
-                    .extend(candidate.provenance);
                 merged_aliases
                     .entry(target_id)
                     .or_default()
@@ -410,6 +421,7 @@ pub fn dedupe_candidates(
                         source_start_id: candidate.source_start_id,
                         source_end_id: candidate.source_end_id,
                         text: candidate.text,
+                        provenance: candidate.provenance,
                     });
                 continue;
             }
@@ -422,19 +434,6 @@ pub fn dedupe_candidates(
         output.push(candidate);
     }
     for candidate in &mut output {
-        if let Some(provenance) = merged_provenance.remove(&candidate.evidence_id) {
-            for provenance in provenance {
-                // Stable dedupe: identical provenance entries (same channel,
-                // variant, mode, and rank) collapse instead of accumulating.
-                if !candidate
-                    .provenance
-                    .iter()
-                    .any(|existing| existing == &provenance)
-                {
-                    candidate.provenance.push(provenance);
-                }
-            }
-        }
         if let Some(aliases) = merged_aliases.remove(&candidate.evidence_id) {
             for alias in aliases {
                 if !candidate
@@ -580,10 +579,18 @@ pub fn concept_coverage(
 }
 
 fn is_semantic(candidate: &RetrievedEvidence) -> bool {
-    candidate
-        .provenance
-        .iter()
-        .any(|provenance| provenance.channel == RetrievalChannel::Semantic)
+    all_provenance(candidate).any(|provenance| provenance.channel == RetrievalChannel::Semantic)
+}
+
+fn all_provenance<'a>(
+    candidate: &'a RetrievedEvidence,
+) -> impl Iterator<Item = &'a EvidenceProvenance> {
+    candidate.provenance.iter().chain(
+        candidate
+            .source_aliases
+            .iter()
+            .flat_map(|alias| alias.provenance.iter()),
+    )
 }
 
 /// The closed set of independently authored document classes corroboration
@@ -604,9 +611,7 @@ fn authoritative_class(kind: &str) -> Option<&'static str> {
 /// variant rank, then variant order), then window ordinal, then stable
 /// document id.
 fn semantic_quality(candidate: &RetrievedEvidence) -> (usize, u8, i64) {
-    let provenance = candidate
-        .provenance
-        .iter()
+    let provenance = all_provenance(candidate)
         .filter(|provenance| provenance.channel == RetrievalChannel::Semantic)
         .map(|provenance| (provenance.rank, variant_order(provenance.variant)))
         .min()
@@ -672,9 +677,7 @@ fn channel_positions<K: Ord>(
     let mut entries: Vec<(&str, K)> = candidates
         .iter()
         .filter_map(|candidate| {
-            candidate
-                .provenance
-                .iter()
+            all_provenance(candidate)
                 .filter(|provenance| select(provenance))
                 .map(&key)
                 .min()
@@ -701,7 +704,7 @@ fn slot_channel_lists<K: Ord>(
 ) -> Vec<Vec<(&str, usize)>> {
     let mut slots: Vec<u8> = candidates
         .iter()
-        .flat_map(|candidate| candidate.provenance.iter())
+        .flat_map(all_provenance)
         .filter(|provenance| select(provenance))
         .map(|provenance| provenance.query_slot)
         .collect();

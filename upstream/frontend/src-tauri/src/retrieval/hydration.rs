@@ -111,9 +111,45 @@ pub async fn hydrate_context(
     cancellation: Option<&CancellationToken>,
 ) -> Result<HydratedContext, RetrievalError> {
     #[cfg(test)]
-    return hydrate(pool, ranked, max_context_chars, cancellation, None).await;
+    return hydrate(
+        pool,
+        ranked,
+        max_context_chars,
+        cancellation,
+        None,
+        MAX_HYDRATED_MEETINGS,
+    )
+    .await;
     #[cfg(not(test))]
-    return hydrate(pool, ranked, max_context_chars, cancellation).await;
+    return hydrate(
+        pool,
+        ranked,
+        max_context_chars,
+        cancellation,
+        MAX_HYDRATED_MEETINGS,
+    )
+    .await;
+}
+
+pub async fn hydrate_search_context(
+    pool: &SqlitePool,
+    ranked: &RankedRetrieval,
+    max_context_chars: usize,
+    max_meetings: usize,
+    cancellation: Option<&CancellationToken>,
+) -> Result<HydratedContext, RetrievalError> {
+    #[cfg(test)]
+    return hydrate(
+        pool,
+        ranked,
+        max_context_chars,
+        cancellation,
+        None,
+        max_meetings,
+    )
+    .await;
+    #[cfg(not(test))]
+    return hydrate(pool, ranked, max_context_chars, cancellation, max_meetings).await;
 }
 
 pub async fn hydrate_context_with_broad_coverage(
@@ -636,7 +672,15 @@ pub(crate) async fn hydrate_with_pause(
     cancellation: Option<&CancellationToken>,
     pause: &HydrationPause,
 ) -> Result<HydratedContext, RetrievalError> {
-    hydrate(pool, ranked, max_context_chars, cancellation, Some(pause)).await
+    hydrate(
+        pool,
+        ranked,
+        max_context_chars,
+        cancellation,
+        Some(pause),
+        MAX_HYDRATED_MEETINGS,
+    )
+    .await
 }
 
 /// Test-only publication gate, mirroring the service's semantic scan gate:
@@ -706,6 +750,7 @@ async fn hydrate(
     max_context_chars: usize,
     cancellation: Option<&CancellationToken>,
     #[cfg(test)] pause: Option<&HydrationPause>,
+    max_meetings: usize,
 ) -> Result<HydratedContext, RetrievalError> {
     let cancel = cancellation.cloned().unwrap_or_default();
     ensure_not_cancelled(&cancel)?;
@@ -730,7 +775,7 @@ async fn hydrate(
         .meetings
         .iter()
         .filter(|meeting| items_by_meeting.contains_key(&meeting.meeting_id))
-        .take(MAX_HYDRATED_MEETINGS)
+        .take(max_meetings)
         .collect();
     if selected.is_empty() {
         return Ok(empty_context(max_context_chars));
@@ -1657,6 +1702,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_hydration_can_publish_past_the_chat_meeting_cap() {
+        let pool = pool().await;
+        let evidence = (1..=6)
+            .map(|index| {
+                let meeting_id = format!("m{index}");
+                (
+                    meeting_id.clone(),
+                    evidence(
+                        &format!("w{index}"),
+                        &meeting_id,
+                        "transcript",
+                        "snippet",
+                        Some(&format!("{meeting_id}-s2")),
+                        None,
+                        None,
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (meeting_id, _) in &evidence {
+            seeded_meeting(&pool, meeting_id, meeting_id, None).await;
+        }
+        let ranked = outcome(
+            PersistedRetrievalScope::All,
+            evidence.into_iter().map(|(_, item)| item).collect(),
+            (1..=6)
+                .map(|index| ranked(&format!("m{index}"), index))
+                .collect(),
+        );
+
+        let context = hydrate_search_context(&pool, &ranked, 50_000, 6, None)
+            .await
+            .unwrap();
+        assert_eq!(context.meetings.len(), 6);
+    }
+
+    #[tokio::test]
     async fn long_first_summary_cannot_starve_other_meetings() {
         let pool = pool().await;
         seeded_meeting(&pool, "m1", "Top", None).await;
@@ -1960,6 +2042,7 @@ mod tests {
             source_start_id: Some("m1-s2".to_string()),
             source_end_id: None,
             text: "lexical alias".to_string(),
+            provenance: Vec::new(),
         });
         let ranked = outcome(
             PersistedRetrievalScope::All,

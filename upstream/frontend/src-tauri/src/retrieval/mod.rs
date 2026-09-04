@@ -14,6 +14,7 @@
 pub mod agent;
 pub mod chunking;
 pub mod commands;
+pub mod contracts;
 pub mod hydration;
 pub mod index;
 pub mod model;
@@ -34,9 +35,15 @@ pub use agent::{
     PLANNER_MAX_ROUNDS, PLANNER_SCHEMA_VERSION,
 };
 pub use chunking::{chunk_meeting, ChunkerConfig, SemanticDocument, TokenizerPolicy};
+pub use contracts::{
+    validate_hybrid_query, HybridContextResponse, HybridMeetingResult, HybridProvenance,
+    HybridRetrievalStatus, HybridScope, HybridSearchResponse, HybridSource,
+    MAX_HYBRID_CONTEXT_CHARS, MAX_HYBRID_QUERY_CHARS, MAX_HYBRID_SEARCH_MEETINGS,
+    MAX_HYBRID_SEARCH_RESULTS,
+};
 pub use hydration::{
     hydrate_broad_scope_context, hydrate_context, hydrate_context_with_broad_coverage,
-    HydratedContext, HydratedMeeting, HydratedSource,
+    hydrate_search_context, HydratedContext, HydratedMeeting, HydratedSource,
 };
 pub use index::{QueryIndexService, ScopeFilter, SearchFailure, VectorHit};
 pub use model::{get_or_load, RetrievalModelError, RetrievalModels};
@@ -44,13 +51,13 @@ pub use ranking::{
     aggregate_meetings, apply_rerank, concept_coverage, coverage_regions, dedupe_candidates, fuse,
     select_rerank_head, title_overlap, AggregationTerms, FusedEvidence, RankedEvidence,
     RankedMeeting, RankingConfig, RankingOutcome, RerankFallback, SegmentOrder, CHAT_RERANK_DEPTH,
-    CONCEPT_DELTA, RERANK_GAMMA, RRF_K, SUPPORT_ALPHA, SUPPORT_CAP, SUPPORT_WINDOW, TITLE_BETA,
-    W_LEXICAL, W_VECTOR,
+    CONCEPT_DELTA, RERANK_GAMMA, RRF_K, SEARCH_RERANK_DEPTH, SUPPORT_ALPHA, SUPPORT_CAP,
+    SUPPORT_WINDOW, TITLE_BETA, W_LEXICAL, W_VECTOR,
 };
 pub use service::{
     CoreTermLanguage, EvidenceProvenance, LexicalMode, PersistedRetrievalScope, QueryVariantKind,
     RankedRetrieval, ResolvedScope, RetrievalChannel, RetrievalError, RetrievalLimits,
     RetrievalPurpose, RetrievalRequest, RetrievalResult, RetrievalService, RetrievedEvidence,
-    SemanticFallbackReason, SourceAlias,
+    SemanticFallbackReason, SourceAlias, HYBRID_CANDIDATES_PER_VARIANT, MAX_ALLOWED_MEETING_IDS,
 };
 pub use worker::RetrievalLifecycle;

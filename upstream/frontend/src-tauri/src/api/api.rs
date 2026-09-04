@@ -1,10 +1,14 @@
 use log::{debug as log_debug, error as log_error, info as log_info, warn as log_warn};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Runtime};
 use tauri_plugin_store::StoreExt;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
+    api::chat::{ChatRequestState, ChatRequestSurface, ChatRequestToken},
     database::{
         models::MeetingModel,
         repositories::{
@@ -14,6 +18,12 @@ use crate::{
             setting::SettingsRepository,
             transcript::TranscriptsRepository,
         },
+    },
+    retrieval::{
+        hydrate_context, hydrate_search_context, validate_hybrid_query, HybridContextResponse,
+        HybridScope, HybridSearchResponse, PersistedRetrievalScope, RetrievalError,
+        RetrievalLimits, RetrievalPurpose, RetrievalRequest, RetrievalService,
+        MAX_HYBRID_CONTEXT_CHARS, MAX_HYBRID_SEARCH_MEETINGS, MAX_HYBRID_SEARCH_RESULTS,
     },
     state::AppState,
     summary::CustomOpenAIConfig,
@@ -357,6 +367,373 @@ fn lexical_search_log_fields(query: &str, mode: &str, result_count: usize) -> St
     )
 }
 
+pub(crate) const HYBRID_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const HYBRID_SEARCH_DEFAULT_LIMIT: u32 = 20;
+pub(crate) const HYBRID_CONTEXT_DEFAULT_CHARS: u32 = 100_000;
+pub(crate) const MCP_HYBRID_BUSY_ERROR: &str =
+    "MCP hybrid request is at its concurrent request limit; retry shortly";
+const HYBRID_INVALIDATED_ERROR: &str = "Hybrid result was invalidated";
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct HybridPublicationGate {
+    entered: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl HybridPublicationGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            entered: std::sync::Arc::new(tokio::sync::Notify::new()),
+            release: std::sync::Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    pub(crate) async fn wait(&self) {
+        self.entered.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+static HYBRID_PUBLICATION_GATE: std::sync::Mutex<Option<(String, HybridPublicationGate)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_hybrid_publication_gate(request_id: &str, gate: Option<HybridPublicationGate>) {
+    *HYBRID_PUBLICATION_GATE.lock().unwrap() = gate.map(|gate| (request_id.to_string(), gate));
+}
+
+#[cfg(test)]
+async fn wait_for_hybrid_publication_gate(request_id: &str) {
+    let gate = HYBRID_PUBLICATION_GATE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|(id, _)| id == request_id)
+        .map(|(_, gate)| gate.clone());
+    if let Some(gate) = gate {
+        gate.entered.notify_one();
+        gate.release.notified().await;
+    }
+}
+
+fn validate_hybrid_request_id(request_id: &str) -> Result<(), String> {
+    if request_id.is_empty()
+        || request_id.chars().count() > 128
+        || !request_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_-:.".contains(character))
+    {
+        return Err("Invalid hybrid request ID".to_string());
+    }
+    Ok(())
+}
+
+fn validate_hybrid_limit(limit: Option<u32>) -> Result<usize, String> {
+    let limit = limit.unwrap_or(HYBRID_SEARCH_DEFAULT_LIMIT);
+    if limit == 0 || limit as usize > MAX_HYBRID_SEARCH_RESULTS {
+        return Err(format!(
+            "Hybrid result limit must be between 1 and {}",
+            MAX_HYBRID_SEARCH_RESULTS
+        ));
+    }
+    Ok(limit as usize)
+}
+
+fn validate_hybrid_context_chars(max_context_chars: Option<u32>) -> Result<usize, String> {
+    let max_context_chars = max_context_chars.unwrap_or(HYBRID_CONTEXT_DEFAULT_CHARS);
+    if max_context_chars == 0 || max_context_chars as usize > MAX_HYBRID_CONTEXT_CHARS {
+        return Err(format!(
+            "Hybrid context limit must be between 1 and {}",
+            MAX_HYBRID_CONTEXT_CHARS
+        ));
+    }
+    Ok(max_context_chars as usize)
+}
+
+fn map_hybrid_error(error: RetrievalError) -> String {
+    match error {
+        RetrievalError::Cancelled => "Hybrid request was cancelled or superseded".to_string(),
+        RetrievalError::InvalidQuery(_) => "Invalid hybrid query".to_string(),
+        RetrievalError::InvalidScope(_) => "Invalid hybrid scope".to_string(),
+        RetrievalError::UnsupportedPurpose(_) => "Hybrid request is not supported".to_string(),
+        RetrievalError::Database(_) => "Hybrid retrieval is unavailable".to_string(),
+    }
+}
+
+struct HybridOwnershipGuard<'a> {
+    state: &'a ChatRequestState,
+    surface: ChatRequestSurface,
+    request_id: &'a str,
+    token: &'a ChatRequestToken,
+}
+
+impl Drop for HybridOwnershipGuard<'_> {
+    fn drop(&mut self) {
+        self.token.cancel();
+        self.state
+            .clear_if_owner(self.surface, self.request_id, self.token);
+    }
+}
+
+struct MeetingDeletionGuard<'a> {
+    state: &'a ChatRequestState,
+    meeting_id: &'a str,
+}
+
+impl Drop for MeetingDeletionGuard<'_> {
+    fn drop(&mut self) {
+        self.state.finish_meeting_deletion(self.meeting_id);
+    }
+}
+
+fn finish_hybrid_request<T>(
+    state: &ChatRequestState,
+    surface: ChatRequestSurface,
+    request_id: &str,
+    token: &ChatRequestToken,
+    result: Result<T, String>,
+    timed_out: bool,
+) -> Result<T, String> {
+    if timed_out {
+        token.cancel();
+    }
+    if !state.clear_if_owner(surface, request_id, token) {
+        return Err("Hybrid request was cancelled or superseded".to_string());
+    }
+    if timed_out {
+        return Err("Hybrid request timed out".to_string());
+    }
+    if token.is_cancelled() {
+        return Err("Hybrid request was cancelled".to_string());
+    }
+    result
+}
+
+pub(crate) async fn with_hybrid_request<T, F, Fut>(
+    state: &ChatRequestState,
+    surface: ChatRequestSurface,
+    request_id: String,
+    timeout: Duration,
+    work: F,
+) -> Result<T, String>
+where
+    F: FnOnce(ChatRequestToken) -> Fut,
+    Fut: Future<Output = Result<T, String>>,
+{
+    validate_hybrid_request_id(&request_id)?;
+    let Some(token) = state.try_claim_request(surface, &request_id) else {
+        return Err(if matches!(surface, ChatRequestSurface::Mcp) {
+            MCP_HYBRID_BUSY_ERROR.to_string()
+        } else {
+            "Hybrid request could not be started".to_string()
+        });
+    };
+    let guard = HybridOwnershipGuard {
+        state,
+        surface,
+        request_id: &request_id,
+        token: &token,
+    };
+    let work = work(token.clone());
+    tokio::pin!(work);
+    let deadline_sleep = tokio::time::sleep(timeout);
+    tokio::pin!(deadline_sleep);
+    let mut timed_out = false;
+    let result = tokio::select! {
+        biased;
+        _ = &mut deadline_sleep => {
+            token.cancel();
+            timed_out = true;
+            Err("Hybrid request timed out".to_string())
+        }
+        result = &mut work => result,
+    };
+    let outcome = finish_hybrid_request(state, surface, &request_id, &token, result, timed_out);
+    drop(guard);
+    outcome
+}
+
+fn hybrid_retrieval_request(
+    query: String,
+    scope: PersistedRetrievalScope,
+    purpose: RetrievalPurpose,
+    limits: RetrievalLimits,
+    token: &CancellationToken,
+) -> RetrievalRequest {
+    RetrievalRequest {
+        original_query: query,
+        rewritten_query: None,
+        scope,
+        purpose,
+        limits,
+        core_language: crate::retrieval::CoreTermLanguage::Unknown,
+        cancellation: Some(token.clone()),
+    }
+}
+
+async fn bind_and_revalidate_hybrid(
+    service: &RetrievalService,
+    pool: &sqlx::SqlitePool,
+    request_state: &ChatRequestState,
+    surface: ChatRequestSurface,
+    request_id: &str,
+    token: &ChatRequestToken,
+    scope: &PersistedRetrievalScope,
+    hydrated: &crate::retrieval::HydratedContext,
+) -> Result<(), String> {
+    let meeting_ids = hydrated
+        .meetings
+        .iter()
+        .map(|meeting| meeting.meeting_id.clone())
+        .collect::<HashSet<_>>();
+    if !request_state.bind_request_meetings(surface, request_id, token, &meeting_ids) {
+        return Err("Hybrid request was cancelled or superseded".to_string());
+    }
+    let requested_ids = meeting_ids.iter().cloned().collect::<Vec<_>>();
+    let current_ids = service
+        .revalidate_ids_in_scope(pool, scope, &requested_ids, token)
+        .await
+        .map_err(map_hybrid_error)?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    if current_ids != meeting_ids {
+        token.cancel();
+        return Err(HYBRID_INVALIDATED_ERROR.to_string());
+    }
+    if !request_state.is_owner(surface, request_id, token) {
+        return Err("Hybrid request was cancelled or superseded".to_string());
+    }
+    Ok(())
+}
+
+pub(crate) async fn execute_hybrid_search(
+    pool: &sqlx::SqlitePool,
+    retrieval: crate::retrieval::worker::RetrievalLifecycle,
+    request_state: &ChatRequestState,
+    surface: ChatRequestSurface,
+    request_id: String,
+    query: String,
+    scope: HybridScope,
+    limit: Option<u32>,
+    timeout: Duration,
+) -> Result<HybridSearchResponse, String> {
+    validate_hybrid_query(&query)?;
+    let scope = scope.into_persisted()?;
+    let limit = validate_hybrid_limit(limit)?;
+    let work_request_id = request_id.clone();
+    with_hybrid_request(request_state, surface, request_id, timeout, move |token| {
+        let request_id = work_request_id;
+        async move {
+            let service = RetrievalService::new(retrieval);
+            let ranked = service
+                .retrieve_ranked(
+                    pool,
+                    hybrid_retrieval_request(
+                        query,
+                        scope.clone(),
+                        RetrievalPurpose::Search,
+                        RetrievalLimits::hybrid_default(),
+                        &token,
+                    ),
+                )
+                .await
+                .map_err(map_hybrid_error)?;
+            let hydrated = hydrate_search_context(
+                pool,
+                &ranked,
+                MAX_HYBRID_CONTEXT_CHARS,
+                MAX_HYBRID_SEARCH_MEETINGS,
+                Some(&token),
+            )
+            .await
+            .map_err(map_hybrid_error)?;
+            bind_and_revalidate_hybrid(
+                &service,
+                pool,
+                request_state,
+                surface,
+                &request_id,
+                &token,
+                &ranked.scope.scope,
+                &hydrated,
+            )
+            .await?;
+            #[cfg(test)]
+            wait_for_hybrid_publication_gate(&request_id).await;
+            request_state
+                .publish_hybrid_if_current(surface, &request_id, &token, || {
+                    HybridSearchResponse::from_outputs(&ranked, &hydrated, limit)
+                })
+                .ok_or_else(|| "Hybrid request was cancelled or superseded".to_string())
+        }
+    })
+    .await
+}
+
+pub(crate) async fn execute_hybrid_context(
+    pool: &sqlx::SqlitePool,
+    retrieval: crate::retrieval::worker::RetrievalLifecycle,
+    request_state: &ChatRequestState,
+    surface: ChatRequestSurface,
+    request_id: String,
+    query: String,
+    scope: HybridScope,
+    max_context_chars: Option<u32>,
+    timeout: Duration,
+) -> Result<HybridContextResponse, String> {
+    validate_hybrid_query(&query)?;
+    let scope = scope.into_persisted()?;
+    let max_context_chars = validate_hybrid_context_chars(max_context_chars)?;
+    let work_request_id = request_id.clone();
+    with_hybrid_request(request_state, surface, request_id, timeout, move |token| {
+        let request_id = work_request_id;
+        async move {
+            let service = RetrievalService::new(retrieval);
+            let ranked = service
+                .retrieve_ranked(
+                    pool,
+                    hybrid_retrieval_request(
+                        query,
+                        scope.clone(),
+                        RetrievalPurpose::Context,
+                        RetrievalLimits::hybrid_default(),
+                        &token,
+                    ),
+                )
+                .await
+                .map_err(map_hybrid_error)?;
+            let hydrated = hydrate_context(pool, &ranked, max_context_chars, Some(&token))
+                .await
+                .map_err(map_hybrid_error)?;
+            bind_and_revalidate_hybrid(
+                &service,
+                pool,
+                request_state,
+                surface,
+                &request_id,
+                &token,
+                &ranked.scope.scope,
+                &hydrated,
+            )
+            .await?;
+            #[cfg(test)]
+            wait_for_hybrid_publication_gate(&request_id).await;
+            request_state
+                .publish_hybrid_if_current(surface, &request_id, &token, || {
+                    HybridContextResponse::from_outputs(&ranked, &hydrated)
+                })
+                .ok_or_else(|| "Hybrid request was cancelled or superseded".to_string())
+        }
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn api_get_meetings<R: Runtime>(
     _app: AppHandle<R>,
@@ -622,6 +999,66 @@ pub async fn api_search_fts<R: Runtime>(
         auth_token.is_some()
     );
     Ok(results)
+}
+
+#[tauri::command]
+pub async fn api_search_hybrid<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    retrieval: tauri::State<'_, crate::retrieval::worker::RetrievalLifecycle>,
+    request_state: tauri::State<'_, ChatRequestState>,
+    query: String,
+    scope: HybridScope,
+    limit: Option<u32>,
+    request_id: String,
+) -> Result<HybridSearchResponse, String> {
+    execute_hybrid_search(
+        state.db_manager.pool(),
+        retrieval.inner().clone(),
+        request_state.inner(),
+        ChatRequestSurface::Sidebar,
+        request_id,
+        query,
+        scope,
+        limit,
+        HYBRID_REQUEST_TIMEOUT,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn api_build_hybrid_context<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    retrieval: tauri::State<'_, crate::retrieval::worker::RetrievalLifecycle>,
+    request_state: tauri::State<'_, ChatRequestState>,
+    query: String,
+    scope: HybridScope,
+    max_context_chars: Option<u32>,
+    request_id: String,
+) -> Result<HybridContextResponse, String> {
+    execute_hybrid_context(
+        state.db_manager.pool(),
+        retrieval.inner().clone(),
+        request_state.inner(),
+        ChatRequestSurface::Sidebar,
+        request_id,
+        query,
+        scope,
+        max_context_chars,
+        HYBRID_REQUEST_TIMEOUT,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn api_cancel_hybrid_request(
+    request_state: tauri::State<'_, ChatRequestState>,
+    request_id: String,
+) -> Result<(), String> {
+    validate_hybrid_request_id(&request_id)?;
+    request_state.cancel_request(ChatRequestSurface::Sidebar, Some(&request_id));
+    Ok(())
 }
 
 #[tauri::command]
@@ -930,10 +1367,15 @@ pub async fn api_delete_meeting<R: Runtime>(
     // references this meeting are cancelled through the one shared request
     // registry, so no later chunk/source/done publication can occur.
     let chat_requests = chat_requests.inner().clone();
+    let deletion_guard = MeetingDeletionGuard {
+        state: &chat_requests,
+        meeting_id: &meeting_id,
+    };
     let deletion = MeetingsRepository::delete_meeting(pool, &meeting_id, |deleted_meeting_id| {
         chat_requests.invalidate_meeting(deleted_meeting_id);
     })
     .await;
+    drop(deletion_guard);
     // One identity-only local notification AFTER the transaction committed:
     // never before commit, on rollback, or with content/sources. The renderer
     // uses it to drop the deleted meeting's retained sources from already
@@ -1112,6 +1554,74 @@ mod tests {
                 assert!(!fields.contains(query));
             }
         }
+    }
+
+    #[test]
+    fn hybrid_request_bounds_and_ids_are_validated() {
+        assert_eq!(validate_hybrid_limit(None).unwrap(), 20);
+        assert_eq!(validate_hybrid_limit(Some(50)).unwrap(), 50);
+        assert!(validate_hybrid_limit(Some(0)).is_err());
+        assert!(validate_hybrid_limit(Some(51)).is_err());
+        assert_eq!(validate_hybrid_context_chars(None).unwrap(), 100_000);
+        assert!(validate_hybrid_context_chars(Some(100_001)).is_err());
+        assert!(validate_hybrid_request_id("").is_err());
+        assert!(validate_hybrid_request_id("request/id").is_err());
+        assert!(validate_hybrid_request_id("sidebar-search-1").is_ok());
+    }
+
+    #[tokio::test]
+    async fn hybrid_cancellation_reclaims_sidebar_ownership() {
+        let state = ChatRequestState::new();
+        let work_state = state.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            with_hybrid_request(
+                &work_state,
+                ChatRequestSurface::Sidebar,
+                "hybrid-cancel".to_string(),
+                Duration::from_secs(30),
+                move |token| async move {
+                    let _ = started_tx.send(());
+                    token.cancelled().await;
+                    Ok::<_, String>(())
+                },
+            )
+            .await
+        });
+        started_rx.await.unwrap();
+        assert!(state.cancel_request(ChatRequestSurface::Sidebar, Some("hybrid-cancel")));
+        assert_eq!(
+            task.await.unwrap(),
+            Err("Hybrid request was cancelled or superseded".to_string())
+        );
+        assert_eq!(state.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn hybrid_mcp_timeout_cancels_the_shared_request_token() {
+        let state = ChatRequestState::new();
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let task_state = state.clone();
+        let task_observed = observed.clone();
+        let result = with_hybrid_request(
+            &task_state,
+            ChatRequestSurface::Mcp,
+            "mcp-hybrid-timeout".to_string(),
+            Duration::from_millis(10),
+            move |token| async move {
+                *task_observed.lock().unwrap() = Some(token.clone());
+                token.cancelled().await;
+                Ok::<_, String>(())
+            },
+        )
+        .await;
+        assert_eq!(result, Err("Hybrid request timed out".to_string()));
+        assert!(observed
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled()));
+        assert_eq!(state.request_count(), 0);
     }
 }
 

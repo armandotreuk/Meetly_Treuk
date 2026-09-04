@@ -370,10 +370,17 @@ impl InteractiveTicket {
                 self.scheduler.remove_queued(self.id);
                 Ok(InferenceLease {
                     _permit: permit.expect("inference semaphore is never closed"),
-                    scheduler: self.scheduler,
+                    scheduler: self.scheduler.clone(),
                 })
             }
         }
+    }
+}
+
+impl Drop for InteractiveTicket {
+    fn drop(&mut self) {
+        self.token.cancel();
+        self.scheduler.remove_queued(self.id);
     }
 }
 

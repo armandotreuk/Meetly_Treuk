@@ -29,13 +29,15 @@ use crate::database::repositories::fts::{
     folder_operator_names, strip_folder_operators, FtsRepository, FtsSearchResult, MatchMode,
 };
 use crate::database::repositories::retrieval::RetrievalRepository;
+use crate::database::repositories::setting::SettingsRepository;
 use crate::retrieval::index::{ScopeFilter, SearchFailure, VectorHit, MAX_QUERY_LIMIT};
 use crate::retrieval::model::RetrievalModelError;
 use crate::retrieval::worker::{RetrievalLifecycle, SchedulerRejection, PAUSE_QUANTUM};
 
 /// Approved bounded size for allowed-ID scopes, mirroring the approved
 /// 100-meeting snapshot ceiling (`MAX_SEARCH_SNAPSHOT_RESULTS`).
-const MAX_ALLOWED_MEETING_IDS: usize = 100;
+pub const MAX_ALLOWED_MEETING_IDS: usize = 100;
+pub const HYBRID_CANDIDATES_PER_VARIANT: usize = 100;
 /// Approved ceiling on the folder membership accelerator: a folder subtree
 /// with at most this many current meetings materializes its ID set once to
 /// accelerate the vector scan; above it the scan runs as [`ScopeFilter::All`]
@@ -54,9 +56,7 @@ const MAX_CANDIDATES_PER_VARIANT: usize = MAX_QUERY_LIMIT;
 /// back to lexical for the request.
 const CATCHUP_RETRIES: usize = 2;
 
-/// Why retrieval runs. Only [`RetrievalPurpose::Chat`] is wired this sprint;
-/// `Search` and `Context` are contract placeholders owned by Sprint 5 and the
-/// future context builder, and are rejected fail-closed until then.
+/// Why retrieval runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetrievalPurpose {
     Chat,
@@ -98,8 +98,15 @@ impl RetrievalLimits {
     /// tunes them with threshold semantics.
     pub const fn chat_default() -> Self {
         Self {
-            lexical_per_variant: 100,
-            vector_per_variant: 100,
+            lexical_per_variant: HYBRID_CANDIDATES_PER_VARIANT,
+            vector_per_variant: HYBRID_CANDIDATES_PER_VARIANT,
+        }
+    }
+
+    pub const fn hybrid_default() -> Self {
+        Self {
+            lexical_per_variant: HYBRID_CANDIDATES_PER_VARIANT,
+            vector_per_variant: HYBRID_CANDIDATES_PER_VARIANT,
         }
     }
 
@@ -216,6 +223,7 @@ pub struct SourceAlias {
     pub source_start_id: Option<String>,
     pub source_end_id: Option<String>,
     pub text: String,
+    pub provenance: Vec<EvidenceProvenance>,
 }
 
 /// The normalized scope: the tagged scope after `folder:"..."` normalization.
@@ -238,6 +246,7 @@ pub enum SemanticFallbackReason {
     GenerationChanged,
     EmbeddingUnavailable,
     SchedulerRejected,
+    ForcedLexical,
     CatchUpTimeout {
         behind: i64,
     },
@@ -248,7 +257,7 @@ pub enum SemanticFallbackReason {
 pub enum RetrievalError {
     #[error("retrieval cancelled")]
     Cancelled,
-    #[error("retrieval purpose {0:?} is not wired; only Chat is supported")]
+    #[error("retrieval purpose {0:?} is not supported")]
     UnsupportedPurpose(RetrievalPurpose),
     #[error("invalid retrieval query: {0}")]
     InvalidQuery(&'static str),
@@ -380,10 +389,11 @@ impl RetrievalService {
         pool: &SqlitePool,
         request: RetrievalRequest,
     ) -> Result<RetrievalResult, RetrievalError> {
-        if request.purpose != RetrievalPurpose::Chat {
-            return Err(RetrievalError::UnsupportedPurpose(request.purpose));
-        }
         let cancel = request.cancellation.clone().unwrap_or_default();
+        ensure_not_cancelled(&cancel)?;
+        let force_lexical = SettingsRepository::get_force_lexical_retrieval(pool)
+            .await
+            .map_err(db_error)?;
         let normalized = self.normalize_request(pool, &request, &cancel).await?;
         ensure_not_cancelled(&cancel)?;
         if let ScopeFilter::Meetings(ids) = &normalized.membership {
@@ -391,7 +401,11 @@ impl RetrievalService {
                 return Ok(RetrievalResult {
                     scope: normalized.resolved(),
                     candidates: Vec::new(),
-                    semantic_fallback: None,
+                    semantic_fallback: if force_lexical {
+                        Some(SemanticFallbackReason::ForcedLexical)
+                    } else {
+                        None
+                    },
                 });
             }
         }
@@ -404,9 +418,12 @@ impl RetrievalService {
         self.title_channel(pool, &normalized, limits, &cancel, &mut candidates)
             .await?;
         ensure_not_cancelled(&cancel)?;
-        let semantic_fallback = self
-            .semantic_channel(pool, &normalized, limits, &cancel, &mut candidates)
-            .await?;
+        let semantic_fallback = if force_lexical {
+            Some(SemanticFallbackReason::ForcedLexical)
+        } else {
+            self.semantic_channel(pool, &normalized, limits, &cancel, &mut candidates)
+                .await?
+        };
         ensure_not_cancelled(&cancel)?;
 
         let candidates = order_candidates(candidates);
@@ -445,6 +462,7 @@ impl RetrievalService {
         request: RetrievalRequest,
     ) -> Result<RankedRetrieval, RetrievalError> {
         let cancel = request.cancellation.clone().unwrap_or_default();
+        let purpose = request.purpose;
         let result = self.retrieve(pool, request.clone()).await?;
         ensure_not_cancelled(&cancel)?;
         let lexical_original = strip_folder_operators(request.original_query.trim().to_string());
@@ -466,7 +484,7 @@ impl RetrievalService {
             result.candidates,
             effective_query.trim(),
             core_terms,
-            &crate::retrieval::ranking::RankingConfig::chat(),
+            &crate::retrieval::ranking::RankingConfig::for_purpose(purpose),
             ranking_mode,
             &cancel,
         )
@@ -483,6 +501,7 @@ impl RetrievalService {
         pool: &SqlitePool,
         request: RetrievalRequest,
     ) -> Result<RankedRetrieval, RetrievalError> {
+        let purpose = request.purpose;
         let cancel = request.cancellation.clone().unwrap_or_default();
         let mut ranked = self.retrieve_ranked(pool, request).await?;
         let allowed_ids = match &ranked.scope.scope {
@@ -547,7 +566,7 @@ impl RetrievalService {
             candidates,
             &ranked.ranking.effective_query,
             ranked.ranking.core_terms.clone(),
-            &crate::retrieval::ranking::RankingConfig::chat(),
+            &crate::retrieval::ranking::RankingConfig::for_purpose(purpose),
             ranking_mode,
             &cancel,
         )
@@ -555,13 +574,10 @@ impl RetrievalService {
         Ok(ranked)
     }
 
-    /// Revalidates the ORIGINAL authoritative scope's current membership and
-    /// returns the supplied meeting IDs still inside it (input order kept).
-    /// Deep retrieval rounds call this after every planner round as an early
-    /// scope filter; it is NOT the final publication authority - the final
-    /// authoritative hydration re-reads current membership and source
-    /// revisions itself, so `All` (permissive by definition) can never
-    /// publish stale evidence on membership alone.
+    /// Revalidates current meeting existence and ORIGINAL authoritative scope,
+    /// returning supplied IDs still inside it (input order kept). Deep
+    /// retrieval rounds call this after every planner round; hybrid callers
+    /// also use it immediately before publication.
     pub async fn revalidate_ids_in_scope(
         &self,
         pool: &SqlitePool,
@@ -569,10 +585,64 @@ impl RetrievalService {
         meeting_ids: &[String],
         cancel: &CancellationToken,
     ) -> Result<Vec<String>, RetrievalError> {
-        let (membership, _) = self.resolve_membership(pool, scope, cancel).await?;
+        if meeting_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        ensure_not_cancelled(cancel)?;
+        let mut query = QueryBuilder::<Sqlite>::new("");
+        if let PersistedRetrievalScope::Folder(folder_id) = scope {
+            query.push(
+                "WITH RECURSIVE folder_scope(id) AS (SELECT id FROM meeting_folders WHERE id = ",
+            );
+            query.push_bind(folder_id);
+            query.push(
+                " UNION ALL SELECT f.id FROM meeting_folders f JOIN folder_scope s ON f.parent_id = s.id) ",
+            );
+        }
+        query.push("SELECT m.id FROM meetings m WHERE m.id IN (");
+        let mut ids = query.separated(", ");
+        for meeting_id in meeting_ids {
+            ids.push_bind(meeting_id);
+        }
+        drop(ids);
+        query.push(")");
+        match scope {
+            PersistedRetrievalScope::All => {}
+            PersistedRetrievalScope::Meeting(scope_id) => {
+                query.push(" AND m.id = ").push_bind(scope_id);
+            }
+            PersistedRetrievalScope::Folder(_) => {
+                query.push(" AND m.folder_id IN (SELECT id FROM folder_scope)");
+            }
+            PersistedRetrievalScope::AllowedMeetingIds(allowed_ids) => {
+                if allowed_ids.len() > MAX_ALLOWED_MEETING_IDS {
+                    return Err(RetrievalError::InvalidScope(format!(
+                        "allowed-ID scope exceeds the approved {} id bound",
+                        MAX_ALLOWED_MEETING_IDS
+                    )));
+                }
+                if allowed_ids.is_empty() {
+                    return Ok(Vec::new());
+                }
+                query.push(" AND m.id IN (");
+                let mut allowed = query.separated(", ");
+                for id in allowed_ids {
+                    allowed.push_bind(id);
+                }
+                drop(allowed);
+                query.push(")");
+            }
+        }
+        let rows: Vec<(String,)> = query
+            .build_query_as()
+            .fetch_all(pool)
+            .await
+            .map_err(db_error)?;
+        ensure_not_cancelled(cancel)?;
+        let current = rows.into_iter().map(|(id,)| id).collect::<HashSet<_>>();
         Ok(meeting_ids
             .iter()
-            .filter(|id| membership.allows(id))
+            .filter(|id| current.contains(id.as_str()))
             .cloned()
             .collect())
     }
@@ -598,6 +668,10 @@ impl RetrievalService {
             ensure_not_cancelled(cancel)?;
             if index == 0 {
                 folder_operator = Some(resolved);
+            } else if folder_operator.as_deref() != Some(resolved.as_str()) {
+                return Err(RetrievalError::InvalidScope(
+                    "folder query operators resolve to conflicting folders".to_string(),
+                ));
             }
         }
         // Only the first `folder:"..."` operator determines scope; any
@@ -632,6 +706,25 @@ impl RetrievalService {
             (scope, None) => scope.clone(),
         };
 
+        let scope = match scope {
+            PersistedRetrievalScope::AllowedMeetingIds(ids) => {
+                if ids.len() > MAX_ALLOWED_MEETING_IDS {
+                    return Err(RetrievalError::InvalidScope(format!(
+                        "allowed-ID scope exceeds the approved {} id bound",
+                        MAX_ALLOWED_MEETING_IDS
+                    )));
+                }
+                let mut deduped = Vec::with_capacity(ids.len());
+                let mut seen = HashSet::new();
+                for id in ids {
+                    if seen.insert(id.clone()) {
+                        deduped.push(id);
+                    }
+                }
+                PersistedRetrievalScope::AllowedMeetingIds(deduped)
+            }
+            scope => scope,
+        };
         let (membership, folder_over_cap) = self.resolve_membership(pool, &scope, cancel).await?;
         ensure_not_cancelled(cancel)?;
         let core_terms = core_terms(&lexical_original, request.core_language);
@@ -1741,6 +1834,7 @@ impl SemanticFallbackReason {
             Self::GenerationChanged => "generation_changed",
             Self::EmbeddingUnavailable => "embedding_unavailable",
             Self::SchedulerRejected => "scheduler_rejected",
+            Self::ForcedLexical => "forced_lexical",
             Self::CatchUpTimeout { .. } => "catch_up_timeout",
             Self::SemanticScanFailed => "semantic_scan_failed",
         }

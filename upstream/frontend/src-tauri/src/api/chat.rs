@@ -377,12 +377,14 @@ struct ChatRequestRegistration {
     meetings: HashSet<String>,
     retain_deletion_abort: bool,
     deletion_invalidated: bool,
+    result_published: bool,
     stream_started: bool,
 }
 
 struct ChatRequestRegistry {
     active: HashMap<ChatRequestSurface, String>,
     requests: HashMap<(ChatRequestSurface, String), ChatRequestRegistration>,
+    deleting_meetings: HashSet<String>,
 }
 
 pub(crate) type ChatRequestToken = Arc<CancellationToken>;
@@ -397,6 +399,7 @@ impl ChatRequestState {
         Self(Arc::new(Mutex::new(ChatRequestRegistry {
             active: HashMap::new(),
             requests: HashMap::new(),
+            deleting_meetings: HashSet::new(),
         })))
     }
 
@@ -473,6 +476,7 @@ impl ChatRequestState {
                 meetings: HashSet::new(),
                 retain_deletion_abort: false,
                 deletion_invalidated: false,
+                result_published: false,
                 stream_started: false,
             },
         );
@@ -511,6 +515,12 @@ impl ChatRequestState {
         if !Self::owns(&registry, surface, request_id, token) {
             return false;
         }
+        if meetings
+            .iter()
+            .any(|meeting_id| registry.deleting_meetings.contains(meeting_id))
+        {
+            return false;
+        }
         let registration = registry
             .requests
             .get_mut(&(surface, request_id.to_string()))
@@ -538,15 +548,17 @@ impl ChatRequestState {
         true
     }
 
-    /// Cancels and removes every registered request whose prepared evidence
-    /// references `meeting_id`. Called from the real meeting-deletion
-    /// transaction before the meeting row disappears. A retained current
-    /// stream atomically converts its next publication into an abort; every
-    /// other request suppresses normal publication.
+    /// Cancels every registered request whose prepared evidence references
+    /// `meeting_id`, unless its result already crossed the publication point.
+    /// Called from the real meeting-deletion transaction before the meeting
+    /// row disappears. A retained current stream atomically converts its next
+    /// publication into an abort; every other request suppresses normal
+    /// publication.
     /// Surface-independent: cancels Chat, Sidebar, and every affected
     /// independent MCP request.
     pub(crate) fn invalidate_meeting(&self, meeting_id: &str) -> usize {
         let mut registry = self.0.lock().unwrap();
+        registry.deleting_meetings.insert(meeting_id.to_string());
         let invalidated: Vec<(ChatRequestSurface, String)> = registry
             .requests
             .iter()
@@ -568,12 +580,23 @@ impl ChatRequestState {
                 registration.token.cancel();
                 continue;
             }
+            if registry
+                .requests
+                .get(&key)
+                .is_some_and(|registration| registration.result_published)
+            {
+                continue;
+            }
             registry.active.remove(surface);
             if let Some(registration) = registry.requests.remove(&key) {
                 registration.token.cancel();
             }
         }
         invalidated.len()
+    }
+
+    pub(crate) fn finish_meeting_deletion(&self, meeting_id: &str) {
+        self.0.lock().unwrap().deleting_meetings.remove(meeting_id);
     }
 
     pub(crate) fn is_owner(
@@ -610,6 +633,26 @@ impl ChatRequestState {
         registry.active.remove(&surface);
         registry.requests.remove(&key);
         true
+    }
+
+    pub(crate) fn publish_hybrid_if_current<T, F: FnOnce() -> T>(
+        &self,
+        surface: ChatRequestSurface,
+        request_id: &str,
+        token: &ChatRequestToken,
+        publish: F,
+    ) -> Option<T> {
+        let mut registry = self.0.lock().unwrap();
+        if !Self::owns(&registry, surface, request_id, token) {
+            return None;
+        }
+        let result = publish();
+        registry
+            .requests
+            .get_mut(&(surface, request_id.to_string()))
+            .expect("ownership re-checked above")
+            .result_published = true;
+        Some(result)
     }
 
     pub(crate) fn cancel_request(
@@ -8064,6 +8107,46 @@ mod tests {
         assert_eq!(state.request_count(), 1);
         state.clear_if_owner(ChatRequestSurface::Chat, "chat-2", &unbound_token);
         assert_eq!(state.request_count(), 0);
+    }
+
+    #[test]
+    fn hybrid_publication_and_deletion_are_ordered_by_the_shared_registry() {
+        let state = ChatRequestState::new();
+        let token = state
+            .try_claim_request(ChatRequestSurface::Mcp, "hybrid-published")
+            .unwrap();
+        assert!(state.bind_request_meetings(
+            ChatRequestSurface::Mcp,
+            "hybrid-published",
+            &token,
+            &HashSet::from(["m1".to_string()])
+        ));
+        assert_eq!(
+            state.publish_hybrid_if_current(
+                ChatRequestSurface::Mcp,
+                "hybrid-published",
+                &token,
+                || "published"
+            ),
+            Some("published")
+        );
+        assert_eq!(state.invalidate_meeting("m1"), 1);
+        assert!(!token.is_cancelled());
+        assert!(state.clear_if_owner(ChatRequestSurface::Mcp, "hybrid-published", &token));
+
+        state.invalidate_meeting("m2");
+        let token = state
+            .try_claim_request(ChatRequestSurface::Mcp, "hybrid-deleting")
+            .unwrap();
+        assert!(!state.bind_request_meetings(
+            ChatRequestSurface::Mcp,
+            "hybrid-deleting",
+            &token,
+            &HashSet::from(["m2".to_string()])
+        ));
+        state.finish_meeting_deletion("m2");
+        token.cancel();
+        assert!(state.clear_if_owner(ChatRequestSurface::Mcp, "hybrid-deleting", &token));
     }
 
     #[derive(Clone, Default)]

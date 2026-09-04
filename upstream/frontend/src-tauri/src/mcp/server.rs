@@ -7,15 +7,21 @@ use sqlx::SqlitePool;
 use tokio::net::TcpListener;
 use tracing::info;
 
+use crate::api::api::{execute_hybrid_context, execute_hybrid_search};
 use crate::api::chat::{
     finish_non_streaming_chat_request, prepare_chat_inputs_with_lifecycle, ChatRequestSurface,
     ChatRetrievalMode, CHAT_REQUEST_TIMEOUT, SYSTEM_PROMPT,
 };
 use crate::database::repositories::{folder::FolderRepository, fts::FtsRepository};
 use crate::export::build_context_markdown;
+use crate::retrieval::{
+    HybridScope, MAX_ALLOWED_MEETING_IDS, MAX_HYBRID_CONTEXT_CHARS, MAX_HYBRID_SEARCH_RESULTS,
+};
 use crate::summary::llm_client::generate_summary;
 
 pub const DEFAULT_PORT: u16 = 5167;
+const MCP_HYBRID_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const MCP_HYBRID_CONTEXT_DEFAULT_CHARS: u32 = 32_000;
 
 pub(crate) fn serialize_chat_sources(
     sources: &[crate::api::chat::ChatSource],
@@ -118,6 +124,44 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "search_meetings_hybrid_v1".to_string(),
+            description: "Fast local hybrid search across meetings using lexical and semantic retrieval with local reranking. Results expose meeting_rank for ordering, channel provenance, and retained evidence IDs; no calibrated or raw channel scores are returned. Requires exactly one persisted scope tag.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "maxLength": 2048 },
+                    "scope": hybrid_scope_schema(),
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of meeting results (default: 20, max: 50)",
+                        "default": 20,
+                        "minimum": 1,
+                        "maximum": 50
+                    }
+                },
+                "required": ["query", "scope"]
+            }),
+        },
+        ToolDefinition {
+            name: "build_context_hybrid_v1".to_string(),
+            description: "Build bounded Fast local hybrid context from lexical and semantic meeting retrieval. Context and sources contain only authoritative retained evidence; provenance and retained evidence IDs are explicit, and raw retrieval scores are not exposed. Requires exactly one persisted scope tag.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "maxLength": 2048 },
+                    "scope": hybrid_scope_schema(),
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "Maximum context characters (default: 32000, max: 100000)",
+                        "default": 32000,
+                        "minimum": 1,
+                        "maximum": 100000
+                    }
+                },
+                "required": ["query", "scope"]
+            }),
+        },
+        ToolDefinition {
             name: "chat_with_meetings".to_string(),
             description: "Ask a question and get an AI-generated answer based on meeting transcripts, summaries, and notes. Returns answer with source citations.".to_string(),
             input_schema: serde_json::json!({
@@ -190,6 +234,92 @@ async fn execute_build_context(
     }))
 }
 
+fn parse_hybrid_scope(params: &serde_json::Value) -> Result<HybridScope, String> {
+    let value = params
+        .get("scope")
+        .cloned()
+        .ok_or_else(|| "Missing 'scope' parameter".to_string())?;
+    serde_json::from_value(value).map_err(|_| "Invalid hybrid scope".to_string())
+}
+
+fn parse_hybrid_limit(params: &serde_json::Value) -> Result<Option<u32>, String> {
+    let Some(value) = params.get("limit") else {
+        return Ok(None);
+    };
+    let limit = value
+        .as_u64()
+        .ok_or_else(|| "Invalid hybrid result limit".to_string())?;
+    if !(1..=MAX_HYBRID_SEARCH_RESULTS as u64).contains(&limit) {
+        return Err("Invalid hybrid result limit".to_string());
+    }
+    Ok(Some(limit as u32))
+}
+
+fn parse_hybrid_context_chars(params: &serde_json::Value) -> Result<Option<u32>, String> {
+    let Some(value) = params.get("max_chars") else {
+        return Ok(Some(MCP_HYBRID_CONTEXT_DEFAULT_CHARS));
+    };
+    let max_chars = value
+        .as_u64()
+        .ok_or_else(|| "Invalid hybrid context limit".to_string())?;
+    if !(1..=MAX_HYBRID_CONTEXT_CHARS as u64).contains(&max_chars) {
+        return Err("Invalid hybrid context limit".to_string());
+    }
+    Ok(Some(max_chars as u32))
+}
+
+async fn execute_search_meetings_hybrid_v1(
+    state: &McpState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let query = params
+        .get("query")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Missing 'query' parameter".to_string())?
+        .to_string();
+    let scope = parse_hybrid_scope(params)?;
+    let limit = parse_hybrid_limit(params)?;
+    let response = execute_hybrid_search(
+        &state.pool,
+        state.retrieval.clone(),
+        &state.chat_requests,
+        ChatRequestSurface::Mcp,
+        format!("mcp-hybrid-search-{}", uuid::Uuid::new_v4()),
+        query,
+        scope,
+        limit,
+        MCP_HYBRID_REQUEST_TIMEOUT,
+    )
+    .await?;
+    serde_json::to_value(response).map_err(|_| "Failed to serialize hybrid search".to_string())
+}
+
+async fn execute_build_context_hybrid_v1(
+    state: &McpState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let query = params
+        .get("query")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Missing 'query' parameter".to_string())?
+        .to_string();
+    let scope = parse_hybrid_scope(params)?;
+    let max_context_chars = parse_hybrid_context_chars(params)?;
+    let response = execute_hybrid_context(
+        &state.pool,
+        state.retrieval.clone(),
+        &state.chat_requests,
+        ChatRequestSurface::Mcp,
+        format!("mcp-hybrid-context-{}", uuid::Uuid::new_v4()),
+        query,
+        scope,
+        max_context_chars,
+        MCP_HYBRID_REQUEST_TIMEOUT,
+    )
+    .await?;
+    serde_json::to_value(response).map_err(|_| "Failed to serialize hybrid context".to_string())
+}
+
 /// Releases one request's registry entry when dropped unless ownership was
 /// already released (idempotent): a panic or abort of the request future
 /// cannot leak an admitted slot.
@@ -210,6 +340,48 @@ impl Drop for OwnershipGuard<'_> {
         self.state
             .clear_if_owner(self.surface, self.request_id, self.token);
     }
+}
+
+fn hybrid_scope_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Exactly one persisted scope tag: all, meeting, folder, or allowed_meeting_ids.",
+        "oneOf": [
+            {
+                "properties": { "kind": { "const": "all" } },
+                "required": ["kind"],
+                "additionalProperties": false
+            },
+            {
+                "properties": {
+                    "kind": { "const": "meeting" },
+                    "meetingId": { "type": "string", "maxLength": 512 }
+                },
+                "required": ["kind", "meetingId"],
+                "additionalProperties": false
+            },
+            {
+                "properties": {
+                    "kind": { "const": "folder" },
+                    "folderId": { "type": "string", "maxLength": 512 }
+                },
+                "required": ["kind", "folderId"],
+                "additionalProperties": false
+            },
+            {
+                "properties": {
+                    "kind": { "const": "allowed_meeting_ids" },
+                    "meetingIds": {
+                        "type": "array",
+                        "maxItems": MAX_ALLOWED_MEETING_IDS,
+                        "items": { "type": "string", "maxLength": 512 }
+                    }
+                },
+                "required": ["kind", "meetingIds"],
+                "additionalProperties": false
+            }
+        ]
+    })
 }
 
 pub(crate) async fn execute_chat_with_meetings(
@@ -408,7 +580,7 @@ pub fn app(state: McpState) -> Router {
         .with_state(state)
 }
 
-async fn handle_jsonrpc(
+pub(crate) async fn handle_jsonrpc(
     AxumState(state): AxumState<McpState>,
     Json(request): Json<JsonRpcRequest>,
 ) -> impl IntoResponse {
@@ -447,6 +619,12 @@ async fn handle_jsonrpc(
             let result = match tool_name {
                 "search_meetings" => execute_search_meetings(&state.pool, tool_args).await,
                 "build_context" => execute_build_context(&state.pool, tool_args).await,
+                "search_meetings_hybrid_v1" => {
+                    execute_search_meetings_hybrid_v1(&state, tool_args).await
+                }
+                "build_context_hybrid_v1" => {
+                    execute_build_context_hybrid_v1(&state, tool_args).await
+                }
                 "chat_with_meetings" => {
                     execute_chat_with_meetings(
                         &state.pool,
@@ -572,12 +750,14 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn tool_definitions_returns_4_tools() {
+    fn tool_definitions_returns_6_tools() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 6);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"search_meetings"));
         assert!(names.contains(&"build_context"));
+        assert!(names.contains(&"search_meetings_hybrid_v1"));
+        assert!(names.contains(&"build_context_hybrid_v1"));
         assert!(names.contains(&"chat_with_meetings"));
         assert!(names.contains(&"list_folders"));
     }
@@ -624,6 +804,189 @@ mod tests {
         let value = serialize_chat_sources(&[source]).unwrap();
         assert_eq!(value[0]["sourceKind"], "transcript");
         assert_eq!(value[0]["snippet"], "text");
+    }
+
+    #[test]
+    fn hybrid_context_limit_defaults_and_stays_bounded() {
+        assert_eq!(parse_hybrid_context_chars(&json!({})), Ok(Some(32_000)));
+        assert!(parse_hybrid_context_chars(&json!({ "max_chars": 0 })).is_err());
+        assert!(parse_hybrid_context_chars(&json!({ "max_chars": 100_001 })).is_err());
+    }
+
+    #[test]
+    fn hybrid_search_limits_are_public_result_limits() {
+        for limit in [1, 20, 50] {
+            assert_eq!(
+                parse_hybrid_limit(&json!({ "limit": limit })),
+                Ok(Some(limit))
+            );
+        }
+        assert!(parse_hybrid_limit(&json!({ "limit": 0 })).is_err());
+        assert!(parse_hybrid_limit(&json!({ "limit": 51 })).is_err());
+    }
+
+    #[test]
+    fn hybrid_scope_and_routing_inputs_fail_closed() {
+        assert!(parse_hybrid_scope(&json!({})).is_err());
+        assert!(parse_hybrid_scope(&json!({
+            "scope": {"kind": "unknown"}
+        }))
+        .is_err());
+        assert!(parse_hybrid_scope(&json!({
+            "scope": {"kind": "all", "meetingId": "m1"}
+        }))
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn hybrid_tool_routing_returns_versioned_scoped_contract() {
+        let pool = chat_pool(true).await;
+        let state = McpState {
+            pool,
+            app_data_dir: None,
+            client: reqwest::Client::new(),
+            retrieval: crate::retrieval::worker::RetrievalLifecycle::new(
+                crate::retrieval::worker::LifecycleConfig::production(None),
+            ),
+            chat_requests: crate::api::chat::ChatRequestState::new(),
+        };
+        let value = execute_search_meetings_hybrid_v1(
+            &state,
+            &json!({
+                "query": "alpha",
+                "scope": {"kind": "all"},
+                "limit": 1
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["version"], "v1");
+        assert_eq!(value["retrievalStatus"], "forced_lexical");
+        assert_eq!(value["scope"]["kind"], "all");
+        assert_eq!(value["results"][0]["meetingRank"], 1);
+        assert!(value["results"][0].get("provenance").is_some());
+        assert!(value["results"][0].get("sources").is_some());
+        assert_eq!(
+            value["results"][0]["provenance"][0]["evidenceId"],
+            value["results"][0]["sources"][0]["evidenceIds"][0]
+        );
+        assert!(value["results"][0].get("score").is_none());
+
+        let context = execute_build_context_hybrid_v1(
+            &state,
+            &json!({
+                "query": "alpha",
+                "scope": {"kind": "all"},
+                "max_chars": 1_000
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(context["version"], "v1");
+        assert_eq!(context["retrievalStatus"], "forced_lexical");
+        assert_eq!(context["scope"]["kind"], "all");
+        assert!(context["context"].as_str().unwrap().chars().count() <= 1_000);
+        assert!(context["sources"].is_array());
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_public_limits_return_the_ranked_prefix() {
+        let pool = chat_pool(true).await;
+        for index in 2..=50 {
+            let meeting_id = format!("m{index}");
+            let transcript_id = format!("t{index}");
+            sqlx::query(
+                "INSERT INTO meetings (id, title, created_at, saved_at) VALUES (?, ?, '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')",
+            )
+            .bind(&meeting_id)
+            .bind(format!("Title {index}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO transcripts (id, meeting_id, transcript, timestamp) VALUES (?, ?, 'alpha', '10:00')",
+            )
+            .bind(&transcript_id)
+            .bind(&meeting_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO meeting_fts (meeting_id, chunk_type, chunk_id, text, folder_name) VALUES (?, 'transcript', ?, 'alpha', 'General')",
+            )
+            .bind(&meeting_id)
+            .bind(&transcript_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let state = McpState {
+            pool,
+            app_data_dir: None,
+            client: reqwest::Client::new(),
+            retrieval: crate::retrieval::worker::RetrievalLifecycle::new(
+                crate::retrieval::worker::LifecycleConfig::production(None),
+            ),
+            chat_requests: crate::api::chat::ChatRequestState::new(),
+        };
+        let params = |limit| {
+            json!({
+                "query": "alpha",
+                "scope": {"kind": "all"},
+                "limit": limit
+            })
+        };
+        let all = execute_search_meetings_hybrid_v1(&state, &params(50))
+            .await
+            .unwrap();
+        assert_eq!(all["results"].as_array().unwrap().len(), 50);
+        let all_ids = all["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["meetingId"].clone())
+            .collect::<Vec<_>>();
+        for limit in [1, 20] {
+            let response = execute_search_meetings_hybrid_v1(&state, &params(limit))
+                .await
+                .unwrap();
+            assert_eq!(response["results"].as_array().unwrap().len(), limit);
+            assert_eq!(
+                response["results"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["meetingId"].clone())
+                    .collect::<Vec<_>>(),
+                all_ids[..limit].to_vec()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_reports_semantic_unavailability_without_failing() {
+        let pool = chat_pool(false).await;
+        let state = McpState {
+            pool,
+            app_data_dir: None,
+            client: reqwest::Client::new(),
+            retrieval: crate::retrieval::worker::RetrievalLifecycle::new(
+                crate::retrieval::worker::LifecycleConfig::production(None),
+            ),
+            chat_requests: crate::api::chat::ChatRequestState::new(),
+        };
+        let value = execute_search_meetings_hybrid_v1(
+            &state,
+            &json!({
+                "query": "alpha",
+                "scope": {"kind": "all"},
+                "limit": 1
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["retrievalStatus"], "lexical_fallback");
+        assert_eq!(value["results"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]

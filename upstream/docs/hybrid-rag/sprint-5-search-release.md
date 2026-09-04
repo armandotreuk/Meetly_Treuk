@@ -2,9 +2,9 @@
 
 ## Status
 
-Planned, blocked for implementation by Sprint 4 approval and completion.
-Sprint 3 release acceptance also remains open as a mandatory inherited gate for
-Task 5.5 and release close.
+In progress for Tasks 5.1-5.4 after the user's 2026-09-04 scope amendment.
+Sprint 4 and Sprint 3 release acceptance remain mandatory gates for Task 5.5,
+Sprint 5 close, and every release claim.
 
 Revised 2026-08-21 after pre-implementation critique: packaging descoped to
 Windows x64, derived-disk gate added, kill-switch UI added, and a sidebar
@@ -82,8 +82,9 @@ not close Sprint 3 release acceptance.
 
 ## Sprint 3 Release-Gate Inheritance (R40)
 
-Sprint 5 remains implementation-dependent on Sprint 4 approval/completion. Its
-release and close criteria additionally inherit Sprint 3's still-open gates:
+The user authorized Tasks 5.1-5.4 to proceed from the code-ready Sprint 4
+baseline at `29df304` while Sprint 4 remains release-blocked. Task 5.5, Sprint
+5 close, and release criteria additionally inherit Sprint 3's still-open gates:
 
 - a valid independently authored Portuguese corpus;
 - production-path quality and final provider-answer evidence;
@@ -128,7 +129,7 @@ may substitute for them.
 
 ## Dependency Order
 
-`Sprint 4 approved implementation -> 5.2 -> 5.1 -> 5.5`
+`Sprint 4 code-ready baseline at 29df304 + user scope amendment -> 5.2 -> 5.1 -> 5.5`
 
 `2.5 -> 5.3 -> 5.5`
 
@@ -649,6 +650,7 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 | 2026-09-02 | Carry Sprint 3's open release gates into Task 5.5 and release close while retaining commits `62d7730` and `1047367` as the reviewed implementation baseline. | R40 separates implementation dependencies from release acceptance; valid corpus, production-path quality/provider-answer, native Windows/R13 hermetic session, and exact-head Actions evidence remain mandatory. | Treat Sprint 4/5 implementation results or broad architecture wording as release evidence. | User-authorized R40 |
 | 2026-09-02 | Reuse one Rust ownership/cancellation mechanism and Chat publication fence for sidebar/Tauri/MCP work, including internal MCP deadline cancellation. | Prevents parallel registries, stale progress, and timeouts that merely drop results while preserving Fast-only MCP compatibility. | Add another request registry or public MCP cancel API. | User-authorized R40 |
 | 2026-09-02 | Carry the single persisted `force_lexical_retrieval` decision through all Deep rounds and sidebar/Tauri/MCP hybrid requests. | Shared-boundary reads, typed `ForcedLexical`, and next-request/restart/disable-restore checks keep rollback consistent without a second service. | Per-surface settings or diagnostics. | User-authorized R40 |
+| 2026-09-04 | Permit Tasks 5.1-5.4 to proceed from code-ready Sprint 4 baseline `29df304` while retaining every Sprint 4/Sprint 3 release gate for Task 5.5, Sprint 5 close, and release claims. | The user explicitly authorized implementation to continue; separating code readiness from release acceptance preserves the inherited evidence gates. | Require Sprint 4 release closure before all Sprint 5 implementation. | User |
 
 ## Task Execution Log
 
@@ -700,7 +702,9 @@ failure recovery, privacy, and final release claims.
 
 ## Approval Gates
 
-- Sprint 4 close must be approved first.
+- The user approved a scope amendment on 2026-09-04 allowing Tasks 5.1-5.4 to
+  proceed from code-ready Sprint 4 baseline `29df304`. This is not Sprint 4
+  close approval and does not waive any inherited release gate.
 - Sprint 3 release acceptance remains open and is mandatory for Task 5.5 and
   release close: valid independently authored Portuguese corpus, production-
   path quality and final provider-answer evidence, native Windows/R13 hermetic

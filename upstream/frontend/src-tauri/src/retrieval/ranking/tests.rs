@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use super::{
     aggregate_meetings, apply_rerank, concept_coverage, coverage_regions, dedupe_candidates, fuse,
     fuse_lexical_only, rank, select_rerank_head, title_overlap, AggregationTerms, FusedEvidence,
-    RankedEvidence, RankingConfig, RerankFallback, SegmentOrder,
+    RankedEvidence, RankingConfig, RerankFallback, SegmentOrder, SEARCH_RERANK_DEPTH,
 };
 use crate::database::repositories::retrieval::{
     MeetingSource, RetrievalRepository, SourceTranscript,
@@ -31,6 +31,20 @@ fn terms_from_title(title_overlap: HashMap<String, f64>) -> AggregationTerms {
         title_overlap,
         ..AggregationTerms::default()
     }
+}
+
+#[test]
+fn search_purpose_uses_the_shallower_rerank_depth() {
+    assert_eq!(SEARCH_RERANK_DEPTH, 25);
+    assert_eq!(
+        RankingConfig::for_purpose(crate::retrieval::service::RetrievalPurpose::Search)
+            .rerank_depth,
+        SEARCH_RERANK_DEPTH
+    );
+    assert_eq!(
+        RankingConfig::for_purpose(crate::retrieval::service::RetrievalPurpose::Chat).rerank_depth,
+        super::CHAT_RERANK_DEPTH
+    );
 }
 
 // -- Candidate builders -------------------------------------------------------
@@ -344,9 +358,16 @@ fn dedupe_merges_fts_segment_positionally_not_lexicographically() {
         provenance_for(merged, RetrievalChannel::Semantic),
         [(QueryVariantKind::Original, None, 1)]
     );
+    assert!(provenance_for(merged, RetrievalChannel::Lexical).is_empty());
     assert_eq!(
-        provenance_for(merged, RetrievalChannel::Lexical),
-        [(QueryVariantKind::Original, Some(LexicalMode::Or), 1)]
+        merged.source_aliases[0].provenance,
+        vec![EvidenceProvenance {
+            channel: RetrievalChannel::Lexical,
+            variant: QueryVariantKind::Original,
+            mode: Some(LexicalMode::Or),
+            rank: 1,
+            query_slot: 0,
+        }]
     );
     assert_eq!(merged.source_aliases[0].evidence_id, "fts:a:s-a1");
     assert_eq!(
@@ -356,6 +377,12 @@ fn dedupe_merges_fts_segment_positionally_not_lexicographically() {
     assert_eq!(merged.source_aliases[0].text, "text of fts:a:s-a1");
     assert!(deduped.iter().any(|e| e.evidence_id == "fts:a:s-m5"));
     assert!(!deduped.iter().any(|e| e.evidence_id == "fts:a:s-a1"));
+    assert_eq!(
+        fuse_lexical_only(&deduped, &RankingConfig::chat())[0]
+            .evidence
+            .evidence_id,
+        "win"
+    );
 }
 
 #[test]
@@ -467,8 +494,14 @@ fn dedupe_merges_provenance_without_duplicates() {
     let deduped = dedupe_candidates(vec![window, fts_one, fts_two], &segment_order);
     assert_eq!(deduped.len(), 1, "both FTS rows absorbed into the window");
     let merged = &deduped[0];
+    assert!(provenance_for(merged, RetrievalChannel::Lexical).is_empty());
     assert_eq!(
-        provenance_for(merged, RetrievalChannel::Lexical),
+        merged
+            .source_aliases
+            .iter()
+            .flat_map(|alias| alias.provenance.iter())
+            .map(|provenance| (provenance.variant, provenance.mode, provenance.rank))
+            .collect::<Vec<_>>(),
         [
             (QueryVariantKind::Original, Some(LexicalMode::Or), 1),
             (QueryVariantKind::Original, Some(LexicalMode::Or), 2),
