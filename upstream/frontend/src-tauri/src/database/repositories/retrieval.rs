@@ -7,6 +7,12 @@ use tokio_util::sync::CancellationToken;
 
 pub const GENERATION_STATES: [&str; 4] = ["building", "ready", "failed", "retired"];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActivationOutcome {
+    NotCommitted,
+    Committed,
+}
+
 /// Index backend recorded at generation registration. Sprint 1 selected exact
 /// search; Task 2.5 owns any future backend vocabulary.
 pub const EXACT_INDEX_BACKEND: &str = "exact";
@@ -251,6 +257,14 @@ pub struct GenerationStatus {
     pub failed_meetings: i64,
     pub canonical_change_id: Option<i64>,
     pub published_change_id: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RetrievalStatusSnapshot {
+    pub active_generation_id: Option<String>,
+    pub active_status: Option<GenerationStatus>,
+    pub shadows: Vec<GenerationStatus>,
+    pub force_lexical_retrieval: bool,
 }
 
 pub struct ReplacementJob<'a> {
@@ -560,11 +574,15 @@ impl RetrievalRepository {
 
     /// Revalidates completeness and the caught-up publication bound while
     /// atomically making a generation ready and active.
-    pub async fn activate_generation_if_ready(
+    pub(crate) async fn activate_generation_if_ready(
         pool: &SqlitePool,
         generation_id: &str,
         caught_up_to: i64,
-    ) -> Result<bool, SqlxError> {
+        cancel: &CancellationToken,
+    ) -> Result<ActivationOutcome, SqlxError> {
+        if cancel.is_cancelled() {
+            return Ok(ActivationOutcome::NotCommitted);
+        }
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         let state: Option<(String,)> =
             sqlx::query_as("SELECT state FROM retrieval_generations WHERE generation_id = ?")
@@ -573,11 +591,11 @@ impl RetrievalRepository {
                 .await?;
         if state.as_ref().is_none_or(|(state,)| state != "building") {
             tx.rollback().await?;
-            return Ok(false);
+            return Ok(ActivationOutcome::NotCommitted);
         }
         let coverage: (i64, i64, i64) = sqlx::query_as(
             "SELECT COUNT(*),
-                    COALESCE(SUM(ms.indexed_source_revision >= s.source_revision), 0),
+                    COALESCE(SUM(ms.state = 'ready' AND ms.indexed_source_revision >= s.source_revision), 0),
                     COALESCE(SUM(ms.state = 'failed'), 0)
              FROM retrieval_meeting_state ms
              JOIN search_source_state s ON s.meeting_id = ms.meeting_id
@@ -598,7 +616,7 @@ impl RetrievalRepository {
             || canonical.is_none_or(|(canonical,)| canonical > caught_up_to)
         {
             tx.rollback().await?;
-            return Ok(false);
+            return Ok(ActivationOutcome::NotCommitted);
         }
         let now = Utc::now().to_rfc3339();
         sqlx::query("UPDATE retrieval_generations SET state = 'ready', activated_at = ? WHERE generation_id = ?")
@@ -628,8 +646,12 @@ impl RetrievalRepository {
         .bind(now)
         .execute(&mut *tx)
         .await?;
+        if cancel.is_cancelled() {
+            tx.rollback().await?;
+            return Ok(ActivationOutcome::NotCommitted);
+        }
         tx.commit().await?;
-        Ok(true)
+        Ok(ActivationOutcome::Committed)
     }
 
     pub async fn active_generation_id(pool: &SqlitePool) -> Result<Option<String>, SqlxError> {
@@ -673,6 +695,20 @@ impl RetrievalRepository {
             .rows_affected();
         tx.commit().await?;
         Ok(deleted > 0)
+    }
+
+    pub async fn clear_derived_index(pool: &SqlitePool) -> Result<(), SqlxError> {
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query("DELETE FROM retrieval_index_changes")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM retrieval_active_model")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM retrieval_generations")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await
     }
 
     // -- Durable due-work selection (non-destructive reads) ---------------
@@ -2151,6 +2187,82 @@ impl RetrievalRepository {
         Ok(deleted > 0)
     }
 
+    pub async fn mark_shadow_generation_failed(
+        pool: &SqlitePool,
+        generation_id: &str,
+    ) -> Result<bool, SqlxError> {
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let active: Option<(String,)> =
+            sqlx::query_as("SELECT generation_id FROM retrieval_active_model WHERE singleton = 1")
+                .fetch_optional(&mut *tx)
+                .await?;
+        if active
+            .as_ref()
+            .is_some_and(|(active,)| active == generation_id)
+        {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let result = sqlx::query(
+            "UPDATE retrieval_generations
+             SET state = 'failed', retired_at = ?
+             WHERE generation_id = ? AND state = 'building'",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(generation_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn retry_failed_generation(
+        pool: &SqlitePool,
+        generation_id: &str,
+    ) -> Result<bool, SqlxError> {
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let state: Option<(String,)> =
+            sqlx::query_as("SELECT state FROM retrieval_generations WHERE generation_id = ?")
+                .bind(generation_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if state.as_ref().is_none_or(|(state,)| state != "failed") {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let active: Option<(String,)> =
+            sqlx::query_as("SELECT generation_id FROM retrieval_active_model WHERE singleton = 1")
+                .fetch_optional(&mut *tx)
+                .await?;
+        if active
+            .as_ref()
+            .is_some_and(|(active,)| active == generation_id)
+        {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE retrieval_generations
+             SET state = 'building', retired_at = NULL
+             WHERE generation_id = ? AND state = 'failed'",
+        )
+        .bind(generation_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE retrieval_meeting_state
+             SET state = 'pending', attempt_count = 0, next_attempt_at = NULL,
+                 last_error = NULL, updated_at = ?
+             WHERE generation_id = ? AND state IN ('failed', 'retry')",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(generation_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// Non-active terminal generations with their retirement timestamps, for
     /// restart-plus-successful-query gated garbage collection.
     pub async fn retired_generations(
@@ -2415,7 +2527,7 @@ impl RetrievalRepository {
         };
         let coverage: (i64, i64, i64, i64) = sqlx::query_as(
             "SELECT COUNT(*),
-                    COALESCE(SUM(ms.indexed_source_revision >= s.source_revision), 0),
+                     COALESCE(SUM(ms.state = 'ready' AND ms.indexed_source_revision >= s.source_revision), 0),
                     COALESCE(SUM(ms.state = 'retry'), 0),
                     COALESCE(SUM(ms.state = 'failed'), 0)
              FROM retrieval_meeting_state ms
@@ -2455,6 +2567,108 @@ impl RetrievalRepository {
             }
         }
         Ok(statuses)
+    }
+
+    pub async fn shadow_generation_statuses(
+        pool: &SqlitePool,
+    ) -> Result<Vec<GenerationStatus>, SqlxError> {
+        Ok(Self::status_snapshot(pool).await?.shadows)
+    }
+
+    pub(crate) async fn status_snapshot(
+        pool: &SqlitePool,
+    ) -> Result<RetrievalStatusSnapshot, SqlxError> {
+        let mut tx = pool.begin().await?;
+        let active_generation_id: Option<String> = sqlx::query_scalar(
+            "SELECT generation_id FROM retrieval_active_model WHERE singleton = 1",
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let force_lexical_retrieval = sqlx::query_scalar::<_, Option<bool>>(
+            "SELECT force_lexical_retrieval FROM settings WHERE id = '1' LIMIT 1",
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten()
+        .unwrap_or(false);
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            Option<i64>,
+            Option<i64>,
+        )> = sqlx::query_as(
+            "SELECT g.generation_id, g.model_id, g.state, g.document_count,
+                    COUNT(s.meeting_id),
+                    COALESCE(SUM(CASE WHEN ms.state = 'ready'
+                                      AND ms.indexed_source_revision >= s.source_revision
+                                      THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN ms.state = 'retry' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN ms.state = 'failed' THEN 1 ELSE 0 END), 0),
+                    i.canonical_change_id, i.published_change_id
+             FROM retrieval_generations g
+             LEFT JOIN retrieval_meeting_state ms ON ms.generation_id = g.generation_id
+             LEFT JOIN search_source_state s ON s.meeting_id = ms.meeting_id
+             LEFT JOIN retrieval_index_state i ON i.generation_id = g.generation_id
+             WHERE g.state IN ('building', 'ready', 'failed') OR g.generation_id = ?
+             GROUP BY g.generation_id, g.model_id, g.state, g.document_count,
+                      i.canonical_change_id, i.published_change_id
+             ORDER BY CASE g.state WHEN 'building' THEN 0 WHEN 'failed' THEN 1
+                                   WHEN 'ready' THEN 2 ELSE 3 END,
+                      g.created_at, g.generation_id",
+        )
+        .bind(active_generation_id.as_deref())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        let statuses: Vec<GenerationStatus> = rows
+            .into_iter()
+            .map(
+                |(
+                    generation_id,
+                    model_id,
+                    state,
+                    document_count,
+                    tracked_meetings,
+                    current_meetings,
+                    retry_meetings,
+                    failed_meetings,
+                    canonical_change_id,
+                    published_change_id,
+                )| GenerationStatus {
+                    generation_id,
+                    model_id,
+                    state,
+                    document_count,
+                    tracked_meetings,
+                    current_meetings,
+                    retry_meetings,
+                    failed_meetings,
+                    canonical_change_id,
+                    published_change_id,
+                },
+            )
+            .collect();
+        let active_status = statuses
+            .iter()
+            .find(|status| active_generation_id.as_deref() == Some(status.generation_id.as_str()))
+            .cloned();
+        let shadows = statuses
+            .into_iter()
+            .filter(|status| active_generation_id.as_deref() != Some(status.generation_id.as_str()))
+            .collect();
+        Ok(RetrievalStatusSnapshot {
+            active_generation_id,
+            active_status,
+            shadows,
+            force_lexical_retrieval,
+        })
     }
 }
 
@@ -2777,6 +2991,7 @@ fn fp16_bits_to_f32(bits: u16) -> f32 {
 mod tests {
     use super::*;
     use crate::database::repositories::folder::FolderRepository;
+    use crate::database::repositories::fts::FtsRepository;
     use crate::database::repositories::meeting::MeetingsRepository;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
@@ -2836,6 +3051,108 @@ mod tests {
 
     async fn scalar_count(pool: &SqlitePool, sql: &str) -> i64 {
         sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn clear_derived_index_preserves_primary_and_fts_data() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "m", "Keep this meeting").await;
+        add_transcript(&pool, "t", "m", "Keep this transcript").await;
+        FtsRepository::refresh_meeting(&pool, "m").await.unwrap();
+        RetrievalRepository::ensure_model(&pool, &f32_spec("model", 2))
+            .await
+            .unwrap();
+        RetrievalRepository::register_generation(&pool, "gen-clear", "model")
+            .await
+            .unwrap();
+
+        let document = doc("d", 2, VectorEncoding::F32, normalized_f32(&[1.0, 0.0]));
+        RetrievalRepository::stage_documents(
+            &pool,
+            "job-clear",
+            "gen-clear",
+            "m",
+            2,
+            &[document.clone()],
+        )
+        .await
+        .unwrap();
+        RetrievalRepository::replace_meeting_documents(
+            &pool,
+            ReplacementJob {
+                generation_id: "gen-clear",
+                meeting_id: "m",
+                expected_source_revision: 2,
+                job_id: "job-clear",
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE retrieval_generations SET state = 'ready' WHERE generation_id = 'gen-clear'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        RetrievalRepository::switch_active_generation(&pool, "gen-clear")
+            .await
+            .unwrap();
+        RetrievalRepository::stage_documents(&pool, "job-staged", "gen-clear", "m", 2, &[document])
+            .await
+            .unwrap();
+
+        RetrievalRepository::clear_derived_index(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            scalar_count(&pool, "SELECT COUNT(*) FROM meetings").await,
+            1
+        );
+        assert_eq!(
+            scalar_count(&pool, "SELECT COUNT(*) FROM transcripts").await,
+            1
+        );
+        assert_eq!(
+            scalar_count(&pool, "SELECT COUNT(*) FROM meeting_fts").await,
+            1
+        );
+        assert_eq!(
+            scalar_count(&pool, "SELECT COUNT(*) FROM search_source_state").await,
+            1
+        );
+        assert_eq!(
+            scalar_count(&pool, "SELECT COUNT(*) FROM retrieval_models").await,
+            1
+        );
+        assert_eq!(
+            scalar_count(&pool, "SELECT COUNT(*) FROM retrieval_active_model").await,
+            0
+        );
+        assert_eq!(
+            scalar_count(&pool, "SELECT COUNT(*) FROM retrieval_generations").await,
+            0
+        );
+        assert_eq!(
+            scalar_count(&pool, "SELECT COUNT(*) FROM retrieval_documents").await,
+            0
+        );
+        assert_eq!(
+            scalar_count(&pool, "SELECT COUNT(*) FROM retrieval_document_staging").await,
+            0
+        );
+        assert_eq!(
+            scalar_count(&pool, "SELECT COUNT(*) FROM retrieval_meeting_state").await,
+            0
+        );
+        assert_eq!(
+            scalar_count(&pool, "SELECT COUNT(*) FROM retrieval_index_state").await,
+            0
+        );
+        assert_eq!(
+            scalar_count(&pool, "SELECT COUNT(*) FROM retrieval_index_changes").await,
+            0
+        );
     }
 
     fn f32_spec(model_id: &str, dimensions: u32) -> ModelSpec {

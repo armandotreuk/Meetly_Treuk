@@ -1054,8 +1054,10 @@ pub fn run() {
             // Retrieval index status/rebuild/pause contract (Task 2.5)
             retrieval::commands::retrieval_index_status,
             retrieval::commands::retrieval_rebuild_index,
+            retrieval::commands::retrieval_retry_rebuild,
             retrieval::commands::retrieval_cancel_rebuild,
             retrieval::commands::retrieval_set_index_paused,
+            retrieval::commands::retrieval_clear_index,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

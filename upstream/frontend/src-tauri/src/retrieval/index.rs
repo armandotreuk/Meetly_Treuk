@@ -37,9 +37,10 @@ use sqlx::SqlitePool;
 use tokio_util::sync::CancellationToken;
 
 use crate::database::repositories::retrieval::{
-    CanonicalSnapshotRead, DerivedDiskUsage, GenerationStatus, RetrievalRepository,
-    SnapshotDocument,
+    ActivationOutcome, CanonicalSnapshotRead, DerivedDiskUsage, GenerationStatus,
+    RetrievalRepository, SnapshotDocument,
 };
+use crate::model_bundle::{approved_retrieval_model_metadata, ApprovedRetrievalModelMetadata};
 use crate::retrieval::worker::{
     quantize_int8, RetrievalScheduler, APPROVED_INT8_DEQUANTIZATION_SCALE,
 };
@@ -525,6 +526,8 @@ struct ServiceState {
     active: Option<Arc<IndexSnapshot>>,
     lag: i64,
     epoch: u64,
+    status_version: u64,
+    next_transition_id: u64,
     model_mismatch: bool,
     loaded_model_ids: BTreeSet<String>,
     published_bounds: BTreeMap<String, i64>,
@@ -532,11 +535,39 @@ struct ServiceState {
     pending_stale: BTreeSet<u64>,
     committed_stale: BTreeMap<u64, (String, i64)>,
     activation_transition: bool,
+    activation_reservation: Option<u64>,
+    activation_reconciliation_required: bool,
+    clear_transition: bool,
     pending_blockers: Vec<String>,
     /// Last derived-disk reading with its measurement instant, reusable only
     /// when it blocks (an exact high watermark or unavailable measurement);
     /// permissive decisions always measure freshly.
     envelope_gate_cache: Option<(tokio::time::Instant, DerivedDiskUsage)>,
+}
+
+#[derive(Clone)]
+struct ServiceStatusSnapshot {
+    version: u64,
+    active_generation_id: Option<String>,
+    active_snapshot_present: bool,
+    lag: i64,
+    model_mismatch: bool,
+    activation_transition: bool,
+    model_load_failure: Option<String>,
+    pending_blockers: Vec<String>,
+    loaded_model_ids: BTreeSet<String>,
+    resident_index_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromotionOutcome {
+    NotCommitted,
+    CommittedAndPublished,
+    CommittedAndFenced,
+}
+
+fn touch_status(state: &mut ServiceState) {
+    state.status_version = state.status_version.wrapping_add(1);
 }
 
 /// The one retrieval query-index service. Owned by the shared Task 2.4
@@ -550,6 +581,18 @@ pub struct QueryIndexService {
     ram_probe: StdMutex<RamProbe>,
     #[cfg(test)]
     envelope_probe: StdMutex<Option<DiskProbe>>,
+    #[cfg(test)]
+    scan_barrier: StdMutex<Option<Arc<std::sync::Barrier>>>,
+    #[cfg(test)]
+    scan_started_notify: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    publish_barrier: StdMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    publish_started_notify: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    activation_commit_barrier: StdMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    activation_committed_notify: Arc<tokio::sync::Notify>,
     created_at: DateTime<Utc>,
 }
 
@@ -562,6 +605,18 @@ impl QueryIndexService {
             ram_probe: StdMutex::new(Arc::new(measure_resident_ram) as RamProbe),
             #[cfg(test)]
             envelope_probe: StdMutex::new(None),
+            #[cfg(test)]
+            scan_barrier: StdMutex::new(None),
+            #[cfg(test)]
+            scan_started_notify: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            publish_barrier: StdMutex::new(None),
+            #[cfg(test)]
+            publish_started_notify: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            activation_commit_barrier: StdMutex::new(None),
+            #[cfg(test)]
+            activation_committed_notify: Arc::new(tokio::sync::Notify::new()),
             created_at: Utc::now(),
         }
     }
@@ -584,8 +639,35 @@ impl QueryIndexService {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    pub(crate) fn mark_status_changed(&self) {
+        let mut state = self.lock_state();
+        touch_status(&mut state);
+    }
+
     pub fn active_snapshot(&self) -> Option<Arc<IndexSnapshot>> {
         self.lock_state().active.clone()
+    }
+
+    pub(crate) fn clear_derived_state(&self) {
+        let mut state = self.lock_state();
+        state.active = None;
+        state.lag = 0;
+        state.epoch = state.epoch.wrapping_add(1);
+        state.model_mismatch = false;
+        state.loaded_model_ids.clear();
+        state.published_bounds.clear();
+        state.model_load_failure = None;
+        state.pending_stale.clear();
+        state.committed_stale.clear();
+        state.activation_transition = false;
+        state.activation_reservation = None;
+        state.activation_reconciliation_required = false;
+        state.clear_transition = false;
+        state.pending_blockers.clear();
+        state.envelope_gate_cache = None;
+        self.acknowledged_fast_hybrid_queries
+            .store(0, Ordering::Relaxed);
+        touch_status(&mut state);
     }
 
     pub(crate) fn active_generation(&self) -> Option<String> {
@@ -596,6 +678,7 @@ impl QueryIndexService {
     }
 
     /// Installs a fully constructed snapshot as the queryable active state.
+    #[cfg(test)]
     fn install_active(&self, snapshot: Arc<IndexSnapshot>) {
         let mut state = self.lock_state();
         let generation_id = snapshot.generation_id().to_string();
@@ -607,14 +690,65 @@ impl QueryIndexService {
             .committed_stale
             .retain(|_, (generation, _)| generation == &generation_id);
         state.epoch = state.epoch.wrapping_add(1);
+        state.activation_transition = false;
+        state.activation_reservation = None;
+        state.activation_reconciliation_required = false;
+        touch_status(&mut state);
     }
 
-    fn replace_snapshot(&self, snapshot: Arc<IndexSnapshot>) {
-        self.lock_state().active = Some(snapshot);
+    fn install_active_if_allowed(
+        &self,
+        snapshot: Arc<IndexSnapshot>,
+        cancel: &CancellationToken,
+    ) -> bool {
+        let mut state = self.lock_state();
+        if state.clear_transition || cancel.is_cancelled() {
+            return false;
+        }
+        let generation_id = snapshot.generation_id().to_string();
+        state.model_mismatch = !state.loaded_model_ids.contains(snapshot.model_id());
+        state.active = Some(snapshot);
+        state.lag = state.lag.max(1);
+        state.activation_transition = false;
+        state.activation_reconciliation_required = false;
+        state
+            .committed_stale
+            .retain(|_, (generation, _)| generation == &generation_id);
+        state.epoch = state.epoch.wrapping_add(1);
+        state.activation_reservation = None;
+        touch_status(&mut state);
+        true
     }
 
-    fn set_lag(&self, lag: i64) {
-        self.lock_state().lag = lag.max(0);
+    fn replace_snapshot_if_allowed(
+        &self,
+        snapshot: Arc<IndexSnapshot>,
+        cancel: &CancellationToken,
+    ) -> bool {
+        let mut state = self.lock_state();
+        if state.clear_transition || cancel.is_cancelled() {
+            return false;
+        }
+        state.active = Some(snapshot);
+        touch_status(&mut state);
+        true
+    }
+
+    fn set_lag_for_generation(&self, generation_id: Option<&str>, lag: i64) {
+        let mut state = self.lock_state();
+        let matches = match (state.active.as_ref(), generation_id) {
+            (None, None) => true,
+            (Some(active), Some(generation_id)) => active.generation_id() == generation_id,
+            _ => false,
+        };
+        if !matches {
+            return;
+        }
+        let lag = lag.max(0);
+        if state.lag != lag {
+            state.lag = lag;
+            touch_status(&mut state);
+        }
     }
 
     pub(crate) fn mark_stale(&self) -> u64 {
@@ -623,6 +757,7 @@ impl QueryIndexService {
         state.lag = state.lag.max(1);
         let token = state.epoch;
         state.pending_stale.insert(token);
+        touch_status(&mut state);
         token
     }
 
@@ -635,6 +770,7 @@ impl QueryIndexService {
         {
             state.lag = 0;
         }
+        touch_status(&mut state);
     }
 
     pub(crate) fn commit_stale(
@@ -670,6 +806,7 @@ impl QueryIndexService {
             {
                 state.lag = 0;
             }
+            touch_status(&mut state);
         }
     }
 
@@ -686,6 +823,7 @@ impl QueryIndexService {
         if state.pending_stale.is_empty() && !state.model_mismatch {
             state.lag = 0;
         }
+        touch_status(&mut state);
     }
 
     fn clear_active_after_deactivation(&self, generation_id: &str) {
@@ -698,21 +836,110 @@ impl QueryIndexService {
             state.active = None;
             state.lag = 0;
             state.model_mismatch = false;
+            state.activation_transition = false;
+            state.activation_reservation = None;
+            state.activation_reconciliation_required = false;
             state.epoch = state.epoch.wrapping_add(1);
+            touch_status(&mut state);
         }
     }
 
-    fn begin_activation_transition(&self) {
-        self.lock_state().activation_transition = true;
+    fn begin_activation_transition(&self) -> Option<u64> {
+        let mut state = self.lock_state();
+        if state.clear_transition
+            || state.activation_transition
+            || state.activation_reservation.is_some()
+            || state.activation_reconciliation_required
+        {
+            return None;
+        }
+        let token = state.next_transition_id;
+        state.next_transition_id = state.next_transition_id.wrapping_add(1);
+        state.activation_transition = true;
+        state.activation_reservation = Some(token);
+        touch_status(&mut state);
+        Some(token)
     }
 
+    #[cfg(test)]
     fn cancel_activation_transition(&self) {
-        self.lock_state().activation_transition = false;
+        let mut state = self.lock_state();
+        if state.activation_transition || state.activation_reservation.is_some() {
+            state.activation_reservation = None;
+            if !state.activation_reconciliation_required {
+                state.activation_transition = false;
+            }
+            touch_status(&mut state);
+        }
     }
 
-    fn semantic_unavailable_state(&self) -> (bool, bool) {
-        let state = self.lock_state();
-        (state.model_mismatch, state.activation_transition)
+    fn cancel_activation_transition_if(&self, token: u64) {
+        let mut state = self.lock_state();
+        if state.activation_reservation == Some(token) {
+            state.activation_reservation = None;
+            if !state.activation_reconciliation_required {
+                state.activation_transition = false;
+            }
+            touch_status(&mut state);
+        }
+    }
+
+    fn publish_active_if_reserved(&self, token: u64, snapshot: Arc<IndexSnapshot>) -> bool {
+        let mut state = self.lock_state();
+        if state.activation_reservation != Some(token) || state.clear_transition {
+            if state.activation_reservation == Some(token) {
+                state.activation_reservation = None;
+            }
+            state.activation_reconciliation_required = true;
+            state.activation_transition = true;
+            touch_status(&mut state);
+            return false;
+        }
+        let generation_id = snapshot.generation_id().to_string();
+        state.model_mismatch = !state.loaded_model_ids.contains(snapshot.model_id());
+        state.active = Some(snapshot);
+        state.lag = state.lag.max(1);
+        state.activation_transition = false;
+        state.activation_reservation = None;
+        state.activation_reconciliation_required = false;
+        state
+            .committed_stale
+            .retain(|_, (generation, _)| generation == &generation_id);
+        state.epoch = state.epoch.wrapping_add(1);
+        touch_status(&mut state);
+        true
+    }
+
+    pub(crate) fn begin_clear_transition(&self) {
+        let mut state = self.lock_state();
+        state.clear_transition = true;
+        state.activation_transition = false;
+        state.activation_reservation = None;
+        state.epoch = state.epoch.wrapping_add(1);
+        touch_status(&mut state);
+    }
+
+    pub(crate) fn cancel_clear_transition(&self) {
+        let mut state = self.lock_state();
+        if state.clear_transition {
+            state.clear_transition = false;
+            touch_status(&mut state);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_activation_commit_barrier(&self, barrier: Arc<tokio::sync::Barrier>) {
+        *self.activation_commit_barrier.lock().unwrap() = Some(barrier);
+    }
+
+    #[cfg(test)]
+    fn take_activation_commit_barrier(&self) -> Option<Arc<tokio::sync::Barrier>> {
+        self.activation_commit_barrier.lock().unwrap().take()
+    }
+
+    #[cfg(test)]
+    fn activation_committed(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.activation_committed_notify)
     }
 
     pub(crate) fn suppress_terminal_failure(&self, generation_id: &str, meeting_id: &str) {
@@ -727,17 +954,23 @@ impl QueryIndexService {
             overlay.deleted.insert(meeting_id.to_string());
             state.active = Some(Arc::new(snapshot.with_overlay(overlay)));
             state.epoch = state.epoch.wrapping_add(1);
+            touch_status(&mut state);
         }
     }
 
     pub(crate) fn set_loaded_model(&self, model_id: &str) {
         let mut state = self.lock_state();
-        state.loaded_model_ids.insert(model_id.to_string());
+        let inserted = state.loaded_model_ids.insert(model_id.to_string());
+        let previous_mismatch = state.model_mismatch;
+        let had_load_failure = state.model_load_failure.is_some();
         state.model_mismatch = state
             .active
             .as_ref()
             .is_some_and(|snapshot| !state.loaded_model_ids.contains(snapshot.model_id()));
         state.model_load_failure = None;
+        if inserted || previous_mismatch != state.model_mismatch || had_load_failure {
+            touch_status(&mut state);
+        }
     }
 
     fn has_loaded_model(&self, model_id: &str) -> bool {
@@ -745,11 +978,11 @@ impl QueryIndexService {
     }
 
     pub(crate) fn set_model_load_failure(&self, reason: String) {
-        self.lock_state().model_load_failure = Some(reason);
-    }
-
-    fn model_load_failure(&self) -> Option<String> {
-        self.lock_state().model_load_failure.clone()
+        let mut state = self.lock_state();
+        if state.model_load_failure.as_deref() != Some(reason.as_str()) {
+            state.model_load_failure = Some(reason);
+            touch_status(&mut state);
+        }
     }
 
     pub fn publication_lag(&self) -> i64 {
@@ -757,7 +990,11 @@ impl QueryIndexService {
     }
 
     fn set_pending_blockers(&self, blockers: Vec<String>) {
-        self.lock_state().pending_blockers = blockers;
+        let mut state = self.lock_state();
+        if state.pending_blockers != blockers {
+            state.pending_blockers = blockers;
+            touch_status(&mut state);
+        }
     }
 
     pub fn pending_activation_blockers(&self) -> Vec<String> {
@@ -868,6 +1105,59 @@ impl QueryIndexService {
         Ok(measured)
     }
 
+    fn status_snapshot(&self) -> ServiceStatusSnapshot {
+        let state = self.lock_state();
+        ServiceStatusSnapshot {
+            version: state.status_version,
+            active_generation_id: state
+                .active
+                .as_ref()
+                .map(|snapshot| snapshot.generation_id().to_string()),
+            active_snapshot_present: state.active.is_some(),
+            lag: state.lag,
+            model_mismatch: state.model_mismatch,
+            activation_transition: state.activation_transition || state.clear_transition,
+            model_load_failure: state.model_load_failure.clone(),
+            pending_blockers: state.pending_blockers.clone(),
+            loaded_model_ids: state.loaded_model_ids.clone(),
+            resident_index_bytes: state
+                .active
+                .as_ref()
+                .map(|snapshot| snapshot.resident_vector_bytes())
+                .unwrap_or(0),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_scan_barrier(&self, barrier: Arc<std::sync::Barrier>) {
+        *self.scan_barrier.lock().unwrap() = Some(barrier);
+    }
+
+    #[cfg(test)]
+    fn take_scan_barrier(&self) -> Option<Arc<std::sync::Barrier>> {
+        self.scan_barrier.lock().unwrap().take()
+    }
+
+    #[cfg(test)]
+    fn scan_started(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.scan_started_notify)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_publish_barrier(&self, barrier: Arc<tokio::sync::Barrier>) {
+        *self.publish_barrier.lock().unwrap() = Some(barrier);
+    }
+
+    #[cfg(test)]
+    fn take_publish_barrier(&self) -> Option<Arc<tokio::sync::Barrier>> {
+        self.publish_barrier.lock().unwrap().take()
+    }
+
+    #[cfg(test)]
+    fn publish_started(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.publish_started_notify)
+    }
+
     /// Process-start proxy for garbage-collection eligibility: anything
     /// retired after this instant was retired inside the current process and
     /// has not yet survived a restart.
@@ -950,12 +1240,15 @@ impl QueryIndexService {
             if snapshot.generation_id() != pinned_generation {
                 return Err(SearchFailure::GenerationChanged);
             }
+            if state.clear_transition {
+                return Err(SearchFailure::CatchUpPending { behind: 1 });
+            }
             (
                 snapshot,
                 state.lag,
                 state.epoch,
                 state.model_mismatch,
-                state.activation_transition,
+                state.activation_transition || state.clear_transition,
                 !state.pending_stale.is_empty() || !state.committed_stale.is_empty(),
             )
         };
@@ -981,7 +1274,17 @@ impl QueryIndexService {
         };
         let scan_cancel = cancel.clone();
         let source_kind = source_kind.map(str::to_string);
+        #[cfg(test)]
+        let scan_barrier = self.take_scan_barrier();
+        #[cfg(test)]
+        let scan_started_notify = self.scan_started();
         let scanned = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            scan_started_notify.notify_one();
+            #[cfg(test)]
+            if let Some(barrier) = scan_barrier {
+                barrier.wait();
+            }
             scan_snapshot(
                 &snapshot,
                 &query_i8,
@@ -1006,7 +1309,11 @@ impl QueryIndexService {
         {
             return Err(SearchFailure::GenerationChanged);
         }
-        if state.epoch != epoch || state.model_mismatch || state.activation_transition {
+        if state.epoch != epoch
+            || state.model_mismatch
+            || state.activation_transition
+            || state.clear_transition
+        {
             return Err(if state.model_mismatch {
                 SearchFailure::ModelMismatch
             } else {
@@ -1031,8 +1338,8 @@ impl QueryIndexService {
 /// One publisher pass inside the worker loop. Errors are returned to the
 /// caller (which logs them); every step leaves prior durable and in-memory
 /// state intact on failure. Cancellation stops the pass at every bounded
-/// DB/page/batch boundary and before any acknowledgement or swap, leaving the
-/// durable bounds and the prior reader snapshot valid.
+/// DB/page/batch boundary and before any acknowledgement or swap, except that
+/// a committed activation completes its reserved in-memory publication.
 #[cfg(test)]
 pub(crate) async fn publish_tick(
     pool: &SqlitePool,
@@ -1058,6 +1365,12 @@ async fn publish_tick_inner(
     service: &QueryIndexService,
     cancel: &CancellationToken,
 ) -> Result<(), String> {
+    #[cfg(test)]
+    service.publish_started().notify_one();
+    #[cfg(test)]
+    if let Some(barrier) = service.take_publish_barrier() {
+        barrier.wait().await;
+    }
     if cancel.is_cancelled() {
         return Ok(());
     }
@@ -1075,6 +1388,8 @@ async fn publish_tick_inner(
             replay_steady_state(pool, service, cancel).await?;
             compact_if_needed(service, cancel).await;
         }
+    } else if let Some(generation_id) = service.active_generation() {
+        service.clear_active_after_deactivation(&generation_id);
     }
 
     if cancel.is_cancelled() {
@@ -1154,7 +1469,9 @@ async fn publish_catch_up_snapshot(
         return Ok(());
     }
     let bound = read.canonical_change_id;
-    service.install_active(Arc::new(base_snapshot(generation_id, read)));
+    if !service.install_active_if_allowed(Arc::new(base_snapshot(generation_id, read)), cancel) {
+        return Ok(());
+    }
     if cancel.is_cancelled() {
         // Installed ahead of its durable bound; idempotent journal replay
         // resynchronizes the acknowledgement on a later pass.
@@ -1177,7 +1494,7 @@ async fn publish_catch_up_snapshot(
     if let Ok(Some((canonical, published))) =
         RetrievalRepository::publication_lag(pool, generation_id).await
     {
-        service.set_lag(canonical - published);
+        service.set_lag_for_generation(Some(generation_id), canonical - published);
     }
     log::info!("Published semantic snapshot for generation {generation_id}");
     Ok(())
@@ -1228,7 +1545,9 @@ async fn publish_replayed_batch(
     if cancel.is_cancelled() {
         return Ok(false);
     }
-    service.replace_snapshot(Arc::clone(next));
+    if !service.replace_snapshot_if_allowed(Arc::clone(next), cancel) {
+        return Ok(false);
+    }
     if cancel.is_cancelled() {
         // Installed ahead of the durable bound; replay resynchronizes the
         // acknowledgement next pass.
@@ -1393,7 +1712,7 @@ async fn compact_if_needed(service: &QueryIndexService, cancel: &CancellationTok
     if cancel.is_cancelled() {
         return;
     }
-    service.replace_snapshot(compacted);
+    service.replace_snapshot_if_allowed(compacted, cancel);
 }
 
 /// Compacts synchronously on a blocking thread, observing cancellation at a
@@ -1516,6 +1835,24 @@ fn coverage_blockers(status: &GenerationStatus) -> Vec<String> {
         ));
     }
     blockers
+}
+
+pub(crate) fn shadow_lifecycle_state(status: &GenerationStatus, paused: bool) -> &'static str {
+    if status.state == "failed" {
+        "failed"
+    } else if status.state == "ready" {
+        "complete"
+    } else if paused {
+        "paused"
+    } else if status.current_meetings == 0 {
+        "queued"
+    } else {
+        "building"
+    }
+}
+
+pub(crate) fn shadow_operation_active(status: &GenerationStatus) -> bool {
+    status.state == "building"
 }
 
 /// Activation disk gate: only an exact derived-table measurement at or below
@@ -1695,21 +2032,28 @@ async fn try_activate_shadow_generation(
             return Ok(());
         }
 
-        if !promote_shadow_generation(pool, service, &generation_id, current, caught_up_to, cancel)
-            .await?
+        match promote_shadow_generation(
+            pool,
+            service,
+            &generation_id,
+            current,
+            caught_up_to,
+            cancel,
+        )
+        .await?
         {
-            // Cancelled after validation but before promotion: nothing was
-            // promoted, installed, or acknowledged from this candidate.
-            return Ok(());
+            PromotionOutcome::NotCommitted | PromotionOutcome::CommittedAndFenced => return Ok(()),
+            PromotionOutcome::CommittedAndPublished => {
+                log::info!(
+                    "Activated semantic generation {} (model {}) with {} documents",
+                    generation_id,
+                    status.model_id,
+                    status.document_count
+                );
+                reported_blockers.clear();
+                break;
+            }
         }
-        log::info!(
-            "Activated semantic generation {} (model {}) with {} documents",
-            generation_id,
-            status.model_id,
-            status.document_count
-        );
-        reported_blockers.clear();
-        break;
     }
     if !reported_blockers.is_empty() {
         log::warn!(
@@ -1734,24 +2078,44 @@ async fn promote_shadow_generation(
     snapshot: IndexSnapshot,
     caught_up_to: i64,
     cancel: &CancellationToken,
-) -> Result<bool, String> {
+) -> Result<PromotionOutcome, String> {
     if cancel.is_cancelled() {
         // Validated candidate discarded before promotion: no readiness flip,
         // no pointer move, no memory swap, no acknowledgement.
-        return Ok(false);
+        return Ok(PromotionOutcome::NotCommitted);
     }
-    service.begin_activation_transition();
-    if !RetrievalRepository::activate_generation_if_ready(pool, generation_id, caught_up_to)
-        .await
-        .map_err(|error| {
-            service.cancel_activation_transition();
-            format!("activating generation failed: {error}")
-        })?
-    {
-        service.cancel_activation_transition();
-        return Ok(false);
+    let Some(transition) = service.begin_activation_transition() else {
+        return Ok(PromotionOutcome::NotCommitted);
+    };
+    match RetrievalRepository::activate_generation_if_ready(
+        pool,
+        generation_id,
+        caught_up_to,
+        cancel,
+    )
+    .await
+    .map_err(|error| {
+        service.cancel_activation_transition_if(transition);
+        format!("activating generation failed: {error}")
+    })? {
+        ActivationOutcome::NotCommitted => {
+            service.cancel_activation_transition_if(transition);
+            return Ok(PromotionOutcome::NotCommitted);
+        }
+        ActivationOutcome::Committed => {}
     }
-    service.install_active(Arc::new(snapshot));
+
+    #[cfg(test)]
+    let activation_commit_barrier = service.take_activation_commit_barrier();
+    #[cfg(test)]
+    if let Some(barrier) = activation_commit_barrier {
+        service.activation_committed().notify_one();
+        barrier.wait().await;
+    }
+
+    if !service.publish_active_if_reserved(transition, Arc::new(snapshot)) {
+        return Ok(PromotionOutcome::CommittedAndFenced);
+    }
     if !cancel.is_cancelled() {
         if let Err(error) =
             RetrievalRepository::acknowledge_journal(pool, generation_id, caught_up_to).await
@@ -1764,22 +2128,24 @@ async fn promote_shadow_generation(
             service.clear_published_stale(generation_id, caught_up_to);
         }
     }
-    Ok(true)
+    update_publication_lag(pool, service).await;
+    Ok(PromotionOutcome::CommittedAndPublished)
 }
 
 async fn update_publication_lag(pool: &SqlitePool, service: &QueryIndexService) {
     let generation_id = match RetrievalRepository::active_generation_id(pool).await {
         Ok(Some(generation_id)) => generation_id,
-        _ => {
-            service.set_lag(1);
+        Ok(None) => {
+            service.set_lag_for_generation(None, 0);
             return;
         }
+        Err(_) => return,
     };
     let lag = match RetrievalRepository::publication_lag(pool, &generation_id).await {
         Ok(Some((canonical, published))) => (canonical - published).max(0),
         _ => 0,
     };
-    service.set_lag(lag);
+    service.set_lag_for_generation(Some(&generation_id), lag);
 }
 
 /// Terminal generations stop being served, but unacknowledged journal changes
@@ -1849,6 +2215,19 @@ impl std::fmt::Display for RebuildRequestError {
 /// rebuild). Healthy active retrieval continues while the worker indexes the
 /// shadow; cancellation removes only the shadow's derived state.
 pub async fn request_rebuild(pool: &SqlitePool) -> Result<String, RebuildRequestError> {
+    if let Some(shadow) = RetrievalRepository::shadow_generation_statuses(pool)
+        .await
+        .map_err(RebuildRequestError::Database)?
+        .into_iter()
+        .find(|status| status.state == "failed")
+    {
+        if RetrievalRepository::retry_failed_generation(pool, &shadow.generation_id)
+            .await
+            .map_err(RebuildRequestError::Database)?
+        {
+            return Ok(shadow.generation_id);
+        }
+    }
     let model_id = match RetrievalRepository::active_generation_id(pool).await {
         Ok(Some(generation_id)) => {
             generation_identity(pool, &generation_id)
@@ -1885,8 +2264,13 @@ pub async fn request_rebuild(pool: &SqlitePool) -> Result<String, RebuildRequest
 #[derive(Debug, Serialize)]
 pub struct RetrievalStatusReport {
     pub backend: &'static str,
-    /// `paused`, `unavailable`, `building`, `loading`, `catching_up`, `ready`.
+    pub indexed_scope: &'static str,
+    /// Serving state, or the current shadow lifecycle when one exists.
     pub semantic_state: String,
+    pub serving_state: String,
+    pub shadow_state: Option<String>,
+    pub operation_active: bool,
+    pub force_lexical_retrieval: bool,
     pub model_load_failure: Option<String>,
     pub paused: bool,
     pub active_generation_id: Option<String>,
@@ -1935,6 +2319,8 @@ pub struct RetrievalStatusReport {
     pub wal_file_size_bytes: Option<u64>,
     pub derived_disk_steady_target_bytes: u64,
     pub derived_disk_activation_limit_bytes: u64,
+    pub model: ApprovedRetrievalModelMetadata,
+    pub model_artifact_state: &'static str,
 }
 
 pub async fn index_status(
@@ -1942,25 +2328,26 @@ pub async fn index_status(
     service: &QueryIndexService,
     paused: bool,
 ) -> Result<RetrievalStatusReport, String> {
-    let pointer = RetrievalRepository::active_generation_id(pool)
-        .await
-        .map_err(|error| error.to_string())?;
-    let status = match &pointer {
-        Some(generation_id) => RetrievalRepository::generation_status(pool, generation_id)
+    let (snapshot, service_status) = loop {
+        let before = service.status_snapshot();
+        let snapshot = RetrievalRepository::status_snapshot(pool)
             .await
-            .map_err(|error| error.to_string())?,
-        None => None,
+            .map_err(|error| error.to_string())?;
+        let after = service.status_snapshot();
+        if before.version == after.version {
+            break (snapshot, after);
+        }
+        tokio::task::yield_now().await;
     };
-    let building = RetrievalRepository::list_live_generations(pool)
-        .await
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .any(|(generation_id, _model_id)| pointer.as_deref() != Some(generation_id.as_str()));
-    let building_generations = RetrievalRepository::building_generation_statuses(pool)
-        .await
-        .map_err(|error| error.to_string())?;
-    let lag = service.publication_lag();
-    let (model_mismatch, activation_transition) = service.semantic_unavailable_state();
+    let force_lexical_retrieval = snapshot.force_lexical_retrieval;
+    let pointer = snapshot.active_generation_id;
+    let status = snapshot.active_status;
+    let building_generations = snapshot.shadows;
+    let building = !building_generations.is_empty();
+    let lag = service_status.lag;
+    let model_mismatch = service_status.model_mismatch;
+    let activation_transition = service_status.activation_transition;
+    let model_load_failure = service_status.model_load_failure;
     // Pure read-only measurements: SELECTs/compile-option PRAGMAs plus a
     // filesystem stat of the WAL sibling - never a checkpoint or any other
     // database mutation.
@@ -1971,9 +2358,7 @@ pub async fn index_status(
         .await
         .map_err(|error| error.to_string())?;
 
-    let semantic_state = if paused {
-        "paused".to_string()
-    } else if service.model_load_failure().is_some() {
+    let serving_state = if model_load_failure.is_some() {
         "model_unavailable".to_string()
     } else if pointer.is_none() {
         if building {
@@ -1985,18 +2370,56 @@ pub async fn index_status(
         "transitioning".to_string()
     } else if model_mismatch {
         "model_mismatch".to_string()
-    } else if service.active_snapshot().is_none() {
+    } else if service_status.active_generation_id.as_deref() != pointer.as_deref() {
+        if service_status.active_snapshot_present {
+            "transitioning".to_string()
+        } else {
+            "loading".to_string()
+        }
+    } else if !service_status.active_snapshot_present {
         "loading".to_string()
     } else if lag > 0 {
         "catching_up".to_string()
     } else {
         "ready".to_string()
     };
+    let shadow_state = building_generations
+        .first()
+        .map(|status| shadow_lifecycle_state(status, paused).to_string());
+    let operation_active = paused || building_generations.iter().any(shadow_operation_active);
+    let semantic_state = shadow_state.clone().unwrap_or_else(|| {
+        if paused {
+            "paused".to_string()
+        } else {
+            serving_state.clone()
+        }
+    });
+
+    let model_id = status
+        .as_ref()
+        .map(|status| status.model_id.as_str())
+        .or_else(|| {
+            building_generations
+                .first()
+                .map(|status| status.model_id.as_str())
+        });
+    let model_artifact_state = if model_load_failure.is_some() {
+        "unavailable"
+    } else if model_id.is_some_and(|model_id| service_status.loaded_model_ids.contains(model_id)) {
+        "verified"
+    } else {
+        "pending"
+    };
 
     Ok(RetrievalStatusReport {
         backend: crate::database::repositories::retrieval::EXACT_INDEX_BACKEND,
+        indexed_scope: "all_saved_meetings",
         semantic_state,
-        model_load_failure: service.model_load_failure(),
+        serving_state,
+        shadow_state,
+        operation_active,
+        force_lexical_retrieval,
+        model_load_failure,
         paused,
         active_generation_id: pointer,
         active_model_id: status.as_ref().map(|status| status.model_id.clone()),
@@ -2012,8 +2435,8 @@ pub async fn index_status(
         published_change_id: status
             .as_ref()
             .and_then(|status| status.published_change_id),
-        activation_blockers: service.pending_activation_blockers(),
-        resident_index_bytes: service.resident_vector_bytes(),
+        activation_blockers: service_status.pending_blockers,
+        resident_index_bytes: service_status.resident_index_bytes,
         resident_process_bytes: measure_resident_ram(),
         activation_ram_ceiling_bytes: ACTIVATION_RAM_CEILING_BYTES,
         activation_ram_scope: ACTIVATION_RAM_SCOPE,
@@ -2025,6 +2448,8 @@ pub async fn index_status(
         wal_file_size_bytes: wal_size,
         derived_disk_steady_target_bytes: DERIVED_DISK_STEADY_TARGET_BYTES,
         derived_disk_activation_limit_bytes: DERIVED_DISK_ACTIVATION_LIMIT_BYTES,
+        model: approved_retrieval_model_metadata(),
+        model_artifact_state,
     })
 }
 
@@ -2039,6 +2464,7 @@ mod tests {
         DerivedDiskMeasurementStatus, ModelSpec, ReplacementJob, ReplacementOutcome,
         StagedDocument, VectorEncoding,
     };
+    use crate::database::repositories::setting::SettingsRepository;
     use sqlx::sqlite::{
         SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
     };
@@ -2997,13 +3423,17 @@ mod tests {
             .0;
 
         add_transcript(&pool, "after-preflight", "m", "changed").await;
-        assert!(!RetrievalRepository::activate_generation_if_ready(
-            &pool,
-            "gen-fenced",
-            caught_up_to
-        )
-        .await
-        .unwrap());
+        assert_eq!(
+            RetrievalRepository::activate_generation_if_ready(
+                &pool,
+                "gen-fenced",
+                caught_up_to,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+            ActivationOutcome::NotCommitted
+        );
         assert!(RetrievalRepository::active_generation_id(&pool)
             .await
             .unwrap()
@@ -3844,6 +4274,19 @@ mod tests {
     async fn status_reports_safe_model_load_failures_and_clears_after_load() {
         let pool = migrated_pool().await;
         let service = fresh_service();
+        let initial = index_status(&pool, &service, false).await.unwrap();
+        assert!(!initial.force_lexical_retrieval);
+        assert_eq!(initial.model.embedding_license, "MIT");
+        assert_eq!(initial.model.reranker_license, "Apache-2.0");
+        SettingsRepository::set_force_lexical_retrieval(&pool, true)
+            .await
+            .unwrap();
+        assert!(
+            index_status(&pool, &service, false)
+                .await
+                .unwrap()
+                .force_lexical_retrieval
+        );
         for reason in ["bundle manifest missing", "bundle artifact corrupt"] {
             service.set_model_load_failure(reason.to_string());
             let status = index_status(&pool, &service, false).await.unwrap();
@@ -3856,6 +4299,167 @@ mod tests {
             .unwrap()
             .model_load_failure
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn status_reports_shadow_progress_failure_and_retry_without_hiding_active() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "m", "Shadow status").await;
+        register_test_model(&pool).await;
+        RetrievalRepository::ensure_generation(&pool, "active", MODEL_ID)
+            .await
+            .unwrap();
+        publish_meeting(&pool, "active", "m", &["active content"]).await;
+        let service = fresh_service();
+        publish_tick(&pool, &service).await.unwrap();
+        assert!(
+            !RetrievalRepository::mark_shadow_generation_failed(&pool, "active")
+                .await
+                .unwrap()
+        );
+
+        let shadow = request_rebuild(&pool).await.unwrap();
+        let queued = index_status(&pool, &service, false).await.unwrap();
+        assert_eq!(queued.semantic_state, "queued");
+        assert_eq!(queued.shadow_state.as_deref(), Some("queued"));
+        assert!(queued.operation_active);
+        assert_eq!(queued.active_generation_id.as_deref(), Some("active"));
+        assert_eq!(queued.serving_state, "ready");
+        assert_eq!(queued.building_generations[0].current_meetings, 0);
+
+        publish_meeting(&pool, &shadow, "m", &["shadow content"]).await;
+        let building = index_status(&pool, &service, false).await.unwrap();
+        assert_eq!(building.semantic_state, "building");
+        assert_eq!(building.shadow_state.as_deref(), Some("building"));
+        assert_eq!(building.building_generations[0].current_meetings, 1);
+        assert_eq!(building.active_generation_id.as_deref(), Some("active"));
+
+        RetrievalRepository::set_generation_state(&pool, &shadow, "ready")
+            .await
+            .unwrap();
+        let complete = index_status(&pool, &service, false).await.unwrap();
+        assert_eq!(complete.semantic_state, "complete");
+        assert_eq!(complete.shadow_state.as_deref(), Some("complete"));
+        assert!(!complete.operation_active);
+        RetrievalRepository::set_generation_state(&pool, &shadow, "building")
+            .await
+            .unwrap();
+
+        RetrievalRepository::record_work_failure(
+            &pool,
+            &shadow,
+            "m",
+            true,
+            "safe terminal failure",
+            "2099-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        RetrievalRepository::mark_shadow_generation_failed(&pool, &shadow)
+            .await
+            .unwrap();
+        let failed = index_status(&pool, &service, false).await.unwrap();
+        assert_eq!(failed.semantic_state, "failed");
+        assert_eq!(failed.shadow_state.as_deref(), Some("failed"));
+        assert!(!failed.operation_active);
+        assert_eq!(failed.active_generation_id.as_deref(), Some("active"));
+        assert_eq!(failed.failed_meetings, 0);
+        assert_eq!(failed.building_generations[0].failed_meetings, 1);
+
+        assert!(RetrievalRepository::retry_failed_generation(&pool, &shadow)
+            .await
+            .unwrap());
+        let retry = index_status(&pool, &service, false).await.unwrap();
+        assert_eq!(retry.shadow_state.as_deref(), Some("queued"));
+        assert!(retry.operation_active);
+        assert_eq!(retry.building_generations[0].failed_meetings, 0);
+
+        let paused = index_status(&pool, &service, true).await.unwrap();
+        assert_eq!(paused.shadow_state.as_deref(), Some("paused"));
+        assert_eq!(paused.semantic_state, "paused");
+        assert_eq!(paused.serving_state, "ready");
+    }
+
+    #[tokio::test]
+    async fn scan_does_not_block_status_or_publication() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "m", "Scan availability").await;
+        register_test_model(&pool).await;
+        RetrievalRepository::ensure_generation(&pool, "active-scan", MODEL_ID)
+            .await
+            .unwrap();
+        publish_meeting(&pool, "active-scan", "m", &["scan content"]).await;
+        let service = Arc::new(fresh_service());
+        publish_tick(&pool, service.as_ref()).await.unwrap();
+
+        let scan_barrier = Arc::new(std::sync::Barrier::new(2));
+        service.set_scan_barrier(Arc::clone(&scan_barrier));
+        let scan_started = service.scan_started();
+        let scan_entered = scan_started.notified();
+        let search_service = Arc::clone(&service);
+        let search = tokio::spawn(async move { search_all(&search_service, "scan").await });
+        scan_entered.await;
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            publish_tick(&pool, service.as_ref()),
+        )
+        .await
+        .expect("publication must run while a scan is held")
+        .unwrap();
+        let status = tokio::time::timeout(
+            Duration::from_secs(2),
+            index_status(&pool, service.as_ref(), false),
+        )
+        .await
+        .expect("status must run while a scan is held")
+        .unwrap();
+        assert_eq!(status.active_generation_id.as_deref(), Some("active-scan"));
+        scan_barrier.wait();
+        assert!(search.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn publisher_does_not_block_status_or_queries() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "m", "Publisher availability").await;
+        register_test_model(&pool).await;
+        RetrievalRepository::ensure_generation(&pool, "active-publish", MODEL_ID)
+            .await
+            .unwrap();
+        publish_meeting(&pool, "active-publish", "m", &["publisher content"]).await;
+        let service = Arc::new(fresh_service());
+        publish_tick(&pool, service.as_ref()).await.unwrap();
+
+        let publish_barrier = Arc::new(tokio::sync::Barrier::new(2));
+        service.set_publish_barrier(Arc::clone(&publish_barrier));
+        let publish_started = service.publish_started();
+        let publish_entered = publish_started.notified();
+        let publication_service = Arc::clone(&service);
+        let publication_pool = pool.clone();
+        let publication = tokio::spawn(async move {
+            publish_tick(&publication_pool, publication_service.as_ref()).await
+        });
+        publish_entered.await;
+
+        let status = tokio::time::timeout(
+            Duration::from_secs(2),
+            index_status(&pool, service.as_ref(), false),
+        )
+        .await
+        .expect("status must run while publication is held")
+        .unwrap();
+        assert_eq!(
+            status.active_generation_id.as_deref(),
+            Some("active-publish")
+        );
+        let hits = tokio::time::timeout(Duration::from_secs(2), search_all(&service, "publisher"))
+            .await
+            .expect("query must run while publication is held")
+            .unwrap();
+        assert!(contains_hit(&hits, "doc-m-0"));
+        publish_barrier.wait().await;
+        publication.await.unwrap().unwrap();
     }
 
     #[test]
@@ -4537,6 +5141,7 @@ mod tests {
             .unwrap();
 
         let query_token = CancellationToken::new();
+        let scan_waiting = service.scheduler().vector_scan_waiting().notified();
         let queued_search = tokio::spawn({
             let service = Arc::clone(&service);
             let token = query_token.clone();
@@ -4546,7 +5151,7 @@ mod tests {
                     .await
             }
         });
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        scan_waiting.await;
         query_token.cancel();
         let result = tokio::time::timeout(Duration::from_secs(2), queued_search)
             .await
@@ -5203,7 +5808,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_shadow_promotion_flips_no_pointer_state_or_memory() {
+    async fn shadow_promotion_cancellation_before_and_after_commit_is_ordered() {
         let pool = migrated_pool().await;
         insert_meeting(&pool, "one", "One").await;
         insert_meeting(&pool, "two", "Two").await;
@@ -5213,7 +5818,7 @@ mod tests {
             .unwrap();
         publish_meeting(&pool, "gen-old", "one", &["one content"]).await;
         publish_meeting(&pool, "gen-old", "two", &["two content"]).await;
-        let service = fresh_service();
+        let service = Arc::new(fresh_service());
         publish_tick(&pool, &service).await.unwrap();
         let active_before = service.active_snapshot().unwrap();
 
@@ -5247,7 +5852,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!promoted);
+        assert_eq!(promoted, PromotionOutcome::NotCommitted);
         assert_eq!(
             RetrievalRepository::active_generation_id(&pool)
                 .await
@@ -5272,26 +5877,60 @@ mod tests {
                 .unwrap();
         assert_eq!(state, "building");
 
-        // A live token promotes through the approved order: readiness, then
-        // pointer + memory swap together, then the durable acknowledgement.
-        let promoted = promote_shadow_generation(
-            &pool,
-            &service,
-            &shadow,
-            base_snapshot(&shadow, read),
-            caught_up_to,
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert!(promoted);
+        let cancel = CancellationToken::new();
+        let commit_barrier = Arc::new(tokio::sync::Barrier::new(2));
+        service.set_activation_commit_barrier(Arc::clone(&commit_barrier));
+        let committed = service.activation_committed();
+        let committed_notification = committed.notified();
+        let promotion_pool = pool.clone();
+        let promotion_service = Arc::clone(&service);
+        let promotion_shadow = shadow.clone();
+        let promotion_snapshot = base_snapshot(&shadow, read);
+        let promotion_cancel = cancel.clone();
+        let promotion = tokio::spawn(async move {
+            promote_shadow_generation(
+                &promotion_pool,
+                &promotion_service,
+                &promotion_shadow,
+                promotion_snapshot,
+                caught_up_to,
+                &promotion_cancel,
+            )
+            .await
+        });
+        committed_notification.await;
         assert_eq!(
             RetrievalRepository::active_generation_id(&pool)
                 .await
                 .unwrap(),
             Some(shadow.clone())
         );
+        assert!(Arc::ptr_eq(
+            &active_before,
+            &service.active_snapshot().unwrap()
+        ));
+        let prior_lag = service.publication_lag();
+        update_publication_lag(&pool, &service).await;
+        assert_eq!(service.publication_lag(), prior_lag);
+        let report = index_status(&pool, &service, false).await.unwrap();
+        assert_eq!(report.serving_state, "transitioning");
+        cancel.cancel();
+        commit_barrier.wait().await;
+        let promoted = promotion.await.unwrap().unwrap();
+        assert_eq!(promoted, PromotionOutcome::CommittedAndPublished);
         assert_eq!(service.active_snapshot().unwrap().generation_id(), shadow);
+        let (canonical, published) = RetrievalRepository::publication_lag(&pool, &shadow)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(service.publication_lag(), (canonical - published).max(0));
+        let report = index_status(&pool, &service, false).await.unwrap();
+        assert_eq!(
+            report.active_generation_id.as_deref(),
+            Some(shadow.as_str())
+        );
+        assert_eq!(report.active_generation_id, service.active_generation());
+        publish_tick(&pool, &service).await.unwrap();
         assert!(contains_hit(
             &search_all(&service, "one").await.unwrap(),
             "doc-one-0"
@@ -5310,6 +5949,136 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(old_state, "retired");
+    }
+
+    #[tokio::test]
+    async fn activation_commit_cannot_resurrect_after_clear_fences_publication() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "one", "One").await;
+        insert_meeting(&pool, "two", "Two").await;
+        register_test_model(&pool).await;
+        RetrievalRepository::ensure_generation(&pool, "gen-old", MODEL_ID)
+            .await
+            .unwrap();
+        publish_meeting(&pool, "gen-old", "one", &["one content"]).await;
+        publish_meeting(&pool, "gen-old", "two", &["two content"]).await;
+        let service = Arc::new(fresh_service());
+        publish_tick(&pool, &service).await.unwrap();
+        let active_before = service.active_snapshot().unwrap();
+
+        let shadow = request_rebuild(&pool).await.unwrap();
+        publish_meeting(&pool, &shadow, "one", &["one rebuilt"]).await;
+        publish_meeting(&pool, &shadow, "two", &["two rebuilt"]).await;
+        let read =
+            RetrievalRepository::read_canonical_snapshot(&pool, &shadow, &CancellationToken::new())
+                .await
+                .unwrap()
+                .unwrap();
+        let caught_up_to = read.canonical_change_id;
+
+        let commit_barrier = Arc::new(tokio::sync::Barrier::new(2));
+        service.set_activation_commit_barrier(Arc::clone(&commit_barrier));
+        let committed = service.activation_committed();
+        let committed_notification = committed.notified();
+        let promotion_pool = pool.clone();
+        let promotion_service = Arc::clone(&service);
+        let promotion_shadow = shadow.clone();
+        let promotion_cancel = CancellationToken::new();
+        let promotion = tokio::spawn(async move {
+            promote_shadow_generation(
+                &promotion_pool,
+                &promotion_service,
+                &promotion_shadow,
+                base_snapshot(&promotion_shadow, read),
+                caught_up_to,
+                &promotion_cancel,
+            )
+            .await
+        });
+        committed_notification.await;
+        assert_eq!(
+            RetrievalRepository::active_generation_id(&pool)
+                .await
+                .unwrap(),
+            Some(shadow.clone())
+        );
+        assert!(Arc::ptr_eq(
+            &active_before,
+            &service.active_snapshot().unwrap()
+        ));
+
+        service.begin_clear_transition();
+        commit_barrier.wait().await;
+        assert_eq!(
+            promotion.await.unwrap().unwrap(),
+            PromotionOutcome::CommittedAndFenced
+        );
+        assert!(Arc::ptr_eq(
+            &active_before,
+            &service.active_snapshot().unwrap()
+        ));
+        assert!(matches!(
+            search_all(&service, "one").await,
+            Err(SearchFailure::CatchUpPending { .. })
+        ));
+
+        service.cancel_clear_transition();
+        publish_tick(&pool, &service).await.unwrap();
+        assert_eq!(
+            service.active_generation().as_deref(),
+            Some(shadow.as_str())
+        );
+        let report = index_status(&pool, &service, false).await.unwrap();
+        assert_eq!(report.active_generation_id, service.active_generation());
+        assert_eq!(report.serving_state, "ready");
+
+        RetrievalRepository::clear_derived_index(&pool)
+            .await
+            .unwrap();
+        service.clear_derived_state();
+        assert!(RetrievalRepository::active_generation_id(&pool)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(service.active_snapshot().is_none());
+        assert_eq!(service.publication_lag(), 0);
+    }
+
+    #[test]
+    fn replaced_activation_reservation_fences_the_old_snapshot() {
+        let service = fresh_service();
+        let old = Arc::new(IndexSnapshot::new(
+            "gen-old".to_string(),
+            MODEL_ID.to_string(),
+            DIMS,
+            BaseRows::default(),
+            Overlay::default(),
+        ));
+        service.install_active(Arc::clone(&old));
+        let stale_token = service.begin_activation_transition().unwrap();
+        let replacement_token = stale_token.wrapping_add(1);
+        {
+            let mut state = service.lock_state();
+            state.activation_reservation = Some(replacement_token);
+            touch_status(&mut state);
+        }
+
+        assert!(!service.publish_active_if_reserved(
+            stale_token,
+            Arc::new(IndexSnapshot::new(
+                "gen-new".to_string(),
+                MODEL_ID.to_string(),
+                DIMS,
+                BaseRows::default(),
+                Overlay::default(),
+            )),
+        ));
+        assert!(Arc::ptr_eq(&old, &service.active_snapshot().unwrap()));
+        assert!(service.lock_state().activation_transition);
+        assert!(service.lock_state().activation_reconciliation_required);
+        service.cancel_activation_transition_if(replacement_token);
+        assert!(service.lock_state().activation_transition);
+        assert!(service.lock_state().activation_reconciliation_required);
     }
 
     #[tokio::test]

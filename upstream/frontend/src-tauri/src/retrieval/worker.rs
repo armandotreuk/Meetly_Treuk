@@ -40,7 +40,7 @@
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::Duration;
 
@@ -54,6 +54,7 @@ use crate::database::repositories::retrieval::{
     is_unreadable_staged_payload, FtsDueItem, GenerationWorkItem, ModelSpec, ReplacementJob,
     ReplacementOutcome, RetrievalRepository, StagedDocument, VectorEncoding,
 };
+use crate::database::repositories::setting::SettingsRepository;
 use crate::retrieval::chunking::{
     chunk_meeting, ChunkerConfig, SemanticDocument, TokenizerPolicy, APPROVED_CHUNKER_VERSION,
 };
@@ -216,6 +217,8 @@ struct SchedulerShared {
     queue: StdMutex<VecDeque<QueuedInteractive>>,
     next_ticket: AtomicU64,
     drained: tokio::sync::Notify,
+    #[cfg(test)]
+    vector_scan_waiting: tokio::sync::Notify,
 }
 
 /// One process-wide scheduler implementing the approved concurrency policy.
@@ -239,6 +242,8 @@ impl RetrievalScheduler {
             queue: StdMutex::new(VecDeque::new()),
             next_ticket: AtomicU64::new(0),
             drained: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            vector_scan_waiting: tokio::sync::Notify::new(),
         }))
     }
 
@@ -312,12 +317,21 @@ impl RetrievalScheduler {
         &self,
         cancel: &CancellationToken,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        #[cfg(test)]
+        if self.0.vector_scans.available_permits() == 0 {
+            self.0.vector_scan_waiting.notify_one();
+        }
         tokio::select! {
             _ = cancel.cancelled() => None,
             permit = Arc::clone(&self.0.vector_scans).acquire_owned() => {
                 Some(permit.expect("vector-scan semaphore is never closed"))
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn vector_scan_waiting(&self) -> &tokio::sync::Notify {
+        &self.0.vector_scan_waiting
     }
 }
 
@@ -448,11 +462,36 @@ struct AttachedWorker {
     worker: tokio::task::JoinHandle<()>,
 }
 
+#[derive(Clone, Copy, Debug)]
+#[repr(u8)]
+pub(crate) enum LifecycleOperation {
+    Rebuild = 1,
+    Retry = 2,
+    Clear = 3,
+    Cancel = 4,
+}
+
+pub(crate) struct OperationReservation {
+    active: Arc<AtomicU8>,
+    operation: u8,
+}
+
+impl Drop for OperationReservation {
+    fn drop(&mut self) {
+        let _ =
+            self.active
+                .compare_exchange(self.operation, 0, Ordering::AcqRel, Ordering::Relaxed);
+    }
+}
+
 struct LifecycleInner {
     config: LifecycleConfig,
     scheduler: RetrievalScheduler,
     index: Arc<crate::retrieval::index::QueryIndexService>,
     paused: Arc<AtomicBool>,
+    // ponytail: control is held only while reserving or transitioning lifecycle state; long work keeps a reservation without holding this lock. If cross-process coordination is ever required, add a durable operation lease rather than widening it.
+    control: Arc<tokio::sync::Mutex<()>>,
+    operation: Arc<AtomicU8>,
     attached: StdMutex<Option<AttachedWorker>>,
     started_attachments: AtomicU64,
 }
@@ -478,6 +517,8 @@ impl RetrievalLifecycle {
             config,
             scheduler,
             attached: StdMutex::new(None),
+            control: Arc::new(tokio::sync::Mutex::new(())),
+            operation: Arc::new(AtomicU8::new(0)),
             started_attachments: AtomicU64::new(0),
         }))
     }
@@ -574,11 +615,150 @@ impl RetrievalLifecycle {
     /// truthful.
     pub fn set_index_paused(&self, paused: bool) {
         self.0.paused.store(paused, Ordering::SeqCst);
+        self.0.index.mark_status_changed();
     }
 
     pub fn index_paused(&self) -> bool {
         self.0.paused.load(Ordering::SeqCst)
     }
+
+    pub(crate) async fn acquire_control(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.0.control.lock().await
+    }
+
+    pub(crate) async fn reserve_operation(
+        &self,
+        operation: LifecycleOperation,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<OperationReservation, String> {
+        let _control = if let Some(cancel) = cancel {
+            tokio::select! {
+                _ = cancel.cancelled() => return Err("retrieval operation cancelled".to_string()),
+                guard = self.acquire_control() => guard,
+            }
+        } else {
+            self.acquire_control().await
+        };
+        self.0
+            .operation
+            .compare_exchange(0, operation as u8, Ordering::AcqRel, Ordering::Relaxed)
+            .map_err(|_| "retrieval operation already active".to_string())?;
+        Ok(OperationReservation {
+            active: Arc::clone(&self.0.operation),
+            operation: operation as u8,
+        })
+    }
+
+    pub(crate) async fn set_index_paused_command(&self, paused: bool) -> Result<(), String> {
+        let _control = self.acquire_control().await;
+        if matches!(
+            self.0.operation.load(Ordering::Acquire),
+            operation if operation == LifecycleOperation::Clear as u8
+                || operation == LifecycleOperation::Cancel as u8
+        ) {
+            return Err("retrieval operation already active".to_string());
+        }
+        self.set_index_paused(paused);
+        Ok(())
+    }
+
+    pub async fn set_force_lexical_retrieval(
+        &self,
+        pool: &SqlitePool,
+        enabled: bool,
+    ) -> Result<(), sqlx::Error> {
+        SettingsRepository::set_force_lexical_retrieval(pool, enabled).await
+    }
+
+    pub async fn clear_index(&self, pool: &SqlitePool) -> Result<(), sqlx::Error> {
+        let _reservation = self
+            .reserve_operation(LifecycleOperation::Clear, None)
+            .await
+            .map_err(sqlx::Error::Protocol)?;
+        let was_running = self.is_running();
+        let was_paused = self.index_paused();
+        if was_paused || shadow_operation_active(pool).await? {
+            return Err(sqlx::Error::Protocol(
+                "retrieval operation already active".into(),
+            ));
+        }
+        self.0.index.begin_clear_transition();
+        self.set_index_paused(true);
+        self.shutdown().await;
+        tokio::task::yield_now().await;
+        match shadow_operation_active(pool).await {
+            Ok(true) => {
+                if was_running {
+                    self.attach_database(pool.clone());
+                }
+                self.0.index.cancel_clear_transition();
+                self.set_index_paused(was_paused);
+                return Err(sqlx::Error::Protocol(
+                    "retrieval operation already active".into(),
+                ));
+            }
+            Ok(false) => {}
+            Err(error) => {
+                if was_running {
+                    self.attach_database(pool.clone());
+                }
+                self.0.index.cancel_clear_transition();
+                self.set_index_paused(was_paused);
+                return Err(error);
+            }
+        }
+        let result = match RetrievalRepository::clear_derived_index(pool).await {
+            Ok(()) => {
+                self.0.index.clear_derived_state();
+                Ok(())
+            }
+            Err(error) => Err(error),
+        };
+        if result.is_err() {
+            self.0.index.cancel_clear_transition();
+        }
+        if was_running {
+            self.attach_database(pool.clone());
+        }
+        self.set_index_paused(was_paused);
+        result
+    }
+
+    pub async fn cancel_rebuild(
+        &self,
+        pool: &SqlitePool,
+        generation_id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let _reservation = self
+            .reserve_operation(LifecycleOperation::Cancel, None)
+            .await
+            .map_err(sqlx::Error::Protocol)?;
+        let state: Option<(String,)> =
+            sqlx::query_as("SELECT state FROM retrieval_generations WHERE generation_id = ?")
+                .bind(generation_id)
+                .fetch_optional(pool)
+                .await?;
+        if state.as_ref().is_none_or(|(state,)| state != "building") {
+            return Ok(false);
+        }
+        let was_running = self.is_running();
+        let was_paused = self.index_paused();
+        self.set_index_paused(true);
+        self.shutdown().await;
+        let result = RetrievalRepository::cancel_building_generation(pool, generation_id).await;
+        if was_running {
+            self.attach_database(pool.clone());
+        }
+        self.set_index_paused(was_paused);
+        result
+    }
+}
+
+async fn shadow_operation_active(pool: &SqlitePool) -> Result<bool, sqlx::Error> {
+    Ok(RetrievalRepository::shadow_generation_statuses(pool)
+        .await?
+        .iter()
+        .any(crate::retrieval::index::shadow_operation_active))
 }
 
 // ---------------------------------------------------------------------------
@@ -628,10 +808,10 @@ async fn run_worker(state: WorkerState) {
         // when the bundled models fail to load. The lifecycle token cancels
         // it at every bounded DB/page/batch boundary so shutdown joins
         // promptly without starting new work.
-        if let Err(error) =
+        let publish_result =
             crate::retrieval::index::publish_tick_with(&state.pool, &state.index, &state.cancel)
-                .await
-        {
+                .await;
+        if let Err(error) = publish_result {
             log::warn!("Query-index publication tick failed: {error}");
         }
 
@@ -709,7 +889,11 @@ async fn run_worker(state: WorkerState) {
             last_load_attempt = Some(std::time::Instant::now());
             match load_embedder(&loader).await {
                 Ok(models) => {
-                    match register_semantic_identity(&state.pool, models.as_ref()).await {
+                    let registered = tokio::select! {
+                        _ = state.cancel.cancelled() => break,
+                        result = register_semantic_identity(&state.pool, models.as_ref()) => result,
+                    };
+                    match registered {
                         Ok(()) => {
                             embedders.insert(models.model_id(), models);
                         }
@@ -1348,6 +1532,12 @@ async fn record_item_failure(
         Ok(()) => {}
         Err(error) => log::warn!("Recording retry state failed for meeting {meeting_id}: {error}"),
     }
+    if terminal {
+        match RetrievalRepository::mark_shadow_generation_failed(pool, generation_id).await {
+            Ok(_) => {}
+            Err(error) => log::warn!("Recording shadow generation failure failed: {error}"),
+        }
+    }
 }
 
 fn staging_job_id(generation_id: &str, meeting_id: &str, revision: i64) -> String {
@@ -1467,6 +1657,7 @@ fn locked<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use crate::database::repositories::folder::FolderRepository;
+    use crate::database::repositories::setting::SettingsRepository;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
     use std::sync::atomic::AtomicBool;
@@ -2491,6 +2682,207 @@ mod tests {
         );
         lifecycle.shutdown().await;
         assert!(!other.is_running(), "shutdown fences every clone");
+    }
+
+    #[tokio::test]
+    async fn clear_index_restarts_the_worker_without_touching_primary_data() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "m", "Primary meeting").await;
+        add_transcript(&pool, "t", "m", "Primary transcript").await;
+        let embedder = FakeEmbedder::new();
+        let lifecycle = lifecycle_for_test(free_pressure(), ok_loader(&embedder));
+        lifecycle.attach_database(pool.clone());
+
+        lifecycle.clear_index(&pool).await.unwrap();
+
+        assert_eq!(lifecycle.started_attachments(), 2);
+        assert!(lifecycle.is_running());
+        assert_eq!(scalar(&pool, "SELECT COUNT(*) FROM meetings").await, 1);
+        assert_eq!(scalar(&pool, "SELECT COUNT(*) FROM transcripts").await, 1);
+        lifecycle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn clear_index_rechecks_after_shutdown_before_removing_a_new_shadow() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "m", "Primary meeting").await;
+        add_transcript(&pool, "t", "m", "Primary transcript").await;
+        RetrievalRepository::register_model(
+            &pool,
+            &ModelSpec {
+                model_id: FAKE_MODEL_ID.to_string(),
+                dimensions: FAKE_DIMENSIONS as u32,
+                vector_encoding: VectorEncoding::F32,
+                chunker_version: APPROVED_CHUNKER_VERSION,
+                dequantization_scale: None,
+                dequantization_zero_point: None,
+            },
+        )
+        .await
+        .unwrap();
+        let lifecycle = lifecycle_for_test(free_pressure(), failing_loader());
+        lifecycle.attach_database(pool.clone());
+        let registration_lifecycle = lifecycle.clone();
+        let registration_pool = pool.clone();
+        let registration = tokio::spawn(async move {
+            while !registration_lifecycle.index_paused() {
+                tokio::task::yield_now().await;
+            }
+            RetrievalRepository::register_generation(
+                &registration_pool,
+                "late-shadow",
+                FAKE_MODEL_ID,
+            )
+            .await
+            .unwrap();
+        });
+
+        let result = lifecycle.clear_index(&pool).await;
+        registration.await.unwrap();
+        assert!(result.is_err());
+        assert!(lifecycle.is_running());
+        assert_eq!(scalar(&pool, "SELECT COUNT(*) FROM meetings").await, 1);
+        assert_eq!(
+            RetrievalRepository::generation_status(&pool, "late-shadow")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "building"
+        );
+        lifecycle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn force_lexical_toggle_does_not_follow_shadow_lifecycle_state() {
+        let pool = migrated_pool().await;
+        let lifecycle = RetrievalLifecycle::default();
+        let generation = ensure_test_generation(&pool).await;
+
+        for (generation_state, paused) in [
+            ("building", true),
+            ("building", false),
+            ("failed", false),
+            ("ready", false),
+        ] {
+            sqlx::query("UPDATE retrieval_generations SET state = ? WHERE generation_id = ?")
+                .bind(generation_state)
+                .bind(&generation)
+                .execute(&pool)
+                .await
+                .unwrap();
+            lifecycle.set_index_paused(paused);
+            lifecycle
+                .set_force_lexical_retrieval(&pool, true)
+                .await
+                .unwrap();
+            assert!(SettingsRepository::get_force_lexical_retrieval(&pool)
+                .await
+                .unwrap());
+            lifecycle
+                .set_force_lexical_retrieval(&pool, false)
+                .await
+                .unwrap();
+            assert!(!SettingsRepository::get_force_lexical_retrieval(&pool)
+                .await
+                .unwrap());
+            assert_eq!(lifecycle.index_paused(), paused);
+            assert_eq!(
+                sqlx::query_scalar::<_, String>(
+                    "SELECT state FROM retrieval_generations WHERE generation_id = ?"
+                )
+                .bind(&generation)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                generation_state
+            );
+        }
+
+        lifecycle.set_index_paused(false);
+    }
+
+    #[tokio::test]
+    async fn concurrent_force_lexical_toggles_do_not_mutate_work() {
+        let pool = migrated_pool().await;
+        let lifecycle = RetrievalLifecycle::default();
+        let generation = ensure_test_generation(&pool).await;
+        lifecycle.set_index_paused(true);
+
+        let first = lifecycle.clone();
+        let second = lifecycle.clone();
+        let first_pool = pool.clone();
+        let second_pool = pool.clone();
+        let (first_result, second_result) = tokio::join!(
+            first.set_force_lexical_retrieval(&first_pool, true),
+            second.set_force_lexical_retrieval(&second_pool, false),
+        );
+        first_result.unwrap();
+        second_result.unwrap();
+        assert!(lifecycle.index_paused());
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM retrieval_generations WHERE generation_id = ?"
+            )
+            .bind(&generation)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "building"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_and_force_toggle_race_preserves_the_building_shadow() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "m", "Primary meeting").await;
+        let lifecycle = RetrievalLifecycle::default();
+        let generation = ensure_test_generation(&pool).await;
+
+        let clear_lifecycle = lifecycle.clone();
+        let clear_pool = pool.clone();
+        let force_lifecycle = lifecycle.clone();
+        let force_pool = pool.clone();
+        let (clear_result, force_result) = tokio::join!(
+            clear_lifecycle.clear_index(&clear_pool),
+            force_lifecycle.set_force_lexical_retrieval(&force_pool, true),
+        );
+
+        assert!(clear_result.is_err());
+        force_result.unwrap();
+        assert!(SettingsRepository::get_force_lexical_retrieval(&pool)
+            .await
+            .unwrap());
+        assert_eq!(
+            RetrievalRepository::generation_status(&pool, &generation)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "building"
+        );
+        assert_eq!(scalar(&pool, "SELECT COUNT(*) FROM meetings").await, 1);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_reservation_wait_honors_cancellation() {
+        let lifecycle = RetrievalLifecycle::default();
+        let control = lifecycle.acquire_control().await;
+        let cancel = CancellationToken::new();
+        let waiting_lifecycle = lifecycle.clone();
+        let waiting_cancel = cancel.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_lifecycle
+                .reserve_operation(LifecycleOperation::Rebuild, Some(&waiting_cancel))
+                .await
+        });
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Err(message) if message == "retrieval operation cancelled"));
+        drop(control);
     }
 
     #[tokio::test]

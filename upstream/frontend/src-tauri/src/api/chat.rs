@@ -66,9 +66,11 @@ pub async fn api_chat_get_force_lexical_retrieval(
 #[tauri::command]
 pub async fn api_chat_set_force_lexical_retrieval(
     state: tauri::State<'_, AppState>,
+    retrieval: tauri::State<'_, RetrievalLifecycle>,
     enabled: bool,
 ) -> Result<(), String> {
-    SettingsRepository::set_force_lexical_retrieval(state.db_manager.pool(), enabled)
+    retrieval
+        .set_force_lexical_retrieval(state.db_manager.pool(), enabled)
         .await
         .map_err(|e| e.to_string())
 }

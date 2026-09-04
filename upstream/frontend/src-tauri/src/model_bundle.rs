@@ -12,7 +12,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -95,6 +95,35 @@ pub const fn approved_embedding_contract() -> ApprovedEmbeddingContract {
         onnx_export_revision: APPROVED_EMBEDDING_EXPORT_REVISION,
         onnx_export_quantization: APPROVED_EMBEDDING_QUANTIZATION,
         dimensions: APPROVED_EMBEDDING_DIMENSIONS,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ApprovedRetrievalModelMetadata {
+    pub embedding_name: &'static str,
+    pub embedding_revision: &'static str,
+    pub embedding_attribution: &'static str,
+    pub embedding_license: &'static str,
+    pub embedding_license_url: &'static str,
+    pub reranker_name: &'static str,
+    pub reranker_revision: &'static str,
+    pub reranker_attribution: &'static str,
+    pub reranker_license: &'static str,
+    pub reranker_license_url: &'static str,
+}
+
+pub const fn approved_retrieval_model_metadata() -> ApprovedRetrievalModelMetadata {
+    ApprovedRetrievalModelMetadata {
+        embedding_name: APPROVED_EMBEDDING_MODEL_ID,
+        embedding_revision: APPROVED_EMBEDDING_REVISION,
+        embedding_attribution: APPROVED_MIT_ATTRIBUTION,
+        embedding_license: APPROVED_MIT_SPDX,
+        embedding_license_url: APPROVED_MIT_SOURCE_URL,
+        reranker_name: APPROVED_RERANKER_MODEL_ID,
+        reranker_revision: APPROVED_RERANKER_REVISION,
+        reranker_attribution: APPROVED_APACHE_ATTRIBUTION,
+        reranker_license: APPROVED_APACHE_SPDX,
+        reranker_license_url: APPROVED_APACHE_SOURCE_URL,
     }
 }
 

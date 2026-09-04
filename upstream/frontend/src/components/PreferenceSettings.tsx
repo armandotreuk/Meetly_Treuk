@@ -9,6 +9,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import { useConfig, NotificationSettings } from "@/contexts/ConfigContext";
 import { logger } from "@/lib/logger";
+import { RetrievalIndexSettings } from "./RetrievalIndexSettings";
 
 export function PreferenceSettings() {
     const {
@@ -168,6 +169,8 @@ export function PreferenceSettings() {
 
     return (
         <div className="space-y-6">
+            <RetrievalIndexSettings />
+
             {/* Notifications Section */}
             <div className="bg-white rounded-lg border border-gray-200 p-6 shadow-sm">
                 <div className="flex items-center justify-between">
