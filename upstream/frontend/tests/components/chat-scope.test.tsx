@@ -378,6 +378,342 @@ describe("ChatHost scoped panel", () => {
         expect(mocks.invoke.mock.calls.filter(([command, args]) => command === "api_chat_save_message" && args.role === "assistant")).toHaveLength(1);
     });
 
+    it("scrubs only the deleted meeting's sources from loaded messages on the deletion notification", async () => {
+        const scope: ChatScope = { kind: "all", key: "all" };
+        mocks.invoke.mockImplementation((command: string, args?: any) => {
+            if (command === "api_get_chat_model_config") return Promise.resolve({});
+            if (command === "api_chat_get_or_create_scoped_conversation") return Promise.resolve({ id: `conversation-${args.scope.key}` });
+            if (command === "api_chat_get_messages") return Promise.resolve([
+                { id: "row-1", conversation_id: "conversation-all", role: "assistant", content: "history answer", sources_json: "{\"unexpected\":\"shape\"}", is_error: false, created_at: "2026-09-03T00:00:00Z" },
+            ]);
+            return Promise.resolve();
+        });
+        await act(async () => root.render(<ChatHost><Launcher scope={scope} label="all" /></ChatHost>));
+        await act(async () => (container.querySelector("button") as HTMLButtonElement).click());
+        await flush();
+        expect(container.textContent).toContain("history answer");
+        const textarea = container.querySelector("textarea")!;
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, "question");
+            textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        await act(async () => (container.querySelector('[aria-label="Send message"]') as HTMLButtonElement).click());
+        await flush();
+        const streamId = mocks.invoke.mock.calls.find(([command]) => command === "api_chat_with_scoped_conversation_stream")![1].streamId;
+
+        // A completed loaded message carrying sources from two meetings,
+        // alongside a history message whose sources array is malformed.
+        const sources = [
+            { meetingId: "kept-1", meetingTitle: "Kept meeting", chunkType: "transcript", snippet: "kept snippet", folderName: "" },
+            { meetingId: "deleted-1", meetingTitle: "Deleted meeting", chunkType: "transcript", snippet: "private deleted snippet", folderName: "" },
+        ];
+        await act(async () => mocks.listeners.get("chat-stream-start")!({ payload: { streamId, sources } }));
+        await act(async () => mocks.listeners.get("chat-stream-chunk")!({ payload: { streamId, text: "completed answer" } }));
+        await act(async () => mocks.listeners.get("chat-stream-done")!({ payload: { streamId, answer: "completed answer", sources } }));
+        expect(container.textContent).toContain("completed answer");
+        expect(container.querySelector('[aria-label="Open meeting Deleted meeting"]')).not.toBeNull();
+        expect(container.querySelector('[aria-label="Open meeting Kept meeting"]')).not.toBeNull();
+        const assistantSaves = () => mocks.invoke.mock.calls.filter(([command, args]) => command === "api_chat_save_message" && args.role === "assistant").length;
+        const savesBefore = assistantSaves();
+
+        // A malformed notification (missing identity) changes nothing.
+        await act(async () => mocks.listeners.get("chat-meeting-deleted")!({ payload: {} }));
+        expect(container.querySelector('[aria-label="Open meeting Deleted meeting"]')).not.toBeNull();
+
+        // The committed-deletion notification scrubs only that meeting's
+        // sources immediately, keeping the answer text and other sources.
+        await act(async () => mocks.listeners.get("chat-meeting-deleted")!({ payload: { meetingId: "deleted-1" } }));
+        expect(container.textContent).toContain("completed answer");
+        expect(container.textContent).toContain("Kept meeting");
+        expect(container.textContent).not.toContain("Deleted meeting");
+        expect(container.textContent).not.toContain("private deleted snippet");
+        expect(container.querySelector('[aria-label="Open meeting Deleted meeting"]')).toBeNull();
+        expect(container.querySelector('[aria-label="Open meeting Kept meeting"]')).not.toBeNull();
+        expect(container.querySelector("textarea")?.disabled).toBe(false);
+        expect(container.querySelectorAll('[role="alert"]')).toHaveLength(0);
+        expect(container.textContent).toContain("history answer");
+        // The scrub is renderer-local: no re-persistence of any sources.
+        expect(assistantSaves()).toBe(savesBefore);
+
+        // A stale/duplicate notification is an idempotent no-op.
+        await act(async () => mocks.listeners.get("chat-meeting-deleted")!({ payload: { meetingId: "deleted-1" } }));
+        expect(container.querySelector('[aria-label="Open meeting Kept meeting"]')).not.toBeNull();
+        expect(container.querySelector('[aria-label="Open meeting Deleted meeting"]')).toBeNull();
+        expect(container.textContent).toContain("completed answer");
+    });
+
+    it("keeps conversation, input, and sending usable while the deletion listener never registers", async () => {
+        const scope: ChatScope = { kind: "all", key: "all" };
+        mocks.listen.mockImplementation((name: string, callback: (event: { payload: any }) => void) => {
+            if (name === "chat-meeting-deleted") {
+                // Registration never settles: nothing may await it.
+                return new Promise(() => {});
+            }
+            mocks.listeners.set(name, callback);
+            return mocks.unlisten;
+        });
+        await act(async () => root.render(<ChatHost><Launcher scope={scope} label="all" /></ChatHost>));
+        await act(async () => (container.querySelector("button") as HTMLButtonElement).click());
+        await flush();
+        // Conversation creation and input are NOT blocked by the pending
+        // registration, and the listener callback was never installed.
+        expect(mocks.invoke.mock.calls.some(([command]) => command === "api_chat_get_or_create_scoped_conversation")).toBe(true);
+        expect(mocks.listeners.has("chat-meeting-deleted")).toBe(false);
+        expect(container.querySelector("textarea")?.disabled).toBe(false);
+        const textarea = container.querySelector("textarea")!;
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, "question");
+            textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        await act(async () => (container.querySelector('[aria-label="Send message"]') as HTMLButtonElement).click());
+        await flush();
+        const streamId = mocks.invoke.mock.calls.find(([command]) => command === "api_chat_with_scoped_conversation_stream")![1].streamId;
+        const sources = [{ meetingId: "m-gone", meetingTitle: "Gone meeting", chunkType: "transcript", snippet: "private gone snippet", folderName: "" }];
+        await act(async () => mocks.listeners.get("chat-stream-start")!({ payload: { streamId, sources } }));
+        await act(async () => mocks.listeners.get("chat-stream-chunk")!({ payload: { streamId, text: "pending answer" } }));
+        await act(async () => mocks.listeners.get("chat-stream-done")!({ payload: { streamId, answer: "pending answer", sources } }));
+        // Text renders source-free while the subscription is unconfirmed; no
+        // raw listener error surfaces.
+        expect(container.textContent).toContain("pending answer");
+        expect(container.textContent).not.toContain("Gone meeting");
+        expect(container.textContent).not.toContain("private gone snippet");
+        expect(container.querySelectorAll('[aria-label="Open meeting Gone meeting"]').length).toBe(0);
+        expect(container.textContent).not.toContain("ipc down");
+        expect(container.querySelector('[aria-label="Stop generating"]')).toBeNull();
+        expect(container.querySelector("textarea")?.disabled).toBe(false);
+    });
+
+    it("filters a locally deleted meeting's sources from a load result that resolves after the deletion", async () => {
+        const scope: ChatScope = { kind: "all", key: "all" };
+        let resolveConversation!: (conversation: any) => void;
+        let resolveLoad!: (rows: any[]) => void;
+        mocks.invoke.mockImplementation((command: string, args?: any) => {
+            if (command === "api_get_chat_model_config") return Promise.resolve({});
+            if (command === "api_chat_get_or_create_scoped_conversation") return new Promise((resolve) => { resolveConversation = resolve; });
+            if (command === "api_chat_get_messages") return new Promise((resolve) => { resolveLoad = resolve; });
+            return Promise.resolve();
+        });
+        await act(async () => root.render(<ChatHost><Launcher scope={scope} label="all" /></ChatHost>));
+        await act(async () => (container.querySelector("button") as HTMLButtonElement).click());
+        await flush();
+        // Registration is confirmed active BEFORE the rows are read.
+        await act(async () => resolveConversation({ id: "conversation-all" }));
+        await flush();
+        // The deletion commits while the load is in flight: the recorded id
+        // must filter the load result that resolves afterwards.
+        await act(async () => mocks.listeners.get("chat-meeting-deleted")!({ payload: { meetingId: "m-gone" } }));
+        await act(async () => resolveLoad([
+            { id: "row-1", role: "assistant", content: "loaded answer", sources_json: JSON.stringify([
+                { meetingId: "m-gone", meetingTitle: "Gone meeting", chunkType: "transcript", snippet: "private gone snippet", folderName: "" },
+                { meetingId: "m-kept", meetingTitle: "Kept meeting", chunkType: "transcript", snippet: "kept snippet", folderName: "" },
+            ]), is_error: false },
+        ]));
+        await flush();
+        expect(container.textContent).toContain("loaded answer");
+        expect(container.textContent).toContain("Kept meeting");
+        expect(container.textContent).not.toContain("Gone meeting");
+        expect(container.textContent).not.toContain("private gone snippet");
+        expect(container.querySelector('[aria-label="Open meeting Kept meeting"]')).not.toBeNull();
+        expect(container.querySelector('[aria-label="Open meeting Gone meeting"]')).toBeNull();
+    });
+
+    it("degrades to source-free rendering when the deletion listener registration fails", async () => {
+        const scope: ChatScope = { kind: "all", key: "all" };
+        let resolveLoad!: (rows: any[]) => void;
+        mocks.listen.mockImplementation((name: string, callback: (event: { payload: any }) => void) => {
+            if (name === "chat-meeting-deleted") {
+                // Registration failure is fail-closed and never surfaced raw.
+                return Promise.reject(new Error("ipc down: raw listener details"));
+            }
+            mocks.listeners.set(name, callback);
+            return mocks.unlisten;
+        });
+        mocks.invoke.mockImplementation((command: string, args?: any) => {
+            if (command === "api_get_chat_model_config") return Promise.resolve({});
+            if (command === "api_chat_get_or_create_scoped_conversation") return Promise.resolve({ id: `conversation-${args.scope.key}` });
+            if (command === "api_chat_get_messages") return new Promise((resolve) => { resolveLoad = resolve; });
+            return Promise.resolve();
+        });
+        await act(async () => root.render(<ChatHost><Launcher scope={scope} label="all" /></ChatHost>));
+        await act(async () => (container.querySelector("button") as HTMLButtonElement).click());
+        await flush();
+        // No listener exists: a committed deletion could not be observed, so
+        // a source-bearing load result must render without any sources.
+        expect(mocks.listeners.has("chat-meeting-deleted")).toBe(false);
+        await act(async () => resolveLoad([
+            { id: "row-1", role: "assistant", content: "loaded answer", sources_json: JSON.stringify([
+                { meetingId: "m-gone", meetingTitle: "Gone meeting", chunkType: "transcript", snippet: "private gone snippet", folderName: "" },
+            ]), is_error: false },
+        ]));
+        await flush();
+        expect(container.textContent).toContain("loaded answer");
+        expect(container.textContent).not.toContain("Gone meeting");
+        expect(container.textContent).not.toContain("private gone snippet");
+        expect(container.querySelectorAll('[aria-label="Open meeting Gone meeting"]').length).toBe(0);
+        // The raw listener error is never surfaced; the panel stays usable.
+        expect(container.textContent).not.toContain("ipc down");
+        const textarea = container.querySelector("textarea")!;
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, "question");
+            textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        await act(async () => (container.querySelector('[aria-label="Send message"]') as HTMLButtonElement).click());
+        await flush();
+        const streamId = mocks.invoke.mock.calls.find(([command]) => command === "api_chat_with_scoped_conversation_stream")![1].streamId;
+        const sources = [{ meetingId: "m-gone", meetingTitle: "Gone meeting", chunkType: "transcript", snippet: "private gone snippet", folderName: "" }];
+        await act(async () => mocks.listeners.get("chat-stream-start")!({ payload: { streamId, sources } }));
+        await act(async () => mocks.listeners.get("chat-stream-chunk")!({ payload: { streamId, text: "stream answer" } }));
+        await act(async () => mocks.listeners.get("chat-stream-done")!({ payload: { streamId, answer: "stream answer", sources } }));
+        expect(container.textContent).toContain("stream answer");
+        expect(container.querySelectorAll('[aria-label="Open meeting Gone meeting"]').length).toBe(0);
+        expect(container.querySelector('[aria-label="Stop generating"]')).toBeNull();
+        expect(container.querySelector("textarea")?.disabled).toBe(false);
+    });
+
+    it("bounds locally retained deletions and degrades source rendering on overflow", async () => {
+        const all: ChatScope = { kind: "all", key: "all" };
+        const meeting: ChatScope = { kind: "meeting", key: "meeting-1" };
+        await act(async () => root.render(<ChatHost><Launcher scope={all} label="all" /><Launcher scope={meeting} label="meeting" /></ChatHost>));
+        await act(async () => (container.querySelector("button") as HTMLButtonElement).click());
+        await flush();
+        // Saturate the per-epoch cap (64) and force one eviction.
+        for (let index = 0; index < 65; index++) {
+            await act(async () => mocks.listeners.get("chat-meeting-deleted")!({ payload: { meetingId: `del-${index}` } }));
+        }
+        // A response carrying an evicted id and unknown ids cannot restore
+        // any source for the rest of this generation: answer text renders,
+        // no source chips do.
+        const textarea = container.querySelector("textarea")!;
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, "saturated");
+            textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        await act(async () => (container.querySelector('[aria-label="Send message"]') as HTMLButtonElement).click());
+        await flush();
+        const streamId = mocks.invoke.mock.calls.find(([command]) => command === "api_chat_with_scoped_conversation_stream")![1].streamId;
+        const saturatedSources = [
+            { meetingId: "del-0", meetingTitle: "Evicted meeting", chunkType: "transcript", snippet: "evicted snippet", folderName: "" },
+            { meetingId: "m-fresh", meetingTitle: "Fresh meeting", chunkType: "transcript", snippet: "fresh snippet", folderName: "" },
+        ];
+        await act(async () => mocks.listeners.get("chat-stream-start")!({ payload: { streamId, sources: saturatedSources } }));
+        await act(async () => mocks.listeners.get("chat-stream-chunk")!({ payload: { streamId, text: "saturated answer" } }));
+        await act(async () => mocks.listeners.get("chat-stream-done")!({ payload: { streamId, answer: "saturated answer", sources: saturatedSources } }));
+        expect(container.textContent).toContain("saturated answer");
+        expect(container.querySelectorAll('[aria-label="Open meeting Evicted meeting"]').length).toBe(0);
+        expect(container.querySelectorAll('[aria-label="Open meeting Fresh meeting"]').length).toBe(0);
+
+        // A scope change bounds the epoch: recorded deletions and the
+        // degradation expire with the old generation, so non-deleted sources
+        // render again (safety permits preserving other metadata).
+        await act(async () => (Array.from(container.querySelectorAll("button")).find((button) => button.textContent === "meeting") as HTMLButtonElement).click());
+        await flush();
+        const meetingTextarea = container.querySelector("textarea")!;
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(meetingTextarea, "after switch");
+            meetingTextarea.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        await act(async () => (container.querySelector('[aria-label="Send message"]') as HTMLButtonElement).click());
+        await flush();
+        const nextStreamId = mocks.invoke.mock.calls.filter(([command]) => command === "api_chat_with_scoped_conversation_stream")[1]![1].streamId;
+        const freshSources = [{ meetingId: "m-fresh", meetingTitle: "Fresh meeting", chunkType: "transcript", snippet: "fresh snippet", folderName: "" }];
+        await act(async () => mocks.listeners.get("chat-stream-start")!({ payload: { streamId: nextStreamId, sources: freshSources } }));
+        await act(async () => mocks.listeners.get("chat-stream-chunk")!({ payload: { streamId: nextStreamId, text: "switched answer" } }));
+        await act(async () => mocks.listeners.get("chat-stream-done")!({ payload: { streamId: nextStreamId, answer: "switched answer", sources: freshSources } }));
+        expect(container.textContent).toContain("switched answer");
+        expect(container.querySelectorAll('[aria-label="Open meeting Fresh meeting"]').length).toBe(1);
+        // The evicted id from the previous epoch stays suppressed server-side
+        // and is no longer rendered anywhere.
+        expect(container.querySelectorAll('[aria-label="Open meeting Evicted meeting"]').length).toBe(0);
+    });
+
+    it("ignores deletion events delivered after the panel unmounts", async () => {
+        const scope: ChatScope = { kind: "all", key: "all" };
+        await act(async () => root.render(<ChatHost><Launcher scope={scope} label="all" /></ChatHost>));
+        await act(async () => (container.querySelector("button") as HTMLButtonElement).click());
+        await flush();
+        const staleCallback = mocks.listeners.get("chat-meeting-deleted")!;
+        expect(staleCallback).toBeDefined();
+
+        // Close the persisted panel via a recording start (established
+        // harness behavior), then deliver the event to the stale callback.
+        mocks.isRecording = true;
+        await act(async () => root.render(<ChatHost><Launcher scope={scope} label="all" /></ChatHost>));
+        await flush();
+        expect(() => staleCallback({ payload: { meetingId: "m-late" } })).not.toThrow();
+
+        // A freshly opened panel instance inherits nothing from the stale
+        // callback: a completed message carrying that meeting's source stays.
+        mocks.isRecording = false;
+        await act(async () => root.render(<ChatHost><Launcher scope={scope} label="all" /></ChatHost>));
+        await act(async () => (container.querySelector("button") as HTMLButtonElement).click());
+        await flush();
+        const textarea = container.querySelector("textarea")!;
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, "question");
+            textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        await act(async () => (container.querySelector('[aria-label="Send message"]') as HTMLButtonElement).click());
+        await flush();
+        const streamId = mocks.invoke.mock.calls.find(([command]) => command === "api_chat_with_scoped_conversation_stream")![1].streamId;
+        const sources = [{ meetingId: "m-late", meetingTitle: "Late meeting", chunkType: "transcript", snippet: "late snippet", folderName: "" }];
+        await act(async () => mocks.listeners.get("chat-stream-start")!({ payload: { streamId, sources } }));
+        await act(async () => mocks.listeners.get("chat-stream-chunk")!({ payload: { streamId, text: "late answer" } }));
+        await act(async () => mocks.listeners.get("chat-stream-done")!({ payload: { streamId, answer: "late answer", sources } }));
+        expect(container.textContent).toContain("late answer");
+        expect(container.querySelector('[aria-label="Open meeting Late meeting"]')).not.toBeNull();
+    });
+
+    it("scrubs the deleted meeting from active and completed rows idempotently", async () => {
+        const scope: ChatScope = { kind: "all", key: "all" };
+        await act(async () => root.render(<ChatHost><Launcher scope={scope} label="all" /></ChatHost>));
+        await act(async () => (container.querySelector("button") as HTMLButtonElement).click());
+        await flush();
+        const typeAndSend = async (text: string) => {
+            const textarea = container.querySelector("textarea")!;
+            await act(async () => {
+                Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, text);
+                textarea.dispatchEvent(new Event("input", { bubbles: true }));
+            });
+            await act(async () => (container.querySelector('[aria-label="Send message"]') as HTMLButtonElement).click());
+            await flush();
+        };
+        await typeAndSend("first");
+        const sources = [
+            { meetingId: "m-gone", meetingTitle: "Gone meeting", chunkType: "transcript", snippet: "private gone snippet", folderName: "" },
+            { meetingId: "m-kept", meetingTitle: "Kept meeting", chunkType: "transcript", snippet: "kept snippet", folderName: "" },
+        ];
+        let streamId = mocks.invoke.mock.calls.find(([command]) => command === "api_chat_with_scoped_conversation_stream")![1].streamId;
+        await act(async () => mocks.listeners.get("chat-stream-start")!({ payload: { streamId, sources } }));
+        await act(async () => mocks.listeners.get("chat-stream-chunk")!({ payload: { streamId, text: "first answer" } }));
+        await act(async () => mocks.listeners.get("chat-stream-done")!({ payload: { streamId, answer: "first answer", sources } }));
+
+        // Second turn: an active streaming row with the same source set.
+        await typeAndSend("second");
+        streamId = mocks.invoke.mock.calls.filter(([command]) => command === "api_chat_with_scoped_conversation_stream")[1]![1].streamId;
+        await act(async () => mocks.listeners.get("chat-stream-start")!({ payload: { streamId, sources } }));
+        await act(async () => mocks.listeners.get("chat-stream-chunk")!({ payload: { streamId, text: "partial second" } }));
+        expect(container.querySelector('[aria-label="Stop generating"]')).not.toBeNull();
+
+        // One deletion scrubs BOTH rows' deleted-meeting sources while
+        // keeping answer text, the other source, and the active stream.
+        await act(async () => mocks.listeners.get("chat-meeting-deleted")!({ payload: { meetingId: "m-gone" } }));
+        expect(container.textContent).toContain("first answer");
+        expect(container.textContent).toContain("partial second");
+        expect(container.textContent).toContain("Kept meeting");
+        expect(container.textContent).not.toContain("Gone meeting");
+        expect(container.textContent).not.toContain("private gone snippet");
+        expect(container.querySelectorAll('[aria-label="Open meeting Kept meeting"]').length).toBe(2);
+        expect(container.querySelectorAll('[aria-label="Open meeting Gone meeting"]').length).toBe(0);
+        expect(container.querySelector('[aria-label="Stop generating"]')).not.toBeNull();
+
+        // A duplicate event is an idempotent no-op.
+        await act(async () => mocks.listeners.get("chat-meeting-deleted")!({ payload: { meetingId: "m-gone" } }));
+        expect(container.querySelectorAll('[aria-label="Open meeting Kept meeting"]').length).toBe(2);
+        expect(container.querySelectorAll('[aria-label="Open meeting Gone meeting"]').length).toBe(0);
+        expect(container.textContent).toContain("first answer");
+        expect(container.textContent).toContain("partial second");
+    });
+
     it("restores the active panel when deletion aborts before stream start", async () => {
         const scope: ChatScope = { kind: "all", key: "all" };
         await act(async () => root.render(<ChatHost><Launcher scope={scope} label="all" /></ChatHost>));
@@ -577,7 +913,14 @@ describe("ChatHost scoped panel", () => {
         let resolveListener!: (unlisten: () => void) => void;
         let staleCallback!: (event: { payload: any }) => void;
         const lateUnlisten = vi.fn();
-        mocks.listen.mockImplementationOnce((_name: string, callback: (event: { payload: any }) => void) => {
+        // Intercept the first STREAM listener registration (the mount-scoped
+        // deletion listener registers separately and is not the stale-stream
+        // subject of this test).
+        mocks.listen.mockImplementation((name: string, callback: (event: { payload: any }) => void) => {
+            if (name !== "chat-stream-start" || staleCallback) {
+                mocks.listeners.set(name, callback);
+                return mocks.unlisten;
+            }
             staleCallback = callback;
             return new Promise((resolve) => { resolveListener = resolve; });
         });

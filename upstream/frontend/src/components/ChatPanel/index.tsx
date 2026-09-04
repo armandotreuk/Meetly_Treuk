@@ -15,6 +15,7 @@ import type {
     ChatStreamDonePayload,
     ChatStreamErrorPayload,
     ChatStreamAbortPayload,
+    ChatMeetingDeletedPayload,
     ChatConversation,
     ChatMessageRow,
     ChatSource,
@@ -28,6 +29,13 @@ interface ChatPanelProps {
     resolvedLabel?: string;
     onClose: () => void;
 }
+
+// ponytail: deletions recorded per panel epoch are capped; overflowing the
+// cap suppresses source rendering for the rest of that epoch (see
+// sanitizeSources) instead of risking a re-rendered deleted source via an
+// in-flight response. Raise the cap only together with a real LRU that
+// invalidates responses on eviction.
+const MAX_LOCALLY_DELETED_MEETING_IDS = 64;
 
 function parseSources(sourcesJson: string): ChatSource[] | undefined {
     try {
@@ -73,6 +81,19 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
     const inputRef = useRef<HTMLTextAreaElement>(null);
     const unlistenersRef = useRef<UnlistenFn[]>([]);
     const streamIdRef = useRef<string | null>(null);
+    // Locally observed deletions, generation-tagged (R74): meeting id to the
+    // scope generation during which the deletion was observed. Bounded by
+    // MAX_LOCALLY_DELETED_MEETING_IDS; entries from older generations are
+    // purged on scope change because older responses can no longer apply.
+    const locallyDeletedMeetingsRef = useRef<Map<string, number>>(new Map());
+    // Set when the cap overflowed during a generation: every response of that
+    // generation may carry an evicted id, so source rendering degrades until
+    // the next scope change bounds the epoch.
+    const deletedSourcesEvictedInRef = useRef<number | null>(null);
+    // True only once the deletion subscription is confirmed registered. Until
+    // then (or if registration failed), rendering source/navigation data is
+    // unsafe: a committed deletion could not be observed. Fail-closed.
+    const deletionSubscriptionActiveRef = useRef(false);
     const [modelLabel, setModelLabel] = useState<string | null>(null);
     const [providerKind, setProviderKind] = useState<string | null>(null);
     const scopeRef = useRef(scope);
@@ -105,6 +126,27 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
         unlistenersRef.current = [];
     }, []);
 
+    // Drops sources that cannot be rendered safely from a source array before
+    // it reaches message state. Fail-closed (R74/R75): the caller passes
+    // trust=true only when the deletion subscription was confirmed active
+    // BEFORE the underlying data was read - otherwise (pending or failed
+    // registration) ALL source/navigation data is suppressed, because a
+    // committed deletion could not have been observed. Trusted results are
+    // additionally stripped once the recorded-deletion cap overflowed during
+    // the current generation (an evicted id could ride in on an in-flight
+    // response) and are filtered against the recorded deletions. Malformed
+    // (non-array) input is normalized to undefined. Idempotent; never
+    // surfaces a raw error.
+    const sanitizeSources = useCallback((sources: ChatSource[] | undefined, trusted: boolean) => {
+        if (!trusted) return undefined;
+        const evictedIn = deletedSourcesEvictedInRef.current;
+        if (evictedIn !== null && evictedIn <= scopeGenerationRef.current) return undefined;
+        if (!Array.isArray(sources)) return undefined;
+        const recorded = locallyDeletedMeetingsRef.current;
+        const filtered = sources.filter((source) => !recorded.has(source?.meetingId));
+        return filtered.length === sources.length ? sources : filtered;
+    }, []);
+
     useEffect(() => {
         let cancelled = false;
         invoke<{ provider?: string | null; model?: string | null }>("api_get_chat_model_config")
@@ -124,9 +166,85 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
         conversationIdRef.current = conversationId;
     }, [conversationId]);
 
+    // Committed-deletion notification (panel lifetime): the backend emits one
+    // identity-only event after a meeting deletion commits. The callback
+    // records the stable id synchronously (idempotent, bounded with
+    // generation-tagged eviction) and scrubs the rows already in state; every
+    // later load/update filters through sanitizeSources with trust captured
+    // BEFORE its data was read. Registration never blocks conversation
+    // creation, sending, or rendering (R75): until it settles - or forever if
+    // it fails - every result is applied source-free, and a LATE successful
+    // registration re-enables sources only for loads/streams whose data is
+    // read after it, never for stripped stale results. After unmount the
+    // callback is a no-op.
+    useEffect(() => {
+        let cancelled = false;
+        let unlisten: UnlistenFn | undefined;
+        void (async () => {
+            const fn = await listen<ChatMeetingDeletedPayload>("chat-meeting-deleted", (event) => {
+                const meetingId = event.payload?.meetingId;
+                if (cancelled || typeof meetingId !== "string" || !meetingId) return;
+                const recorded = locallyDeletedMeetingsRef.current;
+                if (!recorded.has(meetingId)) {
+                    recorded.set(meetingId, scopeGenerationRef.current);
+                    while (recorded.size > MAX_LOCALLY_DELETED_MEETING_IDS) {
+                        let oldestId: string | null = null;
+                        let oldestGeneration = Infinity;
+                        for (const [id, recordedGeneration] of recorded) {
+                            if (recordedGeneration < oldestGeneration) {
+                                oldestGeneration = recordedGeneration;
+                                oldestId = id;
+                            }
+                        }
+                        if (oldestId === null) break;
+                        recorded.delete(oldestId);
+                        deletedSourcesEvictedInRef.current = scopeGenerationRef.current;
+                    }
+                }
+                setMessages((prev) =>
+                    prev.map((message) => {
+                        if (!Array.isArray(message.sources)) return message;
+                        if (!message.sources.some((source) => source?.meetingId === meetingId)) {
+                            return message;
+                        }
+                        return {
+                            ...message,
+                            sources: message.sources.filter(
+                                (source) => source?.meetingId !== meetingId
+                            ),
+                        };
+                    })
+                );
+            });
+            if (cancelled) fn();
+            else {
+                unlisten = fn;
+                deletionSubscriptionActiveRef.current = true;
+            }
+        })().catch((error) => {
+            // Fail closed: deletionSubscriptionActiveRef stays false, so
+            // source/navigation rendering stays suppressed for this panel's
+            // lifetime. The raw error is never surfaced to the UI.
+            logger.error("Failed to listen for meeting deletions:", error);
+        });
+        return () => {
+            cancelled = true;
+            unlisten?.();
+        };
+    }, []);
+
     useEffect(() => {
         let cancelled = false;
         const generation = scopeGenerationRef.current;
+        // Generation change bounds the deletion epoch (R74): responses from
+        // older generations can no longer apply (generation guards below and
+        // isCurrentRequest), so their recorded deletions expire with them,
+        // and any cap-overflow degradation from an older generation lifts.
+        for (const [id, recordedGeneration] of locallyDeletedMeetingsRef.current) {
+            if (recordedGeneration < generation) locallyDeletedMeetingsRef.current.delete(id);
+        }
+        const evictedIn = deletedSourcesEvictedInRef.current;
+        if (evictedIn !== null && evictedIn < generation) deletedSourcesEvictedInRef.current = null;
         const oldStreamId = streamIdRef.current;
         if (oldStreamId) void invoke("api_cancel_chat_stream", { streamId: oldStreamId });
         streamIdRef.current = null;
@@ -148,6 +266,13 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
                 );
                 if (cancelled || generation !== scopeGenerationRef.current) return;
                 const conversationId = conversation.id;
+                // Trust boundary = read start (R75): a load whose rows are
+                // read while the deletion subscription is unconfirmed may
+                // predate an unobservable deletion, so it renders source-free
+                // even if the subscription succeeds before application. A
+                // load read while active is filtered against the recorded
+                // deletions at application.
+                const sourcesTrusted = deletionSubscriptionActiveRef.current;
                 const rows = await invoke<ChatMessageRow[]>("api_chat_get_messages", {
                     conversationId,
                 });
@@ -157,7 +282,10 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
                     rows.map((row) => ({
                         role: row.role,
                         content: row.content,
-                        sources: row.sources_json ? parseSources(row.sources_json) : undefined,
+                        sources: sanitizeSources(
+                            row.sources_json ? parseSources(row.sources_json) : undefined,
+                            sourcesTrusted
+                        ),
                         isError: row.is_error,
                     }))
                 );
@@ -185,7 +313,7 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
             cancelled = true;
             conversationIdRef.current = null;
         };
-    }, [scope, cleanupListeners]);
+    }, [scope, cleanupListeners, sanitizeSources]);
 
     // Auto-scroll to bottom on new messages
     useEffect(() => {
@@ -261,6 +389,10 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
         const streamId = crypto.randomUUID();
         streamIdRef.current = streamId;
         const isCurrentRequest = () => isCurrentScope() && streamIdRef.current === streamId;
+        // Trust boundary = send start (R75): a stream begun while the
+        // deletion subscription is unconfirmed renders source-free for its
+        // whole lifecycle, even if registration succeeds mid-stream.
+        const streamSourcesTrusted = deletionSubscriptionActiveRef.current;
 
         cleanupListeners();
 
@@ -278,7 +410,7 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
                         {
                             role: "assistant",
                             content: "",
-                            sources: event.payload.sources,
+                            sources: sanitizeSources(event.payload.sources, streamSourcesTrusted),
                             isStreaming: true,
                         },
                     ]);
@@ -332,13 +464,14 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
                 "chat-stream-done",
                 (event) => {
                     if (!isCurrentRequest() || event.payload.streamId !== streamId) return;
+                    const sources = sanitizeSources(event.payload.sources, streamSourcesTrusted);
                     setIsStreaming(false);
                     setPreparationProgress(null);
                     cleanupListeners();
                     saveMessage(streamConversationId, {
                         role: "assistant",
                         content: event.payload.answer,
-                        sources: event.payload.sources,
+                        sources,
                     });
                     setMessages((prev) => {
                         const last = prev[prev.length - 1];
@@ -348,7 +481,7 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
                         const updated: ChatMessageType = {
                             ...last,
                             content: event.payload.answer || last.content,
-                            sources: event.payload.sources,
+                            sources,
                             isStreaming: false,
                         };
                         return [...prev.slice(0, -1), updated];

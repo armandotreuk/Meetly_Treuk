@@ -760,6 +760,628 @@ async fn open_and_expansion_of_the_same_meeting_merge_across_rounds() {
     assert!(ids.contains("deep:notes:m-b"), "ids: {ids:?}");
 }
 
+/// Discovers retained range-free (summary/notes) evidence IDs - implicit
+/// opens - through the exact initial pass the agent runs, so the shared
+/// open-budget test scripts real offered capabilities. Returns evidence IDs
+/// paired with their owning meeting in ranked order.
+async fn retained_range_free_evidence_ids(
+    pool: &SqlitePool,
+    query: &str,
+    count: usize,
+) -> Vec<(String, String)> {
+    let service = RetrievalService::new(failing_lifecycle());
+    let ranked = service
+        .retrieve_ranked(
+            pool,
+            RetrievalRequest {
+                original_query: query.to_string(),
+                rewritten_query: Some(query.to_string()),
+                scope: PersistedRetrievalScope::All,
+                purpose: RetrievalPurpose::Chat,
+                limits: RetrievalLimits::chat_default(),
+                core_language: CoreTermLanguage::English,
+                cancellation: None,
+            },
+        )
+        .await
+        .unwrap();
+    ranked
+        .ranking
+        .evidence
+        .iter()
+        .filter(|entry| entry.evidence.source_start_id.is_none())
+        .map(|entry| {
+            (
+                entry.evidence.evidence_id.clone(),
+                entry.evidence.meeting_id.clone(),
+            )
+        })
+        .take(count)
+        .collect()
+}
+
+#[tokio::test]
+async fn deep_only_work_stops_at_the_pre_final_boundary_and_fits_the_original_deadline() {
+    // R82: every Deep-only action carries the absolute pre-final token, which
+    // fires `final_revalidation_reserve` before the total envelope. The
+    // planner round is cut off at exactly that boundary, and the fence plus
+    // the answer handoff finish INSIDE the original deadline - never past it.
+    let pool = seeded_pool(&[("m-a", "Alpha", "zulu quarterly planning notes")]).await;
+    let planner = DeadlineUnblockingPlanner;
+    let started = std::time::Instant::now();
+    let recorder = ProgressRecorder::default();
+    let sink = recorder.sink();
+    let outcome = run_deep_preparation(DeepPreparationInput {
+        bounds: DeepBounds {
+            call_timeout: Duration::from_secs(30),
+            preparation_budget: Duration::from_millis(300),
+            final_revalidation_reserve: Duration::from_millis(100),
+            ..DeepBounds::production()
+        },
+        ..deep_input(
+            &pool,
+            PersistedRetrievalScope::All,
+            "zulu planning",
+            &planner,
+            Some(&sink),
+            &CancellationToken::new(),
+        )
+    })
+    .await
+    .unwrap();
+    // The pre-final boundary fired at 200ms (300ms - 100ms reserve): the
+    // planner round stopped there and the fence plus handoff completed before
+    // the ORIGINAL 300ms deadline - the wall clock never extends past it.
+    assert!(started.elapsed() < Duration::from_millis(300));
+    assert_eq!(outcome.planner_round_trips, 1);
+    assert_eq!(outcome.additional_rounds, 0);
+    assert!(!outcome.hydrated.sources.is_empty());
+    assert!(outcome
+        .hydrated
+        .sources
+        .iter()
+        .all(|source| source.meeting_id == "m-a"));
+    assert!(recorder
+        .stages()
+        .contains(&DeepProgressStage::AnswerGeneration));
+}
+
+#[tokio::test]
+async fn explicit_and_range_free_opens_share_one_admission_budget() {
+    // Ten range-free (summary/notes) expansions from ten distinct meetings
+    // plus three explicit opens: the shared per-round/total open budget must
+    // open at most PLANNER_MAX_OPENS_PER_ROUND distinct meetings in round one
+    // and PLANNER_MAX_OPENS_TOTAL across the request, and excess expansions
+    // run no load work at all.
+    let pool = seeded_pool(&[("m-0", "Base", "zulu quarterly planning notes")]).await;
+    for index in 1..=10 {
+        let id = format!("x-{index}");
+        insert_meeting(&pool, &id, &format!("Range {index}")).await;
+        // Each meeting's unique transcript head is the loader-boundary
+        // probe: a started head load ALWAYS publishes `deep:t-x-{index}`
+        // evidence, so its absence proves the loader never started.
+        add_transcript(
+            &pool,
+            &format!("t-x-{index}"),
+            &id,
+            &format!("zulu planning head transcript {index}"),
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO meeting_notes (meeting_id, notes_markdown, created_at, updated_at) VALUES (?, ?, '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z')",
+        )
+        .bind(&id)
+        .bind(format!("zulu planning archive note {index}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+        refresh_fts(&pool, &id).await;
+    }
+    for index in 1..=5 {
+        let id = format!("e-{index}");
+        insert_meeting(&pool, &id, &format!("Explicit {index}")).await;
+        sqlx::query(
+            "INSERT INTO meeting_notes (meeting_id, notes_markdown, created_at, updated_at) VALUES (?, ?, '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z')",
+        )
+        .bind(&id)
+        .bind(format!("zulu planning explicit note {index}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+        refresh_fts(&pool, &id).await;
+    }
+    // Discover the ten retained range-free (notes) evidence IDs of the
+    // x-meetings through the exact initial pass the agent runs.
+    let range_free = retained_range_free_evidence_ids(&pool, "zulu planning", 50)
+        .await
+        .into_iter()
+        .filter(|(_, meeting)| meeting.starts_with("x-"))
+        .map(|(id, meeting)| (id, meeting))
+        .take(10)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        range_free.len(),
+        10,
+        "ten range-free x-meeting notes evidences must be offered"
+    );
+    let explicit_opens = format!(
+        ",\"openMeetingIds\":[{}]",
+        (1..=5)
+            .map(|index| format!("\"e-{index}\""))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let expansions = format!(
+        ",\"expandEvidenceIds\":[{}]",
+        range_free
+            .iter()
+            .map(|(id, _)| format!("\"{id}\""))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let round_two_opens = format!(
+        ",\"openMeetingIds\":[{}]",
+        (1..=3)
+            .map(|index| format!("\"x-{index}\""))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let planner = FakePlanner::new(vec![
+        // Round 1: the MIXED action - five explicit opens consume the entire
+        // per-round budget, so all ten range-free expansions (a distinct
+        // meeting each) are skipped before any load work runs.
+        Ok(search_more(&format!("{explicit_opens}{expansions}"))),
+        // Round 2: three explicit opens of skipped meetings - the request
+        // total reaches exactly eight.
+        Ok(search_more(&round_two_opens)),
+    ]);
+    reset_head_load_starts();
+    let outcome = run_deep_preparation(deep_input(
+        &pool,
+        PersistedRetrievalScope::All,
+        "zulu planning",
+        &planner,
+        None,
+        &CancellationToken::new(),
+    ))
+    .await
+    .unwrap();
+
+    // Round 1 opened exactly the five explicit meetings (the shared budget
+    // consumed by them skipped every range-free expansion in the same
+    // action), and round 2 opened three more up to the eight-total cap.
+    assert_eq!(outcome.additional_rounds, 2);
+    assert_eq!(outcome.planner_round_trips, 2);
+    let deep_meetings: HashSet<String> = outcome
+        .ranked
+        .ranking
+        .evidence
+        .iter()
+        .filter(|entry| entry.evidence.evidence_id.starts_with("deep:"))
+        .map(|entry| entry.evidence.meeting_id.clone())
+        .collect();
+    for index in 1..=5 {
+        assert!(
+            deep_meetings.contains(&format!("e-{index}")),
+            "explicit meeting e-{index} must be opened: {deep_meetings:?}"
+        );
+    }
+    // Direct loader-invocation instrumentation (R82/R84): eighteen open
+    // actions were issued across the two rounds, but the head loader started
+    // exactly eight times - once per allowed meeting, never for a
+    // budget-exhausted one.
+    assert_eq!(head_load_starts(), PLANNER_MAX_OPENS_TOTAL);
+    // Loader-boundary observation: a started head load of an existing seeded
+    // meeting always publishes its unique transcript head as `deep:t-x-{n}`
+    // evidence. The round-2 opened meetings' head transcripts are present,
+    // and the segment id is absent for every budget-exhausted meeting -
+    // proving the loader never started for the excess.
+    for index in 1..=3 {
+        assert!(
+            outcome
+                .ranked
+                .ranking
+                .evidence
+                .iter()
+                .any(|entry| entry.evidence.evidence_id == format!("deep:t-x-{index}")),
+            "deep:t-x-{index} must be published for the round-2 opened meeting"
+        );
+    }
+    for index in 4..=10 {
+        assert!(
+            !outcome
+                .ranked
+                .ranking
+                .evidence
+                .iter()
+                .any(|entry| entry.evidence.evidence_id == format!("deep:t-x-{index}")),
+            "excess meeting x-{index} must never be loaded"
+        );
+        assert!(
+            !outcome
+                .hydrated
+                .markdown
+                .contains(&format!("head transcript {index}")),
+            "excess meeting x-{index} head content must not render"
+        );
+    }
+    // The excess never ran: no opened evidence exists for any meeting beyond
+    // the shared budget, and the total is exactly the eight-meeting cap.
+    let opened_explicit = (1..=5)
+        .map(|index| format!("e-{index}"))
+        .collect::<HashSet<_>>();
+    let opened_round_two = (1..=3)
+        .map(|index| format!("x-{index}"))
+        .collect::<HashSet<_>>();
+    let opened_beyond_budget: Vec<String> = deep_meetings
+        .iter()
+        .filter(|meeting| {
+            !opened_explicit.contains(*meeting) && !opened_round_two.contains(*meeting)
+        })
+        .cloned()
+        .collect();
+    assert!(
+        opened_beyond_budget.is_empty(),
+        "meetings opened beyond the shared budget: {opened_beyond_budget:?}"
+    );
+    assert_eq!(deep_meetings.len(), PLANNER_MAX_OPENS_TOTAL);
+}
+
+#[tokio::test]
+async fn base_pass_crossing_the_pre_final_boundary_never_starts_deep_only_work() {
+    // R86/R87: the pre-final watchdog is absolute from run start (R87 derives
+    // the boundary as an absolute instant and sleeps_until it). The initial
+    // Fast/base pass (which carries the full budget token) is gated so it
+    // CROSSES the pre-final instant; afterwards the planner loop stops
+    // immediately - no Deep-only action may begin past the boundary - and the
+    // fence re-validates the Fast/base evidence inside the original deadline.
+    let pool = seeded_pool(&[("m-a", "Alpha", "zulu quarterly planning notes")]).await;
+    // Gate the base pass on the pool's single connection and release it AFTER
+    // the pre-final instant (run start + budget - reserve = 1600ms): the base
+    // pass crosses the boundary while the planner loop has not begun.
+    let guard = pool.acquire().await.unwrap();
+    let planner = FakePlanner::new(vec![Ok(finish_action())]);
+    let started = std::time::Instant::now();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1660)).await;
+        drop(guard);
+    });
+    let outcome = run_deep_preparation(DeepPreparationInput {
+        bounds: DeepBounds {
+            call_timeout: Duration::from_secs(30),
+            preparation_budget: Duration::from_millis(2000),
+            final_revalidation_reserve: Duration::from_millis(400),
+            ..DeepBounds::production()
+        },
+        ..deep_input(
+            &pool,
+            PersistedRetrievalScope::All,
+            "zulu planning",
+            &planner,
+            None,
+            &CancellationToken::new(),
+        )
+    })
+    .await
+    .unwrap();
+    // The pre-final boundary fired at 1600ms while the base pass was still
+    // gated; the planner never began, and the fence plus handoff completed
+    // inside the ORIGINAL 800ms deadline.
+    assert!(started.elapsed() < Duration::from_millis(2000));
+    assert_eq!(outcome.planner_round_trips, 0);
+    assert_eq!(outcome.additional_rounds, 0);
+    assert!(!outcome.hydrated.sources.is_empty());
+    assert!(outcome
+        .hydrated
+        .sources
+        .iter()
+        .all(|source| source.meeting_id == "m-a"));
+    assert!(outcome
+        .hydrated
+        .markdown
+        .contains("zulu quarterly planning notes"));
+}
+
+#[tokio::test]
+async fn head_load_that_started_before_the_boundary_stops_at_it() {
+    // R86: an operation that BEGINS inside the pre-final cutoff stops AT the
+    // cutoff. The planner hook acquires the pool's only connection during
+    // round-1 generation and releases it AFTER the pre-final instant, so the
+    // head-load starts inside the cutoff, is cut by the pre-final watchdog
+    // mid-flight, and the fence re-validates the Fast/base evidence inside
+    // the envelope once the connection returns.
+    let pool = seeded_pool(&[
+        ("m-a", "Alpha", "zulu quarterly planning notes"),
+        ("m-open", "Opened", "zulu planning retro decisions material"),
+    ])
+    .await;
+    let hook_pool = pool.clone();
+    let planner = FakePlanner::new(vec![Ok(search_more(",\"openMeetingIds\":[\"m-open\"]"))])
+        .with_on_call(Box::new(move || {
+            let pool = hook_pool.clone();
+            Box::pin(async move {
+                // Hold the pool's only connection; release it well after the
+                // pre-final instant (run start + budget - reserve = 1600ms) so
+                // the cut is deterministic and the fence still has the rest
+                // of the envelope.
+                let guard = pool.acquire().await.unwrap();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(1600)).await;
+                    drop(guard);
+                });
+            }) as BoxFuture<'static, ()>
+        }));
+    let started = std::time::Instant::now();
+    reset_head_load_starts();
+    let recorder = ProgressRecorder::default();
+    let sink = recorder.sink();
+    let outcome = run_deep_preparation(DeepPreparationInput {
+        bounds: DeepBounds {
+            call_timeout: Duration::from_secs(30),
+            preparation_budget: Duration::from_millis(2000),
+            final_revalidation_reserve: Duration::from_millis(400),
+            ..DeepBounds::production()
+        },
+        ..deep_input(
+            &pool,
+            PersistedRetrievalScope::All,
+            "zulu planning",
+            &planner,
+            Some(&sink),
+            &CancellationToken::new(),
+        )
+    })
+    .await
+    .unwrap();
+    // The loader STARTED inside the cutoff (one invocation) and was cut by
+    // the pre-final watchdog: no opened evidence for m-open was published.
+    assert_eq!(head_load_starts(), 1);
+    assert!(!outcome
+        .ranked
+        .ranking
+        .evidence
+        .iter()
+        .any(|entry| entry.evidence.evidence_id == "deep:t-m-open"));
+    // The fence re-validated the Fast/base evidence inside the envelope.
+    assert!(started.elapsed() < Duration::from_millis(2000));
+    assert_eq!(outcome.additional_rounds, 0);
+    assert!(recorder
+        .stages()
+        .contains(&DeepProgressStage::AnswerGeneration));
+}
+
+#[tokio::test]
+async fn initial_failure_after_crossing_the_boundary_keeps_the_underlying_error() {
+    // R87: a base pass that CROSSED the pre-final boundary must not turn an
+    // unrelated initial retrieval failure into `BudgetExhausted`. The gate
+    // holds the base pass past the boundary; the meeting scope references a
+    // nonexistent meeting, so the initial retrieval fails with a genuine
+    // database/scope error once the connection returns - and that underlying
+    // error is what surfaces.
+    let pool = seeded_pool(&[("m-a", "Alpha", "zulu quarterly planning notes")]).await;
+    let guard = pool.acquire().await.unwrap();
+    let planner = FakePlanner::new(vec![Ok(finish_action())]);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1660)).await;
+        drop(guard);
+    });
+    let outcome = run_deep_preparation(DeepPreparationInput {
+        bounds: DeepBounds {
+            call_timeout: Duration::from_secs(30),
+            preparation_budget: Duration::from_millis(2000),
+            final_revalidation_reserve: Duration::from_millis(400),
+            ..DeepBounds::production()
+        },
+        ..deep_input(
+            &pool,
+            PersistedRetrievalScope::Meeting("ghost".to_string()),
+            "zulu planning",
+            &planner,
+            None,
+            &CancellationToken::new(),
+        )
+    })
+    .await;
+    // The boundary fired while the base pass was gated (1600ms), yet the
+    // surfaced failure is the underlying initial retrieval error - never the
+    // budget, and never a cancellation.
+    assert!(matches!(
+        outcome,
+        Err(DeepPreparationError::InitialRetrieval(_))
+    ));
+}
+
+#[tokio::test]
+async fn planner_never_starts_once_the_pre_final_boundary_has_passed() {
+    // R84/R87 post-prompt/loop-top cutoff: the gated base pass completes
+    // AFTER the pre-final boundary (500ms budget, 200ms reserve -> boundary
+    // at 300ms; released at 400ms), so the round stops with the planner
+    // never started, and the fence re-validates the Fast/base evidence
+    // inside the original deadline.
+    let pool = seeded_pool(&[("m-a", "Alpha", "zulu quarterly planning notes")]).await;
+    let guard = pool.acquire().await.unwrap();
+    let planner = FakePlanner::new(vec![Ok(finish_action())]);
+    let started = std::time::Instant::now();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(850)).await;
+        drop(guard);
+    });
+    let outcome = run_deep_preparation(DeepPreparationInput {
+        bounds: DeepBounds {
+            call_timeout: Duration::from_secs(30),
+            preparation_budget: Duration::from_millis(1500),
+            final_revalidation_reserve: Duration::from_millis(700),
+            ..DeepBounds::production()
+        },
+        ..deep_input(
+            &pool,
+            PersistedRetrievalScope::All,
+            "zulu planning",
+            &planner,
+            None,
+            &CancellationToken::new(),
+        )
+    })
+    .await
+    .unwrap();
+    // The boundary fired at 300ms; the base pass completed after it, so no
+    // planner call started and the fence re-validated the Fast/base evidence
+    // inside the deadline.
+    assert!(started.elapsed() < Duration::from_millis(1500));
+    assert_eq!(outcome.planner_round_trips, 0);
+    assert_eq!(outcome.additional_rounds, 0);
+    assert!(!outcome.hydrated.sources.is_empty());
+    assert!(outcome
+        .hydrated
+        .sources
+        .iter()
+        .all(|source| source.meeting_id == "m-a"));
+}
+
+#[tokio::test]
+async fn deep_stage_blocked_across_the_boundary_cannot_continue_past_it() {
+    // R87: a Deep-only operation that BEGINS inside the cutoff and is blocked
+    // across the pre-final boundary cannot continue past it. The round-1
+    // head-load is blocked on the pool's only connection; the pre-final
+    // watchdog fires mid-block (100ms), the load's own cancellation checks
+    // reject it once the connection returns, and the round aborts. The
+    // envelope is spent by then, so the fence fails closed - no result is
+    // published after the deadline, and the wall clock never extends past it.
+    let pool = seeded_pool(&[
+        ("m-a", "Alpha", "zulu quarterly planning notes"),
+        ("m-open", "Opened", "zulu planning retro decisions material"),
+    ])
+    .await;
+    let hook_pool = pool.clone();
+    let planner = FakePlanner::new(vec![Ok(search_more(",\"openMeetingIds\":[\"m-open\"]"))])
+        .with_on_call(Box::new(move || {
+            let pool = hook_pool.clone();
+            Box::pin(async move {
+                // Hold the pool's only connection from round-1 generation and
+                // release it well after the pre-final instant (100ms).
+                let guard = pool.acquire().await.unwrap();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    drop(guard);
+                });
+            }) as BoxFuture<'static, ()>
+        }));
+    let started = std::time::Instant::now();
+    reset_head_load_starts();
+    let recorder = ProgressRecorder::default();
+    let sink = recorder.sink();
+    let result = run_deep_preparation(DeepPreparationInput {
+        bounds: DeepBounds {
+            call_timeout: Duration::from_secs(30),
+            preparation_budget: Duration::from_millis(300),
+            final_revalidation_reserve: Duration::from_millis(100),
+            ..DeepBounds::production()
+        },
+        ..deep_input(
+            &pool,
+            PersistedRetrievalScope::All,
+            "zulu planning",
+            &planner,
+            Some(&sink),
+            &CancellationToken::new(),
+        )
+    })
+    .await;
+    // The loader STARTED inside the cutoff (one invocation) and was stopped
+    // AT the boundary - no opened evidence, no handoff, no result, and the
+    // wall clock never extended past the envelope (budget + slack).
+    assert_eq!(head_load_starts(), 1);
+    assert_eq!(result.unwrap_err(), DeepPreparationError::BudgetExhausted);
+    assert!(!recorder
+        .stages()
+        .contains(&DeepProgressStage::AnswerGeneration));
+    assert!(started.elapsed() < Duration::from_millis(1000));
+}
+
+#[tokio::test]
+async fn slow_progress_callback_crossing_the_boundary_starts_no_deep_work() {
+    // R88: the pre-operation progress callback is synchronous caller code.
+    // This one blocks PAST the absolute pre-final instant (500ms of an
+    // 800ms/300ms envelope), so the re-check immediately after the callback
+    // must break the round before ANY repository/loader invocation - the
+    // fence then re-validates the Fast/base evidence inside the envelope and
+    // the run hands off, with no Deep evidence and no late publication.
+    let pool = seeded_pool(&[
+        ("m-a", "Alpha", "zulu quarterly planning notes"),
+        ("m-open", "Opened", "zulu planning retro decisions material"),
+    ])
+    .await;
+    let planner = FakePlanner::new(vec![Ok(search_more(",\"openMeetingIds\":[\"m-open\"]"))]);
+    let started = std::time::Instant::now();
+    reset_head_load_starts();
+    let recorder = ProgressRecorder::default();
+    let events = recorder.clone();
+    // The round emits TWO AdditionalSearch progress events (pre-op and
+    // round-end); only the FIRST must block past the boundary, otherwise the
+    // second sleep alone would consume the rest of the envelope.
+    let slept = Arc::new(StdMutex::new(false));
+    let slept_for_callback = slept.clone();
+    let handoff = move |event: DeepProgressEvent| {
+        events.0.lock().unwrap().push(event);
+        if event.stage == DeepProgressStage::AdditionalSearch {
+            let mut fired = slept_for_callback.lock().unwrap();
+            if !*fired {
+                *fired = true;
+                drop(fired);
+                std::thread::sleep(Duration::from_millis(600));
+            }
+        }
+    };
+    let outcome = run_deep_preparation(DeepPreparationInput {
+        bounds: DeepBounds {
+            call_timeout: Duration::from_secs(30),
+            preparation_budget: Duration::from_millis(800),
+            final_revalidation_reserve: Duration::from_millis(300),
+            ..DeepBounds::production()
+        },
+        ..deep_input(
+            &pool,
+            PersistedRetrievalScope::All,
+            "zulu planning",
+            &planner,
+            Some(&handoff),
+            &CancellationToken::new(),
+        )
+    })
+    .await
+    .unwrap();
+    // The progress callback ran and crossed the 500ms pre-final instant; the
+    // head loader was never invoked and no Deep evidence exists.
+    assert_eq!(head_load_starts(), 0);
+    assert!(outcome
+        .ranked
+        .ranking
+        .evidence
+        .iter()
+        .all(|entry| !entry.evidence.evidence_id.starts_with("deep:")));
+    // The revalidated Fast/base evidence handed off inside the envelope: the
+    // base meetings' sources only, and the handoff stage was reached.
+    assert!(!outcome.hydrated.sources.is_empty());
+    assert!(outcome
+        .hydrated
+        .sources
+        .iter()
+        .all(|source| matches!(source.meeting_id.as_str(), "m-a" | "m-open")));
+    assert!(outcome
+        .hydrated
+        .markdown
+        .contains("zulu quarterly planning notes"));
+    // The answer handoff was reached: the fallback handed off inside the
+    // envelope.
+    assert!(recorder
+        .stages()
+        .contains(&DeepProgressStage::AnswerGeneration));
+    // No late publication: the whole run finished inside the absolute
+    // envelope.
+    assert!(started.elapsed() < Duration::from_millis(800));
+    assert_eq!(outcome.planner_round_trips, 1);
+}
+
 #[tokio::test]
 async fn expansion_neighborhood_survives_a_full_open_head_cap() {
     let pool = seeded_pool(&[
@@ -1647,7 +2269,10 @@ fn initial_failures_map_typed_cancellation_by_variant() {
         DeepPreparationError::Cancelled
     );
     // Budget expiry during the initial pass is BudgetExhausted, even when
-    // the expired token is what surfaced the cancellation.
+    // the expired token is what surfaced the cancellation. A base pass that
+    // merely CROSSED the pre-final boundary must NOT reclassify an unrelated
+    // failure (R87): the pre-final token is not part of the initial
+    // classification at all.
     let budget = CancellationToken::new();
     budget.cancel();
     assert_eq!(
@@ -1738,9 +2363,71 @@ async fn per_call_deadline_and_total_budget_fall_back_in_time() {
     assert!(started.elapsed() < Duration::from_secs(5));
     assert_eq!(outcome.additional_rounds, 0);
 
-    // Total budget: the remaining budget caps the call deadline, and expiry
-    // fails closed at the final validation instead of publishing evidence
-    // that was never re-validated.
+    // Total budget (R80): the deadline is ABSOLUTE - the final fence runs on
+    // the budget token inside the envelope (no fresh post-expiry token), and
+    // the reserved slice carries the revalidated initial Fast evidence. The
+    // deadline-unblocking planner is cut off at its call deadline (budget
+    // minus reserve), the round stops, and the fallback completes WITHOUT
+    // extending the wall clock.
+    let pool = seeded_pool(&[("m-a", "Alpha", "zulu quarterly planning notes")]).await;
+    let planner = DeadlineUnblockingPlanner;
+    let started = std::time::Instant::now();
+    let recorder = ProgressRecorder::default();
+    let sink = recorder.sink();
+    let outcome = run_deep_preparation(DeepPreparationInput {
+        bounds: DeepBounds {
+            call_timeout: Duration::from_millis(125),
+            preparation_budget: Duration::from_millis(200),
+            final_revalidation_reserve: Duration::from_millis(75),
+            ..DeepBounds::production()
+        },
+        ..deep_input(
+            &pool,
+            PersistedRetrievalScope::All,
+            "zulu planning",
+            &planner,
+            Some(&sink),
+            &CancellationToken::new(),
+        )
+    })
+    .await
+    .unwrap();
+    // No fresh post-expiry token: the whole run finished inside the envelope
+    // (plus scheduling slack) instead of budget + reserve.
+    assert!(started.elapsed() < Duration::from_millis(400));
+    // The planner round was deadline-cancelled (never user cancellation) and
+    // published no additional round: the outcome is the revalidated Fast/base
+    // evidence with exact source parity.
+    assert_eq!(outcome.planner_round_trips, 1);
+    assert_eq!(outcome.additional_rounds, 0);
+    assert!(outcome
+        .ranked
+        .ranking
+        .evidence
+        .iter()
+        .all(|entry| !entry.evidence.evidence_id.starts_with("deep:")));
+    assert!(!outcome.hydrated.sources.is_empty());
+    assert!(outcome
+        .hydrated
+        .sources
+        .iter()
+        .all(|source| source.meeting_id == "m-a"));
+    assert!(outcome
+        .hydrated
+        .markdown
+        .contains("zulu quarterly planning notes"));
+    // The answer handoff was reached: expiry degraded instead of failing.
+    assert!(recorder
+        .stages()
+        .contains(&DeepProgressStage::AnswerGeneration));
+}
+
+#[tokio::test]
+async fn total_envelope_exhaustion_fails_closed_without_publication() {
+    // The whole envelope - including the reserved slice - spent before the
+    // fence could run (this fake planner ignores its call deadline): fail
+    // closed with the typed budget error, no answer handoff, no published
+    // evidence, and never a wall-clock extension past the envelope.
     let pool = seeded_pool(&[("m-a", "Alpha", "zulu quarterly planning notes")]).await;
     let planner = FakePlanner::new(vec![Ok(search_more(
         ",\"queries\":[\"yankee deployment\"]",
@@ -1753,6 +2440,7 @@ async fn per_call_deadline_and_total_budget_fall_back_in_time() {
         bounds: DeepBounds {
             call_timeout: Duration::from_secs(30),
             preparation_budget: Duration::from_millis(200),
+            final_revalidation_reserve: Duration::from_millis(75),
             ..DeepBounds::production()
         },
         ..deep_input(
@@ -1878,11 +2566,11 @@ async fn final_scope_revalidation_drops_meetings_deleted_after_their_round() {
 }
 
 #[tokio::test]
-async fn budget_expiry_during_the_answer_handoff_callback_publishes_nothing() {
+async fn budget_expiry_during_the_answer_handoff_fails_closed() {
     // The AnswerGeneration handoff callback is synchronous caller code: this
-    // one blocks past the hard budget deadline, so only a post-callback
-    // budget re-check can keep the validated context/sources from being
-    // handed to Chat after the budget expired.
+    // one blocks past the hard budget deadline. R84: the hard post-handoff
+    // check means NO successful result is published after the absolute
+    // envelope expired - the validated evidence is discarded unpublished.
     let pool = seeded_pool(&[("m-a", "Alpha", "zulu quarterly planning notes")]).await;
     let planner = FakePlanner::new(vec![Ok(finish_action())]);
     let recorder = ProgressRecorder::default();
@@ -1893,9 +2581,10 @@ async fn budget_expiry_during_the_answer_handoff_callback_publishes_nothing() {
             std::thread::sleep(Duration::from_millis(1200));
         }
     };
-    let result = run_deep_preparation(DeepPreparationInput {
+    let outcome = run_deep_preparation(DeepPreparationInput {
         bounds: DeepBounds {
             preparation_budget: Duration::from_millis(400),
+            final_revalidation_reserve: Duration::from_millis(100),
             ..DeepBounds::production()
         },
         ..deep_input(
@@ -1908,12 +2597,12 @@ async fn budget_expiry_during_the_answer_handoff_callback_publishes_nothing() {
         )
     })
     .await;
-    // The handoff callback ran (the budget expired during it) and the answer
-    // handoff still published nothing: no Ok, no context, no sources.
+    // The handoff callback ran (the budget expired during it) and the hard
+    // post-handoff check failed the request closed: no Ok result.
     assert!(recorder
         .stages()
         .contains(&DeepProgressStage::AnswerGeneration));
-    assert_eq!(result.unwrap_err(), DeepPreparationError::BudgetExhausted);
+    assert_eq!(outcome.unwrap_err(), DeepPreparationError::BudgetExhausted);
 
     // A user cancellation observed during the same synchronous handoff is
     // equally fenced.

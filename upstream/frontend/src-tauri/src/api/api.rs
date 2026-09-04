@@ -1,7 +1,7 @@
 use log::{debug as log_debug, error as log_error, info as log_info, warn as log_warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Emitter, Runtime};
 use tauri_plugin_store::StoreExt;
 
 use crate::{
@@ -907,7 +907,7 @@ pub async fn api_delete_api_key<R: Runtime>(
 
 #[tauri::command]
 pub async fn api_delete_meeting<R: Runtime>(
-    _app: AppHandle<R>,
+    app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
     retrieval: tauri::State<'_, crate::retrieval::worker::RetrievalLifecycle>,
     chat_requests: tauri::State<'_, crate::api::chat::ChatRequestState>,
@@ -930,11 +930,24 @@ pub async fn api_delete_meeting<R: Runtime>(
     // references this meeting are cancelled through the one shared request
     // registry, so no later chunk/source/done publication can occur.
     let chat_requests = chat_requests.inner().clone();
-    match MeetingsRepository::delete_meeting(pool, &meeting_id, |deleted_meeting_id| {
+    let deletion = MeetingsRepository::delete_meeting(pool, &meeting_id, |deleted_meeting_id| {
         chat_requests.invalidate_meeting(deleted_meeting_id);
     })
-    .await
-    {
+    .await;
+    // One identity-only local notification AFTER the transaction committed:
+    // never before commit, on rollback, or with content/sources. The renderer
+    // uses it to drop the deleted meeting's retained sources from already
+    // loaded chat messages.
+    crate::api::chat::emit_chat_meeting_deleted_if_committed(
+        |event, payload| {
+            if let Err(error) = app.emit(event, payload) {
+                log_error!("Failed to emit {}: {}", event, error);
+            }
+        },
+        &meeting_id,
+        &deletion,
+    );
+    match deletion {
         Ok(true) => {
             match active_generation {
                 Some(generation_id) => {

@@ -3476,6 +3476,30 @@ fn emit_chat_stream_event_if_sink<S: ChatEventSink>(
     )
 }
 
+/// Local deletion notification (R72): emitted once AFTER a committed meeting
+/// deletion so the renderer can drop that meeting's retained sources from
+/// already-loaded chat messages. The payload carries the stable meeting
+/// identity only — never content, snippets, or sources.
+pub(crate) const CHAT_MEETING_DELETED_EVENT: &str = "chat-meeting-deleted";
+
+/// Emits [`CHAT_MEETING_DELETED_EVENT`] exactly when `deletion` is a
+/// committed deletion (`Ok(true)`); `Ok(false)` and every error/rollback emit
+/// nothing, so the notification can never precede the commit it describes.
+pub(crate) fn emit_chat_meeting_deleted_if_committed<E>(
+    emit: impl FnOnce(&str, serde_json::Value),
+    meeting_id: &str,
+    deletion: &Result<bool, E>,
+) -> bool {
+    if !matches!(deletion, Ok(true)) {
+        return false;
+    }
+    emit(
+        CHAT_MEETING_DELETED_EVENT,
+        serde_json::json!({ "meetingId": meeting_id }),
+    );
+    true
+}
+
 fn emit_chat_preparation_progress_if_owner<R: Runtime>(
     state: &ChatRequestState,
     app: &AppHandle<R>,
@@ -8783,6 +8807,64 @@ mod tests {
         }));
         assert!(token.is_cancelled());
         assert_eq!(state.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn committed_deletion_notification_is_identity_only_and_failures_emit_none() {
+        use crate::database::repositories::meeting::MeetingsRepository;
+
+        let pool = hybrid_test_pool().await;
+        configure_hybrid_chat(&pool).await;
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at, saved_at) VALUES ('m1', 'Deleted', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let events = Arc::new(Mutex::new(Vec::<(String, serde_json::Value)>::new()));
+        let record = |events: Arc<Mutex<Vec<(String, serde_json::Value)>>>| {
+            move |event: &str, payload: serde_json::Value| {
+                events.lock().unwrap().push((event.to_string(), payload));
+            }
+        };
+
+        // Nothing deleted (Ok(false)) and a failure/rollback shape: no event.
+        let missing = MeetingsRepository::delete_meeting(&pool, "missing", |_| {}).await;
+        assert!(!emit_chat_meeting_deleted_if_committed(
+            record(events.clone()),
+            "missing",
+            &missing
+        ));
+        let failure: Result<bool, sqlx::Error> = Err(sqlx::Error::Protocol("rolled back".into()));
+        assert!(!emit_chat_meeting_deleted_if_committed(
+            record(events.clone()),
+            "m1",
+            &failure
+        ));
+
+        // Committed deletion through the real transaction: exactly one
+        // identity-only event, published only once the row is actually gone.
+        let committed = MeetingsRepository::delete_meeting(&pool, "m1", |_| {}).await;
+        assert!(emit_chat_meeting_deleted_if_committed(
+            record(events.clone()),
+            "m1",
+            &committed
+        ));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM meetings WHERE id = ?")
+                .bind("m1")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0,
+            "the notification must follow the committed row removal"
+        );
+
+        let events = events.lock().unwrap().clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, CHAT_MEETING_DELETED_EVENT);
+        assert_eq!(events[0].1, serde_json::json!({ "meetingId": "m1" }));
     }
 
     #[tokio::test]

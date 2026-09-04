@@ -68,6 +68,12 @@ pub const PLANNER_MAX_OUTPUT_BYTES: usize = 8 * 1024;
 pub const PLANNER_MAX_OUTPUT_TOKENS: u32 = 512;
 pub const PLANNER_CALL_TIMEOUT: Duration = Duration::from_secs(15);
 pub const DEEP_PREPARATION_BUDGET: Duration = Duration::from_secs(30);
+/// The final scope-revalidation/answer-handoff slice reserved inside the
+/// total budget: planner/additional rounds stop early when only this much
+/// remains, and a non-user total-budget expiry falls back to revalidated
+/// initial Fast evidence under the parent token for at most this long
+/// before failing closed.
+pub const FINAL_REVALIDATION_RESERVE: Duration = Duration::from_secs(5);
 /// Planner-directed authoritative transcript segments converted per meeting
 /// load. Hydration's own budget and scopes bound what is finally published.
 const AUTHORITATIVE_SEGMENTS_PER_MEETING: usize = 8;
@@ -299,6 +305,8 @@ pub struct DeepBounds {
     pub generation: BoundedGeneration,
     pub call_timeout: Duration,
     pub preparation_budget: Duration,
+    /// The reserved final-revalidation slice inside `preparation_budget`.
+    pub final_revalidation_reserve: Duration,
 }
 
 impl DeepBounds {
@@ -310,6 +318,7 @@ impl DeepBounds {
             },
             call_timeout: PLANNER_CALL_TIMEOUT,
             preparation_budget: DEEP_PREPARATION_BUDGET,
+            final_revalidation_reserve: FINAL_REVALIDATION_RESERVE,
         }
     }
 }
@@ -353,9 +362,12 @@ pub enum DeepPreparationError {
     Cancelled,
     /// The initial retrieval failed the same way the Fast path would.
     InitialRetrieval(RetrievalError),
-    /// The hard preparation budget expired. Every operation carries the
-    /// budget token and the final validation is skipped once it fires, so
-    /// expiry can never return evidence: it always fails closed.
+    /// Typed ABSOLUTE-deadline miss (R87): the initial Fast/base retrieval
+    /// could not complete inside the 30-second envelope (no evidence exists
+    /// to fall back to), or the envelope expired before/while the final
+    /// revalidation or answer handoff ran - in which case no result is ever
+    /// published after the deadline. The in-envelope non-user fallback
+    /// (revalidated initial Fast/base evidence) is preserved.
     BudgetExhausted,
     /// Final scope revalidation or re-hydration failed, so no validated
     /// evidence can be published. Fail-closed: stale evidence is never
@@ -451,15 +463,15 @@ fn normalize_key(value: &str) -> String {
     value.trim().to_lowercase()
 }
 
-/// Cancels `token` from a spawned task after `after` elapses, so an in-flight
-/// generation observes the deadline BEFORE its future is dropped. The task
-/// self-terminates within `after` even when never aborted.
+/// Cancels `token` at the ABSOLUTE `deadline` instant (R87): `sleep_until`
+/// pins the cutoff to the run-start instant it was derived from, so delayed
+/// task polling can never shift either cutoff.
 fn spawn_deadline_watchdog(
     token: CancellationToken,
-    after: Duration,
+    deadline: tokio::time::Instant,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        tokio::time::sleep(after).await;
+        tokio::time::sleep_until(deadline).await;
         token.cancel();
     })
 }
@@ -478,14 +490,34 @@ pub async fn run_deep_preparation(
     if started.elapsed() >= input.bounds.preparation_budget {
         return Err(DeepPreparationError::BudgetExhausted);
     }
-    // One hard total budget: the watchdog cancels this token at expiry and
-    // every operation below (retrieval, ranking, hydration, planner calls)
-    // carries it, so work begun before expiry stops at the boundary instead
-    // of running past the budget. Child tokens of a cancelled token are
-    // cancelled with it. The watchdog self-terminates within the budget even
-    // when the preparation ends earlier (a late cancel is a no-op).
+    // R87: the two cutoffs are ABSOLUTE instants derived ONCE at run start -
+    // the total envelope (30s) and the pre-final boundary that reserves the
+    // final-revalidation slice. Both watchdogs sleep_until these instants
+    // (spawned here, at run start), so delayed task polling can never shift
+    // either cutoff. The initial Fast/base pass carries the FULL budget
+    // token - it is the fallback evidence and may cross the pre-final
+    // boundary and even the total envelope (typed `BudgetExhausted`) - while
+    // every Deep-only action after it carries `pre_final` and can neither
+    // begin nor continue past the boundary. The final fence and handoff also
+    // run on `budget` inside the original deadline, and the hard checks
+    // afterwards keep any result from being published after the envelope
+    // expired.
+    let budget_deadline = started + input.bounds.preparation_budget;
+    let pre_final_deadline = started
+        + input
+            .bounds
+            .preparation_budget
+            .saturating_sub(input.bounds.final_revalidation_reserve);
     let budget = parent.child_token();
-    let _budget_watchdog = spawn_deadline_watchdog(budget.clone(), input.bounds.preparation_budget);
+    let _budget_watchdog = spawn_deadline_watchdog(
+        budget.clone(),
+        tokio::time::Instant::from_std(budget_deadline),
+    );
+    let pre_final = budget.child_token();
+    let _pre_final_watchdog = spawn_deadline_watchdog(
+        pre_final.clone(),
+        tokio::time::Instant::from_std(pre_final_deadline),
+    );
 
     // -- Initial retrieval: the exact Fast single pass ----------------------
     emit_progress(
@@ -542,6 +574,10 @@ pub async fn run_deep_preparation(
         Ok(hydrated) => hydrated,
         Err(error) => return Err(initial_failure(parent, &budget, error)),
     };
+    // R86: the pre-final watchdog was spawned at run start with the absolute
+    // delay, so a base pass that crossed the boundary already finds the token
+    // cancelled here - the planner loop stops immediately and the fence
+    // re-validates the Fast/base evidence inside the envelope.
     emit_progress(
         input.progress,
         DeepProgressEvent {
@@ -569,10 +605,14 @@ pub async fn run_deep_preparation(
     let mut planner_round_trips = 0usize;
     let mut additional_rounds = 0usize;
     let mut planner_query_slot: u8 = 0;
+    // The initial Fast/base pass is the fallback evidence: a total-budget
+    // expiry later re-validates THIS ranked set within the reserved slice
+    // instead of the expanded one (R78).
+    let initial_ranked = ranked.clone();
 
     for round in 1..=PLANNER_MAX_ROUNDS {
         ensure_alive(parent)?;
-        if budget.is_cancelled() {
+        if pre_final.is_cancelled() || deep_cutoff_passed(pre_final_deadline) {
             log::info!(
                 "Deep planning budget exhausted after {additional_rounds} additional rounds"
             );
@@ -597,18 +637,35 @@ pub async fn run_deep_preparation(
             &opened_meetings,
             &expanded_evidence,
         );
-        planner_round_trips += 1;
+        // R84/R87: re-check after prompt construction - a planner call must
+        // never start with a zero deadline, inside the reserved slice, or
+        // after the absolute pre-final cutoff. The result of a call that
+        // raced the cutoff is discarded (checked again after `generate`).
         let remaining = input
             .bounds
             .preparation_budget
             .saturating_sub(started.elapsed());
-        let call_deadline = input.bounds.call_timeout.min(remaining);
-        // The watchdog cancels the child at the deadline while the generation
-        // future is still alive, so remote body reads and the BuiltInAI
-        // sidecar observe it and shut down; the answer is discarded when the
-        // deadline fired mid-call.
-        let child = budget.child_token();
-        let call_watchdog = spawn_deadline_watchdog(child.clone(), call_deadline);
+        if pre_final.is_cancelled()
+            || deep_cutoff_passed(pre_final_deadline)
+            || remaining <= input.bounds.final_revalidation_reserve
+        {
+            log::info!(
+                "Deep planning stopped before round {round} ({remaining:?} remaining) to reserve final revalidation"
+            );
+            break;
+        }
+        planner_round_trips += 1;
+        let call_deadline = input
+            .bounds
+            .call_timeout
+            .min(remaining.saturating_sub(input.bounds.final_revalidation_reserve));
+        // The watchdog cancels the child at the ABSOLUTE deadline instant
+        // while the generation future is still alive, so remote body reads
+        // and the BuiltInAI sidecar observe it and shut down; the answer is
+        // discarded when the deadline fired mid-call.
+        let child = pre_final.child_token();
+        let call_watchdog =
+            spawn_deadline_watchdog(child.clone(), tokio::time::Instant::now() + call_deadline);
         let raw = input
             .planner
             .generate(
@@ -623,7 +680,7 @@ pub async fn run_deep_preparation(
         if parent.is_cancelled() {
             return Err(DeepPreparationError::Cancelled);
         }
-        if child.is_cancelled() {
+        if child.is_cancelled() || deep_cutoff_passed(pre_final_deadline) {
             log::info!("Deep planner round {round} exceeded its deadline; continuing with current evidence");
             break;
         }
@@ -662,7 +719,7 @@ pub async fn run_deep_preparation(
             break;
         }
         ensure_alive(parent)?;
-        if budget.is_cancelled() {
+        if pre_final.is_cancelled() || deep_cutoff_passed(pre_final_deadline) {
             log::info!("Deep planning budget exhausted before round {round} searches");
             break;
         }
@@ -677,7 +734,7 @@ pub async fn run_deep_preparation(
             if parent.is_cancelled() {
                 return Err(DeepPreparationError::Cancelled);
             }
-            if budget.is_cancelled() {
+            if pre_final.is_cancelled() || deep_cutoff_passed(pre_final_deadline) {
                 break;
             }
             emit_progress(
@@ -688,6 +745,12 @@ pub async fn run_deep_preparation(
                     total: planned_ops,
                 },
             );
+            // R88: the progress callback is synchronous caller code - time
+            // may have crossed the absolute pre-final boundary while it ran.
+            // Re-check before any query-slot mutation or repository await.
+            if pre_final.is_cancelled() || deep_cutoff_passed(pre_final_deadline) {
+                break;
+            }
             planner_query_slot += 1;
             match run_additional_retrieve(
                 &service,
@@ -696,7 +759,7 @@ pub async fn run_deep_preparation(
                 &scope,
                 input.limits,
                 input.core_language,
-                &budget,
+                &pre_final,
             )
             .await
             {
@@ -733,11 +796,16 @@ pub async fn run_deep_preparation(
         // neighborhoods. The loaded content joins the round's ranked outcome
         // post-fusion and is re-read and re-fenced by hydration, so no
         // parallel retriever or synthetic published text exists.
+        // One shared open-meeting admission budget (R78): explicit
+        // `openMeetingIds` and implicit range-free expansions together may
+        // open at most PLANNER_MAX_OPENS_PER_ROUND distinct meetings per
+        // planner round and PLANNER_MAX_OPENS_TOTAL across the request.
+        let mut opens_this_round = admitted.open_meeting_ids.len();
         for meeting_id in &admitted.open_meeting_ids {
             if parent.is_cancelled() {
                 return Err(DeepPreparationError::Cancelled);
             }
-            if budget.is_cancelled() {
+            if pre_final.is_cancelled() || deep_cutoff_passed(pre_final_deadline) {
                 break;
             }
             emit_progress(
@@ -748,15 +816,22 @@ pub async fn run_deep_preparation(
                     total: planned_ops,
                 },
             );
+            // R88: re-check after the synchronous progress callback, before
+            // the loader instrumentation or invocation.
+            if pre_final.is_cancelled() || deep_cutoff_passed(pre_final_deadline) {
+                break;
+            }
             // An open publishes at most AUTHORITATIVE_SEGMENTS_PER_MEETING
             // head segments, so it loads exactly that bounded head instead of
             // the empty-target whole-meeting select (up to MAX_TRANSCRIPT_ROWS
             // rows, almost all of them discarded).
+            #[cfg(test)]
+            record_head_load_start();
             match RetrievalRepository::load_meeting_source_head_with_cancellation(
                 input.pool,
                 meeting_id,
                 AUTHORITATIVE_SEGMENTS_PER_MEETING,
-                &budget,
+                &pre_final,
             )
             .await
             {
@@ -779,7 +854,7 @@ pub async fn run_deep_preparation(
             if parent.is_cancelled() {
                 return Err(DeepPreparationError::Cancelled);
             }
-            if budget.is_cancelled() {
+            if pre_final.is_cancelled() || deep_cutoff_passed(pre_final_deadline) {
                 break;
             }
             emit_progress(
@@ -790,22 +865,32 @@ pub async fn run_deep_preparation(
                     total: planned_ops,
                 },
             );
+            // R88: re-check after the synchronous progress callback, before
+            // the loader instrumentation or invocation.
+            if pre_final.is_cancelled() || deep_cutoff_passed(pre_final_deadline) {
+                break;
+            }
             // A range-free expansion (summary/notes evidence has no transcript
             // neighborhood) would otherwise load and publish a meeting's whole
-            // head - an implicit open. It IS one, so it is charged against the
-            // open budget and served by the same bounded head loader, keeping
-            // the enforced limit equal to the recorded architecture limit.
+            // head - an implicit open. It IS one, so it shares the explicit
+            // opens' per-round and total admission budget, and a round-
+            // exhausted or request-exhausted budget skips it BEFORE any load
+            // work runs.
             let loaded = if segment_ids.is_empty() {
-                if opened_meetings.len() >= PLANNER_MAX_OPENS_TOTAL
+                if opens_this_round >= PLANNER_MAX_OPENS_PER_ROUND
+                    || opened_meetings.len() >= PLANNER_MAX_OPENS_TOTAL
                     || !opened_meetings.insert(meeting_id.clone())
                 {
                     continue;
                 }
+                opens_this_round += 1;
+                #[cfg(test)]
+                record_head_load_start();
                 RetrievalRepository::load_meeting_source_head_with_cancellation(
                     input.pool,
                     meeting_id,
                     AUTHORITATIVE_SEGMENTS_PER_MEETING,
-                    &budget,
+                    &pre_final,
                 )
                 .await
             } else {
@@ -813,7 +898,7 @@ pub async fn run_deep_preparation(
                     input.pool,
                     meeting_id,
                     segment_ids,
-                    &budget,
+                    &pre_final,
                 )
                 .await
             };
@@ -845,7 +930,7 @@ pub async fn run_deep_preparation(
             .into_iter()
             .collect();
         match service
-            .revalidate_ids_in_scope(input.pool, &scope, &meeting_ids, &budget)
+            .revalidate_ids_in_scope(input.pool, &scope, &meeting_ids, &pre_final)
             .await
         {
             Ok(surviving) => {
@@ -876,7 +961,7 @@ pub async fn run_deep_preparation(
             core_terms.clone(),
             &RankingConfig::chat(),
             ranking_mode,
-            &budget,
+            &pre_final,
         )
         .await
         {
@@ -895,11 +980,12 @@ pub async fn run_deep_preparation(
                         input.pool,
                         &merged,
                         input.context_budget,
-                        Some(&budget),
+                        Some(&pre_final),
                     )
                     .await
                 } else {
-                    hydrate_context(input.pool, &merged, input.context_budget, Some(&budget)).await
+                    hydrate_context(input.pool, &merged, input.context_budget, Some(&pre_final))
+                        .await
                 } {
                     Ok(round_hydrated) => {
                         ranked = merged;
@@ -938,54 +1024,75 @@ pub async fn run_deep_preparation(
     // membership and each source's revision immediately before retention, so
     // a meeting deleted, moved, or edited after its round - including
     // All-scope evidence, whose membership filter is permissive by design -
-    // can never publish stale ranked content. A failed or cancelled final
-    // hydration suppresses publication entirely; stale evidence is never
-    // retained past its validation.
+    // can never publish stale ranked content.
+    //
+    // ABSOLUTE total deadline (R80): the fence ALWAYS runs on the budget
+    // token, whose watchdog caps it at exactly the 30-second envelope, so
+    // final revalidation can never extend the wall clock and no fresh
+    // post-expiry token exists. Once only the reserved slice remains - or
+    // the budget expired during a round - the fence re-validates the INITIAL
+    // Fast/base evidence (the smaller target that reliably fits the slice)
+    // and the published evidence falls back to Fast. A fence that cannot
+    // complete inside the envelope fails closed instead of publishing
+    // un-revalidated evidence; user cancellation aborts everywhere.
     ensure_alive(parent)?;
-    match if input.broad_intent {
-        hydrate_context_with_broad_coverage(
-            input.pool,
-            &ranked,
-            input.context_budget,
-            Some(&budget),
-        )
-        .await
-    } else {
-        hydrate_context(input.pool, &ranked, input.context_budget, Some(&budget)).await
-    } {
+    if budget.is_cancelled()
+        || started.elapsed()
+            >= input
+                .bounds
+                .preparation_budget
+                .saturating_sub(input.bounds.final_revalidation_reserve)
+    {
+        log::info!(
+            "Deep final revalidation running inside the reserved slice on the initial Fast evidence"
+        );
+        ranked = initial_ranked;
+    }
+    match run_final_hydration(
+        input.pool,
+        &ranked,
+        input.context_budget,
+        input.broad_intent,
+        &budget,
+    )
+    .await
+    {
         Ok(final_hydrated) => hydrated = final_hydrated,
         Err(error) => {
             if parent.is_cancelled() {
                 return Err(DeepPreparationError::Cancelled);
             }
-            if budget.is_cancelled() {
+            if budget.is_cancelled()
+                || envelope_passed(budget_deadline)
+                || matches!(error, RetrievalError::Cancelled)
+            {
+                // The absolute envelope expired before validation could
+                // complete: fail closed - never publish un-revalidated
+                // evidence, never extend the deadline.
                 return Err(DeepPreparationError::BudgetExhausted);
-            }
-            if matches!(error, RetrievalError::Cancelled) {
-                return Err(DeepPreparationError::Cancelled);
             }
             return Err(DeepPreparationError::FinalValidation(error));
         }
     }
-    // Expiry between the fence and the answer handoff cannot publish either.
-    // The wall clock is checked alongside the token because the watchdog's
-    // cancel is only scheduled, never synchronous.
-    if budget.is_cancelled() || started.elapsed() >= input.bounds.preparation_budget {
+    // R84 HARD deadline checks: no successful result may leave this function
+    // after the absolute envelope expired - even when the fence itself
+    // succeeded, the validated evidence is discarded unpublished and the
+    // typed budget error surfaces.
+    ensure_alive(parent)?;
+    if budget.is_cancelled() || envelope_passed(budget_deadline) {
         return Err(DeepPreparationError::BudgetExhausted);
     }
-
-    ensure_alive(parent)?;
-    let semantic_fallback = match accumulated_semantics(
-        &ranked
+    let semantic_fallback = {
+        let evidence: Vec<RetrievedEvidence> = ranked
             .ranking
             .evidence
             .iter()
             .map(|entry| entry.evidence.clone())
-            .collect::<Vec<_>>(),
-        first_fallback,
-    ) {
-        (RankingMode::Hybrid, _) => None,
-        (_, fallback) => fallback,
+            .collect();
+        match accumulated_semantics(&evidence, first_fallback) {
+            (RankingMode::Hybrid, _) => None,
+            (_, fallback) => fallback,
+        }
     };
     emit_progress(
         input.progress,
@@ -995,14 +1102,17 @@ pub async fn run_deep_preparation(
             total: 1,
         },
     );
-    // The AnswerGeneration handoff callback is synchronous caller code: any
-    // budget expiry or user cancellation while it runs is re-checked here, so
-    // an `Ok` - and with it the context/sources handed to Chat - can never
-    // leave this function after the hard budget expired.
+    // The AnswerGeneration handoff callback is synchronous caller code: a
+    // user cancellation or the absolute envelope expiring while it runs is
+    // re-checked here, so the context and sources handed to Chat are always
+    // fully validated evidence published inside the deadline.
     if parent.is_cancelled() {
         return Err(DeepPreparationError::Cancelled);
     }
-    if budget.is_cancelled() || started.elapsed() >= input.bounds.preparation_budget {
+    if budget.is_cancelled() || envelope_passed(budget_deadline) {
+        log::info!(
+            "Deep absolute envelope reached during the answer handoff; no result is published"
+        );
         return Err(DeepPreparationError::BudgetExhausted);
     }
     Ok(DeepPreparation {
@@ -1014,12 +1124,15 @@ pub async fn run_deep_preparation(
     })
 }
 
-/// Maps an initial-pass failure: user cancellation stays typed, hard budget
+/// Maps an initial-pass failure: user cancellation stays typed, total budget
 /// expiry is `BudgetExhausted`, and everything else is the same failure the
-/// Fast path would have produced. The typed [`RetrievalError::Cancelled`]
-/// variant is matched directly - never by sampling tokens or matching error
-/// strings - so a cancellation surfaced by retrieval or hydration (e.g. a
-/// wrapped SQLx error) can never pose as an ordinary retrieval failure.
+/// Fast path would have produced - including a genuine retrieval/database
+/// error observed after the base pass crossed the pre-final boundary (R87:
+/// the boundary never reclassifies an unrelated failure). The typed
+/// [`RetrievalError::Cancelled`] variant is matched directly - never by
+/// sampling tokens or matching error strings - so a cancellation surfaced by
+/// retrieval or hydration (e.g. a wrapped SQLx error) can never pose as an
+/// ordinary retrieval failure.
 fn initial_failure(
     parent: &CancellationToken,
     budget: &CancellationToken,
@@ -1348,6 +1461,62 @@ fn ensure_alive(cancel: &CancellationToken) -> Result<(), DeepPreparationError> 
         Err(DeepPreparationError::Cancelled)
     } else {
         Ok(())
+    }
+}
+
+/// R87 absolute admission predicate: the Deep-only cutoff (run start +
+/// budget - reserve) has been reached, so no Deep-only action may begin any
+/// more. Used before/after synchronous progress, prompt, and action work,
+/// and alongside the `pre_final` token around every Deep-only await.
+fn deep_cutoff_passed(deadline: Instant) -> bool {
+    Instant::now() >= deadline
+}
+
+/// R87 absolute envelope predicate: the total deadline has been reached, so
+/// no result may be published any more.
+fn envelope_passed(deadline: Instant) -> bool {
+    Instant::now() >= deadline
+}
+
+// Test-only R82 loader-boundary instrumentation: counts head-loader
+// invocations at the exact call sites in `run_deep_preparation`, so the
+// shared open-budget regression can prove budget-exhausted meetings never
+// reach the loader. `#[tokio::test]` runs on the current thread, so the
+// thread-local counter is exact per test.
+#[cfg(test)]
+thread_local! {
+    static HEAD_LOAD_STARTS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn record_head_load_start() {
+    HEAD_LOAD_STARTS.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+pub(crate) fn reset_head_load_starts() {
+    HEAD_LOAD_STARTS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn head_load_starts() -> usize {
+    HEAD_LOAD_STARTS.with(|count| count.get())
+}
+
+/// The one final publication fence: an authoritative hydration over `ranked`
+/// under `token`. Used for the budget-live final validation AND for the
+/// reserved-slice Fast fallback after a non-user total-budget expiry (R78).
+async fn run_final_hydration(
+    pool: &SqlitePool,
+    ranked: &RankedRetrieval,
+    context_budget: usize,
+    broad_intent: bool,
+    token: &CancellationToken,
+) -> Result<HydratedContext, RetrievalError> {
+    if broad_intent {
+        hydrate_context_with_broad_coverage(pool, ranked, context_budget, Some(token)).await
+    } else {
+        hydrate_context(pool, ranked, context_budget, Some(token)).await
     }
 }
 

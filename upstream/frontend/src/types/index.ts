@@ -270,6 +270,14 @@ export interface ChatStreamAbortPayload {
     reason: "referenced_meeting_deleted";
 }
 
+/** Payload for `chat-meeting-deleted`: a privacy-safe local deletion
+ * notification emitted once after a committed meeting deletion, so loaded
+ * chat messages can drop that meeting's retained sources. It carries only
+ * the stable meeting identity — never meeting content or sources. */
+export interface ChatMeetingDeletedPayload {
+    meetingId: string;
+}
+
 export interface ChatSource {
     meetingId: string;
     meetingTitle: string;
