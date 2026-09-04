@@ -621,6 +621,7 @@ mod tests {
         MeetingSource {
             meeting_id: "m-1".to_string(),
             title: title.to_string(),
+            folder_id: None,
             folder_name: String::new(),
             source_revision: Some(7),
             latest_summary_template_id: None,

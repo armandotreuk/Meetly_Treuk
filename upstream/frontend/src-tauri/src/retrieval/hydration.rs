@@ -23,6 +23,8 @@
 //! - sources correspond exactly to the retained Markdown (a source's snippet
 //!   is the text published for it), and summary/notes become sources when
 //!   their text is retained;
+//! - search-only title matches are current metadata sources with no content
+//!   snippet and are never added to context Markdown;
 //! - cancellation is the typed [`RetrievalError::Cancelled`], never a
 //!   fallback. Logs carry counts only - never query or candidate text.
 
@@ -38,6 +40,8 @@ use crate::database::repositories::retrieval::{
 };
 use crate::export::context::build_meeting_sections;
 
+#[cfg(test)]
+use super::ranking::TitleMatch;
 use super::ranking::{RankedEvidence, RankedMeeting};
 use super::service::{PersistedRetrievalScope, RankedRetrieval, RetrievalChannel, RetrievalError};
 
@@ -67,7 +71,7 @@ pub struct HydratedSource {
     pub meeting_id: String,
     pub meeting_title: String,
     pub folder_name: String,
-    /// `summary`, `notes`, or `transcript`.
+    /// `summary`, `notes`, `transcript`, or a search-only `title` metadata row.
     pub source_kind: String,
     pub snippet: String,
     pub source_start_id: Option<String>,
@@ -82,6 +86,7 @@ pub struct HydratedSource {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HydratedMeeting {
     pub meeting_id: String,
+    pub folder_id: Option<String>,
     /// The Task 3.2 aggregated meeting rank.
     pub rank: usize,
     pub retained_evidence_ids: Vec<String>,
@@ -91,8 +96,9 @@ pub struct HydratedMeeting {
 
 /// The hydration outcome: Markdown within the caller's final provider-derived
 /// budget plus the exact retained evidence/source identities and per-meeting
-/// coverage. Task 3.4 owns mapping [`HydratedSource`] onto the existing
-/// `ChatSource` event/persistence contracts.
+/// coverage. Search-only title metadata is returned only by
+/// [`hydrate_search_context`]. Task 3.4 owns mapping [`HydratedSource`] onto
+/// the existing `ChatSource` event/persistence contracts.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HydratedContext {
     pub markdown: String,
@@ -118,6 +124,7 @@ pub async fn hydrate_context(
         cancellation,
         None,
         MAX_HYDRATED_MEETINGS,
+        None,
     )
     .await;
     #[cfg(not(test))]
@@ -127,6 +134,7 @@ pub async fn hydrate_context(
         max_context_chars,
         cancellation,
         MAX_HYDRATED_MEETINGS,
+        None,
     )
     .await;
 }
@@ -138,18 +146,37 @@ pub async fn hydrate_search_context(
     max_meetings: usize,
     cancellation: Option<&CancellationToken>,
 ) -> Result<HydratedContext, RetrievalError> {
-    #[cfg(test)]
-    return hydrate(
-        pool,
-        ranked,
-        max_context_chars,
-        cancellation,
-        None,
-        max_meetings,
-    )
-    .await;
-    #[cfg(not(test))]
-    return hydrate(pool, ranked, max_context_chars, cancellation, max_meetings).await;
+    let search_meeting_ids = search_meeting_ids(ranked, max_meetings);
+    let mut hydrated = {
+        #[cfg(test)]
+        {
+            hydrate(
+                pool,
+                ranked,
+                max_context_chars,
+                cancellation,
+                None,
+                max_meetings,
+                Some(&search_meeting_ids),
+            )
+            .await?
+        }
+        #[cfg(not(test))]
+        {
+            hydrate(
+                pool,
+                ranked,
+                max_context_chars,
+                cancellation,
+                max_meetings,
+                Some(&search_meeting_ids),
+            )
+            .await?
+        }
+    };
+    hydrate_title_only_search_results(pool, ranked, max_meetings, cancellation, &mut hydrated)
+        .await?;
+    Ok(hydrated)
 }
 
 pub async fn hydrate_context_with_broad_coverage(
@@ -334,6 +361,7 @@ async fn hydrate_broad_scope(
         sources.extend(publication.sources);
         meetings.push(HydratedMeeting {
             meeting_id: source.meeting_id,
+            folder_id: source.folder_id,
             rank: rank_by_meeting.get(&meeting_id).copied().unwrap_or(ordinal),
             retained_evidence_ids: meeting_retained_evidence_ids,
             transcript_segments_included: publication.transcript_segments_included,
@@ -679,6 +707,7 @@ pub(crate) async fn hydrate_with_pause(
         cancellation,
         Some(pause),
         MAX_HYDRATED_MEETINGS,
+        None,
     )
     .await
 }
@@ -744,6 +773,32 @@ fn blank(value: Option<&str>) -> Option<&str> {
     value.filter(|value| !value.trim().is_empty())
 }
 
+fn search_meeting_ids(ranked: &RankedRetrieval, max_meetings: usize) -> HashSet<String> {
+    let evidence_meeting_ids: HashSet<&str> = ranked
+        .ranking
+        .evidence
+        .iter()
+        .map(|entry| entry.evidence.meeting_id.as_str())
+        .collect();
+    let title_meeting_ids: HashSet<&str> = ranked
+        .ranking
+        .title_matches
+        .iter()
+        .map(|title| title.meeting_id.as_str())
+        .collect();
+    ranked
+        .ranking
+        .meetings
+        .iter()
+        .filter(|meeting| {
+            evidence_meeting_ids.contains(meeting.meeting_id.as_str())
+                || title_meeting_ids.contains(meeting.meeting_id.as_str())
+        })
+        .take(max_meetings)
+        .map(|meeting| meeting.meeting_id.clone())
+        .collect()
+}
+
 async fn hydrate(
     pool: &SqlitePool,
     ranked: &RankedRetrieval,
@@ -751,6 +806,7 @@ async fn hydrate(
     cancellation: Option<&CancellationToken>,
     #[cfg(test)] pause: Option<&HydrationPause>,
     max_meetings: usize,
+    candidate_meeting_ids: Option<&HashSet<String>>,
 ) -> Result<HydratedContext, RetrievalError> {
     let cancel = cancellation.cloned().unwrap_or_default();
     ensure_not_cancelled(&cancel)?;
@@ -774,6 +830,9 @@ async fn hydrate(
         .ranking
         .meetings
         .iter()
+        .filter(|meeting| {
+            candidate_meeting_ids.map_or(true, |ids| ids.contains(&meeting.meeting_id))
+        })
         .filter(|meeting| items_by_meeting.contains_key(&meeting.meeting_id))
         .take(max_meetings)
         .collect();
@@ -980,6 +1039,7 @@ async fn hydrate(
         sources.extend(meeting_sources);
         coverage.push(HydratedMeeting {
             meeting_id: source.meeting_id,
+            folder_id: source.folder_id,
             rank: meeting.rank,
             retained_evidence_ids: plan.retained_evidence_ids(
                 summary_retained,
@@ -1012,6 +1072,128 @@ async fn hydrate(
         sources,
         meetings: coverage,
     })
+}
+
+async fn hydrate_title_only_search_results(
+    pool: &SqlitePool,
+    ranked: &RankedRetrieval,
+    max_meetings: usize,
+    cancellation: Option<&CancellationToken>,
+    hydrated: &mut HydratedContext,
+) -> Result<(), RetrievalError> {
+    let cancel = cancellation.cloned().unwrap_or_default();
+    let title_matches: Vec<(String, String, usize)> = ranked
+        .ranking
+        .meetings
+        .iter()
+        .take(max_meetings)
+        .filter_map(|meeting| {
+            ranked
+                .ranking
+                .title_matches
+                .iter()
+                .find(|title| title.meeting_id == meeting.meeting_id)
+                .map(|title| {
+                    (
+                        meeting.meeting_id.clone(),
+                        title.evidence_id.clone(),
+                        meeting.rank,
+                    )
+                })
+        })
+        .collect();
+
+    for (meeting_id, evidence_id, rank) in title_matches {
+        ensure_not_cancelled(&cancel)?;
+        if hydrated
+            .meetings
+            .iter()
+            .any(|meeting| meeting.meeting_id == meeting_id)
+        {
+            let Some(metadata) = hydrated
+                .sources
+                .iter()
+                .find(|source| source.meeting_id == meeting_id)
+                .cloned()
+            else {
+                continue;
+            };
+            if let Some(meeting) = hydrated
+                .meetings
+                .iter_mut()
+                .find(|meeting| meeting.meeting_id == meeting_id)
+            {
+                if !meeting.retained_evidence_ids.contains(&evidence_id) {
+                    meeting.retained_evidence_ids.push(evidence_id.clone());
+                }
+            }
+            if !hydrated.retained_evidence_ids.contains(&evidence_id) {
+                hydrated.retained_evidence_ids.push(evidence_id.clone());
+            }
+            if !hydrated.sources.iter().any(|source| {
+                source
+                    .evidence_ids
+                    .iter()
+                    .any(|retained| retained == &evidence_id)
+            }) {
+                hydrated.sources.push(HydratedSource {
+                    meeting_id: metadata.meeting_id,
+                    meeting_title: metadata.meeting_title,
+                    folder_name: metadata.folder_name,
+                    source_kind: "title".to_string(),
+                    snippet: String::new(),
+                    source_start_id: None,
+                    source_end_id: None,
+                    source_template_id: None,
+                    evidence_ids: vec![evidence_id],
+                });
+            }
+            continue;
+        }
+        let Some(source) = RetrievalRepository::load_meeting_source_head_with_cancellation(
+            pool,
+            &meeting_id,
+            1,
+            &cancel,
+        )
+        .await
+        .map_err(db_error)?
+        else {
+            continue;
+        };
+        if !current_scope_and_revision(
+            pool,
+            &ranked.scope.scope,
+            &meeting_id,
+            source.source_revision,
+            &cancel,
+        )
+        .await?
+        {
+            continue;
+        }
+        hydrated.retained_evidence_ids.push(evidence_id.clone());
+        hydrated.sources.push(HydratedSource {
+            meeting_id: source.meeting_id.clone(),
+            meeting_title: source.title,
+            folder_name: source.folder_name,
+            source_kind: "title".to_string(),
+            snippet: String::new(),
+            source_start_id: None,
+            source_end_id: None,
+            source_template_id: None,
+            evidence_ids: vec![evidence_id.clone()],
+        });
+        hydrated.meetings.push(HydratedMeeting {
+            meeting_id: source.meeting_id,
+            folder_id: source.folder_id,
+            rank,
+            retained_evidence_ids: vec![evidence_id],
+            transcript_segments_included: 0,
+            transcript_segments_total: source.transcript_segments_total,
+        });
+    }
+    Ok(())
 }
 
 fn empty_context(max_context_chars: usize) -> HydratedContext {
@@ -1593,6 +1775,15 @@ mod tests {
         evidence: Vec<RetrievedEvidence>,
         meetings: Vec<RankedMeeting>,
     ) -> RankedRetrieval {
+        outcome_with_title_matches(scope, evidence, meetings, Vec::new())
+    }
+
+    fn outcome_with_title_matches(
+        scope: PersistedRetrievalScope,
+        evidence: Vec<RetrievedEvidence>,
+        meetings: Vec<RankedMeeting>,
+        title_matches: Vec<TitleMatch>,
+    ) -> RankedRetrieval {
         RankedRetrieval {
             scope: ResolvedScope { scope },
             ranking: crate::retrieval::RankingOutcome {
@@ -1606,6 +1797,7 @@ mod tests {
                         reranker_score: None,
                     })
                     .collect(),
+                title_matches,
                 meetings,
                 reranker_used: false,
                 rerank_depth: 0,
@@ -1736,6 +1928,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(context.meetings.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn search_hydration_caps_evidence_and_title_union_before_loading() {
+        let pool = pool().await;
+        let mut ranked_evidence = Vec::new();
+        let mut title_matches = Vec::new();
+        for index in 0..100 {
+            let meeting_id = format!("m{index:03}");
+            if index < 50 && index % 2 == 0 {
+                insert_meeting(&pool, &meeting_id, &format!("Title {index}"), None).await;
+                title_matches.push(TitleMatch {
+                    meeting_id: meeting_id.clone(),
+                    evidence_id: format!("title:{meeting_id}"),
+                    provenance: Vec::new(),
+                });
+            } else {
+                seeded_meeting(&pool, &meeting_id, &format!("Meeting {index}"), None).await;
+                ranked_evidence.push(evidence(
+                    &format!("window:{meeting_id}"),
+                    &meeting_id,
+                    "transcript",
+                    "matching content",
+                    Some(&format!("{meeting_id}-s2")),
+                    None,
+                    None,
+                ));
+            }
+        }
+        let ranked = outcome_with_title_matches(
+            PersistedRetrievalScope::All,
+            ranked_evidence,
+            (0..100)
+                .map(|index| ranked(&format!("m{index:03}"), index + 1))
+                .collect(),
+            title_matches,
+        );
+
+        let context = hydrate_search_context(&pool, &ranked, 50_000, 50, None)
+            .await
+            .unwrap();
+        assert_eq!(context.meetings.len(), 50);
+        assert!(context
+            .meetings
+            .iter()
+            .all(|meeting| meeting.meeting_id[1..].parse::<usize>().unwrap() < 50));
     }
 
     #[tokio::test]

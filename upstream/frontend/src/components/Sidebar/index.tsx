@@ -17,12 +17,14 @@ import { useRecordingState } from '@/contexts/RecordingStateContext';
 import { useImportDialog } from '@/contexts/ImportDialogContext';
 import { useConfig } from '@/contexts/ConfigContext';
 import { FolderTreeItem } from './FolderTreeItem';
+import { FolderFilterTree } from './FolderFilterTree';
 import { MeetingTreeItem, type DragPayload } from './MeetingTreeItem';
 import { MoveToFolderModal } from './MoveToFolderModal';
 import { useSidebarTree, type MeetingLike, type MeetingNode } from '@/hooks/useSidebarTree';
 import { useChatHost } from '@/components/ChatPanel/ChatHost';
 import { createSearchSnapshotScope } from '@/components/ChatPanel/scope';
 import { t } from '@/lib/i18n';
+import { buildSidebarSearchRows } from '@/lib/sidebar-search';
 
 import {
   Dialog,
@@ -123,7 +125,11 @@ const Sidebar: React.FC = () => {
     toggleCollapse,
     handleRecordingToggle,
     searchTranscripts,
-    searchResults,
+    cancelSidebarSearch,
+    searchResponse,
+    searchNotice,
+    searchError,
+    searchPhase,
     isSearching,
     meetings,
     setMeetings,
@@ -146,6 +152,7 @@ const Sidebar: React.FC = () => {
   const { betaFeatures } = useConfig();
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set(['unfiled']));
   const [searchQuery, setSearchQuery] = useState<string>('');
+  const [selectedFolderId, setSelectedFolderId] = useState<string | null>(null);
   const [showModelSettings, setShowModelSettings] = useState(false);
   const [modelConfig, setModelConfig] = useState<ModelConfig>({
     provider: 'ollama',
@@ -330,33 +337,42 @@ const Sidebar: React.FC = () => {
   };
 
   // Handle search input changes
-  const handleSearchChange = useCallback(async (value: string) => {
+  const handleSearchChange = useCallback((value: string) => {
     setSearchQuery(value);
+    void searchTranscripts(value, selectedFolderId);
+  }, [searchTranscripts, selectedFolderId]);
 
-    // If search query is empty, just return to normal view
-    if (!value.trim()) return;
+  const handleFolderFilterChange = useCallback((folderId: string | null) => {
+    setSelectedFolderId(folderId);
+    void searchTranscripts(searchQuery, folderId);
+  }, [searchQuery, searchTranscripts]);
 
-    // Search through transcripts
-    await searchTranscripts(value);
-  }, [searchTranscripts]);
+  useEffect(() => {
+    if (selectedFolderId && !folders.some((folder) => folder.id === selectedFolderId)) {
+      setSelectedFolderId(null);
+      void searchTranscripts(searchQuery, null);
+    }
+  }, [folders, searchQuery, searchTranscripts, selectedFolderId]);
+
+  useEffect(() => {
+    return () => {
+      cancelSidebarSearch();
+    };
+  }, [cancelSidebarSearch]);
   // Folder tree (pastas lógicas): unfiled bucket + recursive folder roots.
   const { unfiled, roots } = useSidebarTree(folders, meetings);
 
   const folderNameById = useMemo(() => new Map(folders.map((f) => [f.id, f.name])), [folders]);
 
-  // Global search is flat (decision #19): transcript matches ∪ title matches,
-  // rendered without the tree.
-  const searchFilteredMeetings = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase();
-    if (!q) return [];
-    const matchedIds = new Set(searchResults.map((r) => r.meeting_id));
-    return meetings.filter((m) => matchedIds.has(m.id) || m.title.toLowerCase().includes(q));
-  }, [meetings, searchQuery, searchResults]);
+  const searchRows = useMemo(
+    () => buildSidebarSearchRows(meetings, searchQuery, selectedFolderId, searchResponse),
+    [folders, meetings, searchQuery, searchResponse, selectedFolderId]
+  );
 
   const askSearchResults = useCallback(async () => {
-    const scope = await createSearchSnapshotScope(searchFilteredMeetings);
+    const scope = await createSearchSnapshotScope(searchRows.map(({ meeting }) => meeting));
     if (scope) openChat(scope);
-  }, [openChat, searchFilteredMeetings]);
+  }, [openChat, searchRows]);
 
   // Folder action handlers (backend errors surface as toasts)
   const handleMoveMeeting = useCallback(async (meetingId: string, folderId: string | null) => {
@@ -667,12 +683,6 @@ const Sidebar: React.FC = () => {
     );
   };
 
-  // Find matching transcript snippet for a meeting item
-  const findMatchingSnippet = (itemId: string) => {
-    if (!searchQuery.trim() || !searchResults.length) return null;
-    return searchResults.find(result => result.meeting_id === itemId);
-  };
-
   // Shared meeting row renderer: used by the tree (FolderTreeItem children),
   // the unfiled section, and flat search results. MeetingTreeItem owns the
   // drag-source behavior, date sub-line, and rename/delete/move actions.
@@ -728,7 +738,10 @@ const Sidebar: React.FC = () => {
 
                 <div className="relative mb-1">
                   <InputGroup >
-                    <InputGroupInput placeholder='Search meeting content...' value={searchQuery}
+                    <InputGroupInput
+                      aria-label={t('app.sidebar.searchInputAria')}
+                      placeholder={t('app.sidebar.searchPlaceholder')}
+                      value={searchQuery}
                       onChange={(e) => handleSearchChange(e.target.value)}
                     />
                     <InputGroupAddon>
@@ -737,6 +750,7 @@ const Sidebar: React.FC = () => {
                     {searchQuery &&
                       <InputGroupAddon align={'inline-end'}>
                         <InputGroupButton
+                          aria-label={t('app.sidebar.clearSearchAria')}
                           onClick={() => handleSearchChange('')}
                         >
                           <X />
@@ -772,11 +786,28 @@ const Sidebar: React.FC = () => {
             {!isCollapsed && (
               <div className="flex-shrink-0">
                 <div className="flex items-center transition-all duration-150 p-3 text-lg font-semibold h-10 mx-3 mt-3 rounded-lg group">
-<NotebookPen className="w-4 h-4 mr-2 text-gray-600" />
+ <NotebookPen className="w-4 h-4 mr-2 text-gray-600" />
                   <span className="text-gray-700">Meeting Notes</span>
-                  {searchFilteredMeetings.length > 0 && <button onClick={askSearchResults} className="ml-auto text-xs text-blue-600 hover:text-blue-700">{t('app.sidebar.askSearchResults')}</button>}
+                  {searchRows.length > 0 && <button onClick={askSearchResults} className="ml-auto text-xs text-blue-600 hover:text-blue-700">{t('app.sidebar.askSearchResults')}</button>}
                   {searchQuery && isSearching && (
-                    <span className="ml-2 text-xs text-blue-500 animate-pulse">Searching...</span>
+                    <span role="status" aria-live="polite" aria-atomic="true" className="ml-2 text-xs text-blue-500 animate-pulse">
+                      {t('chat.searching')}
+                    </span>
+                  )}
+                  {searchQuery && !isSearching && searchNotice === 'forced_lexical' && (
+                    <span role="status" aria-live="polite" aria-atomic="true" className="ml-2 text-xs text-gray-500">
+                      {t('app.sidebar.searchForcedLexical')}
+                    </span>
+                  )}
+                  {searchQuery && !isSearching && searchNotice === 'lexical_fallback' && (
+                    <span role="status" aria-live="polite" aria-atomic="true" className="ml-2 text-xs text-amber-600">
+                      {t('app.sidebar.searchLexicalFallback')}
+                    </span>
+                  )}
+                  {searchQuery && !isSearching && searchError && (
+                    <span role="status" aria-live="polite" aria-atomic="true" className="ml-2 text-xs text-gray-500">
+                      {t('app.sidebar.searchUnavailable')}
+                    </span>
                   )}
                   <button
                     onClick={() => openCreateFolderModal(null)}
@@ -787,6 +818,7 @@ const Sidebar: React.FC = () => {
                     <FolderPlus className="w-4 h-4" />
                   </button>
                 </div>
+                <FolderFilterTree folders={folders} selected={selectedFolderId} onSelect={handleFolderFilterChange} />
               </div>
             )}
 
@@ -796,7 +828,7 @@ const Sidebar: React.FC = () => {
                 <div className="mx-3">
                   {searchQuery.trim() ? (
                     <>
-                      {searchFilteredMeetings.map((m) => (
+                      {searchRows.map(({ meeting: m, snippet, provenance }) => (
                         <MeetingTreeItem
                           key={m.id}
                           meetingId={m.id}
@@ -805,15 +837,18 @@ const Sidebar: React.FC = () => {
                           currentMeetingId={currentMeeting?.id}
                           createdAt={m.created_at}
                           hasNotes={m.has_notes}
-                          snippetContext={findMatchingSnippet(m.id)?.snippet ?? null}
-                          folderName={m.folder_id ? folderNameById.get(m.folder_id) ?? null : null}
+                          snippetContext={snippet}
+                          provenanceLabel={provenance}
+                          folderName={m.folder_name ?? null}
                           onEditMeeting={handleEditStart}
                           onRequestDeleteMeeting={(id) => setDeleteModalState({ isOpen: true, itemId: id })}
                           onRequestMoveMeeting={(id) => setMoveModalState({ isOpen: true, kind: 'meeting', id })}
                         />
                       ))}
-                      {searchFilteredMeetings.length === 0 && !isSearching && (
-                        <p className="text-xs text-gray-400 italic px-3 py-2">Nenhum resultado.</p>
+                      {searchRows.length === 0 && searchPhase === 'ready' && !searchError && (
+                        <p role="status" aria-live="polite" aria-atomic="true" className="text-xs text-gray-400 italic px-3 py-2">
+                          {t('app.sidebar.noResults')}
+                        </p>
                       )}
                     </>
                   ) : (

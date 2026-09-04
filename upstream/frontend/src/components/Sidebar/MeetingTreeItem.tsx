@@ -85,6 +85,7 @@ interface MeetingTreeItemProps {
     currentMeetingId?: string;
     snippetContext?: string | null;
     chunkType?: string | null;
+    provenanceLabel?: string | null;
     folderName?: string | null;
     createdAt?: string;
     hasNotes?: boolean;
@@ -100,6 +101,7 @@ export function MeetingTreeItem({
     currentMeetingId,
     snippetContext,
     chunkType,
+    provenanceLabel,
     folderName,
     createdAt,
     hasNotes,
@@ -239,26 +241,64 @@ export function MeetingTreeItem({
                       : "hover:bg-gray-50"
             }`}
             style={{ paddingLeft }}
-            onClick={handleClick}
         >
-            <div className="flex items-center w-full">
-                <div className="flex-shrink-0 flex items-center justify-center w-6 h-6 rounded-full mr-2 bg-blue-100">
-                    <PlusOrFile isIntro={isIntro} />
-                </div>
-                <span className="flex-1 min-w-0 flex items-center gap-1.5">
-                    <span className="break-words">{title}</span>
-                    {hasNotes && (
-                        <span
-                            className="w-2 h-2 rounded-full bg-green-500 flex-shrink-0"
-                            title="Has notes"
-                            role="img"
-                            aria-label="Has notes"
-                        />
+            <div className="flex items-start w-full">
+                <button
+                    type="button"
+                    className="flex min-w-0 flex-1 flex-col text-left"
+                    onClick={handleClick}
+                    aria-label={title}
+                    tabIndex={0}
+                >
+                    <div className="flex items-center w-full">
+                        <div className="flex-shrink-0 flex items-center justify-center w-6 h-6 rounded-full mr-2 bg-blue-100">
+                            <PlusOrFile isIntro={isIntro} />
+                        </div>
+                        <span className="flex-1 min-w-0 flex items-center gap-1.5">
+                            <span className="break-words">{title}</span>
+                            {hasNotes && (
+                                <span
+                                    className="w-2 h-2 rounded-full bg-green-500 flex-shrink-0"
+                                    title="Has notes"
+                                    role="img"
+                                    aria-label="Has notes"
+                                />
+                            )}
+                        </span>
+                    </div>
+                    {snippetContext && (
+                        <div className="mt-1 ml-8 text-xs text-gray-500 bg-yellow-50 p-1.5 rounded border border-yellow-100 line-clamp-2">
+                            <span className="font-medium text-yellow-600">Match:</span>{" "}
+                            {snippetContext}
+                        </div>
                     )}
-                </span>
+                    {formattedDate && (
+                        <div className="mt-1 ml-8 text-xs text-gray-500">{formattedDate}</div>
+                    )}
+                    {(chunkType || provenanceLabel || folderName) && (
+                        <div className="mt-1 ml-8 flex gap-1 flex-wrap">
+                            {chunkType && (
+                                <span className="px-1.5 py-0.5 text-[10px] rounded bg-indigo-100 text-indigo-700 border border-indigo-200">
+                                    {chunkType}
+                                </span>
+                            )}
+                            {provenanceLabel && (
+                                <span className="px-1.5 py-0.5 text-[10px] rounded bg-purple-100 text-purple-700 border border-purple-200">
+                                    {provenanceLabel}
+                                </span>
+                            )}
+                            {folderName && (
+                                <span className="px-1.5 py-0.5 text-[10px] rounded bg-gray-100 text-gray-600 border border-gray-200">
+                                    {folderName}
+                                </span>
+                            )}
+                        </div>
+                    )}
+                </button>
                 {!isIntro && (
-                    <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-150">
+                    <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity duration-150">
                         <button
+                            type="button"
                             onClick={(e) => {
                                 e.stopPropagation();
                                 onEditMeeting(meetingId, title);
@@ -271,6 +311,7 @@ export function MeetingTreeItem({
                         <DropdownMenu>
                             <DropdownMenuTrigger asChild>
                                 <button
+                                    type="button"
                                     onClick={(e) => e.stopPropagation()}
                                     className="hover:text-blue-600 p-1 rounded-md hover:bg-blue-50 flex-shrink-0"
                                     aria-label="Meeting actions"
@@ -298,6 +339,7 @@ export function MeetingTreeItem({
                             </DropdownMenuContent>
                         </DropdownMenu>
                         <button
+                            type="button"
                             onClick={(e) => {
                                 e.stopPropagation();
                                 onRequestDeleteMeeting(meetingId);
@@ -310,28 +352,6 @@ export function MeetingTreeItem({
                     </div>
                 )}
             </div>
-            {snippetContext && (
-                <div className="mt-1 ml-8 text-xs text-gray-500 bg-yellow-50 p-1.5 rounded border border-yellow-100 line-clamp-2">
-                    <span className="font-medium text-yellow-600">Match:</span> {snippetContext}
-                </div>
-            )}
-            {formattedDate && (
-                <div className="mt-1 ml-8 text-xs text-gray-500">{formattedDate}</div>
-            )}
-            {(chunkType || folderName) && (
-                <div className="mt-1 ml-8 flex gap-1 flex-wrap">
-                    {chunkType && (
-                        <span className="px-1.5 py-0.5 text-[10px] rounded bg-indigo-100 text-indigo-700 border border-indigo-200">
-                            {chunkType}
-                        </span>
-                    )}
-                    {folderName && (
-                        <span className="px-1.5 py-0.5 text-[10px] rounded bg-gray-100 text-gray-600 border border-gray-200">
-                            {folderName}
-                        </span>
-                    )}
-                </div>
-            )}
         </div>
     );
 }

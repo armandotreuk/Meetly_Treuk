@@ -190,6 +190,7 @@ pub struct HybridMeetingResult {
     pub meeting_id: String,
     pub meeting_title: String,
     pub folder_name: String,
+    pub folder_id: Option<String>,
     pub meeting_rank: usize,
     pub retained_evidence_ids: Vec<String>,
     pub sources: Vec<HybridSource>,
@@ -236,7 +237,7 @@ impl HybridSearchResponse {
                     .iter()
                     .map(String::as_str)
                     .collect::<HashSet<_>>();
-                let provenance = ranked
+                let mut provenance: Vec<HybridProvenance> = ranked
                     .ranking
                     .evidence
                     .iter()
@@ -268,10 +269,31 @@ impl HybridSearchResponse {
                     })
                     .collect();
                 let first_source = sources.first()?;
+                let folder_id = hydrated
+                    .meetings
+                    .iter()
+                    .find(|item| item.meeting_id == meeting.meeting_id)
+                    .and_then(|item| item.folder_id.clone());
+                provenance.extend(
+                    ranked
+                        .ranking
+                        .title_matches
+                        .iter()
+                        .filter(|title| {
+                            title.meeting_id == meeting.meeting_id
+                                && retained.contains(title.evidence_id.as_str())
+                        })
+                        .flat_map(|title| {
+                            title.provenance.iter().map(|provenance| {
+                                HybridProvenance::from_evidence(provenance, &title.evidence_id)
+                            })
+                        }),
+                );
                 Some(HybridMeetingResult {
                     meeting_id: first_source.meeting_id.clone(),
                     meeting_title: first_source.meeting_title.clone(),
                     folder_name: first_source.folder_name.clone(),
+                    folder_id,
                     meeting_rank: meeting.rank,
                     retained_evidence_ids,
                     sources,
@@ -324,6 +346,7 @@ mod tests {
     use crate::retrieval::hydration::{HydratedMeeting, HydratedSource};
     use crate::retrieval::ranking::{
         dedupe_candidates, RankedEvidence, RankedMeeting, RankingOutcome, RerankFallback,
+        TitleMatch,
     };
     use crate::retrieval::service::{
         EvidenceProvenance, LexicalMode, ResolvedScope, RetrievalChannel, RetrievedEvidence,
@@ -412,6 +435,7 @@ mod tests {
                         reranker_score: None,
                     })
                     .collect(),
+                title_matches: Vec::new(),
                 meetings: (0..count)
                     .map(|index| RankedMeeting {
                         meeting_id: format!("meeting-{index}"),
@@ -461,6 +485,7 @@ mod tests {
                 .enumerate()
                 .map(|(index, item)| HydratedMeeting {
                     meeting_id: item.meeting_id.clone(),
+                    folder_id: None,
                     rank: index + 1,
                     retained_evidence_ids: vec![item.evidence_id.clone()],
                     transcript_segments_included: 1,
@@ -582,6 +607,7 @@ mod tests {
                     fused_score: 1.0,
                     reranker_score: None,
                 }],
+                title_matches: Vec::new(),
                 meetings: vec![RankedMeeting {
                     meeting_id: "meeting-1".to_string(),
                     rank: 1,
@@ -626,6 +652,7 @@ mod tests {
             }],
             meetings: vec![HydratedMeeting {
                 meeting_id: "meeting-1".to_string(),
+                folder_id: None,
                 rank: 1,
                 retained_evidence_ids: vec![
                     "semantic-window".to_string(),
@@ -660,5 +687,100 @@ mod tests {
                 || (item.evidence_id == "fts:transcript:segment-1" && item.channel == "semantic")
         }));
         assert_eq!(result.sources[0].evidence_ids, result.retained_evidence_ids);
+    }
+
+    #[test]
+    fn public_provenance_keeps_distinct_title_ranks_and_identity() {
+        let title = |meeting_id: &str, rank: usize| TitleMatch {
+            meeting_id: meeting_id.to_string(),
+            evidence_id: format!("title:{meeting_id}"),
+            provenance: vec![EvidenceProvenance {
+                channel: RetrievalChannel::Title,
+                variant: QueryVariantKind::CoreTerms,
+                mode: None,
+                rank,
+                query_slot: 0,
+            }],
+        };
+        let meeting = |meeting_id: &str, rank: usize| RankedMeeting {
+            meeting_id: meeting_id.to_string(),
+            rank,
+            score: 0.0,
+            best_fused_score: 0.0,
+            support: 0,
+            corroboration: 0,
+            title_overlap: 1.0,
+            concept_coverage: 0.0,
+        };
+        let source = |meeting_id: &str| HydratedSource {
+            meeting_id: meeting_id.to_string(),
+            meeting_title: format!("Title {meeting_id}"),
+            folder_name: String::new(),
+            source_kind: "title".to_string(),
+            snippet: String::new(),
+            source_start_id: None,
+            source_end_id: None,
+            source_template_id: None,
+            evidence_ids: vec![format!("title:{meeting_id}")],
+        };
+        let ranked = RankedRetrieval {
+            scope: ResolvedScope {
+                scope: PersistedRetrievalScope::All,
+            },
+            ranking: RankingOutcome {
+                evidence: Vec::new(),
+                title_matches: vec![title("m1", 2), title("m2", 1)],
+                meetings: vec![meeting("m1", 1), meeting("m2", 2)],
+                reranker_used: false,
+                rerank_depth: 0,
+                rerank_fallback: Some(RerankFallback::Unavailable),
+                core_terms: Vec::new(),
+                terms: crate::retrieval::AggregationTerms::default(),
+                title_overlap: std::collections::HashMap::new(),
+                effective_query: "query".to_string(),
+                dedupe_degraded: false,
+                chronology_omitted_meetings: Vec::new(),
+            },
+            semantic_fallback: None,
+        };
+        let hydrated = HydratedContext {
+            markdown: String::new(),
+            retained_evidence_ids: vec!["title:m1".to_string(), "title:m2".to_string()],
+            sources: vec![source("m1"), source("m2")],
+            meetings: vec![
+                HydratedMeeting {
+                    meeting_id: "m1".to_string(),
+                    folder_id: None,
+                    rank: 1,
+                    retained_evidence_ids: vec!["title:m1".to_string()],
+                    transcript_segments_included: 0,
+                    transcript_segments_total: 0,
+                },
+                HydratedMeeting {
+                    meeting_id: "m2".to_string(),
+                    folder_id: None,
+                    rank: 2,
+                    retained_evidence_ids: vec!["title:m2".to_string()],
+                    transcript_segments_included: 0,
+                    transcript_segments_total: 0,
+                },
+            ],
+        };
+
+        let response = HybridSearchResponse::from_outputs(&ranked, &hydrated, 2);
+        assert_eq!(
+            response
+                .results
+                .iter()
+                .map(|result| {
+                    (
+                        result.meeting_id.as_str(),
+                        result.provenance[0].evidence_id.as_str(),
+                        result.provenance[0].channel_rank,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![("m1", "title:m1", 2), ("m2", "title:m2", 1)]
+        );
     }
 }

@@ -50,9 +50,9 @@ pub use model::{get_or_load, RetrievalModelError, RetrievalModels};
 pub use ranking::{
     aggregate_meetings, apply_rerank, concept_coverage, coverage_regions, dedupe_candidates, fuse,
     select_rerank_head, title_overlap, AggregationTerms, FusedEvidence, RankedEvidence,
-    RankedMeeting, RankingConfig, RankingOutcome, RerankFallback, SegmentOrder, CHAT_RERANK_DEPTH,
-    CONCEPT_DELTA, RERANK_GAMMA, RRF_K, SEARCH_RERANK_DEPTH, SUPPORT_ALPHA, SUPPORT_CAP,
-    SUPPORT_WINDOW, TITLE_BETA, W_LEXICAL, W_VECTOR,
+    RankedMeeting, RankingConfig, RankingOutcome, RerankFallback, SegmentOrder, TitleMatch,
+    CHAT_RERANK_DEPTH, CONCEPT_DELTA, RERANK_GAMMA, RRF_K, SEARCH_RERANK_DEPTH, SUPPORT_ALPHA,
+    SUPPORT_CAP, SUPPORT_WINDOW, TITLE_BETA, W_LEXICAL, W_VECTOR,
 };
 pub use service::{
     CoreTermLanguage, EvidenceProvenance, LexicalMode, PersistedRetrievalScope, QueryVariantKind,

@@ -3,11 +3,12 @@
 import React from "react";
 import { Folder, X } from "lucide-react";
 import type { MeetingFolder } from "@/types";
+import { t } from "@/lib/i18n";
 
 interface FolderFilterTreeProps {
     folders: MeetingFolder[];
     selected: string | null;
-    onSelect: (name: string | null) => void;
+    onSelect: (folderId: string | null) => void;
 }
 
 export function FolderFilterTree({ folders, selected, onSelect }: FolderFilterTreeProps) {
@@ -16,13 +17,14 @@ export function FolderFilterTree({ folders, selected, onSelect }: FolderFilterTr
     return (
         <div className="flex flex-wrap gap-1 px-1 mt-1">
             {folders.map((f) => {
-                const active = selected === f.name;
+                const active = selected === f.id;
                 return (
                     <button
                         key={f.id}
-                        onClick={() => onSelect(active ? null : f.name)}
+                        type="button"
+                        onClick={() => onSelect(active ? null : f.id)}
                         aria-pressed={active}
-                        aria-label={`Filtrar por pasta ${f.name}`}
+                        aria-label={t("app.sidebar.filterFolderAria", { name: f.name })}
                         className={`flex items-center gap-1 px-2 py-0.5 text-xs rounded-full border transition-colors ${
                             active
                                 ? "bg-blue-100 border-blue-300 text-blue-700"
@@ -37,11 +39,12 @@ export function FolderFilterTree({ folders, selected, onSelect }: FolderFilterTr
             })}
             {selected && (
                 <button
+                    type="button"
                     onClick={() => onSelect(null)}
-                    aria-label="Limpar filtro de pasta"
+                    aria-label={t("app.sidebar.clearFolderFilterAria")}
                     className="text-xs text-gray-400 hover:text-gray-600 underline"
                 >
-                    limpar
+                    {t("app.sidebar.clearFolderFilter")}
                 </button>
             )}
         </div>

@@ -1161,7 +1161,9 @@ async fn variant_provenance_remains_distinguishable() {
 #[tokio::test]
 async fn title_only_query_returns_meeting_with_and_without_semantic() {
     let pool = migrated_pool().await;
+    insert_folder(&pool, "title-folder", "Title Folder", None).await;
     insert_meeting(&pool, "m-title", "Chaves de Acesso Rotation").await;
+    set_meeting_folder(&pool, "m-title", Some("title-folder")).await;
     add_transcript(&pool, "t-title", "m-title", "unrelated content words only").await;
     register_test_model(&pool).await;
     RetrievalRepository::ensure_generation(&pool, "gen-title", MODEL_ID)
@@ -1171,19 +1173,15 @@ async fn title_only_query_returns_meeting_with_and_without_semantic() {
 
     // Semantic unavailable: the title channel must stand alone.
     let lexical_only = RetrievalService::new(query_lifecycle(&ServiceEmbedder::new()));
-    let result = lexical_only
-        .retrieve(
-            &pool,
-            request(
-                "chaves de acesso",
-                PersistedRetrievalScope::All,
-                RetrievalLimits::default(),
-                CoreTermLanguage::Portuguese,
-                None,
-            ),
-        )
-        .await
-        .unwrap();
+    let mut title_request = request(
+        "chaves de acesso",
+        PersistedRetrievalScope::All,
+        RetrievalLimits::default(),
+        CoreTermLanguage::Unknown,
+        None,
+    );
+    title_request.purpose = RetrievalPurpose::Search;
+    let result = lexical_only.retrieve(&pool, title_request).await.unwrap();
     assert_eq!(
         result.semantic_fallback,
         Some(SemanticFallbackReason::NoActiveGeneration)
@@ -1199,24 +1197,47 @@ async fn title_only_query_returns_meeting_with_and_without_semantic() {
         .iter()
         .any(|provenance| provenance.channel == RetrievalChannel::Title));
 
+    let request_state = ChatRequestState::new();
+    let response = execute_hybrid_search(
+        &pool,
+        failing_lifecycle(),
+        &request_state,
+        ChatRequestSurface::Sidebar,
+        "title-search".to_string(),
+        "chaves de acesso".to_string(),
+        HybridScope::Folder {
+            folder_id: "title-folder".to_string(),
+        },
+        Some(50),
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        response
+            .results
+            .iter()
+            .map(|result| result.meeting_id.as_str())
+            .collect::<Vec<_>>(),
+        ["m-title"]
+    );
+    assert_eq!(response.results[0].sources[0].source_kind, "title");
+    assert_eq!(response.results[0].provenance[0].channel, "title");
+
     // Semantic active: the title channel still returns the meeting.
     let embedder = ServiceEmbedder::new();
     let lifecycle = query_lifecycle(&embedder);
     install_snapshot(&pool, &lifecycle, MODEL_ID).await;
     let hybrid = RetrievalService::new(lifecycle);
-    let result = hybrid
-        .retrieve(
-            &pool,
-            request(
-                "chaves de acesso",
-                PersistedRetrievalScope::All,
-                RetrievalLimits::default(),
-                CoreTermLanguage::Portuguese,
-                None,
-            ),
-        )
-        .await
-        .unwrap();
+    let mut title_request = request(
+        "chaves de acesso",
+        PersistedRetrievalScope::All,
+        RetrievalLimits::default(),
+        CoreTermLanguage::Unknown,
+        None,
+    );
+    title_request.purpose = RetrievalPurpose::Search;
+    let result = hybrid.retrieve(&pool, title_request).await.unwrap();
     let title_hit = result
         .candidates
         .iter()
@@ -1226,6 +1247,115 @@ async fn title_only_query_returns_meeting_with_and_without_semantic() {
         .provenance
         .iter()
         .any(|provenance| provenance.channel == RetrievalChannel::Title));
+}
+
+#[tokio::test]
+async fn mixed_title_and_content_search_preserves_independent_provenance() {
+    let pool = migrated_pool().await;
+    insert_meeting(&pool, "m-mixed", "Chaves de Acesso Rotation").await;
+    add_transcript(&pool, "t-mixed", "m-mixed", "chaves de acesso decision").await;
+    crate::database::repositories::fts::FtsRepository::refresh_meeting(&pool, "m-mixed")
+        .await
+        .unwrap();
+
+    let response = execute_hybrid_search(
+        &pool,
+        failing_lifecycle(),
+        &ChatRequestState::new(),
+        ChatRequestSurface::Sidebar,
+        "mixed-title-content".to_string(),
+        "chaves de acesso".to_string(),
+        HybridScope::All {},
+        Some(50),
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    let result = response
+        .results
+        .iter()
+        .find(|result| result.meeting_id == "m-mixed")
+        .expect("mixed title and content result");
+    let title_source = result
+        .sources
+        .iter()
+        .find(|source| source.source_kind == "title")
+        .expect("title metadata source");
+    assert_eq!(title_source.evidence_ids, vec!["title:m-mixed"]);
+    let content_source = result
+        .sources
+        .iter()
+        .find(|source| source.source_kind == "transcript")
+        .expect("transcript source");
+    let content_id = content_source
+        .evidence_ids
+        .first()
+        .expect("transcript evidence identity");
+    assert!(result
+        .retained_evidence_ids
+        .iter()
+        .any(|evidence_id| evidence_id == "title:m-mixed"));
+    assert!(result
+        .retained_evidence_ids
+        .iter()
+        .any(|evidence_id| evidence_id == content_id));
+
+    let title_provenance = result
+        .provenance
+        .iter()
+        .find(|provenance| provenance.evidence_id == "title:m-mixed")
+        .expect("title provenance");
+    assert_eq!(title_provenance.channel, "title");
+    assert_eq!(title_provenance.channel_rank, 1);
+    let content_provenance = result
+        .provenance
+        .iter()
+        .filter(|provenance| provenance.evidence_id == *content_id)
+        .collect::<Vec<_>>();
+    assert!(content_provenance
+        .iter()
+        .all(|provenance| provenance.channel == "lexical"));
+    let variants = content_provenance
+        .iter()
+        .map(|provenance| provenance.variant.as_str())
+        .collect::<BTreeSet<_>>();
+    assert!(variants.contains("original"));
+    assert!(variants.contains("core_terms"));
+}
+
+#[tokio::test]
+async fn unknown_language_title_matching_is_search_only() {
+    let pool = migrated_pool().await;
+    insert_meeting(&pool, "m-common", "What we decided").await;
+    let service = RetrievalService::new(failing_lifecycle());
+
+    let mut context_request = request(
+        "what",
+        PersistedRetrievalScope::All,
+        RetrievalLimits::default(),
+        CoreTermLanguage::Unknown,
+        None,
+    );
+    context_request.purpose = RetrievalPurpose::Context;
+    let context = service.retrieve(&pool, context_request).await.unwrap();
+    assert!(!context
+        .candidates
+        .iter()
+        .any(|candidate| candidate.source_kind == "title"));
+
+    let mut search_request = request(
+        "what",
+        PersistedRetrievalScope::All,
+        RetrievalLimits::default(),
+        CoreTermLanguage::Unknown,
+        None,
+    );
+    search_request.purpose = RetrievalPurpose::Search;
+    let search = service.retrieve(&pool, search_request).await.unwrap();
+    assert!(search
+        .candidates
+        .iter()
+        .any(|candidate| candidate.meeting_id == "m-common" && candidate.source_kind == "title"));
 }
 
 // -- Semantic fallback matrix ----------------------------------------------------

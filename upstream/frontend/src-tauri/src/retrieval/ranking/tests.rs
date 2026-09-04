@@ -1467,6 +1467,7 @@ fn late_cancellation_after_inference_returns_no_outcome() {
         &RankingConfig::chat(),
         &cancel,
         vec![],
+        vec![],
         "pergunta",
         false,
         vec![],
@@ -1480,6 +1481,7 @@ fn late_cancellation_after_inference_returns_no_outcome() {
         &AggregationTerms::default(),
         &RankingConfig::chat(),
         &CancellationToken::new(),
+        vec![],
         vec![],
         "pergunta",
         false,
@@ -1754,6 +1756,7 @@ fn chunker_windows_sit_inside_the_ordered_chronology() {
     let source = MeetingSource {
         meeting_id: "m1".to_string(),
         title: "M".to_string(),
+        folder_id: None,
         folder_name: String::new(),
         source_revision: Some(1),
         latest_summary_template_id: None,

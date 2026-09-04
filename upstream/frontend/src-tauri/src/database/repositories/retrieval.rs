@@ -200,6 +200,7 @@ pub struct SourceTranscript {
 pub struct MeetingSource {
     pub meeting_id: String,
     pub title: String,
+    pub folder_id: Option<String>,
     pub folder_name: String,
     pub source_revision: Option<i64>,
     pub latest_summary_template_id: Option<String>,
@@ -1191,8 +1192,8 @@ impl RetrievalRepository {
         cancel: Option<&CancellationToken>,
     ) -> Result<Option<MeetingSource>, SqlxError> {
         check_source_cancellation(cancel)?;
-        let meta: Option<(String, String, Option<i64>)> = sqlx::query_as(
-            "SELECT m.title, COALESCE(f.name, ''), s.source_revision
+        let meta: Option<(String, Option<String>, String, Option<i64>)> = sqlx::query_as(
+            "SELECT m.title, m.folder_id, COALESCE(f.name, ''), s.source_revision
              FROM meetings m
              LEFT JOIN meeting_folders f ON m.folder_id = f.id
              LEFT JOIN search_source_state s ON s.meeting_id = m.id
@@ -1201,7 +1202,7 @@ impl RetrievalRepository {
         .bind(meeting_id)
         .fetch_optional(pool)
         .await?;
-        let Some((title, folder_name, source_revision)) = meta else {
+        let Some((title, folder_id, folder_name, source_revision)) = meta else {
             return Ok(None);
         };
 
@@ -1285,6 +1286,7 @@ impl RetrievalRepository {
         Ok(Some(MeetingSource {
             meeting_id: meeting_id.to_string(),
             title,
+            folder_id,
             folder_name,
             source_revision,
             latest_summary_template_id,
@@ -1329,10 +1331,10 @@ impl RetrievalRepository {
         transcript_ids: &[String],
         transcript_ranges: &[(String, String)],
     ) -> Result<Option<MeetingSource>, SqlxError> {
-        let meta: Option<(String, String, Option<i64>)> = sqlx::query_as(
-            "SELECT m.title, COALESCE(f.name, ''), s.source_revision FROM meetings m LEFT JOIN meeting_folders f ON m.folder_id = f.id LEFT JOIN search_source_state s ON s.meeting_id = m.id WHERE m.id = ?",
+        let meta: Option<(String, Option<String>, String, Option<i64>)> = sqlx::query_as(
+            "SELECT m.title, m.folder_id, COALESCE(f.name, ''), s.source_revision FROM meetings m LEFT JOIN meeting_folders f ON m.folder_id = f.id LEFT JOIN search_source_state s ON s.meeting_id = m.id WHERE m.id = ?",
         ).bind(meeting_id).fetch_optional(pool).await?;
-        let Some((title, folder_name, source_revision)) = meta else {
+        let Some((title, folder_id, folder_name, source_revision)) = meta else {
             return Ok(None);
         };
         let notes: Option<(Option<String>,)> =
@@ -1368,6 +1370,7 @@ impl RetrievalRepository {
         let mut source = MeetingSource {
             meeting_id: meeting_id.to_string(),
             title,
+            folder_id,
             folder_name,
             source_revision,
             latest_summary_template_id,

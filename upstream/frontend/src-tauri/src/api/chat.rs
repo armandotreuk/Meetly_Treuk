@@ -4711,6 +4711,7 @@ mod tests {
         let source = crate::database::repositories::retrieval::MeetingSource {
             meeting_id: "m2".to_string(),
             title: "Child".to_string(),
+            folder_id: None,
             folder_name: String::new(),
             source_revision: None,
             latest_summary_template_id: None,

@@ -6,9 +6,17 @@ import Analytics from '@/lib/analytics';
 import { invoke } from '@tauri-apps/api/core';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 import { usePanelResize } from '@/hooks/usePanelResize';
-import type { MeetingFolder, FtsSearchResult } from '@/types';
+import type { MeetingFolder, HybridSearchResponse } from '@/types';
 import { buildSummaryCancelArgs } from '@/lib/summary-command-args';
 import { shouldApplySummaryPollResult, summaryPollKey } from '@/lib/summary-polling';
+import {
+  createSidebarSearchController,
+  type SidebarSearchController,
+  type SidebarSearchErrorCode,
+  type SidebarSearchInvoke,
+  type SidebarSearchNotice,
+  type SidebarSearchState,
+} from '@/lib/sidebar-search';
 
 
 interface SidebarItem {
@@ -37,8 +45,12 @@ interface SidebarContextType {
   isMeetingActive: boolean;
   setIsMeetingActive: (active: boolean) => void;
   handleRecordingToggle: () => void;
-  searchTranscripts: (query: string) => Promise<void>;
-  searchResults: FtsSearchResult[];
+  searchTranscripts: (query: string, folderId?: string | null) => Promise<void>;
+  cancelSidebarSearch: () => void;
+  searchResponse: HybridSearchResponse | null;
+  searchNotice: SidebarSearchNotice | null;
+  searchError: SidebarSearchErrorCode | null;
+  searchPhase: SidebarSearchState['phase'];
   isSearching: boolean;
   setServerAddress: (address: string) => void;
   serverAddress: string;
@@ -76,13 +88,21 @@ export const useSidebar = () => {
   return context;
 };
 
-export function SidebarProvider({ children }: { children: React.ReactNode }) {
+export interface SidebarProviderProps {
+  children: React.ReactNode;
+  searchInvoke?: SidebarSearchInvoke;
+}
+
+export function SidebarProvider({ children, searchInvoke }: SidebarProviderProps) {
   const [currentMeeting, setCurrentMeeting] = useState<CurrentMeeting | null>({ id: 'intro-call', title: '+ New Call' });
   const [isCollapsed, setIsCollapsed] = useState(true);
   const [meetings, setMeetings] = useState<CurrentMeeting[]>([]);
   const [sidebarItems, setSidebarItems] = useState<SidebarItem[]>([]);
   const [isMeetingActive, setIsMeetingActive] = useState(false);
-  const [searchResults, setSearchResults] = useState<FtsSearchResult[]>([]);
+  const [searchResponse, setSearchResponse] = useState<HybridSearchResponse | null>(null);
+  const [searchNotice, setSearchNotice] = useState<SidebarSearchNotice | null>(null);
+  const [searchError, setSearchError] = useState<SidebarSearchErrorCode | null>(null);
+  const [searchPhase, setSearchPhase] = useState<SidebarSearchState['phase']>('idle');
   const [isSearching, setIsSearching] = useState(false);
   const [serverAddress, setServerAddress] = useState('');
   const [transcriptServerAddress, setTranscriptServerAddress] = useState('');
@@ -93,6 +113,21 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
 
   // Use recording state from RecordingStateContext (single source of truth)
   const { isRecording } = useRecordingState();
+
+  const searchController = React.useMemo<SidebarSearchController>(
+    () =>
+      createSidebarSearchController({
+        invoke: searchInvoke ?? ((command, args) => invoke(command, args)),
+        onState: (state: SidebarSearchState) => {
+          setIsSearching(state.phase === 'loading');
+          setSearchResponse(state.response);
+          setSearchNotice(state.notice);
+          setSearchError(state.error);
+          setSearchPhase(state.phase);
+        },
+      }),
+    [searchInvoke]
+  );
 
   // ponytail: sidebar resize — initial 256 matches `w-64`, min 200, max 40% of viewport.
   const { width: sidebarWidth, isDragging: sidebarDragging, handleProps: resizeHandleProps } = usePanelResize({
@@ -230,26 +265,16 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     // The actual recording start/stop is handled in the Home component
   };
 
-  // Function to search through meeting transcripts via FTS5 index
-  const searchTranscripts = async (query: string) => {
-    if (!query.trim()) {
-      setSearchResults([]);
-      return;
-    }
+  const searchTranscripts = React.useCallback(
+    async (query: string, folderId: string | null = null) => {
+      searchController.search(query, folderId);
+    },
+    [searchController]
+  );
 
-    try {
-      setIsSearching(true);
-
-
-      const results = await invoke('api_search_fts', { query }) as FtsSearchResult[];
-      setSearchResults(results);
-    } catch (error) {
-      console.error('Error searching transcripts:', error);
-      setSearchResults([]);
-    } finally {
-      setIsSearching(false);
-    }
-  };
+  useEffect(() => {
+    return () => searchController.dispose();
+  }, [searchController]);
 
   // Summary polling management
   const startSummaryPolling = React.useCallback((
@@ -405,8 +430,12 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       isMeetingActive,
       setIsMeetingActive,
       handleRecordingToggle,
-      searchTranscripts,
-      searchResults,
+       searchTranscripts,
+       cancelSidebarSearch: searchController.cancel,
+       searchResponse,
+       searchNotice,
+       searchError,
+       searchPhase,
       isSearching,
       setServerAddress,
       serverAddress,

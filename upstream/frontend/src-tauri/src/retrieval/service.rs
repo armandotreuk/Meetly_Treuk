@@ -314,6 +314,7 @@ pub struct RankedRetrieval {
 /// Internal normalized request: lexical texts with folder operators stripped,
 /// core terms, and request-start membership.
 struct NormalizedRequest {
+    purpose: RetrievalPurpose,
     scope: PersistedRetrievalScope,
     membership: ScopeFilter,
     transcript_only: bool,
@@ -729,6 +730,7 @@ impl RetrievalService {
         ensure_not_cancelled(cancel)?;
         let core_terms = core_terms(&lexical_original, request.core_language);
         Ok(NormalizedRequest {
+            purpose: request.purpose,
             transcript_only: matches!(&scope, PersistedRetrievalScope::Meeting(_)),
             scope,
             membership,
@@ -1081,12 +1083,10 @@ impl RetrievalService {
     /// before truncation. Scope safety, the overlap score, and the
     /// (overlap desc, meeting id asc) ordering are identical to a full sort.
     ///
-    /// Requires a known [`CoreTermLanguage`]: overlap scoring has no
-    /// content-word signal without a stopword list, so for
-    /// [`CoreTermLanguage::Unknown`] every function word in the query would
-    /// score equally with real content words and the channel outranks
-    /// Semantic in [`best_provenance`] - noise that would sit ahead of every
-    /// semantic hit rather than being skipped.
+    /// [`CoreTermLanguage::Unknown`] deliberately keeps every normalized query
+    /// token in `core_terms` for Search, whose contract requires title search
+    /// without an explicit language. Other purposes keep the guard against
+    /// function-word title signals outranking content evidence.
     async fn title_channel(
         &self,
         pool: &SqlitePool,
@@ -1097,7 +1097,8 @@ impl RetrievalService {
     ) -> Result<(), RetrievalError> {
         if normalized.core_terms.is_empty()
             || limits.lexical_per_variant == 0
-            || normalized.core_language == CoreTermLanguage::Unknown
+            || (normalized.purpose != RetrievalPurpose::Search
+                && normalized.core_language == CoreTermLanguage::Unknown)
         {
             return Ok(());
         }

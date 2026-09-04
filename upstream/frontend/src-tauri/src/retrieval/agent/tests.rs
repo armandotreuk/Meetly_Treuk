@@ -2731,6 +2731,7 @@ fn planner_prompt_rejects_unsafe_ids_and_emits_exact_capabilities() {
                     reranker_score: None,
                 },
             ],
+            title_matches: Vec::new(),
             meetings: Vec::new(),
             reranker_used: false,
             rerank_depth: 0,
@@ -2750,6 +2751,7 @@ fn planner_prompt_rejects_unsafe_ids_and_emits_exact_capabilities() {
         sources: Vec::new(),
         meetings: vec![HydratedMeeting {
             meeting_id: "m-1".to_string(),
+            folder_id: None,
             rank: 1,
             retained_evidence_ids: Vec::new(),
             transcript_segments_included: 1,

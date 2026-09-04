@@ -206,6 +206,15 @@ pub struct RankedEvidence {
     pub reranker_score: Option<f32>,
 }
 
+/// A title candidate kept outside citable evidence so its real channel
+/// identity and rank can still reach the search contract.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TitleMatch {
+    pub meeting_id: String,
+    pub evidence_id: String,
+    pub provenance: Vec<EvidenceProvenance>,
+}
+
 /// One meeting in the aggregated ranking order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RankedMeeting {
@@ -268,6 +277,7 @@ impl RerankFallback {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RankingOutcome {
     pub evidence: Vec<RankedEvidence>,
+    pub title_matches: Vec<TitleMatch>,
     pub meetings: Vec<RankedMeeting>,
     pub reranker_used: bool,
     /// The deterministic depth the policy selected for this request.
@@ -1204,6 +1214,24 @@ fn fused_only(fused: Vec<FusedEvidence>) -> Vec<RankedEvidence> {
         .collect()
 }
 
+fn collect_title_matches(candidates: &[RetrievedEvidence]) -> Vec<TitleMatch> {
+    let mut matches = candidates
+        .iter()
+        .filter(|candidate| candidate.source_kind == "title")
+        .map(|candidate| TitleMatch {
+            meeting_id: candidate.meeting_id.clone(),
+            evidence_id: candidate.evidence_id.clone(),
+            provenance: candidate.provenance.clone(),
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        left.meeting_id
+            .cmp(&right.meeting_id)
+            .then_with(|| left.evidence_id.cmp(&right.evidence_id))
+    });
+    matches
+}
+
 // -- Pipeline ----------------------------------------------------------------
 
 enum RerankResult {
@@ -1288,6 +1316,7 @@ pub(crate) async fn rank_with_mode(
     // a meeting matched ONLY by its title would otherwise contribute no
     // title term and disappear from the ranking entirely.
     let title = title_overlap(&candidates, &core_terms);
+    let title_matches = collect_title_matches(&candidates);
     let deduped = dedupe_candidates(candidates, &segment_order);
     // Aggregation inputs computed once from the deduplicated candidates:
     // distinct-concept coverage over evidence text, and the region key that
@@ -1308,6 +1337,7 @@ pub(crate) async fn rank_with_mode(
         let meetings = aggregate_meetings(&fused, &terms, None, config);
         RankingOutcome {
             evidence: fused_only(fused),
+            title_matches: title_matches.clone(),
             meetings,
             reranker_used: false,
             rerank_depth,
@@ -1337,6 +1367,7 @@ pub(crate) async fn rank_with_mode(
                 config,
                 cancel,
                 core_terms,
+                title_matches,
                 effective_query,
                 dedupe_degraded,
                 chronology_omitted_meetings.clone(),
@@ -1350,6 +1381,7 @@ pub(crate) async fn rank_with_mode(
                 let meetings = aggregate_meetings(&fused, &terms, None, config);
                 RankingOutcome {
                     evidence: fused_only(fused),
+                    title_matches: title_matches.clone(),
                     meetings,
                     reranker_used: false,
                     rerank_depth,
@@ -1366,6 +1398,7 @@ pub(crate) async fn rank_with_mode(
                 let meetings = aggregate_meetings(&fused, &terms, None, config);
                 RankingOutcome {
                     evidence: fused_only(fused),
+                    title_matches: title_matches.clone(),
                     meetings,
                     reranker_used: false,
                     rerank_depth,
@@ -1408,6 +1441,7 @@ fn assemble_scored_outcome(
     config: &RankingConfig,
     cancel: &CancellationToken,
     core_terms: Vec<String>,
+    title_matches: Vec<TitleMatch>,
     effective_query: &str,
     dedupe_degraded: bool,
     chronology_omitted_meetings: Vec<String>,
@@ -1422,6 +1456,7 @@ fn assemble_scored_outcome(
     let (evidence, meetings) = apply_rerank(fused, &score_map, terms, config);
     Ok(RankingOutcome {
         evidence,
+        title_matches,
         meetings,
         reranker_used: true,
         rerank_depth: config.rerank_depth.min(head.len()),

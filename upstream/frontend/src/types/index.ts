@@ -183,6 +183,54 @@ export interface FtsSearchResult {
     rank: number;
 }
 
+export type HybridScope =
+    | { kind: "all" }
+    | { kind: "meeting"; meetingId: string }
+    | { kind: "folder"; folderId: string }
+    | { kind: "allowed_meeting_ids"; meetingIds: string[] };
+
+export type HybridRetrievalStatus = "hybrid" | "forced_lexical" | "lexical_fallback";
+
+export interface HybridProvenance {
+    evidenceId: string;
+    channel: "lexical" | "title" | "semantic";
+    variant: "original" | "rewritten" | "core_terms";
+    matchMode?: "and" | "or";
+    channelRank: number;
+    querySlot: number;
+}
+
+export interface HybridSource {
+    meetingId: string;
+    meetingTitle: string;
+    folderName: string;
+    sourceKind: string;
+    snippet: string;
+    sourceStartId?: string;
+    sourceEndId?: string;
+    sourceTemplateId?: string;
+    evidenceIds: string[];
+}
+
+export interface HybridMeetingResult {
+    meetingId: string;
+    meetingTitle: string;
+    folderName: string;
+    folderId: string | null;
+    meetingRank: number;
+    retainedEvidenceIds: string[];
+    sources: HybridSource[];
+    provenance: HybridProvenance[];
+}
+
+export interface HybridSearchResponse {
+    version: "v1";
+    scope: HybridScope;
+    retrievalStatus: HybridRetrievalStatus;
+    results: HybridMeetingResult[];
+    total: number;
+}
+
 // Chat with Meetings types
 export interface ChatMessage {
     role: "user" | "assistant";
