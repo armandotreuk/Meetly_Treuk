@@ -6,6 +6,11 @@ In progress for Tasks 5.1-5.4 after the user's 2026-09-04 scope amendment.
 Sprint 4 and Sprint 3 release acceptance remain mandatory gates for Task 5.5,
 Sprint 5 close, and every release claim.
 
+Task 5.4 was decomposed by user direction on 2026-09-04 into the sequential
+Tasks 5.4a-5.4c. The split changes review and handoff boundaries, not the
+approved Windows-only outcome or any release gate. Each subtask requires its
+own implementation session, acceptance review, and execution-log entry.
+
 Revised 2026-08-21 after pre-implementation critique: packaging descoped to
 Windows x64, derived-disk gate added, kill-switch UI added, and a sidebar
 reranking guard added. Estimate: 8-12 working days.
@@ -124,8 +129,10 @@ may substitute for them.
 | 5.1 | Sidebar search | Consume the approved Tauri hybrid contract for meeting-level sidebar search, relevance snippets/provenance, lexical fallback, cancellation, and stable snapshot IDs. | M | Pending `worker-m` | 5.2 | Frontend/Rust tests prove ranking, fallback, folder filters, request cancellation, dedupe, keyboard/a11y, and snapshot membership. | Switch sidebar invocation back to existing FTS command. |
 | 5.2 | API and MCP | Add explicit cancellable Tauri and versioned bounded Fast-only MCP hybrid search/context contracts while preserving all lexical tools. | M | Pending `worker-m` | Sprint 4 approved contract; Task 4.1 shared ownership mechanism | Contract/execution tests prove surface classification, scope composition, provenance, source retention, shared cancellation/timeout bounds, compatibility, and no score ambiguity. | Remove additive commands/tools; existing lexical APIs remain. |
 | 5.3 | Index UX | Add Settings status, progress, pause/resume, rebuild, force-lexical toggle, error/retry, model/license, and local-size UI. | M | Pending `worker-m` | 2.5, 3.4 | UI/backend tests prove controls, lexical-only state, kill switch, disk reporting, accessibility, and rebuild cannot delete primary data. | Remove additive UI/commands; background index continues or can be disabled. |
-| 5.4 | Packaging | Bundle, sign, attribute, install, and smoke-test embedding/reranker resources on **Windows x64**. | M | Pending `worker-m` | 1.5, Sprint 2 | The installed Windows package loads/tokenizes/embeds/reranks/queries and fails over when resources are unavailable. | Remove resources and ship lexical-only build; never claim hybrid availability. |
-| 5.5 | Release qualification | Run/fix scale, concurrency, crash, upgrade, deletion, corruption, privacy, evaluation, native, and rollback gates. | L | Pending `worker-l` | 5.1-5.4; inherited Sprint 3 release gates | All architecture release gates pass, including every inherited Sprint 3 gate, and final code/architecture reviews approve. | Disable semantic feature paths and retain FTS; restore pre-upgrade backup when release procedure requires. |
+| 5.4a | Package authority | Verify and harden the pinned retrieval bundle staging and Tauri resource contract for Windows x64 without changing model or signing identity. | M | Pending distinct `worker-m` | 1.5, Sprint 2 | The exact manifest-managed model, tokenizer, and license set stages atomically; missing, corrupt, divergent, or extra content fails before packaging. | Revert Task 5.4a package-contract changes; ship lexical-only and make no hybrid package claim. |
+| 5.4b | Packaged diagnostic | Add a safe installed-resource diagnostic that performs real tokenizer, embedding, reranker, and tiny hybrid-fixture inference and proves missing/corrupt resources degrade to lexical behavior. | L | Pending distinct `worker-l` | 5.4a accepted | The diagnostic resolves installed resources without a development override or network, returns typed bounded outcomes, and passes real inference and fallback tests. | Remove the additive diagnostic entry point; normal application and lexical retrieval remain unchanged. |
+| 5.4c | Installed Windows smoke | Extend the active root Windows workflow to install MSI and NSIS artifacts, run the packaged diagnostic, preserve signing, and report package/cache size. | L | Pending distinct `worker-l` | 5.4b accepted | Both installed package formats pass the diagnostic from their installed layouts; workflow evidence records hashes, paths, sizes, and signing treatment. | Revert the additive workflow smoke/report steps; do not claim packaged hybrid support. |
+| 5.5 | Release qualification | Run/fix scale, concurrency, crash, upgrade, deletion, corruption, privacy, evaluation, native, and rollback gates. | L | Pending `worker-l` | 5.1-5.3 and 5.4a-5.4c; inherited Sprint 3 release gates | All architecture release gates pass, including every inherited Sprint 3 gate, and final code/architecture reviews approve. | Disable semantic feature paths and retain FTS; restore pre-upgrade backup when release procedure requires. |
 
 ## Dependency Order
 
@@ -133,13 +140,18 @@ may substitute for them.
 
 `2.5 -> 5.3 -> 5.5`
 
-`1.5 + Sprint 2 -> 5.4 -> 5.5`
+`1.5 + Sprint 2 -> 5.4a -> 5.4b -> 5.4c -> 5.5`
 
 Tasks `5.1` and `5.3` may run in one approved batch only if their TypeScript
 types, command registrations, and settings/search components are disjoint.
 Task `5.2` owns all serialized Tauri/MCP hybrid contracts and runs before its
-sidebar consumer. Task `5.5` is L and runs alone. Task `5.4` dropped from L to
-M when packaging was descoped to Windows x64 only.
+sidebar consumer. Task `5.5` is L and runs alone. The original Task `5.4`
+dropped from L to M when packaging was descoped to Windows x64 only, then was
+split into three review units at user direction. Task `5.4a` is M; the
+cross-cutting installed-resource diagnostic and signed-installer workflow Tasks
+`5.4b` and `5.4c` are L and run alone. All three run sequentially because they
+share the package authority and each subsequent task consumes the prior task's
+accepted contract.
 The Sprint 4 dependency here means its approved implementation contract; it does
 not convert Sprint 3's open release gates into an implementation or evidence
 waiver for Task 5.5.
@@ -404,75 +416,338 @@ git diff --check
 **Worker report additions:** Record Settings placement rationale, state/event
 contract, rebuild safety wording, and accessibility checks.
 
-### 5.4 - Windows model packaging and installed smoke [M]
+### 5.4 - Windows model packaging and installed smoke [Decomposed]
 
-**Outcome:** The supported Windows x64 installed application includes trusted
-retrieval assets and can execute real tokenizer/embedding/reranker inference.
+**Parent user outcome:** A user installing the supported Windows x64 MSI or
+NSIS package receives the complete, trusted local retrieval bundle. The
+installed application can run tokenizer, embedding, reranker, and a tiny local
+hybrid query without downloading model data. If packaged retrieval resources
+are missing or corrupt, the application still starts and search/Chat remain
+usable through the existing typed lexical fallback.
 
-**Platform note:** this task covers Windows x64 only. macOS ARM64 and Linux x64
-are deferred per `architecture.md` "Platform Scope" because this fork has no
-active CI for them. Do not create root-level workflows for those targets here,
-and do not edit the inert workflows under `upstream/.github/workflows/`
-expecting them to run.
+**User-visible boundaries:**
 
-**Likely touchpoints:**
+- No model download, network fallback, setup wizard, or new model choice is
+  introduced. Retrieval assets are package-owned and available offline.
+- The approved model identities, versions, licenses, and local-only behavior do
+  not change.
+- Missing or corrupt semantic resources produce the existing truthful
+  unavailable/degraded state; they do not crash startup or imply readiness.
+- Installer identity and signing behavior do not change.
+- This work supports Windows x64 only. It makes no macOS ARM64 or Linux x64
+  package claim.
+- Package and cache sizes are build/release evidence, not user telemetry. No
+  raw query, meeting text, tokens, embeddings, or local paths enter public logs.
 
-- `frontend/src-tauri/tauri.conf.json`
-- The repository-root `.github/workflows/build-windows.yml`
-- Artifact fetch/verification scripts from Sprint 1
-- Windows smoke-test helper/command
-- License/attribution resources
+**Existing technical authority:**
 
-**Required implementation:**
+- `frontend/src-tauri/resources/retrieval/model-bundle.manifest.json` is the
+  checked-in publication authority for bundle ID
+  `meetily-retrieval-bundle-1`, `intfloat/multilingual-e5-base` embedding, and
+  `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` reranking. Its pinned revisions,
+  byte lengths, SHA-256 digests, tensor contracts, and license records must not
+  be replaced or relaxed in this task.
+- `frontend/src-tauri/scripts/stage-retrieval-models.ps1` is the approved fetch,
+  cache, byte-length/SHA-256 verification, crash recovery, and atomic
+  publication path. `resources/retrieval/bundle` is its sole package output;
+  arbitrary or stale files are rejected.
+- `frontend/src-tauri/tauri.conf.json` already packages
+  `resources/retrieval/bundle`. Its Windows signing command is
+  `scripts/sign-windows.ps1`; no subtask may disable, bypass, replace, or fake
+  that command or its credentials.
+- `frontend/src-tauri/src/retrieval/model.rs::bundle_dir` maps Tauri's installed
+  resource directory to `resources/retrieval/bundle`.
+  `RetrievalModels::get_or_load` parses the approved manifest, verifies all
+  artifacts before ONNX loading, warms the bounded embedding session, and
+  lazily loads the reranker.
+- `frontend/src-tauri/src/main.rs` currently reserves first-argument packaged
+  diagnostics, including `--smoke-dbstat`. A retrieval diagnostic must preserve
+  that exact first-argument safety rule and use distinct documented exit codes.
+- The only active platform workflow is repository-root
+  `.github/workflows/build-windows.yml`. It already stages/verifies the bundle,
+  runs source-tree reference inference, builds both package formats, installs
+  both for `--smoke-dbstat`, preserves the existing signer, and uploads the
+  installers. Nested workflows under `upstream/.github/workflows/` are inert
+  for this fork and are out of scope.
 
-- Fetch pinned model artifacts in the Windows build workflow through the
-  approved verifier.
-- Place resources at stable Tauri resource paths, chosen so a later
-  macOS/Linux enablement is additive rather than a rework.
-- Include model/tokenizer/license files in the installer/package.
-- Preserve app signing behavior.
-- Install package artifacts in CI or a platform runner where supported, then
-  invoke a headless/safe diagnostic that loads both sessions and executes known
-  reference inference.
-- Verify a known local hybrid query over a tiny fixture.
-- Verify model resource path handling after installation, not only in Cargo
-  output.
-- Simulate unavailable/corrupt resource in a dedicated test build/path and
-  prove lexical fallback does not prevent startup.
-- Record installer/package size and build-cache impact.
-- Ensure CUDA/Vulkan/Metal Whisper features do not change ORT retrieval outputs.
+**Parent success criteria:**
 
-**Acceptance criteria:**
+- Both installed Windows x64 package formats resolve the exact packaged
+  manifest and managed files from their installed resource layout.
+- Both installed packages execute real tokenizer, embedding, reranker, and
+  tiny hybrid-fixture inference with finite, dimensionally correct,
+  reference-compatible output and no network access.
+- Missing/corrupt runtime resources fail closed before ONNX consumes them and
+  preserve application startup plus typed lexical fallback.
+- Missing license, missing artifact, digest/length mismatch, divergent manifest
+  copy, and unmanifested package content all fail before package creation.
+- The package contains one retrieval bundle and does not copy model resources
+  into mutable app data.
+- MSI/NSIS byte sizes, retrieval bundle bytes, model-cache effect, manifest
+  digest, installed resource path shape, and diagnostic outcomes are recorded.
+- Signing configuration and installer identity are unchanged unless the user
+  separately approves a signing change.
+- Installed-package success is based on workflow/native-run evidence, never a
+  successful `cargo test`, source-tree inference, or archive listing alone.
 
-- Windows x64 NSIS/MSI package passes installed tokenizer, embedding, reranker,
-  and hybrid fixture inference.
-- Artifact corruption/missing license fails before package creation.
-- Runtime missing/corrupt model produces semantic-unavailable/FTS fallback,
-  not application startup failure.
-- Package contains exact manifest hashes and license attribution.
-- Model resources are not duplicated unnecessarily in app data.
-- Package-size report is recorded and approved.
-- Release documentation states that hybrid retrieval is verified on Windows
-  x64 only and makes no macOS or Linux claim.
+#### 5.4a - Pinned bundle staging and package authority [M]
+
+**Subagent user outcome:** Every Windows installer build receives one complete,
+license-attributed, checksum-verified retrieval bundle, and a bad package input
+is rejected before an installer can be produced.
+
+**Implementation boundary:**
+
+- Own only pre-package artifact authority, staging, verification, and Tauri
+  resource inclusion. Do not add the installed inference diagnostic or modify
+  MSI/NSIS install-smoke steps; those belong to 5.4b and 5.4c.
+- Reuse `stage-retrieval-models.ps1`; do not create another downloader,
+  manifest, model cache, or package directory.
+- Confirm the script's manifest traversal covers embedding model, embedding
+  tokenizer, reranker model, reranker tokenizer, and both managed license
+  entries. Preserve atomic same-volume publication and recovery behavior.
+- Keep `resources/retrieval/bundle` as the only packaged retrieval root and the
+  checked-in manifest outside that root as build authority only.
+- Never commit downloaded ONNX/tokenizer artifacts if repository policy keeps
+  them staged/cache-backed. Do not introduce runtime downloads.
+- Preserve the exact approved bundle/model identities and all manifest hashes.
+  A model, quantization, revision, license, checksum, or artifact-path change is
+  a separate user-approved architecture decision.
+- Inspect the root Windows workflow's existing stage call, but edit the workflow
+  in this subtask only if a pre-build package-integrity gate cannot otherwise be
+  enforced. Leave installed smoke orchestration to 5.4c.
+- Preserve `tauri.conf.json` identifier, targets, icons, external binaries, and
+  Windows `signCommand` exactly.
+
+**Success criteria:**
+
+- A clean staged bundle contains exactly the manifest-managed artifacts, its
+  byte-identical manifest copy, and the already pinned allowed placeholder.
+- Missing model/tokenizer/license, one-byte corruption, wrong byte length,
+  unsafe/duplicate path, divergent manifest, unexpected file, ambiguous crash
+  backup, and tampered placeholder each fail closed.
+- A valid sole crash backup is fully reverified before restoration.
+- Tauri includes the staged bundle once at the stable runtime path, with no
+  duplicate model tree in app data or another package resource root.
+- The staging/build path reaches no unpinned URL and verifies cache hits exactly
+  like fresh downloads.
+- Source diff proves signing command and package identity are unchanged.
 
 **Required verification:**
 
-Run the project platform workflows/commands defined by the task. At minimum:
+```powershell
+./frontend/src-tauri/scripts/stage-retrieval-models.ps1 -SelfTest
+$env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA "meetily-cargo-target"
+cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib model_bundle
+$env:MEETLY_RAG_VERIFY_STAGED_BUNDLE = "1"
+cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib staged_production_bundle -- --nocapture
+cargo check --manifest-path "frontend/src-tauri/Cargo.toml"
+git diff --check
+```
+
+The staged-production check may fetch/cache the approved artifacts through the
+existing script. If network or cache access is unavailable, report that exact
+limitation; the offline self-test does not substitute for real bundle evidence.
+
+**Rollback:** Revert only 5.4a package-contract changes, remove staged resources
+from the build output, retain lexical behavior, and make no packaged hybrid
+claim. Never weaken integrity checks to make packaging succeed.
+
+**Subagent handoff report:** List every changed file, exact managed artifact
+paths, bundle/manifest identity and digest, staging/cache behavior, negative
+integrity tests, signing/config diff result, commands and outputs, omissions,
+and blockers. Append an immutable `5.4a` execution entry; do not mark parent
+5.4 complete.
+
+#### 5.4b - Installed retrieval diagnostic and fallback proof [L]
+
+**Subagent user outcome:** Maintainers can ask the installed executable to prove
+that its own packaged retrieval resources work offline, while a normal user can
+still open and use the app lexically when those resources are unavailable.
+
+**Implementation boundary:**
+
+- Own the additive safe diagnostic entry point, installed resource resolution,
+  real inference fixture, typed exit/result contract, and runtime missing/
+  corrupt fallback tests. Do not edit installer orchestration in the root
+  workflow; 5.4c consumes this accepted diagnostic.
+- Extend the first-argument dispatch pattern in
+  `frontend/src-tauri/src/main.rs`; never match the flag elsewhere in argv.
+- Resolve the production smoke bundle through the same installed Tauri resource
+  path contract as normal startup. The passing installed diagnostic must not use
+  `MEETLY_RAG_BUNDLE_DIR`, `CARGO_MANIFEST_DIR`, the source tree, a developer
+  cache, or an app-data copy.
+- Reuse `model_bundle` validation and `RetrievalModels`; do not implement a
+  second manifest parser, tokenizer, ONNX session loader, or ranking service.
+- Execute known bounded tokenizer, embedding, and reranker reference cases,
+  then a tiny local hybrid query through the production retrieval/ranking path.
+  Fixture content must be synthetic, local, deterministic, and unrelated to the
+  excluded evaluation corpora.
+- Prove no network retrieval is attempted. Do not add a download fallback or
+  rely on network blocking as the implementation.
+- Use privacy-safe output: stage name, typed status, dimensions/counts, finite
+  verdicts, bundle/manifest digest, and exit code only. Never print raw fixture
+  text, token IDs, vectors, absolute user paths, queries, or model internals.
+- Give each failure stage a stable distinct non-zero exit code so CI can
+  distinguish harness/resource/tokenizer/embedding/reranker/hybrid failures.
+- Missing or corrupt model resources in normal startup remain typed semantic
+  unavailable/lexical fallback. A diagnostic may fail non-zero, but must not
+  turn normal application startup into a hard model dependency.
+
+**Success criteria:**
+
+- A real complete package-layout fixture passes manifest verification,
+  tokenizer reference checks, embedding inference, reranker inference, and one
+  tiny hybrid query with retained source/provenance invariants.
+- The diagnostic loads both approved ONNX sessions from the package resource
+  tree and verifies finite, expected-dimensional output.
+- Missing manifest, missing artifact/license, length/hash corruption, tokenizer
+  failure, embedding failure, reranker failure, and hybrid failure map to
+  distinct bounded outcomes without panic or startup side effects.
+- Normal application construction with missing/corrupt semantic resources
+  reaches the existing typed lexical fallback and does not copy or download a
+  replacement.
+- Tests prove the installed-success path rejects source/development overrides
+  and performs zero network calls by construction.
+- Whisper CUDA/Vulkan feature selection does not alter retrieval ORT inputs or
+  reference outputs; Metal remains out of scope on Windows.
+
+**Required verification:**
 
 ```powershell
 $env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA "meetily-cargo-target"
 cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib retrieval::model::tests
+cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib model_bundle
+cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib
 cargo check --manifest-path "frontend/src-tauri/Cargo.toml"
 cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check
 pnpm --dir "frontend" run typecheck
 git diff --check
 ```
 
-CI/package links, installed paths, hashes, and diagnostic output are mandatory
-execution-log evidence.
+Run the diagnostic against a real package-layout directory when available and
+record whether that is a source-side package-layout test or an actually
+installed executable. Only 5.4c can satisfy the MSI/NSIS installed criterion.
 
-**Worker report additions:** Provide Windows x64 artifact layout, installed
-smoke commands/results, signing impact, package sizes, and fallback proof.
+**Rollback:** Remove the additive retrieval diagnostic and its tests. Do not
+change normal startup, resource verification, or lexical fallback behavior.
+
+**Subagent handoff report:** Provide the exact flag, first-argument rule, exit
+code table, resource-root derivation, production functions reused, fixture and
+network-isolation design, real inference output summary, fallback proof,
+changed files, verification, omissions, and blockers. Append an immutable
+`5.4b` execution entry; do not claim installed MSI/NSIS success.
+
+#### 5.4c - MSI/NSIS installed-artifact CI smoke [L]
+
+**Subagent user outcome:** Every supported Windows package is installed and
+tested as users receive it, so a resource-layout, signing, or ONNX packaging
+failure blocks publication rather than appearing after installation.
+
+**Implementation boundary:**
+
+- Own repository-root `.github/workflows/build-windows.yml` installed smoke,
+  package/cache size reporting, artifact evidence, and final package gate. Do
+  not redesign the stager or diagnostic accepted in 5.4a/5.4b.
+- Extend the existing MSI and NSIS installation/teardown pattern. Continue to
+  run `--smoke-dbstat`; add the accepted 5.4b diagnostic against the executable
+  discovered under each actual install root.
+- Keep bounded process timeouts, preserve each diagnostic's exit code, sanitize
+  public failure output, uninstall both packages, and fail the final gate only
+  for smokes that actually ran. Earlier build failures must not be relabeled as
+  smoke failures.
+- Run after artifact staging, source reference inference, and Tauri package
+  build, and before installer upload/publication.
+- Preserve workflow triggers, Windows x64 CPU target, package targets, artifact
+  names, application identifier, and signing behavior. Never add dummy
+  certificates, bypass flags, unsigned fallback publication, or secret output.
+- Record MSI bytes, NSIS bytes, staged retrieval bundle bytes, model-cache
+  bytes/hit state, and build-output/cache impact using native filesystem
+  measurements. These are evidence only; do not introduce telemetry.
+- Produce a concise step-summary record containing commit SHA, package kind,
+  installed relative resource path shape, manifest digest, diagnostic status,
+  and size figures. Do not print absolute runner paths or fixture content.
+
+**Success criteria:**
+
+- MSI is silently installed into an isolated root, its installed executable
+  runs both dbstat and retrieval diagnostics within timeout, then uninstall and
+  residue checks pass.
+- NSIS is silently installed into an isolated root, its installed executable
+  runs both diagnostics within timeout, then uninstall and residue checks pass.
+- Each retrieval diagnostic resolves only that package's installed resource
+  tree and passes tokenizer, embedding, reranker, and hybrid fixture inference
+  without network access.
+- A diagnostic-specific failure remains distinguishable from installer,
+  executable-discovery, timeout, and teardown failures.
+- Missing/corrupt package inputs fail before package creation; installed
+  resource failures fail the smoke and remain normal-runtime lexical fallback.
+- MSI/NSIS sizes, staged bundle size, cache impact, manifest digest, exact
+  commit SHA, workflow run URL, and diagnostic summaries are recorded.
+- The workflow diff preserves the current signing command and does not expose
+  secrets. If signing credentials are unavailable on a runner, report the
+  package/signing evidence limitation rather than bypassing signing.
+- A successful intermediate workflow run is Task 5.4c evidence only. It does
+  not close the inherited exact-head release gate unless it is also the final
+  reviewed release head used by Task 5.5.
+
+**Required verification:**
+
+```powershell
+$env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA "meetily-cargo-target"
+cargo test --manifest-path "frontend/src-tauri/Cargo.toml" --lib
+cargo check --manifest-path "frontend/src-tauri/Cargo.toml"
+cargo fmt --manifest-path "frontend/src-tauri/Cargo.toml" --check
+pnpm --dir "frontend" run typecheck
+git diff --check
+```
+
+The acceptance check also requires a real run of repository-root
+`.github/workflows/build-windows.yml` for the exact reviewed 5.4c commit, with
+both installed package diagnostics and teardown passing. A local package build,
+workflow syntax review, source-tree test, or diagnostic against `target/` does
+not substitute for this evidence.
+
+**Rollback:** Revert only the additive retrieval smoke, size-report, and gate
+steps. Preserve the existing dbstat smoke and installer upload behavior. Make
+no packaged hybrid claim until the installed test is restored.
+
+**Subagent handoff report:** Provide workflow run/commit link, MSI/NSIS
+installer and installed relative paths, sanitized exit-code outcomes, timeout
+and teardown results, package/bundle/cache byte counts, manifest digest,
+signing treatment, changed files, local checks, omissions, and blockers. Append
+an immutable `5.4c` execution entry and state whether parent 5.4 is accepted or
+still waiting on native evidence.
+
+**5.4 review gates:** Review 5.4a before dispatching 5.4b, and review 5.4b before
+dispatching 5.4c. Task 5.4c requires code review plus architecture/release-rigor
+review because it changes signed-package evidence and the active root workflow.
+No subtask may mark Task 5.5, Sprint 5, or the release complete.
+
+**Common subagent constraints:**
+
+- Start from pushed branch `sprint-2/durable-local-index` at or after Task 5.3
+  commit `baf9b47`; report the exact input and output commit IDs.
+- The Git repository root is above the application subtree: the active workflow
+  is `D:\Personal Meetly\.github\workflows\build-windows.yml`, while application
+  paths in this PRD are relative to `D:\Personal Meetly\upstream`.
+- Use one new, distinct `worker-m` session for 5.4a and one new, distinct
+  `worker-l` session for each of 5.4b and 5.4c. Do not let one worker absorb a
+  later subtask, stage, commit, push, or make a release claim.
+- Preserve unrelated dirty work. Never inspect, edit, stage, execute, or cite as
+  evidence `retrieval_evaluation*`, `evaluation_policy*`, rejected/validation
+  corpus fixtures or reports (including V1-V10 and independent variants),
+  `frontend/src-tauri/tests/debug_mt.rs`, or `.opencode/`.
+- Whole-crate formatting may remain blocked only by already documented excluded
+  fixture whitespace. Run touched-file `rustfmt --edition 2021 --check` and
+  `git diff --check`; never format or stage excluded files to make a global gate
+  pass.
+- Use privacy-safe logs and test output. Artifact-relative paths and approved
+  public model identities are allowed; absolute user/runner paths, secrets, raw
+  content, tokens, vectors, and queries are not.
+- A local or corpus-free test can prove package mechanics but cannot become
+  quality/release evidence. Keep the independent corpus, production answer,
+  native Windows/R13, and exact-final-head Actions gates open for Task 5.5.
 
 ### 5.5 - Release qualification and program close [L]
 
@@ -526,7 +801,7 @@ supported Windows x64 package, and within approved scale/resource limits.
   cancellation and scheduler priority.
 - Source parity and persisted old-source compatibility.
 - Privacy-safe logs and no runtime embedding network traffic.
-- Windows x64 installed package smoke evidence from Task 5.4.
+- Windows x64 installed package smoke evidence from accepted Tasks 5.4a-5.4c.
 
 **Acceptance criteria:**
 
@@ -652,6 +927,8 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 | 2026-09-02 | Reuse one Rust ownership/cancellation mechanism and Chat publication fence for sidebar/Tauri/MCP work, including internal MCP deadline cancellation. | Prevents parallel registries, stale progress, and timeouts that merely drop results while preserving Fast-only MCP compatibility. | Add another request registry or public MCP cancel API. | User-authorized R40 |
 | 2026-09-02 | Carry the single persisted `force_lexical_retrieval` decision through all Deep rounds and sidebar/Tauri/MCP hybrid requests. | Shared-boundary reads, typed `ForcedLexical`, and next-request/restart/disable-restore checks keep rollback consistent without a second service. | Per-surface settings or diagnostics. | User-authorized R40 |
 | 2026-09-04 | Permit Tasks 5.1-5.4 to proceed from code-ready Sprint 4 baseline `29df304` while retaining every Sprint 4/Sprint 3 release gate for Task 5.5, Sprint 5 close, and release claims. | The user explicitly authorized implementation to continue; separating code readiness from release acceptance preserves the inherited evidence gates. | Require Sprint 4 release closure before all Sprint 5 implementation. | User |
+| 2026-09-04 | Decompose Task 5.4 into sequential Tasks 5.4a package authority, 5.4b packaged diagnostic, and 5.4c installed MSI/NSIS CI smoke. | Artifact trust, runtime inference/fallback, and signed installer evidence have distinct failure modes and acceptance evidence. Separate handoffs prevent source-only checks from being mistaken for installed-package proof and isolate signing-sensitive workflow changes. | Keep one broad Task 5.4 implementation session; split only the CI step. | User |
+| 2026-09-04 | Reclassify Tasks 5.4b and 5.4c as L and assign each directly to a distinct `worker-l` session after its dependency is accepted. | The installed-resource diagnostic and signed-installer workflow are cross-cutting native/package evidence changes and require higher-risk implementation/review ownership. A worker owns one task; it does not delegate nested worker sessions. | Retain M `worker-m` ownership; use one worker-l as a delegating manager. | User |
 
 ## Task Execution Log
 
@@ -718,11 +995,17 @@ failure recovery, privacy, and final release claims.
 - Task 5.2 external contracts require a dedicated approved batch unless proven
   safe with another task.
 - Task 5.5 is L and runs alone.
+- Tasks 5.4a, 5.4b, and 5.4c require separate sequential batch approvals and
+  distinct worker sessions. A subtask is dependency-ready only after the prior
+  subtask's checks, execution entry, and review are accepted.
+- Tasks 5.4b and 5.4c are L and run alone under their directly assigned
+  `worker-l` sessions; 5.4a remains M under `worker-m`.
 - Package-size, supported-platform, resource-limit, remote behavior, or lexical
   compatibility changes require explicit scope/risk approval.
 - Adding macOS or Linux back to the release scope requires a root-level build
   workflow for that target, the Sprint 1 reference-inference gate executed on
-  it, and the Task 5.4 installed smoke executed on it. It is a scope change,
+  it, and the Tasks 5.4a-5.4c installed smoke executed on it. It is a scope
+  change,
   not a task-level decision.
 - Binary rollback after the semantic migration requires a verified pre-upgrade
   database backup; do not test/claim old-binary startup against a newer migrated
