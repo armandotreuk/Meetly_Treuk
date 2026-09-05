@@ -577,6 +577,23 @@ fn hybrid_retrieval_request(
     }
 }
 
+/// What a surface does when revalidation finds a hydrated meeting is no
+/// longer current (deleted, or moved out of scope, since retrieval ran).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StaleMeetingPolicy {
+    /// Search publishes one independent row per meeting, so a stale meeting
+    /// is dropped and the surviving rows are still returned.
+    Drop,
+    /// Context publishes ONE Markdown blob assembled from every meeting. It
+    /// cannot be pruned after the fact without leaving removed content in the
+    /// text, so any stale meeting fails the whole request closed.
+    FailClosed,
+}
+
+/// Binds the hydrated meetings to the request, then rechecks them against
+/// current existence and scope. Returns the meeting IDs that are still
+/// current; under [`StaleMeetingPolicy::FailClosed`] any loss is an error
+/// instead.
 async fn bind_and_revalidate_hybrid(
     service: &RetrievalService,
     pool: &sqlx::SqlitePool,
@@ -586,7 +603,8 @@ async fn bind_and_revalidate_hybrid(
     token: &ChatRequestToken,
     scope: &PersistedRetrievalScope,
     hydrated: &crate::retrieval::HydratedContext,
-) -> Result<(), String> {
+    stale_policy: StaleMeetingPolicy,
+) -> Result<HashSet<String>, String> {
     let meeting_ids = hydrated
         .meetings
         .iter()
@@ -602,15 +620,50 @@ async fn bind_and_revalidate_hybrid(
         .map_err(map_hybrid_error)?
         .into_iter()
         .collect::<HashSet<_>>();
-    if current_ids != meeting_ids {
+    if current_ids != meeting_ids && stale_policy == StaleMeetingPolicy::FailClosed {
         token.cancel();
         return Err(HYBRID_INVALIDATED_ERROR.to_string());
     }
     if !request_state.is_owner(surface, request_id, token) {
         return Err("Hybrid request was cancelled or superseded".to_string());
     }
-    Ok(())
+    Ok(current_ids)
 }
+
+/// Removes every meeting the recheck did not confirm, so a meeting deleted or
+/// moved out of scope since retrieval ran can never reach a published result.
+fn retain_current_meetings(
+    hydrated: &mut crate::retrieval::HydratedContext,
+    current_ids: &HashSet<String>,
+) {
+    hydrated
+        .meetings
+        .retain(|meeting| current_ids.contains(&meeting.meeting_id));
+    hydrated
+        .sources
+        .retain(|source| current_ids.contains(&source.meeting_id));
+    let published: HashSet<&str> = hydrated
+        .meetings
+        .iter()
+        .flat_map(|meeting| meeting.retained_evidence_ids.iter().map(String::as_str))
+        .collect();
+    hydrated
+        .retained_evidence_ids
+        .retain(|evidence_id| published.contains(evidence_id.as_str()));
+}
+
+/// Per-meeting hydration budget for the search surface. A search result needs
+/// one snippet per meeting, not a Chat-sized context: the budget scales with
+/// the caller's own result limit instead of always spending the contract
+/// maximum (and the assembled Markdown is discarded by the search contract).
+const SEARCH_CONTEXT_CHARS_PER_MEETING: usize = 1_200;
+
+/// Extra meetings hydrated beyond the caller's limit. `from_outputs` drops a
+/// meeting that hydrates no publishable source (content gone, or pruned by the
+/// scope recheck), so hydrating exactly `limit` would silently return short
+/// pages; this margin restores the backfill without restoring the unbounded
+/// contract-maximum hydration.
+const SEARCH_HYDRATION_BACKFILL: usize = 5;
 
 pub(crate) async fn execute_hybrid_search(
     pool: &sqlx::SqlitePool,
@@ -638,22 +691,27 @@ pub(crate) async fn execute_hybrid_search(
                         query,
                         scope.clone(),
                         RetrievalPurpose::Search,
-                        RetrievalLimits::hybrid_default(),
+                        RetrievalLimits::chat_default(),
                         &token,
                     ),
                 )
                 .await
                 .map_err(map_hybrid_error)?;
-            let hydrated = hydrate_search_context(
+            let max_meetings = limit
+                .saturating_add(SEARCH_HYDRATION_BACKFILL)
+                .min(MAX_HYBRID_SEARCH_MEETINGS);
+            let mut hydrated = hydrate_search_context(
                 pool,
                 &ranked,
-                MAX_HYBRID_CONTEXT_CHARS,
-                MAX_HYBRID_SEARCH_MEETINGS,
+                max_meetings
+                    .saturating_mul(SEARCH_CONTEXT_CHARS_PER_MEETING)
+                    .min(MAX_HYBRID_CONTEXT_CHARS),
+                max_meetings,
                 Some(&token),
             )
             .await
             .map_err(map_hybrid_error)?;
-            bind_and_revalidate_hybrid(
+            let current_ids = bind_and_revalidate_hybrid(
                 &service,
                 pool,
                 request_state,
@@ -662,8 +720,10 @@ pub(crate) async fn execute_hybrid_search(
                 &token,
                 &ranked.scope.scope,
                 &hydrated,
+                StaleMeetingPolicy::Drop,
             )
             .await?;
+            retain_current_meetings(&mut hydrated, &current_ids);
             #[cfg(test)]
             wait_for_hybrid_publication_gate(&request_id).await;
             request_state
@@ -702,7 +762,7 @@ pub(crate) async fn execute_hybrid_context(
                         query,
                         scope.clone(),
                         RetrievalPurpose::Context,
-                        RetrievalLimits::hybrid_default(),
+                        RetrievalLimits::chat_default(),
                         &token,
                     ),
                 )
@@ -720,6 +780,7 @@ pub(crate) async fn execute_hybrid_context(
                 &token,
                 &ranked.scope.scope,
                 &hydrated,
+                StaleMeetingPolicy::FailClosed,
             )
             .await?;
             #[cfg(test)]

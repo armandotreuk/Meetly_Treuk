@@ -98,6 +98,12 @@ pub const CONCEPT_DELTA: f64 = 1.0;
 pub const CHAT_RERANK_DEPTH: usize = 50;
 pub const SEARCH_RERANK_DEPTH: usize = 25;
 
+/// Approved minimum Search query length for local model inference. Below it
+/// the cross-encoder is skipped: a one- or two-character prefix carries no
+/// reranking signal worth an ONNX permit on every debounced keystroke, and
+/// the empty-query guard alone does not bound that cost.
+pub const SEARCH_MIN_MODEL_QUERY_CHARS: usize = 3;
+
 /// Authoritative-corroboration credit per additional document class
 /// (transcript / summary / notes) whose evidence the request surfaced for a
 /// meeting in the bounded fused candidate universe. This is the Task 3.2
@@ -189,6 +195,30 @@ impl RankingConfig {
             crate::retrieval::service::RetrievalPurpose::Chat
             | crate::retrieval::service::RetrievalPurpose::Context => Self::chat(),
         }
+    }
+
+    /// The purpose depth, with the cross-encoder disabled outright for Search
+    /// queries below [`SEARCH_MIN_MODEL_QUERY_CHARS`]. Interactive search runs
+    /// per debounced keystroke, so the shallower Search depth alone does not
+    /// bound the cost of one- and two-character queries; a zero depth skips
+    /// reranking entirely (`rank_with_mode` takes the fused-order path) rather
+    /// than rejecting the query, so short queries still return lexical and
+    /// title results. Enforced here so a direct Tauri/MCP caller is bounded
+    /// exactly like the sidebar.
+    pub fn for_purpose_and_query(
+        purpose: crate::retrieval::service::RetrievalPurpose,
+        query: &str,
+    ) -> Self {
+        let config = Self::for_purpose(purpose);
+        if matches!(purpose, crate::retrieval::service::RetrievalPurpose::Search)
+            && query.chars().count() < SEARCH_MIN_MODEL_QUERY_CHARS
+        {
+            return Self {
+                rerank_depth: 0,
+                ..config
+            };
+        }
+        config
     }
 }
 

@@ -156,7 +156,7 @@ describe("sidebar search lifecycle", () => {
         controller.dispose();
     });
 
-    it("dispatches one-character queries after debounce and keeps empty input idle", () => {
+    it("runs no model inference below the approved minimum query length", () => {
         vi.useFakeTimers();
         const invoke = vi.fn((command: string) => {
             if (command === "api_cancel_hybrid_request") return Promise.resolve();
@@ -168,21 +168,39 @@ describe("sidebar search lifecycle", () => {
             requestIdFactory: (generation) => `test-${generation}`,
         });
 
-        expect(SIDEBAR_SEARCH_MIN_QUERY_LENGTH).toBe(1);
-        controller.search("");
-        vi.advanceTimersByTime(250);
-        expect(invoke).not.toHaveBeenCalledWith("api_search_hybrid", expect.anything());
-        controller.search("a");
+        expect(SIDEBAR_SEARCH_MIN_QUERY_LENGTH).toBeGreaterThan(1);
+        for (const shortQuery of ["", "a", "ab"]) {
+            controller.search(shortQuery);
+            vi.advanceTimersByTime(250);
+            expect(invoke).not.toHaveBeenCalledWith("api_search_hybrid", expect.anything());
+        }
+
+        controller.search("abc");
         vi.advanceTimersByTime(249);
         expect(invoke).not.toHaveBeenCalledWith("api_search_hybrid", expect.anything());
         vi.advanceTimersByTime(1);
         expect(invoke).toHaveBeenCalledWith(
             "api_search_hybrid",
-            expect.objectContaining({ query: "a", requestId: "test-2" })
+            expect.objectContaining({ query: "abc", requestId: "test-4" })
         );
         vi.advanceTimersByTime(250);
         controller.dispose();
-        expect(invoke).toHaveBeenCalledWith("api_cancel_hybrid_request", { requestId: "test-2" });
+        expect(invoke).toHaveBeenCalledWith("api_cancel_hybrid_request", { requestId: "test-4" });
+    });
+
+    it("stays disposed once disposed", () => {
+        vi.useFakeTimers();
+        const invoke = vi.fn(() => Promise.resolve(response([]))) as SidebarSearchInvoke;
+        const controller = createSidebarSearchController({
+            invoke,
+            onState: vi.fn(),
+            requestIdFactory: (generation) => `test-${generation}`,
+        });
+
+        controller.dispose();
+        controller.search("retention policy");
+        vi.advanceTimersByTime(1000);
+        expect(invoke).not.toHaveBeenCalled();
     });
 
     it("keeps delayed cancellation scoped to the controller that created the request", () => {
@@ -355,6 +373,43 @@ describe("sidebar search lifecycle", () => {
 });
 
 describe("sidebar search result policy", () => {
+    it("falls back to local title matches when no usable response exists", () => {
+        const meetings = [
+            { id: "m1", title: "Retention policy review", folder_id: "f1" },
+            { id: "m2", title: "Unrelated standup", folder_id: "f1" },
+            { id: "m3", title: "Retention policy offsite", folder_id: "f2" },
+        ];
+
+        // Command failed / still in flight: authoritative title matches remain.
+        expect(
+            buildSidebarSearchRows(meetings, "retention", null, null).map((row) => row.meeting.id)
+        ).toEqual(["m1", "m3"]);
+
+        // A folder filter restricts the fallback to the resolved subtree.
+        expect(
+            buildSidebarSearchRows(
+                meetings,
+                "retention",
+                "f1",
+                null,
+                new Set(["f1"])
+            ).map((row) => row.meeting.id)
+        ).toEqual(["m1"]);
+
+        // A response for a different scope is not usable, so it also falls back.
+        const otherScope = {
+            version: "v1" as const,
+            scope: { kind: "all" as const },
+            retrievalStatus: "hybrid" as const,
+            results: [],
+            total: 0,
+        };
+        expect(
+            buildSidebarSearchRows(meetings, "retention", "f1", otherScope, new Set(["f1", "f2"]))
+                .map((row) => row.meeting.id)
+        ).toEqual(["m1", "m3"]);
+    });
+
     it("uses current scoped server rows without appending stale local title matches", () => {
         const meetings = [{ id: "semantic", title: "Stale cached title", folder_id: "other" }];
         const rows = buildSidebarSearchRows(

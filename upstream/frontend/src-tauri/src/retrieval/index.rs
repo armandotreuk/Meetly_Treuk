@@ -751,6 +751,16 @@ impl QueryIndexService {
         }
     }
 
+    /// Conservative lag marker for an unverifiable publication read: the
+    /// snapshot is reported as behind rather than silently caught up.
+    fn mark_lag_unknown(&self) {
+        let mut state = self.lock_state();
+        if state.lag < 1 {
+            state.lag = 1;
+            touch_status(&mut state);
+        }
+    }
+
     pub(crate) fn mark_stale(&self) -> u64 {
         let mut state = self.lock_state();
         state.epoch = state.epoch.wrapping_add(1);
@@ -2139,7 +2149,12 @@ async fn update_publication_lag(pool: &SqlitePool, service: &QueryIndexService) 
             service.set_lag_for_generation(None, 0);
             return;
         }
-        Err(_) => return,
+        // Unverifiable publication state is reported as behind, never as
+        // caught up: a stale lag of 0 would let `index_status` claim "ready".
+        Err(_) => {
+            service.mark_lag_unknown();
+            return;
+        }
     };
     let lag = match RetrievalRepository::publication_lag(pool, &generation_id).await {
         Ok(Some((canonical, published))) => (canonical - published).max(0),
@@ -2215,18 +2230,19 @@ impl std::fmt::Display for RebuildRequestError {
 /// rebuild). Healthy active retrieval continues while the worker indexes the
 /// shadow; cancellation removes only the shadow's derived state.
 pub async fn request_rebuild(pool: &SqlitePool) -> Result<String, RebuildRequestError> {
-    if let Some(shadow) = RetrievalRepository::shadow_generation_statuses(pool)
+    // A rebuild always builds: a previously failed shadow is DISCARDED (not
+    // resumed) so the fresh generation re-embeds every meeting, matching the
+    // confirmation copy. Resuming partial work is the separate, explicitly
+    // named retry control (`retrieval_retry_rebuild`).
+    for shadow in RetrievalRepository::shadow_generation_statuses(pool)
         .await
         .map_err(RebuildRequestError::Database)?
         .into_iter()
-        .find(|status| status.state == "failed")
+        .filter(|status| status.state == "failed")
     {
-        if RetrievalRepository::retry_failed_generation(pool, &shadow.generation_id)
+        RetrievalRepository::discard_failed_generation(pool, &shadow.generation_id)
             .await
-            .map_err(RebuildRequestError::Database)?
-        {
-            return Ok(shadow.generation_id);
-        }
+            .map_err(RebuildRequestError::Database)?;
     }
     let model_id = match RetrievalRepository::active_generation_id(pool).await {
         Ok(Some(generation_id)) => {
@@ -2323,27 +2339,44 @@ pub struct RetrievalStatusReport {
     pub model_artifact_state: &'static str,
 }
 
+/// Bounded attempts for the status reads' consistency retries. Status is a
+/// diagnostic: a slightly torn read is always preferable to a command that
+/// spins while the index is busy.
+pub(crate) const STATUS_CONSISTENCY_ATTEMPTS: usize = 3;
+
 pub async fn index_status(
     pool: &SqlitePool,
     service: &QueryIndexService,
     paused: bool,
 ) -> Result<RetrievalStatusReport, String> {
-    let (snapshot, service_status) = loop {
-        let before = service.status_snapshot();
-        let snapshot = RetrievalRepository::status_snapshot(pool)
-            .await
-            .map_err(|error| error.to_string())?;
-        let after = service.status_snapshot();
-        if before.version == after.version {
-            break (snapshot, after);
+    // Bounded consistency retry: the worker touches status on every publish,
+    // so an unbounded loop would spin through full status reads for as long
+    // as indexing runs. After the last attempt the freshest pair is returned
+    // (at worst a slightly torn snapshot) instead of never returning.
+    let (snapshot, service_status) = {
+        let mut attempt = 0;
+        loop {
+            let before = service.status_snapshot();
+            let snapshot = RetrievalRepository::status_snapshot(pool)
+                .await
+                .map_err(|error| error.to_string())?;
+            let after = service.status_snapshot();
+            attempt += 1;
+            if before.version == after.version || attempt >= STATUS_CONSISTENCY_ATTEMPTS {
+                break (snapshot, after);
+            }
+            tokio::task::yield_now().await;
         }
-        tokio::task::yield_now().await;
     };
     let force_lexical_retrieval = snapshot.force_lexical_retrieval;
     let pointer = snapshot.active_generation_id;
     let status = snapshot.active_status;
     let building_generations = snapshot.shadows;
-    let building = !building_generations.is_empty();
+    // Shadows include terminal ('failed') and completed ('ready') generations,
+    // so "is something being built" must test the state, not emptiness.
+    let building = building_generations
+        .iter()
+        .any(|status| status.state == "building");
     let lag = service_status.lag;
     let model_mismatch = service_status.model_mismatch;
     let activation_transition = service_status.activation_transition;
@@ -2371,13 +2404,14 @@ pub async fn index_status(
     } else if model_mismatch {
         "model_mismatch".to_string()
     } else if service_status.active_generation_id.as_deref() != pointer.as_deref() {
+        // `active_generation_id` is `Some` exactly when a snapshot is loaded,
+        // so this covers both "no snapshot yet" and "serving a different
+        // generation"; equality below therefore implies a present snapshot.
         if service_status.active_snapshot_present {
             "transitioning".to_string()
         } else {
             "loading".to_string()
         }
-    } else if !service_status.active_snapshot_present {
-        "loading".to_string()
     } else if lag > 0 {
         "catching_up".to_string()
     } else {
@@ -4299,6 +4333,51 @@ mod tests {
             .unwrap()
             .model_load_failure
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn rebuild_discards_a_failed_shadow_instead_of_resuming_it() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "m", "Rebuild target").await;
+        register_test_model(&pool).await;
+        RetrievalRepository::ensure_generation(&pool, "active", MODEL_ID)
+            .await
+            .unwrap();
+        publish_meeting(&pool, "active", "m", &["active content"]).await;
+        let service = fresh_service();
+        publish_tick(&pool, &service).await.unwrap();
+
+        let failed = request_rebuild(&pool).await.unwrap();
+        assert!(
+            RetrievalRepository::mark_shadow_generation_failed(&pool, &failed)
+                .await
+                .unwrap()
+        );
+
+        // A rebuild must BUILD: the failed shadow is discarded and a distinct
+        // fresh generation is registered, rather than the failed one being
+        // silently resumed under the rebuild confirmation copy.
+        let rebuilt = request_rebuild(&pool).await.unwrap();
+        assert_ne!(rebuilt, failed);
+        assert!(RetrievalRepository::generation_status(&pool, &failed)
+            .await
+            .unwrap()
+            .is_none());
+        let status = RetrievalRepository::generation_status(&pool, &rebuilt)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.state, "building");
+        // The fresh generation re-embeds every meeting, so nothing is current.
+        assert_eq!(status.current_meetings, 0);
+        assert_eq!(
+            RetrievalRepository::active_generation_id(&pool)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("active"),
+            "healthy active retrieval keeps serving during a rebuild"
+        );
     }
 
     #[tokio::test]

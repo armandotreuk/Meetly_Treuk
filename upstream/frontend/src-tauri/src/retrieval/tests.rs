@@ -1358,6 +1358,53 @@ async fn unknown_language_title_matching_is_search_only() {
         .any(|candidate| candidate.meeting_id == "m-common" && candidate.source_kind == "title"));
 }
 
+#[tokio::test]
+async fn unknown_language_search_titles_need_every_distinct_core_term() {
+    let pool = migrated_pool().await;
+    insert_meeting(&pool, "m-exact", "Retention policy review").await;
+    insert_meeting(&pool, "m-partial", "What we shipped").await;
+    let service = RetrievalService::new(failing_lifecycle());
+
+    let title_hits = |result: &crate::retrieval::RetrievalResult| {
+        result
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.source_kind == "title")
+            .map(|candidate| candidate.meeting_id.clone())
+            .collect::<Vec<_>>()
+    };
+    let search = |query: &'static str| {
+        let service = &service;
+        let pool = &pool;
+        async move {
+            let mut request = request(
+                query,
+                PersistedRetrievalScope::All,
+                RetrievalLimits::default(),
+                CoreTermLanguage::Unknown,
+                None,
+            );
+            request.purpose = RetrievalPurpose::Search;
+            service.retrieve(pool, request).await.unwrap()
+        }
+    };
+
+    // Every distinct term present: an exact authoritative title match.
+    assert_eq!(
+        title_hits(&search("retention policy").await),
+        vec!["m-exact".to_string()]
+    );
+    // A shared function word alone must not title-match without a stopword
+    // list; that noise would otherwise outrank semantic evidence.
+    assert!(title_hits(&search("what happened to retention").await).is_empty());
+    // A repeated query token still matches: the gate uses the DISTINCT count,
+    // which is what `title_term_overlap` can actually reach.
+    assert_eq!(
+        title_hits(&search("retention retention").await),
+        vec!["m-exact".to_string()]
+    );
+}
+
 // -- Semantic fallback matrix ----------------------------------------------------
 
 #[tokio::test]

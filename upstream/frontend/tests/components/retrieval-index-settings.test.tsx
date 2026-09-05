@@ -3,6 +3,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+    IDLE_POLL_INTERVAL_MS,
     RetrievalIndexSettings,
     type RetrievalStatusReport,
 } from "@/components/RetrievalIndexSettings";
@@ -102,6 +103,36 @@ afterEach(() => {
 });
 
 describe("RetrievalIndexSettings", () => {
+    it("measures derived disk against the envelope that applies", async () => {
+        vi.useFakeTimers();
+        // Between the steady-state target and the shadow-rebuild limit: in
+        // steady state this is over budget, during a rebuild it is not.
+        const overSteady = { ...status, derived_disk_gate_input_bytes: 6144 };
+        mocks.invoke.mockImplementation((command: string) =>
+            command === "retrieval_index_status" ? Promise.resolve(overSteady) : Promise.resolve()
+        );
+        await act(async () => {
+            root.render(<RetrievalIndexSettings />);
+            await Promise.resolve();
+        });
+        expect(container.textContent).toContain("Steady-state envelope exceeded (4.0 KiB target)");
+
+        const rebuilding = {
+            ...overSteady,
+            semantic_state: "building",
+            shadow_state: "building",
+            operation_active: true,
+            building_generations: [shadowStatus({ current_meetings: 2 })],
+        };
+        mocks.invoke.mockImplementation((command: string) =>
+            command === "retrieval_index_status" ? Promise.resolve(rebuilding) : Promise.resolve()
+        );
+        await act(async () => {
+            await vi.advanceTimersByTimeAsync(IDLE_POLL_INTERVAL_MS);
+        });
+        expect(container.textContent).toContain("Within activation envelope (8.0 KiB limit)");
+    });
+
     it("exposes status, the persisted lexical kill switch, and derived-only clear confirmation", async () => {
         await act(async () => {
             root.render(<RetrievalIndexSettings />);
@@ -113,7 +144,9 @@ describe("RetrievalIndexSettings", () => {
         expect(container.textContent).toContain("Scope: all saved meetings");
         expect(container.textContent).toContain("intfloat/multilingual-e5-base");
         expect(container.textContent).toContain("License: MIT");
-        expect(container.textContent).toContain("Within activation envelope");
+        // Steady state is measured against the steady-state target, not
+        // the higher shadow-rebuild activation limit.
+        expect(container.textContent).toContain("Within steady-state envelope (4.0 KiB target)");
         expect(container.textContent).toContain("Resident memory");
         expect(container.querySelector('[role="status"]')?.getAttribute("aria-live")).toBe(
             "polite"
@@ -245,7 +278,7 @@ describe("RetrievalIndexSettings", () => {
 
         currentStatus = { ...status };
         await act(async () => {
-            await vi.advanceTimersByTimeAsync(2000);
+            await vi.advanceTimersByTimeAsync(IDLE_POLL_INTERVAL_MS);
         });
         expect(rebuild().disabled).toBe(false);
     });
@@ -266,7 +299,7 @@ describe("RetrievalIndexSettings", () => {
         expect(resolveStatus).toHaveLength(1);
 
         await act(async () => {
-            await vi.advanceTimersByTimeAsync(2000);
+            await vi.advanceTimersByTimeAsync(IDLE_POLL_INTERVAL_MS);
         });
         expect(resolveStatus).toHaveLength(2);
         const building = {

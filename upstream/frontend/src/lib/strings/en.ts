@@ -148,6 +148,8 @@ export const en: Record<string, string> = {
     "settings.retrieval.sizeExact": "Exact derived-table measurement",
     "settings.retrieval.diskWithinEnvelope": "Within activation envelope ({limit} limit)",
     "settings.retrieval.diskExceeded": "Activation envelope exceeded ({limit} limit)",
+    "settings.retrieval.diskWithinSteady": "Within steady-state envelope ({limit} target)",
+    "settings.retrieval.diskSteadyExceeded": "Steady-state envelope exceeded ({limit} target)",
     "settings.retrieval.diskEnvelopeUnavailable": "Activation envelope status unavailable",
     "settings.retrieval.ram": "Resident memory",
     "settings.retrieval.ramValue": "{value} · activation ceiling {ceiling}",

@@ -370,7 +370,7 @@ describe("mounted Sidebar search rows", () => {
 
         const input = await mountExpandedSidebar();
         await act(async () => {
-            setSearchInput(input, "a");
+            setSearchInput(input, "alpha");
             vi.advanceTimersByTime(250);
             await Promise.resolve();
         });
@@ -409,7 +409,7 @@ describe("mounted Sidebar search rows", () => {
 
         const input = await mountExpandedSidebar();
         await act(async () => {
-            setSearchInput(input, "a");
+            setSearchInput(input, "alpha");
             vi.advanceTimersByTime(250);
             await Promise.resolve();
             await Promise.resolve();

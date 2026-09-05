@@ -114,10 +114,21 @@ export function SidebarProvider({ children, searchInvoke }: SidebarProviderProps
   // Use recording state from RecordingStateContext (single source of truth)
   const { isRecording } = useRecordingState();
 
-  const searchController = React.useMemo<SidebarSearchController>(
-    () =>
-      createSidebarSearchController({
-        invoke: searchInvoke ?? ((command, args) => invoke(command, args)),
+  // `dispose()` is terminal, so the controller cannot live in a useMemo that
+  // React may re-run (or an effect that may re-mount) while the disposed
+  // instance stays referenced: search would silently stop working. The ref is
+  // cleared on teardown, so the next search builds a fresh controller.
+  const searchControllerRef = React.useRef<SidebarSearchController | null>(null);
+  const searchInvokeRef = React.useRef(searchInvoke);
+  searchInvokeRef.current = searchInvoke;
+
+  const ensureSearchController = React.useCallback((): SidebarSearchController => {
+    if (!searchControllerRef.current) {
+      searchControllerRef.current = createSidebarSearchController({
+        invoke: (command, args) =>
+          searchInvokeRef.current
+            ? searchInvokeRef.current(command, args)
+            : invoke(command, args),
         onState: (state: SidebarSearchState) => {
           setIsSearching(state.phase === 'loading');
           setSearchResponse(state.response);
@@ -125,9 +136,10 @@ export function SidebarProvider({ children, searchInvoke }: SidebarProviderProps
           setSearchError(state.error);
           setSearchPhase(state.phase);
         },
-      }),
-    [searchInvoke]
-  );
+      });
+    }
+    return searchControllerRef.current;
+  }, []);
 
   // ponytail: sidebar resize — initial 256 matches `w-64`, min 200, max 40% of viewport.
   const { width: sidebarWidth, isDragging: sidebarDragging, handleProps: resizeHandleProps } = usePanelResize({
@@ -267,14 +279,21 @@ export function SidebarProvider({ children, searchInvoke }: SidebarProviderProps
 
   const searchTranscripts = React.useCallback(
     async (query: string, folderId: string | null = null) => {
-      searchController.search(query, folderId);
+      ensureSearchController().search(query, folderId);
     },
-    [searchController]
+    [ensureSearchController]
   );
 
+  const cancelSidebarSearch = React.useCallback(() => {
+    searchControllerRef.current?.cancel();
+  }, []);
+
   useEffect(() => {
-    return () => searchController.dispose();
-  }, [searchController]);
+    return () => {
+      searchControllerRef.current?.dispose();
+      searchControllerRef.current = null;
+    };
+  }, []);
 
   // Summary polling management
   const startSummaryPolling = React.useCallback((
@@ -431,7 +450,7 @@ export function SidebarProvider({ children, searchInvoke }: SidebarProviderProps
       setIsMeetingActive,
       handleRecordingToggle,
        searchTranscripts,
-       cancelSidebarSearch: searchController.cancel,
+       cancelSidebarSearch,
        searchResponse,
        searchNotice,
        searchError,

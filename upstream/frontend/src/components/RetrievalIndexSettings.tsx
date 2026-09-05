@@ -80,6 +80,9 @@ export interface RetrievalStatusReport {
     model_artifact_state: string;
 }
 
+export const ACTIVE_POLL_INTERVAL_MS = 2000;
+export const IDLE_POLL_INTERVAL_MS = 30000;
+
 type RetrievalAction = "force" | "pause" | "rebuild" | "retry" | "clear" | null;
 type RetrievalConfirmation = "rebuild" | "clear" | null;
 
@@ -156,16 +159,25 @@ export function RetrievalIndexSettings() {
         }
     }, []);
 
+    const [activePoll, setActivePoll] = useState(false);
+
     useEffect(() => {
         mountedRef.current = true;
         void loadStatus(true);
-        const interval = window.setInterval(() => void loadStatus(), 2000);
+        // Every poll runs the status join aggregate, the derived-disk
+        // measurement and an RSS probe against the same pool the indexer and
+        // Chat use, so only poll fast while an operation can actually change
+        // the report; idle panels fall back to a slow refresh.
+        const interval = window.setInterval(
+            () => void loadStatus(),
+            activePoll ? ACTIVE_POLL_INTERVAL_MS : IDLE_POLL_INTERVAL_MS
+        );
         return () => {
             mountedRef.current = false;
             statusRequestRef.current += 1;
             window.clearInterval(interval);
         };
-    }, [loadStatus]);
+    }, [activePoll, loadStatus]);
 
     const runAction = useCallback(
         async (nextAction: Exclude<RetrievalAction, null>, operation: () => Promise<unknown>) => {
@@ -191,6 +203,18 @@ export function RetrievalIndexSettings() {
     const shadowState = status?.shadow_state ?? null;
     const operationActive = status?.operation_active ?? false;
     const controlsDisabled = action !== null || operationActive;
+    // Only a report that can still change on its own earns the fast interval:
+    // a running operation, or a serving state that is still settling.
+    const statusIsSettling =
+        operationActive ||
+        shadowState === "building" ||
+        shadowState === "queued" ||
+        status?.serving_state === "loading" ||
+        status?.serving_state === "catching_up" ||
+        status?.serving_state === "transitioning";
+    useEffect(() => {
+        setActivePoll(statusIsSettling);
+    }, [statusIsSettling]);
     const progressSource = shadowGeneration ?? status;
     const progress = progressSource
         ? progressSource.tracked_meetings > 0
@@ -205,11 +229,22 @@ export function RetrievalIndexSettings() {
               : 0
         : 0;
     const diskBytes = status?.derived_disk_bytes ?? status?.derived_disk_estimate_bytes ?? null;
+    // Two approved figures govern derived disk: the steady-state target and
+    // the higher shadow-rebuild peak. Comparing steady-state usage against the
+    // rebuild limit would report "within envelope" while the approved
+    // steady-state ceiling is already exceeded, so pick the one that applies.
+    const rebuildInFlight = shadowState === "building" || shadowState === "queued";
+    const diskEnvelopeLimit = status
+        ? rebuildInFlight
+            ? status.derived_disk_activation_limit_bytes
+            : status.derived_disk_steady_target_bytes
+        : null;
     const diskEnvelopeState =
         status?.derived_disk_gate_input_bytes === null ||
-        status?.derived_disk_gate_input_bytes === undefined
+        status?.derived_disk_gate_input_bytes === undefined ||
+        diskEnvelopeLimit === null
             ? "unavailable"
-            : status.derived_disk_gate_input_bytes >= status.derived_disk_activation_limit_bytes
+            : status.derived_disk_gate_input_bytes >= diskEnvelopeLimit
               ? "exceeded"
               : "within";
     const hasIndexError =
@@ -377,19 +412,27 @@ export function RetrievalIndexSettings() {
                                     ? t("settings.retrieval.sizeEstimate")
                                     : t("settings.retrieval.sizeExact")}
                             </p>
-                            <p className="mt-1 text-xs text-gray-500">
+                            <p
+                                className={
+                                    diskEnvelopeState === "exceeded"
+                                        ? "mt-1 text-xs font-medium text-amber-700"
+                                        : "mt-1 text-xs text-gray-500"
+                                }
+                            >
                                 {diskEnvelopeState === "exceeded"
-                                    ? t("settings.retrieval.diskExceeded", {
-                                          limit: formatBytes(
-                                              status.derived_disk_activation_limit_bytes
-                                          ),
-                                      })
+                                    ? t(
+                                          rebuildInFlight
+                                              ? "settings.retrieval.diskExceeded"
+                                              : "settings.retrieval.diskSteadyExceeded",
+                                          { limit: formatBytes(diskEnvelopeLimit ?? 0) }
+                                      )
                                     : diskEnvelopeState === "within"
-                                      ? t("settings.retrieval.diskWithinEnvelope", {
-                                            limit: formatBytes(
-                                                status.derived_disk_activation_limit_bytes
-                                            ),
-                                        })
+                                      ? t(
+                                            rebuildInFlight
+                                                ? "settings.retrieval.diskWithinEnvelope"
+                                                : "settings.retrieval.diskWithinSteady",
+                                            { limit: formatBytes(diskEnvelopeLimit ?? 0) }
+                                        )
                                       : t("settings.retrieval.diskEnvelopeUnavailable")}
                             </p>
                             <p className="mt-3 font-medium text-gray-900">

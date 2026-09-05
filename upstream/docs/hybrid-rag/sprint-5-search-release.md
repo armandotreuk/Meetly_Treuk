@@ -963,10 +963,36 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 
 ### Code Review
 
-**Reviewer:** Pending
-**Verdict:** Pending
-**Findings:** Pending
-**Required follow-ups:** Pending
+**Reviewer:** `anthropic/claude-opus-5` (Claude Code, `/code-review xhigh`), two rounds
+**Verdict:** Implementation findings resolved; sprint close still blocked by the
+release-qualification gates below, which this review did not and cannot clear.
+
+**Findings:**
+
+- **R5.R1** (full Sprint 5 range `29df304..2f767a2`): 15 findings - 3 blockers
+  (a single terminal per-meeting failure ended the whole shadow generation; the
+  approved sidebar minimum query length was set to 1, making it a no-op; a
+  hybrid command error left the sidebar with no lexical fallback at all), 10
+  should-fix, 2 cleanup. All 15 fixed in Task HR-5.R1.
+- **R5.R2** (review of the HR-5.R1 remediation diff): 5 findings, all in the
+  remediation itself - 1 blocker (the new title gate compared a deduplicated
+  overlap against a raw term count, so any repeated query token disabled the
+  title channel), 3 should-fix, 1 conventions. All 5 fixed in Task HR-5.R2.
+
+Both rounds, their per-finding corrections, verification output, and the
+environment/flake caveats are recorded in
+[`notes-chat-improvement-execution.md`](../notes-chat-improvement-execution.md)
+under `R5.R1`, `HR-5.R1`, `R5.R2`, and `HR-5.R2`.
+
+**Verification after remediation:** `cargo check` pass; `cargo test --lib` 887
+passed / 0 failed / 2 ignored; `cargo fmt --check` pass; `pnpm run typecheck`
+pass; `pnpm exec vitest run` 156 passed / 23 files; `git diff --check` pass.
+
+**Required follow-ups:** Task 5.4 packaging, Task 5.5 release qualification, and
+sprint close remain blocked by their own unchanged evidence gates (independently
+authored corpus, production-path quality and final provider-answer evidence,
+native Windows hermetic-session evidence, exact-head GitHub Actions evidence,
+and the installed-package smoke). No release claim follows from this review.
 
 ### Architecture Review
 

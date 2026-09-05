@@ -1532,10 +1532,24 @@ async fn record_item_failure(
         Ok(()) => {}
         Err(error) => log::warn!("Recording retry state failed for meeting {meeting_id}: {error}"),
     }
+    // A terminal item failure is an activation blocker, never a generation
+    // killer: `record_work_failure` keeps the queue's place so one poison
+    // meeting can neither destroy nor starve the rest of the generation. Only
+    // once NOTHING else can make progress does the generation itself become
+    // terminal, so the user gets a retryable state instead of a silent stall.
     if terminal {
-        match RetrievalRepository::mark_shadow_generation_failed(pool, generation_id).await {
-            Ok(_) => {}
-            Err(error) => log::warn!("Recording shadow generation failure failed: {error}"),
+        match RetrievalRepository::generation_has_outstanding_work(pool, generation_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                match RetrievalRepository::mark_shadow_generation_failed(pool, generation_id).await
+                {
+                    Ok(_) => {}
+                    Err(error) => {
+                        log::warn!("Recording shadow generation failure failed: {error}")
+                    }
+                }
+            }
+            Err(error) => log::warn!("Outstanding generation work check failed: {error}"),
         }
     }
 }
@@ -3392,6 +3406,67 @@ mod tests {
             0
         );
         lifecycle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn one_terminal_item_never_ends_a_generation_that_can_still_progress() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "poison", "Poison Meeting").await;
+        insert_meeting(&pool, "waiting", "Waiting Meeting").await;
+        add_transcript(&pool, "p1", "poison", "veneno permanente").await;
+        add_transcript(&pool, "w1", "waiting", "conteudo pendente").await;
+        let generation = ensure_test_generation(&pool).await;
+
+        // One meeting fails terminally while another is still pending: the
+        // generation must keep its 'building' state so the remaining work is
+        // neither destroyed nor starved by the poison item.
+        RetrievalRepository::record_work_failure(
+            &pool,
+            &generation,
+            "poison",
+            true,
+            "safe terminal failure",
+            "2099-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        assert!(
+            RetrievalRepository::generation_has_outstanding_work(&pool, &generation)
+                .await
+                .unwrap(),
+            "the pending meeting is still outstanding work"
+        );
+        assert_eq!(
+            RetrievalRepository::generation_status(&pool, &generation)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "building"
+        );
+
+        // Once nothing else can progress the generation becomes terminal, so
+        // the user gets a retryable state instead of a silent stall.
+        RetrievalRepository::record_work_failure(
+            &pool,
+            &generation,
+            "waiting",
+            true,
+            "safe terminal failure",
+            "2099-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        assert!(
+            !RetrievalRepository::generation_has_outstanding_work(&pool, &generation)
+                .await
+                .unwrap()
+        );
+        assert!(
+            RetrievalRepository::mark_shadow_generation_failed(&pool, &generation)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

@@ -2,7 +2,14 @@ import type { HybridMeetingResult, HybridRetrievalStatus, HybridSearchResponse }
 import { t } from "@/lib/i18n";
 
 export const SIDEBAR_SEARCH_DEBOUNCE_MS = 250;
-export const SIDEBAR_SEARCH_MIN_QUERY_LENGTH = 1;
+/**
+ * Approved minimum query length before the sidebar issues a hybrid request.
+ * Mirrors `SEARCH_MIN_MODEL_QUERY_CHARS` in the Rust ranking policy: sidebar
+ * search runs the cross-encoder on every debounced keystroke, and a guard of
+ * 1 is only the empty-query check under a different name. Shorter queries
+ * still get local title matches from `buildSidebarSearchRows`.
+ */
+export const SIDEBAR_SEARCH_MIN_QUERY_LENGTH = 3;
 export const SIDEBAR_SEARCH_RESULT_LIMIT = 50;
 
 export type SidebarSearchNotice = "forced_lexical" | "lexical_fallback";
@@ -250,7 +257,10 @@ export function createSidebarSearchController({
     };
 
     const search = (query: string, folderId: string | null = null) => {
-        disposed = false;
+        // No `disposed = false` here: dispose() is terminal, so a late state
+        // update after unmount can never revive the controller and issue
+        // invokes for a component that no longer exists.
+        if (disposed) return;
         generation += 1;
         const currentGeneration = generation;
         if (timer !== null) {
@@ -349,11 +359,48 @@ export function formatHybridProvenance(result: HybridMeetingResult): string | nu
     return [channel, kind].filter(Boolean).join(" · ") || null;
 }
 
+function inFolderScope(
+    meeting: SidebarSearchMeeting,
+    folderId: string | null,
+    folderScope: ReadonlySet<string> | null
+): boolean {
+    if (folderId === null) return true;
+    const meetingFolderId = meeting.folder_id ?? null;
+    if (meetingFolderId === null) return false;
+    // Without a resolved subtree only the folder itself is provably in scope,
+    // so the degraded fallback shows fewer rows rather than a meeting from
+    // another folder.
+    return folderScope ? folderScope.has(meetingFolderId) : meetingFolderId === folderId;
+}
+
+/**
+ * Local, always-available substring title matching over the meetings already
+ * in the sidebar. This is the lexical fallback the hybrid contract cannot
+ * provide when the command itself fails (timeout, retrieval unavailable,
+ * superseded), and the path for queries below the minimum length, so a title
+ * match stays findable in every state.
+ */
+export function localTitleMatches(
+    meetings: SidebarSearchMeeting[],
+    query: string,
+    folderId: string | null,
+    folderScope: ReadonlySet<string> | null = null
+): SidebarSearchMeeting[] {
+    const normalizedQuery = query.trim().toLowerCase();
+    if (!normalizedQuery) return [];
+    return meetings.filter(
+        (meeting) =>
+            meeting.title.toLowerCase().includes(normalizedQuery) &&
+            inFolderScope(meeting, folderId, folderScope)
+    );
+}
+
 export function buildSidebarSearchRows(
     meetings: SidebarSearchMeeting[],
     query: string,
     folderId: string | null,
-    response: HybridSearchResponse | null
+    response: HybridSearchResponse | null,
+    folderScope: ReadonlySet<string> | null = null
 ): SidebarSearchRow[] {
     const normalizedQuery = query.trim().toLowerCase();
     if (!normalizedQuery) return [];
@@ -372,20 +419,28 @@ export function buildSidebarSearchRows(
         rows.push({ meeting, snippet, provenance });
     };
 
-    if (!response || !responseMatchesScope(response, folderId)) return [];
-    for (const result of response.results.slice(0, SIDEBAR_SEARCH_RESULT_LIMIT)) {
-        const cached = currentMeetings.get(result.meetingId);
-        const meeting: SidebarSearchMeeting = {
-            id: result.meetingId,
-            title: result.meetingTitle,
-            folder_id: result.folderId,
-            folder_name: result.folderName,
-            created_at: cached?.created_at,
-            has_notes: cached?.has_notes,
-        };
-        const source = bestHybridSource(result);
-        add(meeting, displaySnippet(source?.snippet), formatHybridProvenance(result));
+    const usableResponse = response && responseMatchesScope(response, folderId) ? response : null;
+    if (usableResponse) {
+        for (const result of usableResponse.results.slice(0, SIDEBAR_SEARCH_RESULT_LIMIT)) {
+            const cached = currentMeetings.get(result.meetingId);
+            const meeting: SidebarSearchMeeting = {
+                id: result.meetingId,
+                title: result.meetingTitle,
+                folder_id: result.folderId,
+                folder_name: result.folderName,
+                created_at: cached?.created_at,
+                has_notes: cached?.has_notes,
+            };
+            const source = bestHybridSource(result);
+            add(meeting, displaySnippet(source?.snippet), formatHybridProvenance(result));
+        }
+        return rows.slice(0, SIDEBAR_SEARCH_RESULT_LIMIT);
     }
 
+    // No authoritative response for this scope: fall back to local title
+    // matching so a semantic failure never leaves the sidebar empty.
+    for (const meeting of localTitleMatches(meetings, query, folderId, folderScope)) {
+        add(meeting, null, t("app.sidebar.provenance.title"));
+    }
     return rows.slice(0, SIDEBAR_SEARCH_RESULT_LIMIT);
 }

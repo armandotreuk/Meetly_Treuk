@@ -43,10 +43,15 @@ pub(crate) async fn ensure_no_active_operation(
 #[tauri::command]
 pub async fn retrieval_index_status(app: AppHandle) -> Result<RetrievalStatusReport, String> {
     let (lifecycle, pool) = lifecycle_and_pool(&app)?;
+    // Bounded like the service-side consistency retry in `index::index_status`:
+    // rapid pause toggling must not spin this command through repeated full
+    // status reads. The last attempt's report is returned regardless.
+    let mut attempt = 0;
     loop {
         let paused = lifecycle.index_paused();
         let report = index::index_status(&pool, lifecycle.index_service().as_ref(), paused).await?;
-        if paused == lifecycle.index_paused() {
+        attempt += 1;
+        if paused == lifecycle.index_paused() || attempt >= index::STATUS_CONSISTENCY_ATTEMPTS {
             return Ok(report);
         }
         tokio::task::yield_now().await;

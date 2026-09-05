@@ -213,7 +213,7 @@ impl HybridSearchResponse {
         hydrated: &HydratedContext,
         max_results: usize,
     ) -> Self {
-        let results = ranked
+        let mut results = ranked
             .ranking
             .meetings
             .iter()
@@ -300,15 +300,19 @@ impl HybridSearchResponse {
                     provenance,
                 })
             })
-            .take(max_results)
             .collect::<Vec<_>>();
+        // `total` counts every meeting the request could publish, BEFORE the
+        // caller's public limit truncates it, so a client can tell "one match"
+        // from "one of forty shown".
+        let total = results.len();
+        results.truncate(max_results);
         Self {
             version: "v1",
             scope: HybridScope::from(&ranked.scope.scope),
             retrieval_status: HybridRetrievalStatus::from_fallback(
                 ranked.semantic_fallback.as_ref(),
             ),
-            total: results.len(),
+            total,
             results,
         }
     }
@@ -497,6 +501,9 @@ mod tests {
         for limit in [1, 20, count] {
             let response = HybridSearchResponse::from_outputs(&ranked, &hydrated, limit);
             assert_eq!(response.results.len(), limit);
+            // `total` counts the publishable matches, not the truncated page,
+            // so a client can distinguish "one match" from "one of fifty".
+            assert_eq!(response.total, count);
             assert_eq!(
                 response
                     .results

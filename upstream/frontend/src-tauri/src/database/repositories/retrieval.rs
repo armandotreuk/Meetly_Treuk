@@ -2187,6 +2187,73 @@ impl RetrievalRepository {
         Ok(deleted > 0)
     }
 
+    /// True while `generation_id` still has meetings that can make progress
+    /// (pending or backing-off retry rows below their current source
+    /// revision). One terminal per-meeting failure must never end a
+    /// generation that still has other work queued.
+    pub async fn generation_has_outstanding_work(
+        pool: &SqlitePool,
+        generation_id: &str,
+    ) -> Result<bool, SqlxError> {
+        let outstanding: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1
+             FROM retrieval_meeting_state ms
+             JOIN search_source_state s ON s.meeting_id = ms.meeting_id
+             WHERE ms.generation_id = ?
+               AND ms.state IN ('pending', 'retry')
+               AND ms.indexed_source_revision < s.source_revision
+             LIMIT 1",
+        )
+        .bind(generation_id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(outstanding.is_some())
+    }
+
+    /// Removes a non-active `failed` generation and its journal, mirroring
+    /// [`Self::cancel_building_generation`] for the terminal state. A manual
+    /// rebuild uses it to free a retention slot before registering a fresh
+    /// shadow instead of silently resuming the failed one.
+    pub async fn discard_failed_generation(
+        pool: &SqlitePool,
+        generation_id: &str,
+    ) -> Result<bool, SqlxError> {
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let state: Option<(String,)> =
+            sqlx::query_as("SELECT state FROM retrieval_generations WHERE generation_id = ?")
+                .bind(generation_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if state.as_ref().is_none_or(|(state,)| state != "failed") {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let active: Option<(String,)> =
+            sqlx::query_as("SELECT generation_id FROM retrieval_active_model WHERE singleton = 1")
+                .fetch_optional(&mut *tx)
+                .await?;
+        if active
+            .as_ref()
+            .is_some_and(|(active,)| active == generation_id)
+        {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query("DELETE FROM retrieval_index_changes WHERE generation_id = ?")
+            .bind(generation_id)
+            .execute(&mut *tx)
+            .await?;
+        let deleted = sqlx::query(
+            "DELETE FROM retrieval_generations WHERE generation_id = ? AND state = 'failed'",
+        )
+        .bind(generation_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(deleted > 0)
+    }
+
     pub async fn mark_shadow_generation_failed(
         pool: &SqlitePool,
         generation_id: &str,

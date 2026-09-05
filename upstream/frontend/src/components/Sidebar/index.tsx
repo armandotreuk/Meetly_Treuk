@@ -364,9 +364,38 @@ const Sidebar: React.FC = () => {
 
   const folderNameById = useMemo(() => new Map(folders.map((f) => [f.id, f.name])), [folders]);
 
+  // Folder ids in the selected subtree, so the local lexical fallback can
+  // include the same recursive membership the Rust folder scope resolves.
+  const selectedFolderScope = useMemo(() => {
+    if (!selectedFolderId) return null;
+    const childrenByParent = new Map<string, string[]>();
+    for (const folder of folders) {
+      if (!folder.parent_id) continue;
+      const siblings = childrenByParent.get(folder.parent_id) ?? [];
+      siblings.push(folder.id);
+      childrenByParent.set(folder.parent_id, siblings);
+    }
+    const scope = new Set<string>();
+    const pending = [selectedFolderId];
+    while (pending.length > 0) {
+      const current = pending.pop() as string;
+      if (scope.has(current)) continue;
+      scope.add(current);
+      pending.push(...(childrenByParent.get(current) ?? []));
+    }
+    return scope;
+  }, [folders, selectedFolderId]);
+
   const searchRows = useMemo(
-    () => buildSidebarSearchRows(meetings, searchQuery, selectedFolderId, searchResponse),
-    [folders, meetings, searchQuery, searchResponse, selectedFolderId]
+    () =>
+      buildSidebarSearchRows(
+        meetings,
+        searchQuery,
+        selectedFolderId,
+        searchResponse,
+        selectedFolderScope
+      ),
+    [meetings, searchQuery, searchResponse, selectedFolderId, selectedFolderScope]
   );
 
   const askSearchResults = useCallback(async () => {

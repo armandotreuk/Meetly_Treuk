@@ -103,13 +103,6 @@ impl RetrievalLimits {
         }
     }
 
-    pub const fn hybrid_default() -> Self {
-        Self {
-            lexical_per_variant: HYBRID_CANDIDATES_PER_VARIANT,
-            vector_per_variant: HYBRID_CANDIDATES_PER_VARIANT,
-        }
-    }
-
     fn clamped(self) -> Self {
         Self {
             lexical_per_variant: self
@@ -326,6 +319,14 @@ struct NormalizedRequest {
     lexical_rewritten: Option<String>,
     core_terms: Vec<String>,
     core_language: CoreTermLanguage,
+    /// Minimum `title_term_overlap` a title candidate must reach; 0 means any
+    /// non-zero overlap. Set to the DISTINCT core-term count when the title
+    /// channel runs without a stopword list (Search on an unstated language),
+    /// where partial overlap would let query function words title-match
+    /// arbitrary meetings. It must be the distinct count because
+    /// `title_term_overlap` deduplicates terms before counting, so a repeated
+    /// query token could never reach the raw `core_terms.len()`.
+    title_min_overlap: usize,
 }
 
 /// The one shared retrieval service. Holds a clone of the process-wide
@@ -485,7 +486,10 @@ impl RetrievalService {
             result.candidates,
             effective_query.trim(),
             core_terms,
-            &crate::retrieval::ranking::RankingConfig::for_purpose(purpose),
+            &crate::retrieval::ranking::RankingConfig::for_purpose_and_query(
+                purpose,
+                effective_query.trim(),
+            ),
             ranking_mode,
             &cancel,
         )
@@ -567,7 +571,10 @@ impl RetrievalService {
             candidates,
             &ranked.ranking.effective_query,
             ranked.ranking.core_terms.clone(),
-            &crate::retrieval::ranking::RankingConfig::for_purpose(purpose),
+            &crate::retrieval::ranking::RankingConfig::for_purpose_and_query(
+                purpose,
+                ranked.ranking.effective_query.trim(),
+            ),
             ranking_mode,
             &cancel,
         )
@@ -731,6 +738,13 @@ impl RetrievalService {
         let core_terms = core_terms(&lexical_original, request.core_language);
         Ok(NormalizedRequest {
             purpose: request.purpose,
+            title_min_overlap: if request.purpose == RetrievalPurpose::Search
+                && request.core_language == CoreTermLanguage::Unknown
+            {
+                core_terms.iter().collect::<HashSet<_>>().len()
+            } else {
+                0
+            },
             transcript_only: matches!(&scope, PersistedRetrievalScope::Meeting(_)),
             scope,
             membership,
@@ -1083,10 +1097,16 @@ impl RetrievalService {
     /// before truncation. Scope safety, the overlap score, and the
     /// (overlap desc, meeting id asc) ordering are identical to a full sort.
     ///
-    /// [`CoreTermLanguage::Unknown`] deliberately keeps every normalized query
-    /// token in `core_terms` for Search, whose contract requires title search
-    /// without an explicit language. Other purposes keep the guard against
-    /// function-word title signals outranking content evidence.
+    /// [`CoreTermLanguage::Unknown`] keeps every normalized query token in
+    /// `core_terms` (the evaluated core-term policy removes only a stated
+    /// language's fixed list and never a cross-language union). Search still
+    /// needs title matching without a stated language, so instead of relaxing
+    /// that policy it tightens the MATCH: with no stopword list a title
+    /// candidate must contain EVERY distinct core term (`title_min_overlap`),
+    /// which is exactly the "exact authoritative title-only match" the search
+    /// contract asks for and cannot be satisfied by a shared function word.
+    /// Other purposes keep the original guard, so function-word title signals
+    /// can never outrank content evidence through [`best_provenance`].
     async fn title_channel(
         &self,
         pool: &SqlitePool,
@@ -1738,7 +1758,7 @@ fn push_title_candidates(
             continue;
         }
         let overlap = title_term_overlap(&normalized.core_terms, &title);
-        if overlap == 0 {
+        if overlap == 0 || overlap < normalized.title_min_overlap {
             continue;
         }
         let candidate = TitleCandidate {

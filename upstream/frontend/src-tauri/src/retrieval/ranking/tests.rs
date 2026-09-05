@@ -47,6 +47,36 @@ fn search_purpose_uses_the_shallower_rerank_depth() {
     );
 }
 
+#[test]
+fn search_queries_below_the_minimum_length_skip_the_cross_encoder() {
+    use super::SEARCH_MIN_MODEL_QUERY_CHARS;
+    use crate::retrieval::service::RetrievalPurpose;
+
+    assert_eq!(SEARCH_MIN_MODEL_QUERY_CHARS, 3);
+    for short in ["a", "ab", " b "] {
+        assert_eq!(
+            RankingConfig::for_purpose_and_query(RetrievalPurpose::Search, short.trim())
+                .rerank_depth,
+            0,
+            "a {short:?} search query must not run model inference"
+        );
+    }
+    assert_eq!(
+        RankingConfig::for_purpose_and_query(RetrievalPurpose::Search, "abc").rerank_depth,
+        SEARCH_RERANK_DEPTH
+    );
+    // Multi-byte characters are counted as characters, not bytes.
+    assert_eq!(
+        RankingConfig::for_purpose_and_query(RetrievalPurpose::Search, "ação").rerank_depth,
+        SEARCH_RERANK_DEPTH
+    );
+    // The guard is Search-only: Chat keeps its depth at any length.
+    assert_eq!(
+        RankingConfig::for_purpose_and_query(RetrievalPurpose::Chat, "a").rerank_depth,
+        super::CHAT_RERANK_DEPTH
+    );
+}
+
 // -- Candidate builders -------------------------------------------------------
 
 fn lexical_candidate(

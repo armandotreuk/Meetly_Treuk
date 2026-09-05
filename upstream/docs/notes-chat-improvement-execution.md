@@ -3548,3 +3548,105 @@ Orchestrator may insert ad-hoc reviews after any task that surprises it (larger 
 - Tests assessed: reviewer reran the three focused deterministic activation tests (`shadow_promotion_cancellation_before_and_after_commit_is_ordered`, `activation_commit_cannot_resurrect_after_clear_fences_publication`, and `replaced_activation_reservation_fences_the_old_snapshot`) ✅; `pnpm run typecheck` ✅; `pnpm exec vitest run` ✅ 153 passed / 23 files with existing React/Radix `act(...)` warnings; `cargo test --manifest-path "src-tauri/Cargo.toml" --lib -- --test-threads=1` ✅ 883 passed / 0 failed / 2 ignored; `cargo check --manifest-path "src-tauri/Cargo.toml"` ✅; touched-file `rustfmt --edition 2021 --check` and scoped `git diff --check` ✅. Excluded evaluation/corpus/debug/`.opencode` artifacts were not inspected or run.
 - Residual risks: Cancellation remains intentionally best-effort at the exact durable commit boundary: cancellation observed before commit rolls the transaction back, while cancellation after a successful commit must finish the matching reserved in-memory publication and may defer only journal acknowledgement. A clear or replaced reservation instead keeps readers/status in transitioning state until clear resets derived state or the next publisher reconciles the durable pointer. The barrier tests exercise those boundaries directly; generation-conditional lag refresh prevents a new durable pointer from making a retired in-memory snapshot appear current. Immutable scans, embedding/index construction, publisher I/O, status reads, and retrieval readers remain free of lifecycle/state locks across awaits. Prior force-lexical independence, derived-only clear preservation, serialized controls, fenced mounted polling, deterministic Settings states, a11y/i18n, and privacy-safe diagnostics remain intact. The HR-5.3.R4 implementation entry is present but was inserted earlier in §6 rather than chronologically after R5.3.R4 (`docs/notes-chat-improvement-execution.md:3422`); this documentation-ordering quirk does not alter the recorded scope or evidence. Task 5.4, Task 5.5, Sprint close, and release remain blocked by the unchanged independently authored Portuguese corpus, production-path quality/final provider-answer, native Windows/R13 hermetic-session, and exact-head GitHub Actions evidence gates; no release claim is made.
 - Follow-up tasks created: none.
+
+### Review R5.R1 — Sprint 5 full-scope code review
+- Date: 2026-09-05
+- Reviewer model: anthropic/claude-opus-5 (Claude Code, `/code-review xhigh`)
+- Scope reviewed: the whole Sprint 5 implementation range `29df304..2f767a2` (Tasks 5.1-5.3 plus the 5.4 documentation split) — 33 files, ~8.3k added lines across `api/api.rs`, `api/chat.rs`, `database/repositories/retrieval.rs`, `mcp/server.rs`, `model_bundle.rs`, the `retrieval/` module (new `contracts.rs`, plus `hydration.rs`, `index.rs`, `ranking.rs`, `service.rs`, `worker.rs`, `commands.rs`), and the sidebar/Settings frontend with its tests. Read against `docs/hybrid-rag/sprint-5-search-release.md`, `architecture.md`, and this log.
+- Method: ten inline finder angles (line-by-line, removed-behaviour, cross-file tracer, language pitfalls, wrapper correctness, reuse, simplification, efficiency, altitude, CLAUDE.md conventions), then dedup and a gap sweep. No subagents.
+- Verdict: changes-requested — 15 findings (13 correctness, 2 cleanup).
+- Findings:
+  1. **Blocker — one terminal per-meeting failure ends the whole generation.** `record_item_failure` called `mark_shadow_generation_failed` on the first item that exhausted `MAX_ITEM_ATTEMPTS` (`retrieval/worker.rs:1536`), contradicting `record_work_failure`'s own documented invariant that one poison meeting never destroys or starves other work. `next_due_item` selects only `list_live_generations` ('building'/'ready'), so every remaining pending meeting stopped. On a fresh install the first generation is not the active one, so it is eligible — a single unindexable meeting killed semantic indexing library-wide.
+  2. **Blocker — the approved minimum query length was a no-op.** `SIDEBAR_SEARCH_MIN_QUERY_LENGTH = 1` made the guard identical to the empty-query check the PRD called insufficient, and `validate_hybrid_query` added no compensating bound, so one character ran embedding plus cross-encoder reranking on every debounced keystroke. `tests/lib/sidebar-search.test.ts` pinned the value at 1.
+  3. **Blocker — a hybrid command error left the sidebar with zero results.** `buildSidebarSearchRows` returned `[]` on a null response and the previous client-side title-substring union was deleted, so timeout / retrieval-unavailable / invalidated responses showed nothing even for an exact title match — breaking "every semantic failure preserves lexical functionality".
+  4. **Should-fix — one stale meeting failed a whole hybrid request.** `bind_and_revalidate_hybrid` errored when the scope/existence recheck lost any hydrated meeting, discarding a full page of valid results for one stale vector.
+  5. **Should-fix — "Rebuild" did not rebuild.** `request_rebuild` resumed an existing failed generation via `retry_failed_generation`, leaving already-'ready' meetings un-re-embedded under the rebuild confirmation copy, and duplicating the dedicated `retrieval_retry_rebuild` control.
+  6. **Should-fix — Search ran the title channel on stopword core terms.** The `CoreTermLanguage::Unknown` guard was removed for Search while every hybrid request hardcodes `Unknown`; `best_provenance` orders Title above Semantic, so query function words could outrank content evidence — the exact consequence the deleted doc comment warned about.
+  7. **Should-fix — `HybridSearchResponse.total` was computed after `.take(max_results)`**, so the public v1 contract could never report more matches than it returned.
+  8. **Should-fix — search hydrated the contract maximum per keystroke.** `execute_hybrid_search` always passed `MAX_HYBRID_CONTEXT_CHARS`/`MAX_HYBRID_SEARCH_MEETINGS` regardless of `limit`, assembling up to 100 KB of Markdown the search contract never reads.
+  9. **Should-fix — `building` counted terminal shadows.** `!building_generations.is_empty()` included 'failed'/'ready' generations, so a failed-only index reported `serving_state = "building"`.
+  10. **Should-fix — derived disk was never measured against its steady-state ceiling.** The envelope indicator compared only against the 3 GiB activation limit while displaying the 2 GiB steady target, so 2-3 GiB steady-state usage read "Within activation envelope".
+  11. **Should-fix — two nested unbounded retry loops in `retrieval_index_status`**, each re-running the status join aggregate, derived-disk measurement and RSS probe, with only `yield_now()` as backoff.
+  12. **Should-fix — `update_publication_lag` swallowed a failed pointer read** (`Err(_) => return`) where it previously reported lag 1, letting status claim "ready" from a stale lag.
+  13. **Should-fix — the Settings panel polled the heavy status command every 2 s** for as long as it was mounted, with no idle backoff.
+  14. **Nit — `dispose()` was revivable**: `search()` reset `disposed = false`, so a torn-down controller could invoke for an unmounted component.
+  15. **Nit — `RetrievalLimits::hybrid_default()` duplicated `chat_default()` verbatim**, implying a search-specific bound that did not exist.
+- Explicitly cleared during review: the `dedupe_candidates` provenance move into `source_aliases` (every consumer — `is_semantic`, `semantic_quality`, `channel_positions`, `slot_channel_lists`, `agent::accumulated_semantics`, `merge_candidates` — was updated, and the two remaining raw `.provenance` readers in `hydration.rs`/`api/chat.rs` are unaffected because absorption targets already carry their own channel); the `MeetingDeletionGuard`/`deleting_meetings` pairing (the deletion callback receives only the top-level `meeting_id`, and the guard clears it on every path); `clear_derived_index` recovery (a restarted worker re-registers a generation through `register_semantic_identity`); and progress denominators (`register_generation` seeds `retrieval_meeting_state` for all meetings up front).
+- Not run in this review: evaluation/benchmark harnesses, packaging/installed-smoke gates, and the excluded corpus/debug/`.opencode` suites.
+- Follow-up tasks created: HR-5.R1
+
+### Task HR-5.R1 — R5.R1 review remediation [L]
+- Date: 2026-09-05
+- Implementer model: anthropic/claude-opus-5 (Claude Code)
+- Status: done (implementation and mandatory verification; no release claim and no gate re-opened).
+- Scope: fix all 15 R5.R1 findings, preferring the deeper mechanism change over a local patch in each case.
+- Files changed: `frontend/src-tauri/src/api/api.rs`, `frontend/src-tauri/src/database/repositories/retrieval.rs`, `frontend/src-tauri/src/retrieval/{commands.rs,contracts.rs,index.rs,ranking.rs,service.rs,worker.rs}`, `frontend/src/components/RetrievalIndexSettings.tsx`, `frontend/src/components/Sidebar/{SidebarProvider.tsx,index.tsx}`, `frontend/src/lib/sidebar-search.ts`, `frontend/src/lib/strings/en.ts`, `frontend/tests/components/{retrieval-index-settings.test.tsx,sidebar-search.test.tsx}`, `frontend/tests/lib/sidebar-search.test.ts`, this doc.
+- Corrections applied:
+  1. (F1) New `RetrievalRepository::generation_has_outstanding_work` gates `mark_shadow_generation_failed`: a terminal item stays an activation blocker, and the generation only becomes terminal once nothing else can progress — restoring the documented queue-fairness invariant while keeping a retryable end state.
+  2. (F2) `SIDEBAR_SEARCH_MIN_QUERY_LENGTH = 3`, mirrored server-side by `SEARCH_MIN_MODEL_QUERY_CHARS` and `RankingConfig::for_purpose_and_query`, which sets `rerank_depth = 0` for sub-minimum Search queries so a direct Tauri/MCP caller is bounded exactly like the sidebar. Short queries still return lexical/title results rather than an error.
+  3. (F3) New `localTitleMatches` restores folder-scoped title matching whenever no usable response exists (command failure, scope mismatch, or a below-minimum query). `Sidebar/index.tsx` resolves the selected folder's subtree so the fallback matches the recursive membership Rust resolves, and never shows an out-of-scope meeting.
+  4. (F4) A `StaleMeetingPolicy` splits the two surfaces: search drops stale meetings via `retain_current_meetings` and publishes the survivors; context keeps failing closed because its single Markdown blob cannot be pruned after assembly.
+  5. (F5) New `RetrievalRepository::discard_failed_generation` removes non-active failed shadows, and `request_rebuild` always registers a fresh generation. Resuming partial work remains the explicit `retrieval_retry_rebuild` control.
+  6. (F6) Rather than weakening the evaluated core-term policy (which forbids a cross-language stopword union), the title MATCH is tightened: `NormalizedRequest::title_min_overlap` requires every distinct core term when Search runs without a stated language — the "exact authoritative title-only match" the contract asks for, unreachable by a shared function word.
+  7. (F7) `total` is taken before truncation.
+  8. (F8) Search hydration is sized as `limit x SEARCH_CONTEXT_CHARS_PER_MEETING` capped at the contract maximum, with a `SEARCH_HYDRATION_BACKFILL` margin.
+  9. (F9) `building` tests `state == "building"`.
+  10. (F10) The disk envelope selects the activation limit only while a rebuild is in flight, otherwise the steady-state target, with distinct copy (`diskWithinSteady`/`diskSteadyExceeded`) and an amber treatment when exceeded.
+  11. (F11) Both retry loops are capped at `STATUS_CONSISTENCY_ATTEMPTS` and return the freshest read.
+  12. (F12) New `QueryIndexService::mark_lag_unknown` reports an unverifiable publication read as behind.
+  13. (F13) The 2 s cadence applies only while the report can still change; otherwise 30 s.
+  14. (F14) `dispose()` is terminal, and `SidebarProvider` owns the controller through a ref cleared on teardown.
+  15. (F15) `hybrid_default()` removed; both call sites use `chat_default()`.
+- Verification (worktree `.claude/worktrees/rust-v9-validation-corpus-8c4b15`, `CARGO_TARGET_DIR=%LOCALAPPDATA%\meetily-cargo-target`):
+  - `pnpm --dir frontend run typecheck` — OK.
+  - `pnpm --dir frontend exec vitest run` — OK, 156 passed / 23 files (existing React/Radix `act(...)` warnings).
+  - `cargo check --manifest-path frontend/src-tauri/Cargo.toml` — OK, 0 errors.
+  - `cargo test --manifest-path frontend/src-tauri/Cargo.toml --lib` — OK, 887 passed / 0 failed / 2 ignored.
+  - `cargo fmt --manifest-path frontend/src-tauri/Cargo.toml --check` — OK; `git diff --check` — OK.
+  - Environment note: this worktree lacked the gitignored `src-tauri/binaries/llama-helper-*.exe` sidecar and `resources/retrieval/bundle/{model-bundle.manifest.json,licenses,models,tokenizers}`. Both were copied read-only from the main checkout so the build script and `retrieval::model::tests::reference_token_ids_match_staged_bundle` could run; neither is tracked and neither was modified.
+  - Flake note: under full-suite parallelism `retrieval::agent::tests::per_call_deadline_and_total_budget_fall_back_in_time` and `retrieval::index::tests::manual_pause_stops_index_work_without_disabling_queries_or_publication` each failed once across four runs and pass deterministically in isolation and on the unmodified `2f767a2` baseline. Both are wall-clock/spin-loop tests; they are pre-existing timing flakes, not regressions.
+- Notes/decisions:
+  1. Context deliberately keeps the fail-closed recheck. Pruning is only sound for a surface that publishes independent per-meeting rows; the context Markdown is assembled once and cannot have a removed meeting excised afterwards.
+  2. The Unknown-language title fix does not touch `core_terms`. The evaluated Task 1.2 policy forbids an all-language union as a language substitute, so the correction lives in the match threshold, not the term list.
+  3. The minimum query length is enforced in two independent places on purpose: the frontend avoids the round trip, and the ranking policy guarantees the bound for any caller.
+- Inherited Sprint 3 release gates (unchanged, each still absent): valid independently authored Portuguese corpus; production-path quality and final provider-answer evidence; native Windows/R13 hermetic session evidence; exact-head GitHub Actions evidence. Task 5.4, Task 5.5, Sprint close, and release remain blocked.
+- Spillover: none.
+
+### Review R5.R2 — after HR-5.R1
+- Date: 2026-09-05
+- Reviewer model: anthropic/claude-opus-5 (Claude Code, `/code-review xhigh`)
+- Scope reviewed: the HR-5.R1 remediation diff `2f767a2..HEAD` (15 files, +529/-97), re-read against the R5.R1 findings and the PRD.
+- Verdict: changes-requested — 5 findings, all in code introduced by HR-5.R1 itself.
+- Findings:
+  1. **Blocker — the new title gate was unreachable for any repeated query token.** `title_term_overlap` deduplicates terms into a `HashSet` before counting, so its maximum is the DISTINCT term count, but the gate compared it against the raw `core_terms.len()`. A Search query of "retention retention" could never reach 2, silently disabling the title channel and making an exactly-titled meeting unfindable by title.
+  2. **Should-fix — terminal `dispose()` could permanently kill sidebar search.** The controller lived in a `useMemo` disposed by an effect cleanup; React may recompute a memo, and a StrictMode/Offscreen remount runs cleanup then mounts again with the same instance, after which `search()` returns early forever. Latent today (`reactStrictMode: false`) but introduced by making dispose terminal.
+  3. **Should-fix — limit-scaled hydration removed result backfill.** `from_outputs` drops a meeting that hydrates no publishable source, so hydrating exactly `limit` meetings could silently return short pages where the previous 50-meeting hydration filled them.
+  4. **Should-fix — the bounded status loop left a panicking fall-through.** The `for` loop plus `unreachable!()` puts a panic on a Tauri command's fall-through path if the attempt constant is ever set to 0.
+  5. **Nit — Rust `///` doc comments used in TypeScript**, where they are ordinary line comments that never reach tooltips or generated docs.
+- Not run in this review: evaluation/benchmark harnesses, packaging/installed-smoke gates, and the excluded corpus/debug/`.opencode` suites.
+- Follow-up tasks created: HR-5.R2
+
+### Task HR-5.R2 — R5.R2 review remediation [S]
+- Date: 2026-09-05
+- Implementer model: anthropic/claude-opus-5 (Claude Code)
+- Status: done (implementation and mandatory verification; no release claim and no gate re-opened).
+- Scope: fix all 5 R5.R2 findings and add regression coverage for the R5.R1 corrections that had none.
+- Files changed: `frontend/src-tauri/src/api/api.rs`, `frontend/src-tauri/src/retrieval/{commands.rs,contracts.rs,index.rs,service.rs,worker.rs}`, `frontend/src-tauri/src/retrieval/ranking/tests.rs`, `frontend/src-tauri/src/retrieval/tests.rs`, `frontend/src/components/Sidebar/SidebarProvider.tsx`, `frontend/src/lib/sidebar-search.ts`, this doc.
+- Corrections applied:
+  1. `NormalizedRequest::title_requires_all_terms: bool` became `title_min_overlap: usize`, precomputed once as the DISTINCT core-term count (0 meaning "any non-zero overlap"). This also removes a per-row recomputation from the title scan.
+  2. `SidebarProvider` owns the controller through `searchControllerRef` plus `ensureSearchController()`; teardown disposes and nulls the ref, so a remount builds a fresh controller and `dispose()` stays terminal. `searchInvoke` is read through a ref so the controller identity no longer depends on it.
+  3. New `SEARCH_HYDRATION_BACKFILL = 5` is added on top of the caller's limit (still capped at `MAX_HYBRID_SEARCH_MEETINGS`), restoring backfill without restoring contract-maximum hydration.
+  4. `retrieval_index_status` uses a counted `loop` that always returns a report — no `unreachable!()` on a command path.
+  5. The two TypeScript comments converted to `/** ... */` JSDoc.
+- Regression tests added: `ranking::tests::search_queries_below_the_minimum_length_skip_the_cross_encoder` (including a multi-byte case and the Chat-unaffected case); `retrieval::tests::unknown_language_search_titles_need_every_distinct_core_term` (exact match, function-word rejection, repeated-token match); `worker::tests::one_terminal_item_never_ends_a_generation_that_can_still_progress`; `index::tests::rebuild_discards_a_failed_shadow_instead_of_resuming_it`; a `total`-before-truncation assertion in `contracts::tests::public_result_limits_only_truncate_stable_ranked_outputs`; and, on the frontend, a lexical-fallback test, a dispose-is-terminal test, a rewritten minimum-length test, and a disk-envelope test covering steady-state vs rebuild.
+- Verification:
+  - `pnpm --dir frontend run typecheck` — OK.
+  - `pnpm --dir frontend exec vitest run` — OK, 156 passed / 23 files.
+  - `cargo check --manifest-path frontend/src-tauri/Cargo.toml` — OK, 0 errors.
+  - `cargo test --manifest-path frontend/src-tauri/Cargo.toml --lib` — OK, 887 passed / 0 failed / 2 ignored (clean full-suite run, no flakes observed).
+  - `cargo fmt --manifest-path frontend/src-tauri/Cargo.toml --check` — OK; `git diff --check` — OK.
+- Notes/decisions:
+  1. `title_min_overlap` is the distinct count rather than a boolean so the threshold is expressed in the same unit `title_term_overlap` actually returns; the earlier boolean invited exactly the unit mismatch it caused.
+  2. The backfill margin is fixed rather than proportional: the cost that mattered was the unbounded per-keystroke ceiling, and a constant margin keeps the bound predictable at every limit.
+- Inherited Sprint 3 release gates (unchanged, each still absent): valid independently authored Portuguese corpus; production-path quality and final provider-answer evidence; native Windows/R13 hermetic session evidence; exact-head GitHub Actions evidence. Task 5.4, Task 5.5, Sprint close, and release remain blocked.
+- Spillover: none.
