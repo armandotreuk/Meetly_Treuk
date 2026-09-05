@@ -24,6 +24,7 @@ use crate::{
         HybridScope, HybridSearchResponse, PersistedRetrievalScope, RetrievalError,
         RetrievalLimits, RetrievalPurpose, RetrievalRequest, RetrievalService,
         MAX_HYBRID_CONTEXT_CHARS, MAX_HYBRID_SEARCH_MEETINGS, MAX_HYBRID_SEARCH_RESULTS,
+        SEARCH_HYDRATION_BACKFILL,
     },
     state::AppState,
     summary::CustomOpenAIConfig,
@@ -481,17 +482,6 @@ impl Drop for HybridOwnershipGuard<'_> {
     }
 }
 
-struct MeetingDeletionGuard<'a> {
-    state: &'a ChatRequestState,
-    meeting_id: &'a str,
-}
-
-impl Drop for MeetingDeletionGuard<'_> {
-    fn drop(&mut self) {
-        self.state.finish_meeting_deletion(self.meeting_id);
-    }
-}
-
 fn finish_hybrid_request<T>(
     state: &ChatRequestState,
     surface: ChatRequestSurface,
@@ -657,13 +647,6 @@ fn retain_current_meetings(
 /// the caller's own result limit instead of always spending the contract
 /// maximum (and the assembled Markdown is discarded by the search contract).
 const SEARCH_CONTEXT_CHARS_PER_MEETING: usize = 1_200;
-
-/// Extra meetings hydrated beyond the caller's limit. `from_outputs` drops a
-/// meeting that hydrates no publishable source (content gone, or pruned by the
-/// scope recheck), so hydrating exactly `limit` would silently return short
-/// pages; this margin restores the backfill without restoring the unbounded
-/// contract-maximum hydration.
-const SEARCH_HYDRATION_BACKFILL: usize = 5;
 
 pub(crate) async fn execute_hybrid_search(
     pool: &sqlx::SqlitePool,
@@ -1428,10 +1411,7 @@ pub async fn api_delete_meeting<R: Runtime>(
     // references this meeting are cancelled through the one shared request
     // registry, so no later chunk/source/done publication can occur.
     let chat_requests = chat_requests.inner().clone();
-    let deletion_guard = MeetingDeletionGuard {
-        state: &chat_requests,
-        meeting_id: &meeting_id,
-    };
+    let deletion_guard = chat_requests.begin_meeting_deletion(&meeting_id);
     let deletion = MeetingsRepository::delete_meeting(pool, &meeting_id, |deleted_meeting_id| {
         chat_requests.invalidate_meeting(deleted_meeting_id);
     })

@@ -3650,3 +3650,71 @@ Orchestrator may insert ad-hoc reviews after any task that surprises it (larger 
   2. The backfill margin is fixed rather than proportional: the cost that mattered was the unbounded per-keystroke ceiling, and a constant margin keeps the bound predictable at every limit.
 - Inherited Sprint 3 release gates (unchanged, each still absent): valid independently authored Portuguese corpus; production-path quality and final provider-answer evidence; native Windows/R13 hermetic session evidence; exact-head GitHub Actions evidence. Task 5.4, Task 5.5, Sprint close, and release remain blocked.
 - Spillover: none.
+
+### Review R5.R3 — full Sprint 5 range, after HR-5.R2
+- Date: 2026-09-05
+- Reviewer model: anthropic/claude-opus-5 (Claude Code, `/code-review xhigh`)
+- Scope reviewed: the whole Sprint 5 implementation at `29df304..HEAD` (5 commits, 33 files, +9054/-454), re-read against the Sprint 5 PRD, `architecture.md`, and this log. Ten inline finder angles plus a gap sweep; the surfaces R5.R1/R5.R2 had covered least — `mcp/server.rs`, `retrieval/{contracts,hydration}.rs`, `RetrievalIndexSettings.tsx`, `MeetingTreeItem.tsx`, `types/index.ts` — were read in full.
+- Verdict: changes-requested — 15 findings: 2 blockers, 9 should-fix, 4 cleanup/altitude/conventions.
+- Findings:
+  1. **Blocker — the sidebar rejected every real hybrid response.** `HybridProvenance::match_mode` is `Option<String>` with no `skip_serializing_if`, so serde emits `"matchMode": null`; `isHybridProvenance` accepts only `undefined | "and" | "or"`. Only the lexical channel sets a mode, so any response carrying a semantic or title provenance entry — that is, every hybrid response — failed validation, threw `Invalid hybrid response`, and left the sidebar showing "Search unavailable" with local-title-only rows. Task 5.1 did not work in production. Verified by negative control: the serialized value is `{"channel":"semantic",…,"matchMode":null,…}`. Every test passed because the single frontend fixture used `matchMode: "or"` and no Rust test asserted the serialized shape.
+  2. **Blocker (scale) — a full table scan of `meetings` on every debounced keystroke.** Task 5.1 enabled the title channel for `RetrievalPurpose::Search` regardless of `CoreTermLanguage`. Every production caller passes `Unknown`, so the channel had never run in production before; it now does, and for the default `All` scope `title_channel` pages the entire `meetings` table at `TITLE_SCAN_PAGE = 256`. At the sprint's own 250k gate that is ~977 sequentially awaited SQLite queries and 250k rows normalized in Rust per keystroke, on the pool a live Chat stream shares — against the "sustained sidebar typing while a Chat stream is active" and 250k qualification gates.
+  3. **Should-fix — substring title matches disappeared in the active hybrid state.** `buildSidebarSearchRows` returned early once a scope-matching response existed, so local title matching ran only as a fallback, while the Rust title channel matches whole normalized tokens. Typing `reten` no longer found "Retention Review" while retrieval was healthy, but did find it the moment retrieval degraded — against acceptance "Title-only fixtures match current sidebar behavior during active and every lexical-fallback state".
+  4. **Should-fix — the folder label vanished from every lexical-fallback row.** `folderName={m.folder_name ?? null}` replaced a `folderNameById` lookup, but `CurrentMeeting` has no `folder_name`; the fallback path passes those objects through unchanged and the optional field made it type-check.
+  5. **Conventions — `SIDEBAR_SEARCH_MIN_QUERY_LENGTH = 3` contradicted a user-approved decision.** The PRD Decisions row of 2026-09-04 approves one non-empty Unicode character and lists "require two or more characters" as the rejected alternative; HR-5.R1 changed the constant without recording a supersession.
+  6. **Should-fix — sub-minimum queries never rendered the empty state.** The message was gated on `searchPhase === 'ready'`, but a query below the minimum publishes `idle`, so `ab` with no title match produced a blank pane and no status text.
+  7. **Should-fix — `SEARCH_HYDRATION_BACKFILL` was inert for the only production caller.** `MAX_HYBRID_SEARCH_MEETINGS` and `MAX_HYBRID_SEARCH_RESULTS` were both 50 and the sidebar always sends 50, so `min(limit + 5, 50)` clamped back to 50 and the R5.R2 correction had no effect on the sidebar path.
+  8. **Should-fix — `total` could not mean what its contract said.** It was documented as the pre-truncation match count, but hydration is capped at `limit + backfill`, so with `limit = 1` it never exceeds 6.
+  9. **Should-fix — a healthy build reported itself broken.** `hasIndexError` included `retry_meetings > 0`; `retry` is the worker's ordinary backoff state, so one transient item raised the destructive alert — whose Retry button `controlsDisabled` had already disabled because the operation was active.
+  10. **Should-fix — the disk figure and its envelope line quoted different targets.** The size line always interpolated the steady-state target while `diskEnvelopeLimit` correctly switched to the activation limit during a rebuild, so adjacent lines reported the same measurement against 2 GiB and 3 GiB.
+  11. **Should-fix — `>=` reported "exceeded" exactly at the approved ceiling**, though the gate is "at most".
+  12. **Simplification — `RetrievalLifecycle::set_force_lexical_retrieval` was a pure pass-through**, yet `api_chat_set_force_lexical_retrieval` gained a `RetrievalLifecycle` state dependency to reach it, while the read side already called the repository directly.
+  13. **Efficiency — `from_outputs` scanned `hydrated.meetings` twice per meeting** on the per-keystroke path.
+  14. **Should-fix — `invalidate_meeting` counted requests it deliberately skipped**, and the HR-5.R1 test pinned the wrong number.
+  15. **Altitude — the `deleting_meetings` window depended on an unenforced pairing**, its insert in `chat.rs` and its only removal in `api.rs`; a second caller would have pinned a meeting id forever and silently failed every later request touching it.
+- Cleared by evidence rather than assumption: the MCP `oneOf` scope schema (exactly one branch matches each tagged scope); the MCP default limit (`HYBRID_SEARCH_DEFAULT_LIMIT = 20` matches the advertised default); `hydrate_title_only_search_results` running after `hydrate`'s `empty_context` early return, so a pure title-only search still publishes; `MeetingTreeItem`'s drag behaviour surviving the button extraction (drag is bound to `rootRef` natively); and `load_meeting_source_head` returning `Some` for a meeting with no transcript rows.
+- Not run in this review: evaluation/benchmark harnesses, packaging/installed-smoke gates, and the excluded corpus/debug/`.opencode` suites.
+- Follow-up tasks created: HR-5.R3
+
+### Task HR-5.R3 — R5.R3 review remediation [M]
+- Date: 2026-09-05
+- Implementer model: anthropic/claude-opus-5 (Claude Code)
+- Status: done (implementation and mandatory verification; no release claim and no gate re-opened).
+- Scope: fix all 15 R5.R3 findings, prove the two blockers by negative control, and add regression coverage for every behaviour change.
+- Files changed: `frontend/src-tauri/src/api/{api.rs,chat.rs}`, `frontend/src-tauri/src/retrieval/{contracts.rs,mod.rs,service.rs,worker.rs}`, `frontend/src-tauri/src/retrieval/tests.rs`, `frontend/src/components/RetrievalIndexSettings.tsx`, `frontend/src/components/Sidebar/index.tsx`, `frontend/src/lib/sidebar-search.ts`, `frontend/src/lib/strings/en.ts`, `frontend/tests/components/{retrieval-index-settings,sidebar-search}.test.tsx`, `frontend/tests/lib/sidebar-search.test.ts`, `docs/hybrid-rag/sprint-5-search-release.md`, this doc.
+- Corrections applied:
+  1. `match_mode` carries `#[serde(skip_serializing_if = "Option::is_none")]`, so the field is absent rather than `null` for the semantic and title channels.
+  2. The interactive title scan is bounded by `MAX_SEARCH_TITLE_SCAN_MEETINGS = 10_000` through a `title_scan_exhausted(purpose, scanned)` policy helper. Chat and Context stay uncapped: they run the scan at most once per turn, and truncating them would drop title candidates from answers.
+  3. `buildSidebarSearchRows` runs the local title union in every state instead of only as a fallback. `add` already dedupes by meeting id, so an authoritative row keeps its rank, snippet and provenance and only titles the backend genuinely missed are appended.
+  4. The folder label falls back through the still-live `folderNameById` map when a row carries no `folder_name`.
+  5. A 2026-09-05 PRD Decisions row records the minimum-length change, states why the original rationale (short-name title matching) is now satisfied at any length by correction 3, and is marked **Pending user approval** as a supersession of a user-approved row. The code keeps 3; reverting to 1 would reinstate a guard that bounds nothing.
+  6. The empty state is gated on `searchPhase !== 'loading'`, so it also covers the `idle` phase a sub-minimum query publishes.
+  7. `SEARCH_HYDRATION_BACKFILL` moved into `contracts.rs` and `MAX_HYBRID_SEARCH_MEETINGS` is now derived as `MAX_HYBRID_SEARCH_RESULTS + SEARCH_HYDRATION_BACKFILL`, so the clamp can no longer cancel the backfill at any limit.
+  8. The `total` contract text now states what the field counts and warns explicitly that it is not a corpus-wide match count.
+  9. `hasIndexError` keys on terminal state only — `failed_meetings`, `state === "failed"`, model load failure, activation blockers.
+  10. The size line quotes the applicable envelope; because the copy names it, a `settings.retrieval.sizeValueRebuild` string ("rebuild limit {target}") was added so the wording switches with the number.
+  11. The envelope comparison is `>`, matching the "at most" gate.
+  12. The lifecycle pass-through is deleted; the command calls `SettingsRepository` directly and no longer takes a `RetrievalLifecycle` state. The three lifecycle tests were retargeted at the repository and still prove a bare setting write leaves pause state and the building shadow untouched, including under a race with `clear_index`.
+  13. `from_outputs` binds the hydrated meeting once and reads both fields from it.
+  14. `invalidate_meeting` counts only registrations it actually cancelled.
+  15. The deletion window moved into `ChatRequestState::begin_meeting_deletion`, `#[must_use]`, returning the guard that closes it; `invalidate_meeting` no longer touches the set and the guard type lives beside the registry it mutates.
+- Negative controls (each fix proven to catch its bug before it was applied):
+  - Removing `skip_serializing_if` makes the new test fail with the actual payload `{"channel":"semantic",…,"matchMode":null,…}`.
+  - Restoring `folderName={m.folder_name ?? null}` and the `=== 'ready'` gate fails both new mounted-Sidebar tests.
+  - Restoring `retry_meetings` in `hasIndexError` and `>=` in the envelope comparison fails both new settings tests.
+- Regression tests added: `contracts::tests::public_provenance_omits_match_mode_when_the_channel_has_none`; `retrieval::tests::only_the_interactive_purpose_bounds_the_title_scan`; frontend `buildSidebarSearchRows` tests for the appended substring title match, the no-duplicate case, and folder-subtree containment of appended rows; mounted-Sidebar tests for the sub-minimum empty state and the fallback folder label; settings tests for the single-envelope size line, equality-at-ceiling, and transient retries versus a terminal failure. The `begin_meeting_deletion` test now also asserts the window closes with the guard.
+- Verification:
+  - `pnpm --dir frontend run typecheck` — OK.
+  - `pnpm --dir frontend exec vitest run` — OK, 164 passed / 23 files.
+  - `cargo check --manifest-path frontend/src-tauri/Cargo.toml` — OK, 0 errors, 0 warnings from this crate's own code.
+  - `cargo test --manifest-path frontend/src-tauri/Cargo.toml --lib` — OK, 889 passed / 0 failed / 2 ignored (clean full-suite run; neither previously recorded timing flake reproduced).
+  - `cargo fmt --manifest-path frontend/src-tauri/Cargo.toml --check` — OK; `git diff --check` — OK.
+  - Environment note: unchanged from HR-5.R1 — this worktree still relies on the gitignored `src-tauri/binaries/llama-helper-*.exe` sidecar and `resources/retrieval/bundle/` artifacts copied read-only from the main checkout. Neither is tracked and neither was modified.
+  - Line-ending note: files rewritten by script were normalized back to the repository's LF endings before `cargo fmt --check`, so no whitespace-only churn entered the diff.
+- Notes/decisions:
+  1. Finding 1 is the reason this round existed. Both earlier rounds read the Rust contract and the TypeScript validator, but neither compared the *serialized* payload against the validator, and the one fixture happened to use the only channel that populates the field. The new test asserts the JSON, not the struct.
+  2. The title scan is bounded rather than made index-backed. A SQL `LIKE` pre-filter looked attractive but is not a superset of the current match: `normalize_core_token` folds diacritics, so `LIKE '%cafe%'` would drop the "Café" matches the folding exists to find. Bounding the interactive purpose keeps the match semantics exactly as evaluated and leaves the client-side union as the safety net.
+  3. Correction 3 is deliberately a union rather than a replacement of either path. The backend owns ranking, provenance and authoritative folder scope; the client owns substring recall over meetings already loaded. Neither can do the other's job, and the dedupe makes the union safe.
+  4. Finding 5 is recorded as pending approval rather than resolved unilaterally. The code and the PRD now agree on what the number is and on the fact that a user decision was superseded; the approval itself is the user's to give.
+- Inherited Sprint 3 release gates (unchanged, each still absent): valid independently authored Portuguese corpus; production-path quality and final provider-answer evidence; native Windows/R13 hermetic session evidence; exact-head GitHub Actions evidence. Task 5.4, Task 5.5, Sprint close, and release remain blocked.
+- Spillover: the 2026-09-05 minimum-query-length decision row awaits user approval.

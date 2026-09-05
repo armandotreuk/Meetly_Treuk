@@ -523,4 +523,58 @@ describe("sidebar search result policy", () => {
             buildSidebarSearchRows([{ id: "m1", title: "No match" }], "budget", null, response([]))
         ).toEqual([]);
     });
+
+    it("appends local substring title matches the backend cannot make, in the active hybrid state", () => {
+        // The Rust title channel matches whole normalized tokens, so a prefix
+        // query never reaches "Retention Review" through the backend. The
+        // pre-hybrid sidebar matched titles by substring on every keystroke,
+        // and that must still hold while hybrid retrieval is healthy.
+        const meetings = [
+            { id: "hybrid-hit", title: "Quarterly planning", folder_id: "root" },
+            { id: "title-only", title: "Retention Review", folder_id: "root" },
+        ];
+        const rows = buildSidebarSearchRows(
+            meetings,
+            "reten",
+            null,
+            response([{ ...hybridResult, meetingId: "hybrid-hit", meetingRank: 1 }])
+        );
+
+        expect(rows.map((row) => row.meeting.id)).toEqual(["hybrid-hit", "title-only"]);
+        // The authoritative row keeps its snippet and provenance; the appended
+        // one is labelled as a title match.
+        expect(rows[0].snippet).toBe("budget plan");
+        expect(rows[1].snippet).toBeNull();
+        expect(rows[1].provenance).toBe("Title");
+    });
+
+    it("never duplicates a meeting the backend already returned", () => {
+        const rows = buildSidebarSearchRows(
+            [{ id: "semantic", title: "Budget planning", folder_id: "root" }],
+            "budget",
+            null,
+            response([hybridResult])
+        );
+
+        expect(rows).toHaveLength(1);
+        // The backend row wins: its title, snippet and provenance survive.
+        expect(rows[0].meeting.title).toBe("Stale response title");
+        expect(rows[0].snippet).toBe("budget plan");
+    });
+
+    it("keeps the appended title matches inside the selected folder subtree", () => {
+        const meetings = [
+            { id: "in-scope", title: "Retention Review", folder_id: "child" },
+            { id: "out-of-scope", title: "Retention Offsite", folder_id: "elsewhere" },
+        ];
+        const rows = buildSidebarSearchRows(
+            meetings,
+            "reten",
+            "root",
+            response([], "hybrid", { kind: "folder", folderId: "root" }),
+            new Set(["root", "child"])
+        );
+
+        expect(rows.map((row) => row.meeting.id)).toEqual(["in-scope"]);
+    });
 });

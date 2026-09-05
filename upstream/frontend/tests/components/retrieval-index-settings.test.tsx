@@ -3,6 +3,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+    ACTIVE_POLL_INTERVAL_MS,
     IDLE_POLL_INTERVAL_MS,
     RetrievalIndexSettings,
     type RetrievalStatusReport,
@@ -131,6 +132,83 @@ describe("RetrievalIndexSettings", () => {
             await vi.advanceTimersByTimeAsync(IDLE_POLL_INTERVAL_MS);
         });
         expect(container.textContent).toContain("Within activation envelope (8.0 KiB limit)");
+    });
+
+    it("quotes one envelope: the size line and the envelope line cannot disagree", async () => {
+        vi.useFakeTimers();
+        const rebuilding = {
+            ...status,
+            derived_disk_bytes: 6144,
+            derived_disk_gate_input_bytes: 6144,
+            shadow_state: "building",
+            operation_active: true,
+            building_generations: [shadowStatus({ current_meetings: 2 })],
+        };
+        mocks.invoke.mockImplementation((command: string) =>
+            command === "retrieval_index_status" ? Promise.resolve(rebuilding) : Promise.resolve()
+        );
+        await act(async () => {
+            root.render(<RetrievalIndexSettings />);
+            await Promise.resolve();
+        });
+
+        // During a rebuild the applicable ceiling is the activation limit, so
+        // the measured size must be quoted against it, not against the
+        // steady-state target the line below it is no longer using.
+        expect(container.textContent).toContain("6.0 KiB · rebuild limit 8.0 KiB");
+        expect(container.textContent).not.toContain("steady-state target 4.0 KiB");
+        expect(container.textContent).toContain("Within activation envelope (8.0 KiB limit)");
+    });
+
+    it("treats derived disk exactly at the approved ceiling as within it", async () => {
+        // The approved gate is "at most", so equality is inside the envelope.
+        const atCeiling = {
+            ...status,
+            derived_disk_gate_input_bytes: status.derived_disk_steady_target_bytes,
+        };
+        mocks.invoke.mockImplementation((command: string) =>
+            command === "retrieval_index_status" ? Promise.resolve(atCeiling) : Promise.resolve()
+        );
+        await act(async () => {
+            root.render(<RetrievalIndexSettings />);
+            await Promise.resolve();
+        });
+        expect(container.textContent).not.toContain("Steady-state envelope exceeded");
+        expect(container.textContent).toContain("Within steady-state envelope");
+    });
+
+    it("does not report a healthy build with transient retries as a broken index", async () => {
+        vi.useFakeTimers();
+        // `retry` is the worker's ordinary backoff state; only terminal
+        // failures are an index error.
+        const retrying = {
+            ...status,
+            retry_meetings: 2,
+            semantic_state: "building",
+            shadow_state: "building",
+            operation_active: true,
+            building_generations: [shadowStatus({ current_meetings: 1, retry_meetings: 2 })],
+        };
+        mocks.invoke.mockImplementation((command: string) =>
+            command === "retrieval_index_status" ? Promise.resolve(retrying) : Promise.resolve()
+        );
+        await act(async () => {
+            root.render(<RetrievalIndexSettings />);
+            await Promise.resolve();
+        });
+        expect(container.textContent).not.toContain("Semantic indexing needs attention");
+
+        const failing = {
+            ...retrying,
+            building_generations: [shadowStatus({ current_meetings: 1, failed_meetings: 1 })],
+        };
+        mocks.invoke.mockImplementation((command: string) =>
+            command === "retrieval_index_status" ? Promise.resolve(failing) : Promise.resolve()
+        );
+        await act(async () => {
+            await vi.advanceTimersByTimeAsync(ACTIVE_POLL_INTERVAL_MS);
+        });
+        expect(container.textContent).toContain("Semantic indexing needs attention");
     });
 
     it("exposes status, the persisted lexical kill switch, and derived-only clear confirmation", async () => {

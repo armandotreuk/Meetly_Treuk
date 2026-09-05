@@ -17,9 +17,9 @@ use tokio_util::sync::CancellationToken;
 use super::contracts::HybridScope;
 use super::model::RetrievalModelError;
 use super::service::{
-    CoreTermLanguage, LexicalMode, PersistedRetrievalScope, QueryVariantKind, RetrievalChannel,
-    RetrievalError, RetrievalLimits, RetrievalPurpose, RetrievalRequest, RetrievalService,
-    SemanticFallbackReason,
+    title_scan_exhausted, CoreTermLanguage, LexicalMode, PersistedRetrievalScope, QueryVariantKind,
+    RetrievalChannel, RetrievalError, RetrievalLimits, RetrievalPurpose, RetrievalRequest,
+    RetrievalService, SemanticFallbackReason, MAX_SEARCH_TITLE_SCAN_MEETINGS,
 };
 use super::worker::{quantize_int8, DocumentEmbedder, LifecycleConfig, RetrievalLifecycle};
 use crate::api::api::{
@@ -3258,4 +3258,27 @@ async fn fast_hybrid_query_counter_counts_only_clean_completions() {
         .provenance
         .iter()
         .any(|provenance| provenance.channel == RetrievalChannel::Lexical)));
+}
+
+/// The title channel has no index to seek on, so its scan is linear in the
+/// meeting count. Search runs it per debounced keystroke and must stop; the
+/// per-turn purposes must not, because truncating them would silently drop
+/// title candidates from Chat and Context answers.
+#[test]
+fn only_the_interactive_purpose_bounds_the_title_scan() {
+    assert!(!title_scan_exhausted(
+        RetrievalPurpose::Search,
+        MAX_SEARCH_TITLE_SCAN_MEETINGS - 1
+    ));
+    assert!(title_scan_exhausted(
+        RetrievalPurpose::Search,
+        MAX_SEARCH_TITLE_SCAN_MEETINGS
+    ));
+    for purpose in [RetrievalPurpose::Chat, RetrievalPurpose::Context] {
+        assert!(!title_scan_exhausted(
+            purpose,
+            MAX_SEARCH_TITLE_SCAN_MEETINGS
+        ));
+        assert!(!title_scan_exhausted(purpose, usize::MAX));
+    }
 }

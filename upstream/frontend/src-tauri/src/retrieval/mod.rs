@@ -39,7 +39,7 @@ pub use contracts::{
     validate_hybrid_query, HybridContextResponse, HybridMeetingResult, HybridProvenance,
     HybridRetrievalStatus, HybridScope, HybridSearchResponse, HybridSource,
     MAX_HYBRID_CONTEXT_CHARS, MAX_HYBRID_QUERY_CHARS, MAX_HYBRID_SEARCH_MEETINGS,
-    MAX_HYBRID_SEARCH_RESULTS,
+    MAX_HYBRID_SEARCH_RESULTS, SEARCH_HYDRATION_BACKFILL,
 };
 pub use hydration::{
     hydrate_broad_scope_context, hydrate_context, hydrate_context_with_broad_coverage,

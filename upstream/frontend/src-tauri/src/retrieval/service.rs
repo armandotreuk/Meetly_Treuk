@@ -47,6 +47,17 @@ pub(crate) const MAX_FOLDER_SCAN_MEMBERSHIP: usize = 20_000;
 /// Streaming page size of the bounded title scan; only one page plus the
 /// bounded top-k heap is ever resident.
 pub(crate) const TITLE_SCAN_PAGE: usize = 256;
+/// Approved ceiling on the rows one interactive title scan will examine.
+///
+/// The title channel has no index to seek on: titles are not in `meeting_fts`,
+/// and the match is a normalized-token overlap, so a SQL `LIKE` pre-filter
+/// would drop exactly the diacritic-folded matches `normalize_core_token`
+/// exists to find. The scan is therefore linear in the meeting count. Chat and
+/// Context run it at most once per turn; Search runs it on every debounced
+/// keystroke, so Search stops after this many rows instead of paging an
+/// unbounded table while a Chat stream competes for the same pool. Beyond the
+/// cap the sidebar's own local title matching still covers the remainder.
+pub(crate) const MAX_SEARCH_TITLE_SCAN_MEETINGS: usize = 10_000;
 /// Approved candidate ceiling per variant per channel (architecture:
 /// FTS/vector candidates per variant 50-150; the index enforces the same
 /// ceiling on vector scans).
@@ -1124,6 +1135,8 @@ impl RetrievalService {
         }
         let mut top: std::collections::BinaryHeap<std::cmp::Reverse<TitleCandidate>> =
             std::collections::BinaryHeap::with_capacity(limits.lexical_per_variant + 1);
+        let purpose = normalized.purpose;
+        let mut scanned = 0usize;
         match &normalized.scope {
             PersistedRetrievalScope::Folder(folder_id) => {
                 let mut cursor = String::new();
@@ -1149,7 +1162,11 @@ impl RetrievalService {
                     ensure_not_cancelled(cancel)?;
                     let next_cursor = rows.last().map(|(id, _)| id.clone());
                     let complete_page = rows.len() == TITLE_SCAN_PAGE;
+                    scanned += rows.len();
                     push_title_candidates(&mut top, rows, normalized, limits.lexical_per_variant);
+                    if title_scan_exhausted(purpose, scanned) {
+                        break;
+                    }
                     match next_cursor {
                         Some(id) if complete_page => cursor = id,
                         _ => break,
@@ -1198,7 +1215,11 @@ impl RetrievalService {
                     ensure_not_cancelled(cancel)?;
                     let next_cursor = rows.last().map(|(id, _)| id.clone());
                     let complete_page = rows.len() == TITLE_SCAN_PAGE;
+                    scanned += rows.len();
                     push_title_candidates(&mut top, rows, normalized, limits.lexical_per_variant);
+                    if title_scan_exhausted(purpose, scanned) {
+                        break;
+                    }
                     match next_cursor {
                         Some(id) if complete_page => cursor = id,
                         _ => break,
@@ -1775,6 +1796,14 @@ fn push_title_candidates(
             }
         }
     }
+}
+
+/// Whether an in-progress title scan has spent its row budget. Only the
+/// interactive purpose is capped: Chat and Context run the scan at most once
+/// per turn, while Search runs it on every debounced keystroke. See
+/// [`MAX_SEARCH_TITLE_SCAN_MEETINGS`].
+pub(super) fn title_scan_exhausted(purpose: RetrievalPurpose, scanned: usize) -> bool {
+    purpose == RetrievalPurpose::Search && scanned >= MAX_SEARCH_TITLE_SCAN_MEETINGS
 }
 
 fn title_term_overlap(terms: &[String], title: &str) -> usize {

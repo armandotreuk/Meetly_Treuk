@@ -10,7 +10,17 @@ use super::service::{
 
 pub const MAX_HYBRID_QUERY_CHARS: usize = 2_048;
 pub const MAX_HYBRID_SEARCH_RESULTS: usize = 50;
-pub const MAX_HYBRID_SEARCH_MEETINGS: usize = 50;
+/// Extra meetings hydrated beyond the caller's own result limit.
+/// `HybridSearchResponse::from_outputs` drops a meeting that hydrated no
+/// publishable source (content gone, or pruned by the scope recheck), so
+/// hydrating exactly `limit` silently returns short pages. This margin
+/// restores the backfill without restoring unbounded hydration.
+pub const SEARCH_HYDRATION_BACKFILL: usize = 5;
+/// The hydration window ceiling. It must stay strictly above
+/// [`MAX_HYBRID_SEARCH_RESULTS`], otherwise the clamp in `execute_hybrid_search`
+/// cancels [`SEARCH_HYDRATION_BACKFILL`] out for a caller asking for the
+/// maximum page - which is exactly what the sidebar asks for.
+pub const MAX_HYBRID_SEARCH_MEETINGS: usize = MAX_HYBRID_SEARCH_RESULTS + SEARCH_HYDRATION_BACKFILL;
 pub const MAX_HYBRID_CONTEXT_CHARS: usize = 100_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -120,6 +130,11 @@ pub struct HybridProvenance {
     pub evidence_id: String,
     pub channel: String,
     pub variant: String,
+    /// Absent, never `null`, for the semantic and title channels: every
+    /// public consumer models this as an optional `"and" | "or"`, and a JSON
+    /// `null` fails that check on every hybrid response carrying a semantic
+    /// or title provenance entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub match_mode: Option<String>,
     pub channel_rank: usize,
     pub query_slot: u8,
@@ -227,10 +242,11 @@ impl HybridSearchResponse {
                 if sources.is_empty() {
                     return None;
                 }
-                let retained_evidence_ids = hydrated
+                let hydrated_meeting = hydrated
                     .meetings
                     .iter()
-                    .find(|item| item.meeting_id == meeting.meeting_id)
+                    .find(|item| item.meeting_id == meeting.meeting_id);
+                let retained_evidence_ids = hydrated_meeting
                     .map(|item| item.retained_evidence_ids.clone())
                     .unwrap_or_default();
                 let retained = retained_evidence_ids
@@ -269,11 +285,7 @@ impl HybridSearchResponse {
                     })
                     .collect();
                 let first_source = sources.first()?;
-                let folder_id = hydrated
-                    .meetings
-                    .iter()
-                    .find(|item| item.meeting_id == meeting.meeting_id)
-                    .and_then(|item| item.folder_id.clone());
+                let folder_id = hydrated_meeting.and_then(|item| item.folder_id.clone());
                 provenance.extend(
                     ranked
                         .ranking
@@ -301,9 +313,11 @@ impl HybridSearchResponse {
                 })
             })
             .collect::<Vec<_>>();
-        // `total` counts every meeting the request could publish, BEFORE the
-        // caller's public limit truncates it, so a client can tell "one match"
-        // from "one of forty shown".
+        // `total` counts the meetings this request PUBLISHED, before the
+        // caller's public limit truncated them. It is not a corpus-wide match
+        // count: the caller hydrates a bounded window (`limit` plus the search
+        // backfill), so `total` never exceeds that window and a client must
+        // not read it as "how many meetings matched".
         let total = results.len();
         results.truncate(max_results);
         Self {
@@ -694,6 +708,40 @@ mod tests {
                 || (item.evidence_id == "fts:transcript:segment-1" && item.channel == "semantic")
         }));
         assert_eq!(result.sources[0].evidence_ids, result.retained_evidence_ids);
+    }
+
+    /// The public JSON must OMIT `matchMode` for a channel that has no lexical
+    /// mode. Emitting `null` is not equivalent: every consumer models the
+    /// field as an optional `"and" | "or"`, so a serialized `null` fails
+    /// validation on any response carrying a semantic or title entry - which
+    /// is every hybrid response.
+    #[test]
+    fn public_provenance_omits_match_mode_when_the_channel_has_none() {
+        let provenance = |channel, mode| {
+            HybridProvenance::from_evidence(
+                &EvidenceProvenance {
+                    channel,
+                    variant: QueryVariantKind::Original,
+                    mode,
+                    rank: 1,
+                    query_slot: 0,
+                },
+                "evidence-1",
+            )
+        };
+        for channel in [RetrievalChannel::Semantic, RetrievalChannel::Title] {
+            let value = serde_json::to_value(provenance(channel, None)).unwrap();
+            assert!(
+                value.get("matchMode").is_none(),
+                "matchMode must be absent, not null, for {value}"
+            );
+        }
+        let lexical = serde_json::to_value(provenance(
+            RetrievalChannel::Lexical,
+            Some(LexicalMode::And),
+        ))
+        .unwrap();
+        assert_eq!(lexical["matchMode"], "and");
     }
 
     #[test]

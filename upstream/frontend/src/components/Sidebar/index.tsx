@@ -868,13 +868,16 @@ const Sidebar: React.FC = () => {
                           hasNotes={m.has_notes}
                           snippetContext={snippet}
                           provenanceLabel={provenance}
-                          folderName={m.folder_name ?? null}
+                          folderName={
+                            m.folder_name ??
+                            (m.folder_id ? folderNameById.get(m.folder_id) ?? null : null)
+                          }
                           onEditMeeting={handleEditStart}
                           onRequestDeleteMeeting={(id) => setDeleteModalState({ isOpen: true, itemId: id })}
                           onRequestMoveMeeting={(id) => setMoveModalState({ isOpen: true, kind: 'meeting', id })}
                         />
                       ))}
-                      {searchRows.length === 0 && searchPhase === 'ready' && !searchError && (
+                      {searchRows.length === 0 && searchPhase !== 'loading' && !searchError && (
                         <p role="status" aria-live="polite" aria-atomic="true" className="text-xs text-gray-400 italic px-3 py-2">
                           {t('app.sidebar.noResults')}
                         </p>

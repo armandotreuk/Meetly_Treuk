@@ -434,11 +434,15 @@ export function buildSidebarSearchRows(
             const source = bestHybridSource(result);
             add(meeting, displaySnippet(source?.snippet), formatHybridProvenance(result));
         }
-        return rows.slice(0, SIDEBAR_SEARCH_RESULT_LIMIT);
     }
 
-    // No authoritative response for this scope: fall back to local title
-    // matching so a semantic failure never leaves the sidebar empty.
+    // Local title matching runs in EVERY state, not only as a fallback. The
+    // Rust title channel matches whole normalized tokens, so a prefix like
+    // "reten" cannot reach "Retention Review" through the backend, and the
+    // pre-hybrid sidebar matched titles by substring on every keystroke.
+    // `add` dedupes by meeting id, so an authoritative row always keeps its
+    // rank, snippet and provenance and only titles the backend genuinely
+    // missed are appended after it.
     for (const meeting of localTitleMatches(meetings, query, folderId, folderScope)) {
         add(meeting, null, t("app.sidebar.provenance.title"));
     }

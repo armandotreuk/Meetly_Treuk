@@ -54,7 +54,6 @@ use crate::database::repositories::retrieval::{
     is_unreadable_staged_payload, FtsDueItem, GenerationWorkItem, ModelSpec, ReplacementJob,
     ReplacementOutcome, RetrievalRepository, StagedDocument, VectorEncoding,
 };
-use crate::database::repositories::setting::SettingsRepository;
 use crate::retrieval::chunking::{
     chunk_meeting, ChunkerConfig, SemanticDocument, TokenizerPolicy, APPROVED_CHUNKER_VERSION,
 };
@@ -660,14 +659,6 @@ impl RetrievalLifecycle {
         }
         self.set_index_paused(paused);
         Ok(())
-    }
-
-    pub async fn set_force_lexical_retrieval(
-        &self,
-        pool: &SqlitePool,
-        enabled: bool,
-    ) -> Result<(), sqlx::Error> {
-        SettingsRepository::set_force_lexical_retrieval(pool, enabled).await
     }
 
     pub async fn clear_index(&self, pool: &SqlitePool) -> Result<(), sqlx::Error> {
@@ -2786,15 +2777,13 @@ mod tests {
                 .await
                 .unwrap();
             lifecycle.set_index_paused(paused);
-            lifecycle
-                .set_force_lexical_retrieval(&pool, true)
+            SettingsRepository::set_force_lexical_retrieval(&pool, true)
                 .await
                 .unwrap();
             assert!(SettingsRepository::get_force_lexical_retrieval(&pool)
                 .await
                 .unwrap());
-            lifecycle
-                .set_force_lexical_retrieval(&pool, false)
+            SettingsRepository::set_force_lexical_retrieval(&pool, false)
                 .await
                 .unwrap();
             assert!(!SettingsRepository::get_force_lexical_retrieval(&pool)
@@ -2823,13 +2812,11 @@ mod tests {
         let generation = ensure_test_generation(&pool).await;
         lifecycle.set_index_paused(true);
 
-        let first = lifecycle.clone();
-        let second = lifecycle.clone();
         let first_pool = pool.clone();
         let second_pool = pool.clone();
         let (first_result, second_result) = tokio::join!(
-            first.set_force_lexical_retrieval(&first_pool, true),
-            second.set_force_lexical_retrieval(&second_pool, false),
+            SettingsRepository::set_force_lexical_retrieval(&first_pool, true),
+            SettingsRepository::set_force_lexical_retrieval(&second_pool, false),
         );
         first_result.unwrap();
         second_result.unwrap();
@@ -2855,11 +2842,10 @@ mod tests {
 
         let clear_lifecycle = lifecycle.clone();
         let clear_pool = pool.clone();
-        let force_lifecycle = lifecycle.clone();
         let force_pool = pool.clone();
         let (clear_result, force_result) = tokio::join!(
             clear_lifecycle.clear_index(&clear_pool),
-            force_lifecycle.set_force_lexical_retrieval(&force_pool, true),
+            SettingsRepository::set_force_lexical_retrieval(&force_pool, true),
         );
 
         assert!(clear_result.is_err());

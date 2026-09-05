@@ -66,11 +66,14 @@ pub async fn api_chat_get_force_lexical_retrieval(
 #[tauri::command]
 pub async fn api_chat_set_force_lexical_retrieval(
     state: tauri::State<'_, AppState>,
-    retrieval: tauri::State<'_, RetrievalLifecycle>,
     enabled: bool,
 ) -> Result<(), String> {
-    retrieval
-        .set_force_lexical_retrieval(state.db_manager.pool(), enabled)
+    // The persisted setting is the whole mechanism: the shared retrieval
+    // boundary reads it per request (`RetrievalService::retrieve`), and the
+    // toggle deliberately takes no lifecycle reservation so it can never
+    // pause or invalidate the index. Writing it through the lifecycle added
+    // an indirection with no behaviour and an asymmetry with that read.
+    SettingsRepository::set_force_lexical_retrieval(state.db_manager.pool(), enabled)
         .await
         .map_err(|e| e.to_string())
 }
@@ -391,6 +394,26 @@ struct ChatRequestRegistry {
 
 pub(crate) type ChatRequestToken = Arc<CancellationToken>;
 
+/// Holds the deletion window opened by
+/// [`ChatRequestState::begin_meeting_deletion`] open for its lifetime. It
+/// lives beside the registry it mutates so the insert and its removal cannot
+/// drift into different modules.
+pub(crate) struct MeetingDeletionGuard<'a> {
+    state: &'a ChatRequestState,
+    meeting_id: &'a str,
+}
+
+impl Drop for MeetingDeletionGuard<'_> {
+    fn drop(&mut self) {
+        self.state
+            .0
+            .lock()
+            .unwrap()
+            .deleting_meetings
+            .remove(self.meeting_id);
+    }
+}
+
 #[derive(Clone)]
 pub struct ChatRequestState(Arc<Mutex<ChatRequestRegistry>>);
 
@@ -550,24 +573,50 @@ impl ChatRequestState {
         true
     }
 
+    /// Opens the deletion window for `meeting_id` and returns the guard that
+    /// closes it. While the guard lives, [`Self::bind_request_meetings`]
+    /// refuses to bind the meeting, so no request can adopt evidence from a
+    /// meeting that is on its way out.
+    ///
+    /// The window is a guard rather than a bare insert paired with a separate
+    /// removal call: the insert used to live inside `invalidate_meeting` while
+    /// only the caller's own guard removed it, so any second caller of
+    /// `invalidate_meeting` would have pinned the id forever and silently
+    /// failed every later Chat and hybrid request touching that meeting.
+    #[must_use = "dropping the guard immediately reopens the deletion window"]
+    pub(crate) fn begin_meeting_deletion<'a>(
+        &'a self,
+        meeting_id: &'a str,
+    ) -> MeetingDeletionGuard<'a> {
+        self.0
+            .lock()
+            .unwrap()
+            .deleting_meetings
+            .insert(meeting_id.to_string());
+        MeetingDeletionGuard {
+            state: self,
+            meeting_id,
+        }
+    }
+
     /// Cancels every registered request whose prepared evidence references
-    /// `meeting_id`, unless its result already crossed the publication point.
-    /// Called from the real meeting-deletion transaction before the meeting
-    /// row disappears. A retained current stream atomically converts its next
-    /// publication into an abort; every other request suppresses normal
-    /// publication.
+    /// `meeting_id`, unless its result already crossed the publication point,
+    /// and returns how many were actually cancelled. Called from the real
+    /// meeting-deletion transaction before the meeting row disappears. A
+    /// retained current stream atomically converts its next publication into
+    /// an abort; every other request suppresses normal publication.
     /// Surface-independent: cancels Chat, Sidebar, and every affected
     /// independent MCP request.
     pub(crate) fn invalidate_meeting(&self, meeting_id: &str) -> usize {
         let mut registry = self.0.lock().unwrap();
-        registry.deleting_meetings.insert(meeting_id.to_string());
-        let invalidated: Vec<(ChatRequestSurface, String)> = registry
+        let matched: Vec<(ChatRequestSurface, String)> = registry
             .requests
             .iter()
             .filter(|(_, registration)| registration.meetings.contains(meeting_id))
             .map(|(key, _)| key.clone())
             .collect();
-        for (surface, request_id) in &invalidated {
+        let mut cancelled = 0;
+        for (surface, request_id) in &matched {
             let key = (*surface, request_id.clone());
             if registry
                 .requests
@@ -580,8 +629,11 @@ impl ChatRequestState {
                     .expect("registration was checked above");
                 registration.deletion_invalidated = true;
                 registration.token.cancel();
+                cancelled += 1;
                 continue;
             }
+            // Already published: the caller holds the result, so there is
+            // nothing left to cancel and it must not be counted as cancelled.
             if registry
                 .requests
                 .get(&key)
@@ -592,13 +644,10 @@ impl ChatRequestState {
             registry.active.remove(surface);
             if let Some(registration) = registry.requests.remove(&key) {
                 registration.token.cancel();
+                cancelled += 1;
             }
         }
-        invalidated.len()
-    }
-
-    pub(crate) fn finish_meeting_deletion(&self, meeting_id: &str) {
-        self.0.lock().unwrap().deleting_meetings.remove(meeting_id);
+        cancelled
     }
 
     pub(crate) fn is_owner(
@@ -8133,23 +8182,37 @@ mod tests {
             ),
             Some("published")
         );
-        assert_eq!(state.invalidate_meeting("m1"), 1);
+        // A published result is left alone, so nothing was cancelled and the
+        // count must say so.
+        assert_eq!(state.invalidate_meeting("m1"), 0);
         assert!(!token.is_cancelled());
         assert!(state.clear_if_owner(ChatRequestSurface::Mcp, "hybrid-published", &token));
 
-        state.invalidate_meeting("m2");
+        {
+            let _deleting = state.begin_meeting_deletion("m2");
+            let token = state
+                .try_claim_request(ChatRequestSurface::Mcp, "hybrid-deleting")
+                .unwrap();
+            assert!(!state.bind_request_meetings(
+                ChatRequestSurface::Mcp,
+                "hybrid-deleting",
+                &token,
+                &HashSet::from(["m2".to_string()])
+            ));
+            token.cancel();
+            assert!(state.clear_if_owner(ChatRequestSurface::Mcp, "hybrid-deleting", &token));
+        }
+
+        // The window closes with the guard, so a later request binds again.
         let token = state
-            .try_claim_request(ChatRequestSurface::Mcp, "hybrid-deleting")
+            .try_claim_request(ChatRequestSurface::Mcp, "hybrid-after-deletion")
             .unwrap();
-        assert!(!state.bind_request_meetings(
+        assert!(state.bind_request_meetings(
             ChatRequestSurface::Mcp,
-            "hybrid-deleting",
+            "hybrid-after-deletion",
             &token,
             &HashSet::from(["m2".to_string()])
         ));
-        state.finish_meeting_deletion("m2");
-        token.cancel();
-        assert!(state.clear_if_owner(ChatRequestSurface::Mcp, "hybrid-deleting", &token));
     }
 
     #[derive(Clone, Default)]

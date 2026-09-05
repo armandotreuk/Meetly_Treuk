@@ -142,6 +142,7 @@ export const en: Record<string, string> = {
     "settings.retrieval.scope.unknown": "Scope: unavailable",
     "settings.retrieval.localSize": "Local index size",
     "settings.retrieval.sizeValue": "{size} · steady-state target {target}",
+    "settings.retrieval.sizeValueRebuild": "{size} · rebuild limit {target}",
     "settings.retrieval.sizeUnavailable": "Size unavailable",
     "settings.retrieval.sizeEstimate":
         "Estimate only; exact measurement is required before activation.",

@@ -395,6 +395,61 @@ describe("mounted Sidebar search rows", () => {
         expect(noResults.getAttribute("aria-atomic")).toBe("true");
     });
 
+    it("still announces no results for a query below the inference minimum", async () => {
+        // A sub-minimum query never issues a hybrid request, so the controller
+        // publishes `idle`, not `ready`. Gating the empty state on `ready`
+        // left the pane blank with no message at all.
+        mocks.invoke.mockImplementation((command: string) => {
+            if (command === "api_get_meetings" || command === "api_get_folders") {
+                return Promise.resolve([]);
+            }
+            return Promise.resolve();
+        });
+
+        const input = await mountExpandedSidebar();
+        await act(async () => {
+            setSearchInput(input, "ab");
+            await Promise.resolve();
+        });
+
+        expect(mocks.invoke).not.toHaveBeenCalledWith("api_search_hybrid", expect.anything());
+        const noResults = Array.from(container.querySelectorAll('[role="status"]')).find((node) =>
+            node.textContent?.includes("No results")
+        ) as HTMLElement;
+        expect(noResults).toBeDefined();
+    });
+
+    it("keeps the folder label on rows that came from local title matching", async () => {
+        // Those rows carry the sidebar's own meeting objects, which have a
+        // `folder_id` but no `folder_name`, so the label has to be resolved
+        // from the loaded folders.
+        mocks.invoke.mockImplementation((command: string) => {
+            if (command === "api_get_meetings") {
+                return Promise.resolve([
+                    { id: "m1", title: "Retention Review", folder_id: "f1" },
+                ]);
+            }
+            if (command === "api_get_folders") {
+                return Promise.resolve([
+                    { id: "f1", name: "Clients", parent_id: null } as MeetingFolder,
+                ]);
+            }
+            return Promise.resolve();
+        });
+
+        const input = await mountExpandedSidebar();
+        await act(async () => {
+            setSearchInput(input, "reten");
+            await Promise.resolve();
+        });
+
+        const row = Array.from(container.querySelectorAll("button")).find((node) =>
+            node.textContent?.includes("Retention Review")
+        ) as HTMLElement;
+        expect(row).toBeDefined();
+        expect(row.textContent).toContain("Clients");
+    });
+
     it("announces degraded fallback without exposing backend details", async () => {
         vi.useFakeTimers();
         mocks.invoke.mockImplementation((command: string) => {

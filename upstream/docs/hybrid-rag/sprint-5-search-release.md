@@ -923,6 +923,7 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 | 2026-08-21 | Add derived-disk qualification at every scale, including the rebuild peak. | Derived text plus vectors plus two retained generations plausibly reach ~2 GiB with no prior ceiling anywhere in the program. | Report disk as an unanchored metric. | Main agent, pending sprint approval |
 | 2026-08-21 | Guard sidebar reranking with a minimum query length, `Search` depth, and in-flight cancellation. | Sidebar runs the cross-encoder per debounced keystroke; an empty-query check alone does not bound that cost. | Rely on debounce and the empty-query guard. | Main agent, pending sprint approval |
 | 2026-09-04 | Set the approved sidebar inference minimum to one non-empty Unicode character. | Preserve exact title matching for short names while avoiding model inference for empty input. | Require two or more characters; rely only on debounce. | User |
+| 2026-09-05 | Raise the sidebar inference minimum from one character to three (`SIDEBAR_SEARCH_MIN_QUERY_LENGTH` / `SEARCH_MIN_MODEL_QUERY_CHARS`), and keep the 2026-09-04 rationale satisfied by matching titles locally by substring in every retrieval state rather than by query length. | At one character the guard is the empty-query check under another name, so Task 5.1's "minimum query length" mitigation bounded nothing; the original rationale was short-name title matching, which the client-side title union now preserves at any length, including lengths below the minimum. | Keep the approved minimum at one and accept unbounded cross-encoder inference per debounced keystroke; rely on debounce alone. | **Pending user approval** - supersedes the 2026-09-04 row above, which the user approved. |
 | 2026-09-02 | Carry Sprint 3's open release gates into Task 5.5 and release close while retaining commits `62d7730` and `1047367` as the reviewed implementation baseline. | R40 separates implementation dependencies from release acceptance; valid corpus, production-path quality/provider-answer, native Windows/R13 hermetic session, and exact-head Actions evidence remain mandatory. | Treat Sprint 4/5 implementation results or broad architecture wording as release evidence. | User-authorized R40 |
 | 2026-09-02 | Reuse one Rust ownership/cancellation mechanism and Chat publication fence for sidebar/Tauri/MCP work, including internal MCP deadline cancellation. | Prevents parallel registries, stale progress, and timeouts that merely drop results while preserving Fast-only MCP compatibility. | Add another request registry or public MCP cancel API. | User-authorized R40 |
 | 2026-09-02 | Carry the single persisted `force_lexical_retrieval` decision through all Deep rounds and sidebar/Tauri/MCP hybrid requests. | Shared-boundary reads, typed `ForcedLexical`, and next-request/restart/disable-restore checks keep rollback consistent without a second service. | Per-surface settings or diagnostics. | User-authorized R40 |
@@ -963,7 +964,7 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 
 ### Code Review
 
-**Reviewer:** `anthropic/claude-opus-5` (Claude Code, `/code-review xhigh`), two rounds
+**Reviewer:** `anthropic/claude-opus-5` (Claude Code, `/code-review xhigh`), three rounds
 **Verdict:** Implementation findings resolved; sprint close still blocked by the
 release-qualification gates below, which this review did not and cannot clear.
 
@@ -978,15 +979,27 @@ release-qualification gates below, which this review did not and cannot clear.
   remediation itself - 1 blocker (the new title gate compared a deduplicated
   overlap against a raw term count, so any repeated query token disabled the
   title channel), 3 should-fix, 1 conventions. All 5 fixed in Task HR-5.R2.
+- **R5.R3** (full Sprint 5 range again, after HR-5.R2): 15 findings - 2
+  blockers (`matchMode` serialized as `null`, which the sidebar's own response
+  validator rejects, so every hybrid response containing a semantic or title
+  provenance entry - that is, every hybrid response - fell back to "Search
+  unavailable"; and the Search title channel full-scanning the `meetings`
+  table on every debounced keystroke, ~977 sequential queries at the 250k
+  gate), 9 should-fix, 4 cleanup/altitude/conventions. All 15 fixed in Task
+  HR-5.R3, with both blockers proven by negative control before the fix.
 
 Both rounds, their per-finding corrections, verification output, and the
 environment/flake caveats are recorded in
 [`notes-chat-improvement-execution.md`](../notes-chat-improvement-execution.md)
-under `R5.R1`, `HR-5.R1`, `R5.R2`, and `HR-5.R2`.
+under `R5.R1`, `HR-5.R1`, `R5.R2`, `HR-5.R2`, `R5.R3`, and `HR-5.R3`.
 
-**Verification after remediation:** `cargo check` pass; `cargo test --lib` 887
+**Verification after remediation:** `cargo check` pass; `cargo test --lib` 889
 passed / 0 failed / 2 ignored; `cargo fmt --check` pass; `pnpm run typecheck`
-pass; `pnpm exec vitest run` 156 passed / 23 files; `git diff --check` pass.
+pass; `pnpm exec vitest run` 164 passed / 23 files; `git diff --check` pass.
+
+**Open item from R5.R3:** the 2026-09-05 Decisions row raising the sidebar
+inference minimum from one character to three supersedes a user-approved row
+and is marked pending user approval.
 
 **Required follow-ups:** Task 5.4 packaging, Task 5.5 release qualification, and
 sprint close remain blocked by their own unchanged evidence gates (independently

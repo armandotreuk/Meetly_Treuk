@@ -244,19 +244,19 @@ export function RetrievalIndexSettings() {
         status?.derived_disk_gate_input_bytes === undefined ||
         diskEnvelopeLimit === null
             ? "unavailable"
-            : status.derived_disk_gate_input_bytes >= diskEnvelopeLimit
+            : status.derived_disk_gate_input_bytes > diskEnvelopeLimit
               ? "exceeded"
               : "within";
+    // Only terminal state is an index error. `retry_meetings` counts meetings
+    // in the worker's ordinary backoff state during a healthy build, so
+    // including it raised a destructive alert - whose Retry button
+    // `controlsDisabled` had already disabled - for an index that was working.
     const hasIndexError =
         (status?.model_load_failure !== null && status?.model_load_failure !== undefined) ||
         (status?.failed_meetings ?? 0) > 0 ||
-        (status?.retry_meetings ?? 0) > 0 ||
         (status?.activation_blockers.length ?? 0) > 0 ||
         status?.building_generations.some(
-            (generation) =>
-                generation.state === "failed" ||
-                generation.failed_meetings > 0 ||
-                generation.retry_meetings > 0
+            (generation) => generation.state === "failed" || generation.failed_meetings > 0
         ) === true;
 
     if (statusLoading && !status) {
@@ -400,12 +400,18 @@ export function RetrievalIndexSettings() {
                             <p className="mt-2 text-sm text-gray-600">
                                 {diskBytes === null
                                     ? t("settings.retrieval.sizeUnavailable")
-                                    : t("settings.retrieval.sizeValue", {
-                                          size: formatBytes(diskBytes),
-                                          target: formatBytes(
-                                              status.derived_disk_steady_target_bytes
-                                          ),
-                                      })}
+                                    : t(
+                                          rebuildInFlight
+                                              ? "settings.retrieval.sizeValueRebuild"
+                                              : "settings.retrieval.sizeValue",
+                                          {
+                                              size: formatBytes(diskBytes),
+                                              target: formatBytes(
+                                                  diskEnvelopeLimit ??
+                                                      status.derived_disk_steady_target_bytes
+                                              ),
+                                          }
+                                      )}
                             </p>
                             <p className="mt-1 text-xs text-gray-500">
                                 {status.derived_disk_is_estimate
