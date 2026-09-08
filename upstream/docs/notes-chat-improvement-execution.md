@@ -4137,3 +4137,29 @@ etrieval/model.rs:1714 unused_parens warning).
 - Reviewer: ci_measurement_arch_review, GPT-5.6 Terra / medium.
 - Verdict: approved for diagnostic retry. The reviewer confirmed the active root workflow is byte-identical to `72b8005`, source hashes match, fixed stage/reason values cannot serialize exception text or paths, and reparse/measurement/identity/manifest/ownership/signing authority is preserved. CI2 documentation accurately records a pre-staging failure with unknown cause.
 - Boundary: no actual root-cause, package, installed diagnostic, signing or teardown evidence follows from this review. The next exact-commit Actions run remains required.
+
+### Result HR-5.4c.CI3 — Diagnostic identifies restored Rust-cache reparse entry
+- Date: 2026-09-08
+- Reviewed diagnostic/output commit: `28696a4b7b9b53bdae1bc9dff8346ae902827c19`, pushed cleanly after both R5.4c.R4 approvals. CI3: https://github.com/armandotreuk/Meetly_Treuk/actions/runs/34285224499, exact release-build input and commit.
+- Results: `Cargo Check (Windows)` passed. Frozen frontend installation and native package-harness self-tests passed again; CI reported 211 assertions with `native_inventory_probe=passed` and `native_installer_evidence=false`. The build then stopped at `Measure retrieval cache before staging`, before model staging, package construction, signing or any installer operation.
+- Proven cause: the new fixed diagnostic emitted `stage=measure_rust_cache reason=reparse_rejected`. The restored `upstream/target` Rust build/cache contains at least one reparse entry, and the generic secure tree measurement rejects it. The previous cold-cache hypothesis is disproved for this failure.
+- Approved correction boundary: package resources, model cache, frontend build output, installed roots and cleanup paths must retain fail-closed reparse rejection. Rust build-cache evidence alone may skip rather than follow reparse entries, record their count, and measure only physical non-link entries inside the cache root. Link targets/paths remain private and must never be traversed. Independent tests/reviews and a new exact-commit Actions run are required before proceeding to installed-package evidence.
+
+### Task HR-5.4c.R5 — Rust-cache-only reparse exclusion and disclosure
+- Date: 2026-09-08
+- Owner: reused ci_size_measurement_fix session, GPT-5.6 Terra / medium, retaining its exact measurement context for cost efficiency. Status: implemented, locally verified and independently approved for CI retry.
+- Scope: only `frontend/src-tauri/scripts/windows-package-smoke.ps1` and `windows-package-smoke.tests.ps1`. `Get-TreeMeasurement` still defaults to fail-closed `reject`. A new `skip` policy increments a numeric `reparse_entries` counter and immediately continues; it does not enumerate a linked directory, read a linked file's size or resolve the target.
+- Authority boundary: the sole production `skip` call is measurement of derived `upstream/target` Rust compiler/cache output. Staged retrieval bundle, model cache, frontend build output, installed executable/resource roots and cleanup checks retain default reparse rejection. Rust-cache before/after physical bytes and reparse counts are recorded in the existing schema-1 evidence and step summary without paths.
+- Verification: a real temporary directory junction regression proves the three-byte physical cache file is counted, a seven-byte external target is excluded, and `reparse_entries=1`; default policy still rejects the same junction. Worker, primary and independent code-review runs each passed 212 assertions. PowerShell parsing and diff check passed. No file-symlink test is claimed because local privilege was unavailable; the attribute check covers any reparse-point kind. Final SHA-256: helper `84cea296123169c401739eee11f3e6d3756d614f77c3ec3b2192d54bb60b56f1`; tests `5522fea1f8ed6493d9e5dabf79b407656f8c1972ba753edbbf38f8654ca6e4f1`.
+
+### Review R5.4c.R5 — Independent code review
+- Date: 2026-09-08
+- Reviewer: rust_cache_measure_code_review, GPT-5.6 Terra / medium.
+- Verdict: approved with no findings. Independently confirmed immediate non-traversing skip semantics, sole Rust-cache call site, default rejection everywhere authority-sensitive, additive numeric evidence, junction behavior and unchanged schema. Independently reran 212 assertions, matched both hashes and passed diff check.
+- Boundary: approval permits only a CI retry. It does not accept 5.4c, parent 5.4 or release.
+
+### Review R5.4c.R5 — Independent architecture/release-rigor review
+- Date: 2026-09-08
+- Reviewer: rust_cache_measure_arch_review, GPT-5.6 Terra / medium.
+- Verdict: approved for CI retry with no blockers. The reviewer matched final hashes and clean PowerShell parses, audited every call site, confirmed only derived Rust cache skips links, and verified the active root workflow is unchanged. CI3 remains correctly described as pre-staging with no package/install/signing evidence.
+- Boundary: exact-commit Actions MSI/NSIS installation, diagnostics, teardown and signing treatment remain required.

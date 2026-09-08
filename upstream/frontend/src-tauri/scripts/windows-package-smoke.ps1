@@ -16,21 +16,26 @@ $script:ManifestDigest = '8a3751069f4c77ddec4db7c92f75d99900525bbe48e00e28ec1cf3
 $script:ResourceRelative = 'resources/retrieval/bundle'
 $script:RetrievalSuccess = "smoke-retrieval: stage=complete status=passed bundle=$script:BundleId manifest_sha256=$script:ManifestDigest dimensions=768 embeddings=6 pairs=5 sources=2 finite=true exit_code=0"
 
-function Get-TreeMeasurement([string]$Path) {
+function Get-TreeMeasurement([string]$Path, [ValidateSet('reject', 'skip')][string]$ReparsePolicy = 'reject') {
     $bytes = [long]0
     $files = [long]0
-    if (-not (Test-Path -LiteralPath $Path)) { return @{ bytes = $bytes; files = $files } }
+    $reparseEntries = [long]0
+    if (-not (Test-Path -LiteralPath $Path)) { return @{ bytes = $bytes; files = $files; reparse_entries = $reparseEntries } }
     $pending = [System.Collections.Generic.Stack[string]]::new()
     $pending.Push([IO.Path]::GetFullPath($Path))
     while ($pending.Count -gt 0) {
         $item = Get-Item -LiteralPath $pending.Pop() -Force
         # Do not count/follow a junction into a cache, source tree, or user data.
-        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'reparse_rejected' }
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            if ($ReparsePolicy -eq 'reject') { throw 'reparse_rejected' }
+            $reparseEntries++
+            continue
+        }
         if ($item.PSIsContainer) {
             foreach ($child in Get-ChildItem -LiteralPath $item.FullName -Force) { $pending.Push($child.FullName) }
         } else { $bytes += $item.Length; $files++ }
     }
-    return @{ bytes = $bytes; files = $files }
+    return @{ bytes = $bytes; files = $files; reparse_entries = $reparseEntries }
 }
 
 function Assert-NoReparseAncestors([string]$Path) {
@@ -710,7 +715,10 @@ function Invoke-SizeEvidence([string]$Phase, [string]$Workspace, [string]$Tempor
     $script:MeasurementStage = 'measure_model_cache'
     $modelCache = Get-TreeMeasurement $env:MODEL_CACHE_PATH
     $script:MeasurementStage = 'measure_rust_cache'
-    $rustCache = Get-TreeMeasurement (Join-Path $Workspace 'upstream/target')
+    # rust-cache restores compiler output that can legitimately contain links.
+    # Measure only physical entries in this cache; all install, bundle, model,
+    # cleanup, and frontend build paths retain fail-closed rejection.
+    $rustCache = Get-TreeMeasurement (Join-Path $Workspace 'upstream/target') 'skip'
     $script:MeasurementStage = 'measure_build_output'
     $buildOutput = Get-TreeMeasurement (Join-Path $Workspace 'upstream/frontend/target')
     $data[$Phase] = @{
@@ -729,7 +737,7 @@ function Invoke-SizeEvidence([string]$Phase, [string]$Workspace, [string]$Tempor
         $lines = @('### Native package/cache measurements', '', "- Commit: $($identity.commit); workflow: $($identity.run_url)",
             "- Model cache restore=$($data.model_cache_restore); before_bytes=$($data.before.model_cache.bytes); after_bytes=$($data.after.model_cache.bytes); delta_bytes=$($data.model_cache_delta_bytes)",
             "- Staged bundle bytes=$($data.after.staged_bundle.bytes); files=$($data.after.staged_bundle.files); manifest SHA-256=$($data.manifest_sha256)",
-            "- Cargo cache before_bytes=$($data.before.rust_cache.bytes); after_bytes=$($data.after.rust_cache.bytes); delta_bytes=$($data.rust_cache_delta_bytes)",
+            "- Cargo cache before_bytes=$($data.before.rust_cache.bytes); after_bytes=$($data.after.rust_cache.bytes); delta_bytes=$($data.rust_cache_delta_bytes); before_reparse_entries=$($data.before.rust_cache.reparse_entries); after_reparse_entries=$($data.after.rust_cache.reparse_entries)",
             "- Build output before_bytes=$($data.before.build_output.bytes); removed_before_build_bytes=$($data.prepare_build.build_output.bytes); after_bytes=$($data.after.build_output.bytes); delta_bytes=$($data.build_output_delta_bytes)", '')
         if ($env:GITHUB_STEP_SUMMARY) {
             $script:MeasurementStage = 'write_summary'

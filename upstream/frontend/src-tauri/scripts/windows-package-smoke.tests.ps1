@@ -407,6 +407,18 @@ try {
     [IO.File]::WriteAllText((Join-Path $target 'output.bin'), '12345')
     [IO.File]::WriteAllText((Join-Path $cache 'cached.bin'), '123')
     Assert-Check ((Get-TreeMeasurement $target).bytes -eq 5 -and (Get-TreeMeasurement $cache).files -eq 1) 'native_byte_measurements'
+    $linkedCacheTarget = Join-Path $script:TestRoot 'linked-rust-cache-target'
+    New-Item -ItemType Directory -Path $linkedCacheTarget | Out-Null
+    [IO.File]::WriteAllText((Join-Path $linkedCacheTarget 'not-physical-cache.bin'), '1234567')
+    $cacheJunction = Join-Path $cache 'linked-cache-entry'
+    New-Item -ItemType Junction -Path $cacheJunction -Target $linkedCacheTarget | Out-Null
+    $rustMeasurement = Get-TreeMeasurement $cache 'skip'
+    Assert-Check ($rustMeasurement.bytes -eq 3 -and $rustMeasurement.files -eq 1 -and $rustMeasurement.reparse_entries -eq 1) 'rust_cache_junction_is_excluded_without_following'
+    $rejected = $false
+    try { $null = Get-TreeMeasurement $cache } catch { $rejected = $true }
+    Assert-Check $rejected 'non_rust_cache_junction_remains_rejected'
+    # Remove only the junction itself, never recurse through its target.
+    Remove-Item -LiteralPath $cacheJunction -Force
     $rejected = $false
     try { Clear-ExactFrontendBuildOutput $fakeWorkspace $cache } catch { $rejected = $true }
     Assert-Check ($rejected -and (Test-Path -LiteralPath (Join-Path $cache 'cached.bin'))) 'wrong_cleanup_target_rejected'
@@ -440,6 +452,7 @@ try {
     $staged = Join-Path $fakeWorkspace 'upstream/frontend/src-tauri/resources/retrieval/bundle'
     New-Item -ItemType Directory -Path $staged -Force | Out-Null
     Copy-Item -LiteralPath $msi.manifest -Destination (Join-Path $staged 'model-bundle.manifest.json')
+    New-Item -ItemType Junction -Path $cacheJunction -Target $linkedCacheTarget | Out-Null
     Invoke-SizeEvidence 'before' $fakeWorkspace $script:TestRoot
     # Metadata remains readable while this native handle denies deletion.
     # Exercise the real top-level cleanup error, not only the stage helper.
@@ -466,9 +479,11 @@ try {
     $sizes = Get-Content -LiteralPath $sizesPath -Raw | ConvertFrom-Json -AsHashtable
     Assert-Check ($sizes.model_cache_restore -eq 'exact_hit' -and $sizes.model_cache_delta_bytes -eq 7 -and
         $sizes.rust_cache_delta_bytes -eq 0 -and $sizes.build_output_delta_bytes -eq 5 -and
+        $sizes.before.rust_cache.reparse_entries -eq 1 -and $sizes.after.rust_cache.reparse_entries -eq 1 -and
         $sizes.after.staged_bundle.bytes -eq $msi.expected.bytes -and $sizes.manifest_sha256 -ceq $script:ManifestDigest) 'native_size_phases_and_cache_hit'
     Assert-Check (-not [IO.File]::ReadAllText($sizesPath).Contains($script:TestRoot) -and
         -not [IO.File]::ReadAllText($env:GITHUB_STEP_SUMMARY).Contains($script:TestRoot)) 'measurement_paths_private'
+    Remove-Item -LiteralPath $cacheJunction -Force
     $junction = Join-Path $fakeWorkspace 'junction'
     New-Item -ItemType Junction -Path $junction -Target $cache | Out-Null
     $rejected = $false

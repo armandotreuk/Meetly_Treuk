@@ -21,7 +21,7 @@ Verified implementation state on 2026-09-08 in `fix/sprint-5-review-r5`
 | HR-5.R10 correctness | Activation, snapshot/hydration, folder and public-ID fixes approved. User approved exact SQL title top-k with an explicit linear-work limitation on 2026-09-08. | Implement and independently review that approved query change after the current packaging batch; preserve cancellation and all other gates. |
 | 5.4a package authority | Accepted after real Tauri expansion, staging/recovery tests, and independent review. | Installed-package evidence belongs to 5.4c. |
 | 5.4b retrieval diagnostic | Accepted after pinned Rust 1.88 tests, real source-side package-layout inference, fallback tests, and independent review. | Source-layout inference is not MSI/NSIS installation evidence. |
-| 5.4c installer CI | CI2 passed frozen setup, native harness and Rust check, then failed before staging. Privacy-safe measurement diagnostics now pass 210 assertions and both independent reviews. | Diagnostic CI retry to identify/fix the actual cause, then exact-reviewed Actions MSI/NSIS smokes/teardown. |
+| 5.4c installer CI | CI3 identified a restored Rust-cache reparse entry. Rust-cache-only exclude/count handling now passes 212 assertions and both independent reviews; all authority-sensitive trees still reject links. | Exact-commit Actions MSI/NSIS smokes, diagnostics and teardown. |
 | 5.5 release qualification | Not started; dependencies and inherited evidence remain open. | Independent corpus, production quality/provider answers, native/R13 sessions, full qualification matrix, exact final-head Actions, and user close approval. |
 
 The latest explicit Rust 1.88 integration run passed 920 library tests (four
