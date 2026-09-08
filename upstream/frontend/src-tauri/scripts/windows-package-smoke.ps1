@@ -720,7 +720,11 @@ function Invoke-SizeEvidence([string]$Phase, [string]$Workspace, [string]$Tempor
     # cleanup, and frontend build paths retain fail-closed rejection.
     $rustCache = Get-TreeMeasurement (Join-Path $Workspace 'upstream/target') 'skip'
     $script:MeasurementStage = 'measure_build_output'
-    $buildOutput = Get-TreeMeasurement (Join-Path $Workspace 'upstream/frontend/target')
+    # The post-build aggregate can contain compiler-created links. This is a
+    # metric only: pre-build/prepare measurements and guarded cleanup still
+    # reject links so they can never be traversed or deleted.
+    $buildOutputPolicy = if ($Phase -eq 'after') { 'skip' } else { 'reject' }
+    $buildOutput = Get-TreeMeasurement (Join-Path $Workspace 'upstream/frontend/target') $buildOutputPolicy
     $data[$Phase] = @{
         staged_bundle = $stagedBundle
         model_cache = $modelCache
@@ -738,7 +742,7 @@ function Invoke-SizeEvidence([string]$Phase, [string]$Workspace, [string]$Tempor
             "- Model cache restore=$($data.model_cache_restore); before_bytes=$($data.before.model_cache.bytes); after_bytes=$($data.after.model_cache.bytes); delta_bytes=$($data.model_cache_delta_bytes)",
             "- Staged bundle bytes=$($data.after.staged_bundle.bytes); files=$($data.after.staged_bundle.files); manifest SHA-256=$($data.manifest_sha256)",
             "- Cargo cache before_bytes=$($data.before.rust_cache.bytes); after_bytes=$($data.after.rust_cache.bytes); delta_bytes=$($data.rust_cache_delta_bytes); before_reparse_entries=$($data.before.rust_cache.reparse_entries); after_reparse_entries=$($data.after.rust_cache.reparse_entries)",
-            "- Build output before_bytes=$($data.before.build_output.bytes); removed_before_build_bytes=$($data.prepare_build.build_output.bytes); after_bytes=$($data.after.build_output.bytes); delta_bytes=$($data.build_output_delta_bytes)", '')
+            "- Build output before_bytes=$($data.before.build_output.bytes); before_reparse_entries=$($data.before.build_output.reparse_entries); removed_before_build_bytes=$($data.prepare_build.build_output.bytes); removed_before_build_reparse_entries=$($data.prepare_build.build_output.reparse_entries); after_bytes=$($data.after.build_output.bytes); after_reparse_entries=$($data.after.build_output.reparse_entries); delta_bytes=$($data.build_output_delta_bytes)", '')
         if ($env:GITHUB_STEP_SUMMARY) {
             $script:MeasurementStage = 'write_summary'
             [IO.File]::AppendAllLines($env:GITHUB_STEP_SUMMARY, [string[]]$lines)

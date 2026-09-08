@@ -422,6 +422,16 @@ try {
     $rejected = $false
     try { Clear-ExactFrontendBuildOutput $fakeWorkspace $cache } catch { $rejected = $true }
     Assert-Check ($rejected -and (Test-Path -LiteralPath (Join-Path $cache 'cached.bin'))) 'wrong_cleanup_target_rejected'
+    $linkedBuildTarget = Join-Path $script:TestRoot 'linked-build-output-target'
+    New-Item -ItemType Directory -Path $linkedBuildTarget | Out-Null
+    [IO.File]::WriteAllText((Join-Path $linkedBuildTarget 'not-physical-build.bin'), '1234567')
+    $buildJunction = Join-Path $target 'linked-build-entry'
+    New-Item -ItemType Junction -Path $buildJunction -Target $linkedBuildTarget | Out-Null
+    $rejected = $false
+    try { Clear-ExactFrontendBuildOutput $fakeWorkspace $target } catch { $rejected = $true }
+    Assert-Check ($rejected -and (Test-Path -LiteralPath (Join-Path $target 'output.bin')) -and
+        (Test-Path -LiteralPath (Join-Path $linkedBuildTarget 'not-physical-build.bin'))) 'build_cleanup_reparse_rejected_and_preserves_target'
+    Remove-Item -LiteralPath $buildJunction -Force
     Clear-ExactFrontendBuildOutput $fakeWorkspace $target
     Assert-Check (-not (Test-Path -LiteralPath $target) -and (Test-Path -LiteralPath $cache)) 'only_exact_frontend_target_cleaned'
     $env:GITHUB_SHA = (& git rev-parse HEAD | Out-String).Trim()
@@ -474,16 +484,20 @@ try {
     New-Item -ItemType Directory -Path $target -Force | Out-Null
     [IO.File]::WriteAllText((Join-Path $target 'new-output.bin'), '12345')
     [IO.File]::WriteAllText((Join-Path $env:MODEL_CACHE_PATH 'new-cache.bin'), '1234567')
+    New-Item -ItemType Junction -Path $buildJunction -Target $linkedBuildTarget | Out-Null
     Invoke-SizeEvidence 'after' $fakeWorkspace $script:TestRoot
     $sizesPath = Join-Path $script:TestRoot 'meetily-package-sizes.json'
     $sizes = Get-Content -LiteralPath $sizesPath -Raw | ConvertFrom-Json -AsHashtable
     Assert-Check ($sizes.model_cache_restore -eq 'exact_hit' -and $sizes.model_cache_delta_bytes -eq 7 -and
         $sizes.rust_cache_delta_bytes -eq 0 -and $sizes.build_output_delta_bytes -eq 5 -and
         $sizes.before.rust_cache.reparse_entries -eq 1 -and $sizes.after.rust_cache.reparse_entries -eq 1 -and
+        $sizes.before.build_output.reparse_entries -eq 0 -and $sizes.prepare_build.build_output.reparse_entries -eq 0 -and
+        $sizes.after.build_output.bytes -eq 5 -and $sizes.after.build_output.files -eq 1 -and $sizes.after.build_output.reparse_entries -eq 1 -and
         $sizes.after.staged_bundle.bytes -eq $msi.expected.bytes -and $sizes.manifest_sha256 -ceq $script:ManifestDigest) 'native_size_phases_and_cache_hit'
     Assert-Check (-not [IO.File]::ReadAllText($sizesPath).Contains($script:TestRoot) -and
         -not [IO.File]::ReadAllText($env:GITHUB_STEP_SUMMARY).Contains($script:TestRoot)) 'measurement_paths_private'
     Remove-Item -LiteralPath $cacheJunction -Force
+    Remove-Item -LiteralPath $buildJunction -Force
     $junction = Join-Path $fakeWorkspace 'junction'
     New-Item -ItemType Junction -Path $junction -Target $cache | Out-Null
     $rejected = $false

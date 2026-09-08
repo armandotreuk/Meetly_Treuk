@@ -4163,3 +4163,29 @@ etrieval/model.rs:1714 unused_parens warning).
 - Reviewer: rust_cache_measure_arch_review, GPT-5.6 Terra / medium.
 - Verdict: approved for CI retry with no blockers. The reviewer matched final hashes and clean PowerShell parses, audited every call site, confirmed only derived Rust cache skips links, and verified the active root workflow is unchanged. CI3 remains correctly described as pre-staging with no package/install/signing evidence.
 - Boundary: exact-commit Actions MSI/NSIS installation, diagnostics, teardown and signing treatment remain required.
+
+### Result HR-5.4c.CI4 — Package build passes; post-build aggregate measurement finds reparse
+- Date: 2026-09-08
+- Run: https://github.com/armandotreuk/Meetly_Treuk/actions/runs/34287254287 at exact reviewed commit `6d05ac57bd2b61090b07228fc1bd657791b1bfe5`. Overall failure; independent `Cargo Check (Windows)` passed.
+- Passed in the build job: frozen frontend installation, pinned Rust, native sidecar, manifest authority, installed-harness self-test (213 assertions, `native_inventory_probe=passed`, `native_installer_evidence=false`), pre-staging measurement, model staging/full artifact assertion, real tokenizer/embedding/reranker reference inference, CLI 2.11.1 resource-expansion guard, exact frontend target preparation, and full Tauri release build.
+- Failure: `Measure staged bundle and build cache impact` emitted `stage=measure_build_output reason=reparse_rejected`. The full derived `upstream/frontend/target` aggregate produced by the successful build contains a reparse entry. MSI and NSIS smoke steps were skipped, the final evidence gate correctly reported both as skipped instead of relabeling the measurement failure, and installer uploads were skipped. No application installation, packaged diagnostic, teardown or signing result exists from this run.
+- Correction boundary: only the post-build aggregate build-output metric may skip/non-follow and count reparse entries, as the Rust-cache metric does. Pre-build/prepare measurement and exact target cleanup keep fail-closed reparse/ancestor checks. Bundle, installer, installed resource, model-cache and installation-root checks remain fail-closed. A separate regression and both independent reviews precede CI5.
+
+### Task HR-5.4c.R6 — Post-build aggregate reparse exclusion
+- Date: 2026-09-08
+- Owner: reused ci_size_measurement_fix session, GPT-5.6 Terra / medium. Status: implemented, verified and independently approved for CI retry.
+- Scope: only `frontend/src-tauri/scripts/windows-package-smoke.ps1` and `windows-package-smoke.tests.ps1`. For `Invoke-SizeEvidence` phase `after` only, aggregate `upstream/frontend/target` measurement skips/non-follows reparse entries and records their count. The `before` and `prepare_build` phases retain default rejection. `Clear-ExactFrontendBuildOutput` remains exact-path and ancestor validated, then performs a default-rejecting measurement before any recursive deletion.
+- Authority boundary: package bundle, model cache, installer, installed executable/resource and residue/cleanup paths remain fail-closed. Schema 1 is retained with additive numeric before/prepare/after build reparse counts; evidence and summaries contain no paths.
+- Verification: a real temporary junction test proves post-build aggregation counts only a five-byte physical file, excludes a seven-byte linked target and records one reparse entry. Guarded cleanup rejects and preserves both the link and its target. Worker and primary suites passed 213 assertions; PowerShell parsing and diff check passed. Final SHA-256: helper `868b8ac7c6ced7f3783a6c42179571ff049e9552e42826e28a6542f54a6e6197`; tests `6419339fd35e51220561e06b67a885dcd8168260297091d2afc5c8af3a45dee4`.
+
+### Review R5.4c.R6 — Independent code review
+- Date: 2026-09-08
+- Reviewer: build_output_measure_code_review, GPT-5.6 Terra / medium.
+- Verdict: approved with no blockers. Confirmed exact after-only condition, physical-only walker, default rejection for pre-build/cleanup and every authority path, additive private evidence, junction coverage and final hashes. The reviewer did not rerun the suite because its read-only review constraint conflicted with the fixture's internal `git rev-parse`; primary execution supplies the final 213-assertion result.
+- Boundary: retry approval only; no installed evidence.
+
+### Review R5.4c.R6 — Independent architecture/release-rigor review
+- Date: 2026-09-08
+- Reviewer: build_output_measure_arch_review, GPT-5.6 Terra / medium.
+- Verdict: approved for CI retry with no blockers. Confirmed exact HEAD/hashes, clean parsing/diff, after-only measurement scope, unchanged cleanup/package/model/identity/ownership/signing authority, honest CI4 record and absence of installed evidence. The reviewer also recorded the 213-assertion passing result.
+- Boundary: Task 5.4c still requires exact-commit MSI/NSIS install, both diagnostics, signing treatment and teardown.
