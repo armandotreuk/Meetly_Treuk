@@ -3718,3 +3718,52 @@ Orchestrator may insert ad-hoc reviews after any task that surprises it (larger 
   4. Finding 5 is recorded as pending approval rather than resolved unilaterally. The code and the PRD now agree on what the number is and on the fact that a user decision was superseded; the approval itself is the user's to give.
 - Inherited Sprint 3 release gates (unchanged, each still absent): valid independently authored Portuguese corpus; production-path quality and final provider-answer evidence; native Windows/R13 hermetic session evidence; exact-head GitHub Actions evidence. Task 5.4, Task 5.5, Sprint close, and release remain blocked.
 - Spillover: the 2026-09-05 minimum-query-length decision row awaits user approval.
+
+### Task HR-5.R3b — R5.R3 judgement follow-ups [S]
+- Date: 2026-09-05
+- Implementer model: anthropic/claude-opus-5 (Claude Code)
+- Status: done (implementation and mandatory verification; no release claim and no gate re-opened).
+- Scope: the two low-risk follow-ups the user selected from the R5.R3 judgement calls. The third — indexing meeting titles in `meeting_fts` — was deliberately NOT done here; see the open item below.
+- Files changed: `frontend/src-tauri/src/retrieval/service.rs`, `frontend/src/lib/sidebar-search.ts`, `frontend/tests/lib/sidebar-search.test.ts`, this doc.
+- Corrections applied:
+  1. `TITLE_SCAN_PAGE` raised from 256 to 1024. This is a round-trip lever only: the scan visits the same rows and keeps the same bounded top-k heap at any page size, so it changes no match semantics. It matters most on the Chat and Context purposes, which the row budget deliberately does not cap — at the top scale gate those drop from ~977 statements per scan to ~245. Its doc comment records that `MAX_SEARCH_TITLE_SCAN_MEETINGS` is provisional: the approved envelope is expressed in semantic DOCUMENTS (250,000) and no document-per-meeting figure is recorded anywhere, so the cap is not yet derived from an approved number.
+  2. `buildSidebarSearchRows` places up to `SIDEBAR_LOCAL_TITLE_RESERVE = 10` missed title matches AHEAD of the ranked rows instead of appending all of them. Appending was not enough: the backend can return a full page of 50 for any query semantic retrieval answers, and the final slice then dropped every appended row — losing the signal in exactly the crowded case the union exists for. A substring match on a meeting's own name is a high-precision signal, and the Rust title channel already ranks the title matches it can see highly, so a small bounded head is consistent rather than a thumb on the scale. The remainder still follows the ranked rows.
+- Verification: covered by the HR-5.R4 run below, which is the same working tree.
+
+### Review R5.R4 — the HR-5.R3b follow-ups
+- Date: 2026-09-05
+- Reviewer model: anthropic/claude-opus-5 (Claude Code, `/code-review xhigh`)
+- Scope reviewed: the HR-5.R3b working-tree diff (3 files, +105/-30), with the enclosing functions re-read — including the R5.R3 code the reserve change re-exposed.
+- Verdict: changes-requested — 4 findings, all in code introduced by HR-5.R3 or HR-5.R3b.
+- Findings:
+  1. **Should-fix — the client-side title scan was unbounded and now ran on every search.** HR-5.R3 moved `localTitleMatches` from the fallback path onto every query, and it filtered the whole loaded `meetings` array for at most 50 usable rows. That is the client-side mirror of the very Rust scan R5.R3 had just bounded, on the UI thread.
+  2. **Should-fix — `SIDEBAR_LOCAL_TITLE_RESERVE` counted candidates, not rendered rows.** `add` deduplicates by meeting id after the reserve is sliced, so repeats of one meeting could consume the whole head and push every other missed title match past the final slice.
+  3. **Simplification — `TITLE_SCAN_PAGE` carried two doc comments.** The new paragraph was inserted after the existing one-line doc rather than replacing it, leaving two consecutive definitions of the same constant and a residency sentence describing a page four times smaller than the one that ships.
+  4. **Test-coverage — the 50-result ranked page fixture was duplicated verbatim** across the two new reserved-head tests.
+- Not run in this review: evaluation/benchmark harnesses, packaging/installed-smoke gates, and the excluded corpus/debug/`.opencode` suites.
+- Follow-up tasks created: HR-5.R4
+
+### Task HR-5.R4 — R5.R4 review remediation [S]
+- Date: 2026-09-05
+- Implementer model: anthropic/claude-opus-5 (Claude Code)
+- Status: done (implementation and mandatory verification; no release claim and no gate re-opened).
+- Scope: fix all 4 R5.R4 findings and prove the two behavioural ones by negative control.
+- Files changed: `frontend/src-tauri/src/retrieval/service.rs`, `frontend/src/lib/sidebar-search.ts`, `frontend/tests/lib/sidebar-search.test.ts`, this doc.
+- Corrections applied:
+  1. `localTitleMatches` takes an `exclude` set and a `limit` and scans with an early exit instead of filtering the whole array. The call site passes `rankedIds` and `SIDEBAR_SEARCH_RESULT_LIMIT`, so the scan stops as soon as a full page of usable candidates exists. It has one caller, so the signature change is contained.
+  2. The same pass deduplicates as it goes — the `exclude` set doubles as the seen set — so a slice of the result is now a count of rows that will actually render, which is what the reserve constant claims.
+  3. The two `TITLE_SCAN_PAGE` doc comments merged into one that states the residency and the round-trip rationale once.
+  4. `fullRankedPage()` extracted beside the existing `hybridResult` and `response` fixtures; all four reserved-head tests use it.
+- Negative controls: restoring the pre-fix `localTitleMatches` body and call site fails both new tests — the scan returns all 5,000 matches instead of stopping at 3, and the repeated-candidate case yields `['title-dup', 'ranked-0']`, showing `title-other` lost entirely.
+- Regression tests added: `spends the reserved head on rendered rows, not on repeated candidates`; `stops scanning once a full page of title matches is available`; `keeps a missed title match visible when the backend fills the whole page`; `bounds the reserved head so title matches cannot flood the ranked rows`.
+- Verification:
+  - `pnpm --dir frontend run typecheck` — OK.
+  - `pnpm --dir frontend exec vitest run` — OK, 168 passed / 23 files.
+  - `cargo test --manifest-path frontend/src-tauri/Cargo.toml --lib` — OK, 889 passed / 0 failed / 2 ignored (clean full-suite run; neither previously recorded timing flake reproduced).
+  - `cargo fmt --manifest-path frontend/src-tauri/Cargo.toml --check` — OK; `git diff --check` — OK.
+- Notes/decisions:
+  1. The reserved head is a deliberate 20% of the page: when the backend fills all 50 slots AND title matches were missed, up to ten of the lowest-ranked authoritative rows are evicted. That trade is only paid when both conditions hold, and the test suite pins both the eviction and its bound.
+  2. Findings 1 and 2 are both in HR-5.R3's own correction rather than in Sprint 5 code. Recording that plainly is the point of running the round: the union fix was right in substance and wrong in two mechanical details, and neither would have been caught by the tests HR-5.R3 shipped with it.
+- Open item — the root cause is still unaddressed: meeting titles are in no index. `meeting_fts` indexes transcript, summary and note text only and joins `meetings` for the title purely to display it. That single gap is what forces both the bounded Rust scan and the client-side substring pass. Indexing titles under a distinct `chunk_type = 'title'` would make title lookup index-backed (removing the cap), give prefix matching natively through FTS5 `token*` (returning the client union to fallback-only), and restore one ranking authority. It requires a migration plus a rebuild path, and every legacy lexical query must exclude that chunk type so `api_search_fts` and `search_meetings` BM25 semantics stay unchanged — a contract the PRD explicitly guards. It is therefore a user-approved decision, not a task-level one, and is recorded here as a Task 5.5 dependency rather than done.
+- Inherited Sprint 3 release gates (unchanged, each still absent): valid independently authored Portuguese corpus; production-path quality and final provider-answer evidence; native Windows/R13 hermetic session evidence; exact-head GitHub Actions evidence. Task 5.4, Task 5.5, Sprint close, and release remain blocked.
+- Spillover: the 2026-09-05 minimum-query-length decision row and the FTS title-index proposal both await user approval.

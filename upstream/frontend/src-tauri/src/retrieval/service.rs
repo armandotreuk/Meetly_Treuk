@@ -44,9 +44,14 @@ pub const HYBRID_CANDIDATES_PER_VARIANT: usize = 100;
 /// and the repository's recursive root-folder gate is the sole semantic
 /// membership authority.
 pub(crate) const MAX_FOLDER_SCAN_MEMBERSHIP: usize = 20_000;
-/// Streaming page size of the bounded title scan; only one page plus the
-/// bounded top-k heap is ever resident.
-pub(crate) const TITLE_SCAN_PAGE: usize = 256;
+/// Rows per streamed page of the title scan: one page plus the bounded top-k
+/// heap is all that is ever resident.
+///
+/// This is a round-trip lever, not a correctness one. The scan visits the same
+/// rows and keeps the same heap at any page size, so raising it only reduces
+/// how many statements the scan builds and steps - which matters most on the
+/// purposes the row budget below does NOT cap.
+pub(crate) const TITLE_SCAN_PAGE: usize = 1_024;
 /// Approved ceiling on the rows one interactive title scan will examine.
 ///
 /// The title channel has no index to seek on: titles are not in `meeting_fts`,
@@ -54,9 +59,17 @@ pub(crate) const TITLE_SCAN_PAGE: usize = 256;
 /// would drop exactly the diacritic-folded matches `normalize_core_token`
 /// exists to find. The scan is therefore linear in the meeting count. Chat and
 /// Context run it at most once per turn; Search runs it on every debounced
-/// keystroke, so Search stops after this many rows instead of paging an
-/// unbounded table while a Chat stream competes for the same pool. Beyond the
-/// cap the sidebar's own local title matching still covers the remainder.
+/// keystroke, so Search stops once it has scanned at least this many rows
+/// instead of paging an unbounded table while a Chat stream competes for the
+/// same pool. The budget is checked per page, so the scan overshoots by less
+/// than one [`TITLE_SCAN_PAGE`]. Beyond the cap the sidebar's own local title
+/// matching still covers the remainder.
+///
+/// The value is provisional: the approved release envelope is expressed in
+/// semantic DOCUMENTS (250,000), and the meeting count that corresponds to is
+/// not recorded anywhere, so this is not yet derived from an approved figure.
+/// Task 5.5 must report meetings-per-corpus at each scale and set it from that
+/// measurement.
 pub(crate) const MAX_SEARCH_TITLE_SCAN_MEETINGS: usize = 10_000;
 /// Approved candidate ceiling per variant per channel (architecture:
 /// FTS/vector candidates per variant 50-150; the index enforces the same

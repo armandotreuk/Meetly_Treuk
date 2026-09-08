@@ -4,7 +4,10 @@ import type { HybridSearchResponse } from "@/types";
 import {
     buildSidebarSearchRows,
     createSidebarSearchController,
+    localTitleMatches,
+    SIDEBAR_LOCAL_TITLE_RESERVE,
     SIDEBAR_SEARCH_MIN_QUERY_LENGTH,
+    SIDEBAR_SEARCH_RESULT_LIMIT,
     type SidebarSearchInvoke,
     type SidebarSearchState,
 } from "@/lib/sidebar-search";
@@ -68,6 +71,16 @@ const hybridResult = {
         },
     ],
 };
+
+/** A backend page with no room left: every slot taken by a ranked result. */
+function fullRankedPage() {
+    return Array.from({ length: SIDEBAR_SEARCH_RESULT_LIMIT }, (_unused, index) => ({
+        ...hybridResult,
+        meetingId: `ranked-${index}`,
+        meetingRank: index + 1,
+        sources: [{ ...hybridResult.sources[0], meetingId: `ranked-${index}` }],
+    }));
+}
 
 afterEach(() => {
     vi.useRealTimers();
@@ -524,7 +537,7 @@ describe("sidebar search result policy", () => {
         ).toEqual([]);
     });
 
-    it("appends local substring title matches the backend cannot make, in the active hybrid state", () => {
+    it("surfaces local substring title matches the backend cannot make, in the active hybrid state", () => {
         // The Rust title channel matches whole normalized tokens, so a prefix
         // query never reaches "Retention Review" through the backend. The
         // pre-hybrid sidebar matched titles by substring on every keystroke,
@@ -540,12 +553,77 @@ describe("sidebar search result policy", () => {
             response([{ ...hybridResult, meetingId: "hybrid-hit", meetingRank: 1 }])
         );
 
-        expect(rows.map((row) => row.meeting.id)).toEqual(["hybrid-hit", "title-only"]);
-        // The authoritative row keeps its snippet and provenance; the appended
-        // one is labelled as a title match.
-        expect(rows[0].snippet).toBe("budget plan");
-        expect(rows[1].snippet).toBeNull();
-        expect(rows[1].provenance).toBe("Title");
+        expect(rows.map((row) => row.meeting.id)).toEqual(["title-only", "hybrid-hit"]);
+        expect(rows[0].snippet).toBeNull();
+        expect(rows[0].provenance).toBe("Title");
+        // The authoritative row keeps its own snippet and provenance.
+        expect(rows[1].snippet).toBe("budget plan");
+    });
+
+    it("keeps a missed title match visible when the backend fills the whole page", () => {
+        // Appending would have put it past the final slice: this is the case
+        // the reserved head exists for.
+        const ranked = fullRankedPage();
+        const meetings = [
+            ...ranked.map((result) => ({ id: result.meetingId, title: "Quarterly planning" })),
+            { id: "title-only", title: "Retention Review" },
+        ];
+
+        const rows = buildSidebarSearchRows(meetings, "reten", null, response(ranked));
+
+        expect(rows).toHaveLength(SIDEBAR_SEARCH_RESULT_LIMIT);
+        expect(rows[0].meeting.id).toBe("title-only");
+    });
+
+    it("spends the reserved head on rendered rows, not on repeated candidates", () => {
+        // A duplicated meeting must not consume two reserved slots and then
+        // collapse into one row.
+        const ranked = fullRankedPage();
+        const duplicate = { id: "title-dup", title: "Retention Review" };
+        const meetings = [
+            ...ranked.map((result) => ({ id: result.meetingId, title: "Quarterly planning" })),
+            // Enough copies to exhaust the reserve on their own.
+            ...Array.from({ length: SIDEBAR_LOCAL_TITLE_RESERVE }, () => duplicate),
+            { id: "title-other", title: "Retention Offsite" },
+        ];
+
+        const rows = buildSidebarSearchRows(meetings, "reten", null, response(ranked));
+
+        // Counting candidates would spend the whole head on one meeting and
+        // push "title-other" past the final slice entirely.
+        expect(rows.slice(0, 2).map((row) => row.meeting.id)).toEqual([
+            "title-dup",
+            "title-other",
+        ]);
+        expect(rows.filter((row) => row.meeting.id === "title-dup")).toHaveLength(1);
+    });
+
+    it("stops scanning once a full page of title matches is available", () => {
+        const meetings = Array.from({ length: 5_000 }, (_unused, index) => ({
+            id: `m-${index}`,
+            title: `Retention ${index}`,
+        }));
+
+        const matches = localTitleMatches(meetings, "reten", null, null, new Set(), 3);
+
+        expect(matches.map((meeting) => meeting.id)).toEqual(["m-0", "m-1", "m-2"]);
+    });
+
+    it("bounds the reserved head so title matches cannot flood the ranked rows", () => {
+        const ranked = fullRankedPage();
+        const meetings = [
+            ...ranked.map((result) => ({ id: result.meetingId, title: "Quarterly planning" })),
+            ...Array.from({ length: 25 }, (_unused, index) => ({
+                id: `title-${index}`,
+                title: `Retention ${index}`,
+            })),
+        ];
+
+        const rows = buildSidebarSearchRows(meetings, "reten", null, response(ranked));
+
+        const head = rows.slice(0, SIDEBAR_LOCAL_TITLE_RESERVE);
+        expect(head.every((row) => row.meeting.id.startsWith("title-"))).toBe(true);
+        expect(rows[SIDEBAR_LOCAL_TITLE_RESERVE].meeting.id).toBe("ranked-0");
     });
 
     it("never duplicates a meeting the backend already returned", () => {

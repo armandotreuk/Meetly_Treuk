@@ -964,7 +964,7 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 
 ### Code Review
 
-**Reviewer:** `anthropic/claude-opus-5` (Claude Code, `/code-review xhigh`), three rounds
+**Reviewer:** `anthropic/claude-opus-5` (Claude Code, `/code-review xhigh`), four rounds
 **Verdict:** Implementation findings resolved; sprint close still blocked by the
 release-qualification gates below, which this review did not and cannot clear.
 
@@ -987,19 +987,31 @@ release-qualification gates below, which this review did not and cannot clear.
   table on every debounced keystroke, ~977 sequential queries at the 250k
   gate), 9 should-fix, 4 cleanup/altitude/conventions. All 15 fixed in Task
   HR-5.R3, with both blockers proven by negative control before the fix.
+- **R5.R4** (the two follow-ups selected from the R5.R3 judgement calls): 4
+  findings, all in the HR-5.R3/HR-5.R3b corrections themselves - the
+  client-side title scan was unbounded and now ran on every search, and the
+  reserved head counted candidates instead of rendered rows, so repeats could
+  push every other missed title match past the final slice. All 4 fixed in
+  Task HR-5.R4, both behavioural ones proven by negative control.
 
 Both rounds, their per-finding corrections, verification output, and the
 environment/flake caveats are recorded in
 [`notes-chat-improvement-execution.md`](../notes-chat-improvement-execution.md)
-under `R5.R1`, `HR-5.R1`, `R5.R2`, `HR-5.R2`, `R5.R3`, and `HR-5.R3`.
+under `R5.R1`, `HR-5.R1`, `R5.R2`, `HR-5.R2`, `R5.R3`, `HR-5.R3`,
+`HR-5.R3b`, `R5.R4`, and `HR-5.R4`.
 
 **Verification after remediation:** `cargo check` pass; `cargo test --lib` 889
 passed / 0 failed / 2 ignored; `cargo fmt --check` pass; `pnpm run typecheck`
-pass; `pnpm exec vitest run` 164 passed / 23 files; `git diff --check` pass.
+pass; `pnpm exec vitest run` 168 passed / 23 files; `git diff --check` pass.
 
-**Open item from R5.R3:** the 2026-09-05 Decisions row raising the sidebar
-inference minimum from one character to three supersedes a user-approved row
-and is marked pending user approval.
+**Open items:** (1) the 2026-09-05 Decisions row raising the sidebar inference
+minimum from one character to three supersedes a user-approved row and is
+marked pending user approval. (2) Meeting titles are in no index -
+`meeting_fts` covers transcript, summary and note text only - which is the
+root cause behind both the bounded Rust title scan and the client-side
+substring pass. Indexing titles under a distinct `chunk_type` would remove
+both, but it changes a guarded lexical contract and is recorded as a Task 5.5
+dependency awaiting user approval, not as done.
 
 **Required follow-ups:** Task 5.4 packaging, Task 5.5 release qualification, and
 sprint close remain blocked by their own unchanged evidence gates (independently

@@ -11,6 +11,18 @@ export const SIDEBAR_SEARCH_DEBOUNCE_MS = 250;
  */
 export const SIDEBAR_SEARCH_MIN_QUERY_LENGTH = 3;
 export const SIDEBAR_SEARCH_RESULT_LIMIT = 50;
+/**
+ * How many local title matches the backend missed are placed AHEAD of the
+ * ranked rows. Appending them instead is not enough: the backend can return a
+ * full page of `SIDEBAR_SEARCH_RESULT_LIMIT` rows for any query semantic
+ * retrieval answers, and the final slice would then drop every appended row -
+ * silently losing the signal in exactly the crowded case it exists for. A
+ * substring match on a meeting's own name is high precision, and the Rust
+ * title channel already ranks the title matches IT can see highly, so a small
+ * bounded head is consistent rather than a thumb on the scale. The remainder
+ * still follows the ranked rows.
+ */
+export const SIDEBAR_LOCAL_TITLE_RESERVE = 10;
 
 export type SidebarSearchNotice = "forced_lexical" | "lexical_fallback";
 export type SidebarSearchErrorCode = "invalid_request" | "timeout" | "unavailable";
@@ -384,15 +396,28 @@ export function localTitleMatches(
     meetings: SidebarSearchMeeting[],
     query: string,
     folderId: string | null,
-    folderScope: ReadonlySet<string> | null = null
+    folderScope: ReadonlySet<string> | null = null,
+    exclude: ReadonlySet<string> = new Set(),
+    limit = Number.POSITIVE_INFINITY
 ): SidebarSearchMeeting[] {
     const normalizedQuery = query.trim().toLowerCase();
     if (!normalizedQuery) return [];
-    return meetings.filter(
-        (meeting) =>
-            meeting.title.toLowerCase().includes(normalizedQuery) &&
-            inFolderScope(meeting, folderId, folderScope)
-    );
+    // Bounded and de-duplicated as it goes: this runs on every search, over
+    // however many meetings the sidebar holds, for at most `limit` usable
+    // rows. Filtering the whole array and slicing afterwards would scan the
+    // entire list on the UI thread to throw nearly all of it away, and would
+    // let a repeated meeting id consume a caller's budget twice.
+    const matches: SidebarSearchMeeting[] = [];
+    const seen = new Set<string>(exclude);
+    for (const meeting of meetings) {
+        if (matches.length >= limit) break;
+        if (seen.has(meeting.id)) continue;
+        if (!meeting.title.toLowerCase().includes(normalizedQuery)) continue;
+        if (!inFolderScope(meeting, folderId, folderScope)) continue;
+        seen.add(meeting.id);
+        matches.push(meeting);
+    }
+    return matches;
 }
 
 export function buildSidebarSearchRows(
@@ -420,31 +445,44 @@ export function buildSidebarSearchRows(
     };
 
     const usableResponse = response && responseMatchesScope(response, folderId) ? response : null;
-    if (usableResponse) {
-        for (const result of usableResponse.results.slice(0, SIDEBAR_SEARCH_RESULT_LIMIT)) {
-            const cached = currentMeetings.get(result.meetingId);
-            const meeting: SidebarSearchMeeting = {
-                id: result.meetingId,
-                title: result.meetingTitle,
-                folder_id: result.folderId,
-                folder_name: result.folderName,
-                created_at: cached?.created_at,
-                has_notes: cached?.has_notes,
-            };
-            const source = bestHybridSource(result);
-            add(meeting, displaySnippet(source?.snippet), formatHybridProvenance(result));
-        }
-    }
+    const ranked = usableResponse
+        ? usableResponse.results.slice(0, SIDEBAR_SEARCH_RESULT_LIMIT)
+        : [];
+    const rankedIds = new Set(ranked.map((result) => result.meetingId));
 
     // Local title matching runs in EVERY state, not only as a fallback. The
     // Rust title channel matches whole normalized tokens, so a prefix like
     // "reten" cannot reach "Retention Review" through the backend, and the
     // pre-hybrid sidebar matched titles by substring on every keystroke.
-    // `add` dedupes by meeting id, so an authoritative row always keeps its
-    // rank, snippet and provenance and only titles the backend genuinely
-    // missed are appended after it.
-    for (const meeting of localTitleMatches(meetings, query, folderId, folderScope)) {
+    // At most one full page of rows is ever rendered, so the scan never needs
+    // more candidates than that.
+    const missingTitleMatches = localTitleMatches(
+        meetings,
+        query,
+        folderId,
+        folderScope,
+        rankedIds,
+        SIDEBAR_SEARCH_RESULT_LIMIT
+    );
+    const addTitleMatch = (meeting: SidebarSearchMeeting) =>
         add(meeting, null, t("app.sidebar.provenance.title"));
+
+    // `localTitleMatches` already excluded the ranked ids and returns distinct
+    // meetings, so a slice here is a count of rows that will actually render.
+    missingTitleMatches.slice(0, SIDEBAR_LOCAL_TITLE_RESERVE).forEach(addTitleMatch);
+    for (const result of ranked) {
+        const cached = currentMeetings.get(result.meetingId);
+        const meeting: SidebarSearchMeeting = {
+            id: result.meetingId,
+            title: result.meetingTitle,
+            folder_id: result.folderId,
+            folder_name: result.folderName,
+            created_at: cached?.created_at,
+            has_notes: cached?.has_notes,
+        };
+        const source = bestHybridSource(result);
+        add(meeting, displaySnippet(source?.snippet), formatHybridProvenance(result));
     }
+    missingTitleMatches.slice(SIDEBAR_LOCAL_TITLE_RESERVE).forEach(addTitleMatch);
     return rows.slice(0, SIDEBAR_SEARCH_RESULT_LIMIT);
 }
