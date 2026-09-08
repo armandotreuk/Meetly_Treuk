@@ -4031,6 +4031,7 @@ dependencies = [
  "realfft",
  "regex",
  "reqwest 0.11.27",
+ "retrieval-package-contract",
  "ringbuf",
  "rubato 0.15.0",
  "serde",
@@ -5661,6 +5662,16 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams 0.5.0",
  "web-sys",
+]
+
+[[package]]
+name = "retrieval-package-contract"
+version = "0.1.0"
+dependencies = [
+ "dunce",
+ "serde_json",
+ "tauri-utils",
+ "tempfile",
 ]
 
 [[package]]

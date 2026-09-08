@@ -989,6 +989,52 @@ mod tests {
         assert_eq!(value["results"].as_array().unwrap().len(), 1);
     }
 
+    /// The MCP hybrid route shares the service title channel: an exact title
+    /// match beyond the retired 10,000-meeting scan cap must surface with
+    /// title provenance instead of being silently dropped.
+    #[tokio::test]
+    async fn hybrid_search_mcp_route_finds_a_matching_title_beyond_the_retired_scan_cap() {
+        let pool = chat_pool(false).await;
+        sqlx::query(
+            "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < ?)
+             INSERT INTO meetings (id, title, created_at, saved_at)
+             SELECT 'filler-' || printf('%05d', n), 'Filler', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z' FROM seq",
+        )
+        .bind(10_000i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, saved_at) VALUES ('zz-target', 'Chaves de Acesso Rotation', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = McpState {
+            pool,
+            app_data_dir: None,
+            client: reqwest::Client::new(),
+            retrieval: crate::retrieval::worker::RetrievalLifecycle::new(
+                crate::retrieval::worker::LifecycleConfig::production(None),
+            ),
+            chat_requests: crate::api::chat::ChatRequestState::new(),
+        };
+        let value = execute_search_meetings_hybrid_v1(
+            &state,
+            &json!({
+                "query": "chaves de acesso",
+                "scope": {"kind": "all"},
+                "limit": 50
+            }),
+        )
+        .await
+        .unwrap();
+        let first = &value["results"][0];
+        assert_eq!(first["meetingId"], "zz-target");
+        assert_eq!(first["provenance"][0]["channel"], "title");
+        assert_eq!(first["provenance"][0]["channelRank"], 1);
+    }
+
     #[tokio::test]
     async fn chat_preparation_uses_managed_forced_lexical_boundary() {
         let pool = chat_pool(true).await;
@@ -1490,6 +1536,27 @@ mod tests {
             CREATE VIRTUAL TABLE meeting_fts USING fts5(meeting_id UNINDEXED, chunk_type UNINDEXED, chunk_id UNINDEXED, text, speaker UNINDEXED, timestamp_label UNINDEXED, folder_id UNINDEXED, folder_name);
             CREATE TABLE transcript_chunks (meeting_id TEXT);
             CREATE TABLE retrieval_generations (generation_id TEXT PRIMARY KEY NOT NULL, model_id TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'building', document_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT '');
+            CREATE VIRTUAL TABLE retrieval_title_fts USING fts5(meeting_id UNINDEXED, title, scope, tokenize = 'unicode61');
+            CREATE TRIGGER retrieval_title_fts_ai AFTER INSERT ON meetings BEGIN
+                INSERT INTO retrieval_title_fts (meeting_id, title, scope)
+                VALUES (NEW.id, NEW.title,
+                        'm' || lower(hex(NEW.id)) || CASE WHEN NEW.folder_id IS NULL THEN ' pad pad' ELSE ' f' || lower(hex(NEW.folder_id)) || ' pad' END);
+            END;
+            CREATE TRIGGER retrieval_title_fts_ad AFTER DELETE ON meetings BEGIN
+                DELETE FROM retrieval_title_fts WHERE meeting_id = OLD.id;
+            END;
+            CREATE TRIGGER retrieval_title_fts_au AFTER UPDATE OF title ON meetings WHEN OLD.title IS NOT NEW.title BEGIN
+                DELETE FROM retrieval_title_fts WHERE meeting_id = NEW.id;
+                INSERT INTO retrieval_title_fts (meeting_id, title, scope)
+                VALUES (NEW.id, NEW.title,
+                        'm' || lower(hex(NEW.id)) || CASE WHEN NEW.folder_id IS NULL THEN ' pad pad' ELSE ' f' || lower(hex(NEW.folder_id)) || ' pad' END);
+            END;
+            CREATE TRIGGER retrieval_title_fts_af AFTER UPDATE OF folder_id ON meetings WHEN OLD.folder_id IS NOT NEW.folder_id BEGIN
+                DELETE FROM retrieval_title_fts WHERE meeting_id = NEW.id;
+                INSERT INTO retrieval_title_fts (meeting_id, title, scope)
+                VALUES (NEW.id, NEW.title,
+                        'm' || lower(hex(NEW.id)) || CASE WHEN NEW.folder_id IS NULL THEN ' pad pad' ELSE ' f' || lower(hex(NEW.folder_id)) || ' pad' END);
+            END;
             CREATE TABLE retrieval_documents (id INTEGER PRIMARY KEY AUTOINCREMENT, generation_id TEXT NOT NULL REFERENCES retrieval_generations(generation_id) ON DELETE CASCADE, document_id TEXT NOT NULL, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, source_kind TEXT NOT NULL DEFAULT '', ordinal INTEGER NOT NULL DEFAULT 0, content TEXT NOT NULL DEFAULT '', content_hash BLOB NOT NULL DEFAULT x'', dimensions INTEGER NOT NULL DEFAULT 2 CHECK (dimensions > 0), vector_encoding TEXT NOT NULL DEFAULT 'int8', vector BLOB NOT NULL DEFAULT x'', source_revision INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT '', UNIQUE (generation_id, document_id));
             CREATE TABLE chat_messages (id TEXT PRIMARY KEY NOT NULL, conversation_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, sources_json TEXT, is_error INTEGER DEFAULT 0, created_at TEXT NOT NULL);
             INSERT INTO meetings (id, title, created_at, saved_at) VALUES ('m1', 'Title', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z');

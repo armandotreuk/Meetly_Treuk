@@ -54,6 +54,7 @@ pub mod openai;
 pub mod openrouter;
 pub mod parakeet_engine;
 pub mod retrieval;
+pub mod retrieval_smoke;
 pub mod security;
 pub mod state;
 pub mod summary;

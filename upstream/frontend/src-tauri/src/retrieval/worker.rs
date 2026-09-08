@@ -52,7 +52,8 @@ use tokio_util::sync::CancellationToken;
 use crate::database::repositories::fts::FtsRepository;
 use crate::database::repositories::retrieval::{
     is_unreadable_staged_payload, FtsDueItem, GenerationWorkItem, ModelSpec, ReplacementJob,
-    ReplacementOutcome, RetrievalRepository, StagedDocument, VectorEncoding,
+    ReplacementOutcome, RetrievalRepository, StagedDocument, TerminalWorkFailureOutcome,
+    VectorEncoding,
 };
 use crate::retrieval::chunking::{
     chunk_meeting, ChunkerConfig, SemanticDocument, TokenizerPolicy, APPROVED_CHUNKER_VERSION,
@@ -1508,13 +1509,52 @@ async fn record_item_failure(
         "Semantic indexing failed for meeting {meeting_id} (attempt {next_attempt}, terminal: {terminal}): {safe_error}"
     );
     if terminal {
-        index.suppress_terminal_failure(generation_id, meeting_id);
+        // One `BEGIN IMMEDIATE` records the terminal failure fenced to the
+        // exact revision the failed work targeted, inspects outstanding work,
+        // and conditionally terminalizes the non-active building generation.
+        // If the user mutated the meeting before the writer lock was
+        // acquired, the stale failure is rejected and the work requeued for
+        // the newer revision - never terminalized over. Serving suppression
+        // runs only after the applicable record is confirmed; a stale record
+        // must not suppress documents the requeued work will rebuild.
+        match RetrievalRepository::record_terminal_work_failure_and_maybe_terminalize(
+            pool,
+            generation_id,
+            meeting_id,
+            item.source_revision,
+            safe_error,
+            &backoff_timestamp(next_attempt),
+        )
+        .await
+        {
+            Ok(TerminalWorkFailureOutcome::Recorded { .. }) => {
+                index.suppress_terminal_failure(generation_id, meeting_id);
+            }
+            Ok(TerminalWorkFailureOutcome::SourceGone { .. }) => {}
+            Ok(TerminalWorkFailureOutcome::StaleWorkRequeued) => {
+                log::debug!(
+                    "Terminal failure for meeting {meeting_id} was stale; work requeued at the current source revision"
+                );
+            }
+            Err(error) => {
+                log::warn!(
+                    "Recording terminal work failure failed for meeting {meeting_id}: {error}"
+                )
+            }
+        }
+        return;
     }
+    // A non-terminal item failure is an activation blocker, never a
+    // generation killer: `record_work_failure` keeps the queue's place so one
+    // poison meeting can neither destroy nor starve the rest of the
+    // generation. Terminalization is the atomic operation above and only
+    // fires once NOTHING else can make progress, so the user gets a
+    // retryable state instead of a silent stall.
     match RetrievalRepository::record_work_failure(
         pool,
         generation_id,
         meeting_id,
-        terminal,
+        false,
         safe_error,
         &backoff_timestamp(next_attempt),
     )
@@ -1522,26 +1562,6 @@ async fn record_item_failure(
     {
         Ok(()) => {}
         Err(error) => log::warn!("Recording retry state failed for meeting {meeting_id}: {error}"),
-    }
-    // A terminal item failure is an activation blocker, never a generation
-    // killer: `record_work_failure` keeps the queue's place so one poison
-    // meeting can neither destroy nor starve the rest of the generation. Only
-    // once NOTHING else can make progress does the generation itself become
-    // terminal, so the user gets a retryable state instead of a silent stall.
-    if terminal {
-        match RetrievalRepository::generation_has_outstanding_work(pool, generation_id).await {
-            Ok(true) => {}
-            Ok(false) => {
-                match RetrievalRepository::mark_shadow_generation_failed(pool, generation_id).await
-                {
-                    Ok(_) => {}
-                    Err(error) => {
-                        log::warn!("Recording shadow generation failure failed: {error}")
-                    }
-                }
-            }
-            Err(error) => log::warn!("Outstanding generation work check failed: {error}"),
-        }
     }
 }
 
@@ -3452,6 +3472,426 @@ mod tests {
             RetrievalRepository::mark_shadow_generation_failed(&pool, &generation)
                 .await
                 .unwrap()
+        );
+    }
+
+    /// Mutation-barrier regression for the split check-then-write the
+    /// terminalization used to be: user work created while the terminalize
+    /// operation waits for the write lock must be visible to the operation's
+    /// in-transaction outstanding-work check, so new pending work can never be
+    /// stranded behind a freshly terminal failed generation. A file-backed
+    /// pool lets the barrier connection hold the SQLite write lock while the
+    /// operation waits, making the interleaving deterministic.
+    #[tokio::test]
+    async fn terminalization_never_marks_a_generation_failed_over_work_created_while_it_waited() {
+        use sqlx::Connection as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "meetly-r5-terminalize-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let options = SqliteConnectOptions::from_str(&format!(
+            "sqlite://{}",
+            dir.join("terminalize.db").display()
+        ))
+        .unwrap()
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_secs(30));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        RetrievalRepository::ensure_model(
+            &pool,
+            &semantic_model_spec(FAKE_MODEL_ID, FAKE_DIMENSIONS),
+        )
+        .await
+        .unwrap();
+        RetrievalRepository::register_generation(&pool, "shadow", FAKE_MODEL_ID)
+            .await
+            .unwrap();
+        // One terminally failed meeting leaves nothing outstanding, so a
+        // split check-then-write would terminalize right here.
+        insert_meeting(&pool, "poison", "Poison Meeting").await;
+        RetrievalRepository::record_work_failure(
+            &pool,
+            "shadow",
+            "poison",
+            true,
+            "safe terminal failure",
+            "2099-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        assert!(
+            !RetrievalRepository::generation_has_outstanding_work(&pool, "shadow")
+                .await
+                .unwrap()
+        );
+
+        // Barrier: take the write lock and commit a user mutation (a new
+        // meeting) while the terminalize operation waits, so the mutation is
+        // durably visible before the operation's own transaction can read
+        // outstanding work.
+        let mut barrier = pool.acquire().await.unwrap();
+        let mut tx = barrier.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at)
+             VALUES ('late', 'Late Mutation', '2026-08-26T00:00:00Z', '2026-08-26T00:00:00Z')",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let op_pool = pool.clone();
+        let op = tokio::spawn(async move {
+            RetrievalRepository::mark_shadow_generation_failed(&op_pool, "shadow").await
+        });
+        tx.commit().await.unwrap();
+        drop(barrier);
+        assert!(!op.await.unwrap().unwrap());
+        assert_eq!(
+            RetrievalRepository::generation_status(&pool, "shadow")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "building",
+            "work created before the write must keep the generation building"
+        );
+        assert!(
+            RetrievalRepository::generation_has_outstanding_work(&pool, "shadow")
+                .await
+                .unwrap()
+        );
+
+        // Once genuinely idle the terminalization proceeds, and user mutation
+        // semantics after a terminal failed state are preserved: the failed
+        // generation is never seeded again, the mutation's rows stay durable,
+        // and the user retry resets them.
+        RetrievalRepository::record_work_failure(
+            &pool,
+            "shadow",
+            "late",
+            true,
+            "safe terminal failure",
+            "2099-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        assert!(
+            RetrievalRepository::mark_shadow_generation_failed(&pool, "shadow")
+                .await
+                .unwrap()
+        );
+        insert_meeting(&pool, "post", "Post Terminal").await;
+        let post_row: Option<(String,)> = sqlx::query_as(
+            "SELECT state FROM retrieval_meeting_state
+             WHERE generation_id = 'shadow' AND meeting_id = 'post'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert!(
+            post_row.is_none(),
+            "a failed generation is never seeded again"
+        );
+        assert!(
+            RetrievalRepository::retry_failed_generation(&pool, "shadow")
+                .await
+                .unwrap()
+        );
+        let late_row: (String,) = sqlx::query_as(
+            "SELECT state FROM retrieval_meeting_state
+             WHERE generation_id = 'shadow' AND meeting_id = 'late'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(late_row.0, "pending");
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Seeds an ACTIVE generation whose one meeting is published and served,
+    /// and returns the generation, the service, the terminal work item, and
+    /// the document's query vector.
+    async fn active_generation_with_published_meeting(
+        pool: &SqlitePool,
+    ) -> (
+        String,
+        Arc<crate::retrieval::index::QueryIndexService>,
+        GenerationWorkItem,
+        Vec<f32>,
+    ) {
+        insert_meeting(pool, "target", "Target Meeting").await;
+        add_transcript(pool, "t1", "target", "conteudo original").await;
+        let generation = ensure_test_generation(pool).await;
+        let revision = RetrievalRepository::current_source_revision(pool, "target")
+            .await
+            .unwrap()
+            .unwrap();
+        let job_id = staging_job_id(&generation, "target", revision);
+        RetrievalRepository::stage_documents(
+            pool,
+            &job_id,
+            &generation,
+            "target",
+            revision,
+            &[test_document("doc", "conteudo")],
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            RetrievalRepository::replace_meeting_documents(
+                pool,
+                ReplacementJob {
+                    generation_id: &generation,
+                    meeting_id: "target",
+                    expected_source_revision: revision,
+                    job_id: &job_id,
+                },
+            )
+            .await
+            .unwrap(),
+            ReplacementOutcome::Published { .. }
+        ));
+        sqlx::query("UPDATE retrieval_generations SET state = 'ready' WHERE generation_id = ?")
+            .bind(&generation)
+            .execute(pool)
+            .await
+            .unwrap();
+        RetrievalRepository::switch_active_generation(pool, &generation)
+            .await
+            .unwrap();
+        let service = Arc::new(crate::retrieval::index::QueryIndexService::new(
+            RetrievalScheduler::new(),
+        ));
+        service.set_loaded_model(FAKE_MODEL_ID);
+        crate::retrieval::index::publish_tick(pool, service.as_ref())
+            .await
+            .unwrap();
+        let item = GenerationWorkItem {
+            meeting_id: "target".to_string(),
+            indexed_source_revision: 0,
+            source_revision: revision,
+            state: "pending".to_string(),
+            attempt_count: MAX_ITEM_ATTEMPTS - 1,
+        };
+        (
+            generation,
+            service,
+            item,
+            FakeEmbedder::vector_for("conteudo"),
+        )
+    }
+
+    fn served_document_ids(hits: &[crate::retrieval::index::VectorHit]) -> Vec<&str> {
+        hits.iter().map(|hit| hit.document_id.as_str()).collect()
+    }
+
+    /// The real `record_item_failure` terminal flow over a concurrently
+    /// mutated meeting: a barrier connection holds the SQLite write lock while
+    /// a user title update advances the source revision, so the terminal
+    /// record must be rejected as stale, the work requeued for the newer
+    /// revision, serving NOT suppressed, and the active generation left
+    /// untouched. A file-backed pool makes the interleaving deterministic.
+    #[tokio::test]
+    async fn record_item_failure_rejects_a_stale_terminal_failure_over_a_concurrent_mutation() {
+        use sqlx::Connection as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "meetly-r6-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let options = SqliteConnectOptions::from_str(&format!(
+            "sqlite://{}",
+            dir.join("failure.db").display()
+        ))
+        .unwrap()
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_secs(30));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let (generation, service, item, query_vector) =
+            active_generation_with_published_meeting(&pool).await;
+        let pre_hits = service
+            .search(
+                &query_vector,
+                crate::retrieval::index::ScopeFilter::All,
+                10,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(served_document_ids(&pre_hits), vec!["doc"]);
+
+        // Barrier: the user mutation commits while the terminal failure
+        // operation waits for the writer lock.
+        let mut barrier = pool.acquire().await.unwrap();
+        let mut tx = barrier.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let op_pool = pool.clone();
+        let op_service = Arc::clone(&service);
+        let op_item = item.clone();
+        let op_generation = generation.clone();
+        let op = tokio::spawn(async move {
+            record_item_failure(
+                &op_pool,
+                &op_service,
+                &op_generation,
+                "target",
+                &op_item,
+                "safe terminal failure",
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        sqlx::query("UPDATE meetings SET title = 'Target Renamed' WHERE id = 'target'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        drop(barrier);
+        op.await.unwrap();
+
+        assert_eq!(
+            meeting_state(&pool, &generation, "target").await,
+            ("pending".to_string(), 0, item.source_revision),
+            "the stale terminal failure was rejected and requeued for the newer revision"
+        );
+        let current_revision = RetrievalRepository::current_source_revision(&pool, "target")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            current_revision > item.source_revision,
+            "the mutation moved the source revision past the failed work"
+        );
+        assert_eq!(
+            RetrievalRepository::generation_status(&pool, &generation)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "ready",
+            "the active generation is never terminalized"
+        );
+        assert!(
+            !service.terminal_failure_suppressed(&generation, "target"),
+            "a rejected stale record must not suppress serving"
+        );
+        let post_hits = service
+            .search(
+                &query_vector,
+                crate::retrieval::index::ScopeFilter::All,
+                10,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            served_document_ids(&post_hits),
+            vec!["doc"],
+            "the requeued work's documents stay served"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The real `record_item_failure` terminal flow at an unchanged source
+    /// revision: the record is confirmed, serving is suppressed only after
+    /// that confirmation, the active generation is never terminalized, and an
+    /// idle non-active building generation terminalizes with its record.
+    #[tokio::test]
+    async fn record_item_failure_records_suppresses_and_terminalizes_only_when_idle() {
+        let pool = migrated_pool().await;
+        let (generation, service, item, query_vector) =
+            active_generation_with_published_meeting(&pool).await;
+        record_item_failure(
+            &pool,
+            &service,
+            &generation,
+            "target",
+            &item,
+            "safe terminal failure",
+        )
+        .await;
+
+        assert_eq!(
+            meeting_state(&pool, &generation, "target").await,
+            ("failed".to_string(), 1, item.source_revision),
+        );
+        assert_eq!(
+            RetrievalRepository::generation_status(&pool, &generation)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "ready",
+            "the active generation is never terminalized"
+        );
+        assert!(service.terminal_failure_suppressed(&generation, "target"));
+        let hits = service
+            .search(
+                &query_vector,
+                crate::retrieval::index::ScopeFilter::All,
+                10,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            served_document_ids(&hits),
+            Vec::<&str>::new(),
+            "the terminally failed meeting stops being served"
+        );
+
+        // An idle non-active building generation terminalizes with its own
+        // confirmed record of the same meeting.
+        let shadow = format!("shadow-{generation}");
+        RetrievalRepository::register_generation(&pool, &shadow, FAKE_MODEL_ID)
+            .await
+            .unwrap();
+        record_item_failure(
+            &pool,
+            &service,
+            &shadow,
+            "target",
+            &item,
+            "safe terminal failure",
+        )
+        .await;
+        assert_eq!(
+            meeting_state(&pool, &shadow, "target").await,
+            ("failed".to_string(), 1, 0),
+        );
+        assert_eq!(
+            RetrievalRepository::generation_status(&pool, &shadow)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "failed",
+            "an idle non-active building generation terminalizes with the record"
         );
     }
 

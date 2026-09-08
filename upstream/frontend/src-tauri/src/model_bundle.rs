@@ -1651,7 +1651,15 @@ mod tests {
             "MEETLY_RAG_VERIFY_STAGED_BUNDLE=1 but no staged bundle at {} (run stage-retrieval-models.ps1)",
             bundle_root.display()
         );
-        let json = fs::read_to_string(bundle_root.join("model-bundle.manifest.json"))
+        let staged_manifest_path = bundle_root.join("model-bundle.manifest.json");
+        let publication_manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("resources/retrieval/model-bundle.manifest.json");
+        assert_eq!(
+            fs::read(&staged_manifest_path).expect("staged bundle manifest copy must be readable"),
+            fs::read(&publication_manifest_path).expect("publication manifest must be readable"),
+            "staged manifest must be byte-identical to the checked-in publication authority"
+        );
+        let json = fs::read_to_string(&staged_manifest_path)
             .expect("staged bundle must contain its own manifest copy");
         let manifest = parse_manifest(&json).expect("staged bundle manifest must validate");
         assert_eq!(
@@ -1662,6 +1670,18 @@ mod tests {
         manifest
             .verify_artifacts(&bundle_root)
             .expect("all ten manifest-managed artifacts must be present and hash-verified");
+    }
+
+    #[test]
+    fn tauri_config_has_one_staged_retrieval_resource() {
+        let config_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tauri.conf.json");
+        let config: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(config_path).expect("Tauri configuration must be readable"),
+        )
+        .expect("Tauri configuration must be valid JSON");
+        let resources = &config["bundle"]["resources"];
+        retrieval_package_contract::validate_static(resources)
+            .expect("Tauri must package the staged retrieval bundle exactly once");
     }
 
     #[test]

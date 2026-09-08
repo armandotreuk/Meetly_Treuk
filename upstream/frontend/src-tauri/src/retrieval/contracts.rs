@@ -749,6 +749,7 @@ mod tests {
         let title = |meeting_id: &str, rank: usize| TitleMatch {
             meeting_id: meeting_id.to_string(),
             evidence_id: format!("title:{meeting_id}"),
+            selected_title: meeting_id.to_string(),
             provenance: vec![EvidenceProvenance {
                 channel: RetrievalChannel::Title,
                 variant: QueryVariantKind::CoreTerms,

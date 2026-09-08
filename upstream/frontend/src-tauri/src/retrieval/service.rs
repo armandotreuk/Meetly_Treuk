@@ -44,33 +44,6 @@ pub const HYBRID_CANDIDATES_PER_VARIANT: usize = 100;
 /// and the repository's recursive root-folder gate is the sole semantic
 /// membership authority.
 pub(crate) const MAX_FOLDER_SCAN_MEMBERSHIP: usize = 20_000;
-/// Rows per streamed page of the title scan: one page plus the bounded top-k
-/// heap is all that is ever resident.
-///
-/// This is a round-trip lever, not a correctness one. The scan visits the same
-/// rows and keeps the same heap at any page size, so raising it only reduces
-/// how many statements the scan builds and steps - which matters most on the
-/// purposes the row budget below does NOT cap.
-pub(crate) const TITLE_SCAN_PAGE: usize = 1_024;
-/// Approved ceiling on the rows one interactive title scan will examine.
-///
-/// The title channel has no index to seek on: titles are not in `meeting_fts`,
-/// and the match is a normalized-token overlap, so a SQL `LIKE` pre-filter
-/// would drop exactly the diacritic-folded matches `normalize_core_token`
-/// exists to find. The scan is therefore linear in the meeting count. Chat and
-/// Context run it at most once per turn; Search runs it on every debounced
-/// keystroke, so Search stops once it has scanned at least this many rows
-/// instead of paging an unbounded table while a Chat stream competes for the
-/// same pool. The budget is checked per page, so the scan overshoots by less
-/// than one [`TITLE_SCAN_PAGE`]. Beyond the cap the sidebar's own local title
-/// matching still covers the remainder.
-///
-/// The value is provisional: the approved release envelope is expressed in
-/// semantic DOCUMENTS (250,000), and the meeting count that corresponds to is
-/// not recorded anywhere, so this is not yet derived from an approved figure.
-/// Task 5.5 must report meetings-per-corpus at each scale and set it from that
-/// measurement.
-pub(crate) const MAX_SEARCH_TITLE_SCAN_MEETINGS: usize = 10_000;
 /// Approved candidate ceiling per variant per channel (architecture:
 /// FTS/vector candidates per variant 50-150; the index enforces the same
 /// ceiling on vector scans).
@@ -331,7 +304,6 @@ pub struct RankedRetrieval {
 /// Internal normalized request: lexical texts with folder operators stripped,
 /// core terms, and request-start membership.
 struct NormalizedRequest {
-    purpose: RetrievalPurpose,
     scope: PersistedRetrievalScope,
     membership: ScopeFilter,
     transcript_only: bool,
@@ -342,15 +314,6 @@ struct NormalizedRequest {
     lexical_original: String,
     lexical_rewritten: Option<String>,
     core_terms: Vec<String>,
-    core_language: CoreTermLanguage,
-    /// Minimum `title_term_overlap` a title candidate must reach; 0 means any
-    /// non-zero overlap. Set to the DISTINCT core-term count when the title
-    /// channel runs without a stopword list (Search on an unstated language),
-    /// where partial overlap would let query function words title-match
-    /// arbitrary meetings. It must be the distinct count because
-    /// `title_term_overlap` deduplicates terms before counting, so a repeated
-    /// query token could never reach the raw `core_terms.len()`.
-    title_min_overlap: usize,
 }
 
 /// The one shared retrieval service. Holds a clone of the process-wide
@@ -361,6 +324,10 @@ pub struct RetrievalService {
     lifecycle: RetrievalLifecycle,
     #[cfg(test)]
     scan_gate: Arc<SemanticScanGate>,
+    #[cfg(test)]
+    title_scan_gate: Arc<SemanticScanGate>,
+    #[cfg(test)]
+    title_scope_gate: Arc<SemanticScanGate>,
 }
 
 /// Minimal test-only synchronization point for pinned-generation regressions:
@@ -389,6 +356,10 @@ impl RetrievalService {
             lifecycle,
             #[cfg(test)]
             scan_gate: Arc::new(SemanticScanGate::new()),
+            #[cfg(test)]
+            title_scan_gate: Arc::new(SemanticScanGate::new()),
+            #[cfg(test)]
+            title_scope_gate: Arc::new(SemanticScanGate::new()),
         }
     }
 
@@ -406,6 +377,37 @@ impl RetrievalService {
     #[cfg(test)]
     pub(crate) fn release_scan_gate(&self) {
         self.scan_gate.release.notify_one();
+    }
+
+    /// Pauses after the first title page so concurrent database mutations
+    /// can be committed deterministically by a second WAL connection.
+    #[cfg(test)]
+    pub(crate) fn arm_title_scan_gate(&self, sender: tokio::sync::mpsc::UnboundedSender<()>) {
+        *self
+            .title_scan_gate
+            .armed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(sender);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_title_scan_gate(&self) {
+        self.title_scan_gate.release.notify_one();
+    }
+
+    /// Pauses after request normalization but before the title read snapshot.
+    #[cfg(test)]
+    pub(crate) fn arm_title_scope_gate(&self, sender: tokio::sync::mpsc::UnboundedSender<()>) {
+        *self
+            .title_scope_gate
+            .armed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(sender);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_title_scope_gate(&self) {
+        self.title_scope_gate.release.notify_one();
     }
 
     /// Resolves the scope once, then runs the lexical, current-title, and
@@ -761,14 +763,6 @@ impl RetrievalService {
         ensure_not_cancelled(cancel)?;
         let core_terms = core_terms(&lexical_original, request.core_language);
         Ok(NormalizedRequest {
-            purpose: request.purpose,
-            title_min_overlap: if request.purpose == RetrievalPurpose::Search
-                && request.core_language == CoreTermLanguage::Unknown
-            {
-                core_terms.iter().collect::<HashSet<_>>().len()
-            } else {
-                0
-            },
             transcript_only: matches!(&scope, PersistedRetrievalScope::Meeting(_)),
             scope,
             membership,
@@ -776,7 +770,6 @@ impl RetrievalService {
             lexical_original,
             lexical_rewritten,
             core_terms,
-            core_language: request.core_language,
         })
     }
 
@@ -805,7 +798,7 @@ impl RetrievalService {
     /// plus one row: at or below the cap the IDs are a vector-scan
     /// accelerator; above it the semantic scan runs as [`ScopeFilter::All`]
     /// and the repository's recursive root-folder gate is the sole semantic
-    /// admission authority (lexical FTS and title scans stay root-scoped
+    /// admission authority (lexical FTS and title lookups stay root-scoped
     /// SQL). `All` stays `All`: the FTS and title queries already join
     /// current meetings, and semantic candidates are verified against
     /// current existence per candidate.
@@ -1112,25 +1105,45 @@ impl RetrievalService {
             .collect())
     }
 
-    /// Authoritative current-title candidates. FTS does not index titles, so
-    /// title-only search must not depend on semantic availability.
+    /// Authoritative current-title candidates from the additive
+    /// `retrieval_title_fts` mirror (migration `20260908000000`). The mirror
+    /// stores the stable meeting string ID plus SCOPE TOKENS (its own
+    /// identity token and its direct-folder token, both lowercase hex of the
+    /// stable ID), and its triggers keep it transactionally in sync with
+    /// every meetings insert, title update, folder move, and delete, so the
+    /// lookup runs for EVERY purpose (Search, Chat, Context - Tauri and MCP
+    /// alike) and scope with no row cap where the retired ID-ordered scan
+    /// silently stopped after its arbitrary row budget or its
+    /// unknown-language/purpose bypass dropped the channel. The join with
+    /// `meetings` on the string ID reads current identity and current title,
+    /// so a stale or deleted mirror row can never be served.
     ///
-    /// Streaming with bounded top-k: meetings are read in keyset-paged
-    /// batches and only the current best `lexical_per_variant` candidates are
-    /// ever held, so a large corpus is never fetched, stored, or sorted whole
-    /// before truncation. Scope safety, the overlap score, and the
-    /// (overlap desc, meeting id asc) ordering are identical to a full sort.
+    /// Scope is INSIDE the index: the MATCH expression ANDs column-filtered
+    /// `{title}` terms with column-filtered `{scope}` tokens, so the FTS
+    /// intersection itself is bounded by the requested scope - a narrow
+    /// folder never scans the global match set. Meeting and allowed-ID
+    /// scopes intersect identity tokens; a folder scope intersects the
+    /// subtree's DIRECT folder tokens, expanded from the LIVE
+    /// `meeting_folders` table at query time (bounded and fail-closed past
+    /// [`MAX_TITLE_SCOPE_KEYS`]), so descendant folders are correct and a
+    /// re-parented subtree needs no mirror maintenance.
     ///
-    /// [`CoreTermLanguage::Unknown`] keeps every normalized query token in
-    /// `core_terms` (the evaluated core-term policy removes only a stated
-    /// language's fixed list and never a cross-language union). Search still
-    /// needs title matching without a stated language, so instead of relaxing
-    /// that policy it tightens the MATCH: with no stopword list a title
-    /// candidate must contain EVERY distinct core term (`title_min_overlap`),
-    /// which is exactly the "exact authoritative title-only match" the search
-    /// contract asks for and cannot be satisfied by a shared function word.
-    /// Other purposes keep the original guard, so function-word title signals
-    /// can never outrank content evidence through [`best_provenance`].
+    /// Ranking is title-driven by construction: each candidate's score is
+    /// computed with an explicit per-query bm25 weight of ZERO for the scope
+    /// column (`bm25(ft, 1.0, 1.0, 0.0)`), so scope-token document
+    /// frequencies can never influence title relevance or order, while the
+    /// scope column's fixed three-token shape keeps the ranking document
+    /// length uniform across rows.
+    ///
+    /// Deterministic, collision-free selection: the candidate stream is read
+    /// in bounded rowid-window batches (the rowid constraint is pushed into
+    /// FTS5, so the scan visits each in-scope match exactly once and never
+    /// re-scans, and no SQL sort materializes the matched set) and the
+    /// bounded top-k heap ranks by (bm25 title score, meeting ID ascending).
+    /// The meeting ID itself is the tie-break - a bijective, collision-free
+    /// identity for arbitrary TEXT IDs - so the selection is a deterministic
+    /// function of the database content, independent of insertion history,
+    /// and no meeting ID can fail insertion, upgrade, or backfill.
     async fn title_channel(
         &self,
         pool: &SqlitePool,
@@ -1139,53 +1152,33 @@ impl RetrievalService {
         cancel: &CancellationToken,
         candidates: &mut HashMap<String, RetrievedEvidence>,
     ) -> Result<(), RetrievalError> {
-        if normalized.core_terms.is_empty()
-            || limits.lexical_per_variant == 0
-            || (normalized.purpose != RetrievalPurpose::Search
-                && normalized.core_language == CoreTermLanguage::Unknown)
-        {
+        if normalized.core_terms.is_empty() || limits.lexical_per_variant == 0 {
             return Ok(());
         }
-        let mut top: std::collections::BinaryHeap<std::cmp::Reverse<TitleCandidate>> =
-            std::collections::BinaryHeap::with_capacity(limits.lexical_per_variant + 1);
-        let purpose = normalized.purpose;
-        let mut scanned = 0usize;
-        match &normalized.scope {
-            PersistedRetrievalScope::Folder(folder_id) => {
-                let mut cursor = String::new();
-                loop {
-                    ensure_not_cancelled(cancel)?;
-                    let mut query = QueryBuilder::<Sqlite>::new(
-                        "WITH RECURSIVE folder_scope(id) AS (SELECT id FROM meeting_folders WHERE id = ",
-                    );
-                    query.push_bind(folder_id);
-                    query.push(
-                        " UNION ALL SELECT f.id FROM meeting_folders f JOIN folder_scope s ON f.parent_id = s.id) SELECT m.id, m.title FROM meetings m WHERE m.id > ",
-                    );
-                    query.push_bind(&cursor);
-                    query.push(
-                        " AND m.folder_id IN (SELECT id FROM folder_scope) ORDER BY m.id LIMIT ",
-                    );
-                    query.push_bind(TITLE_SCAN_PAGE as i64);
-                    let rows: Vec<(String, String)> = query
-                        .build_query_as()
-                        .fetch_all(pool)
-                        .await
-                        .map_err(db_error)?;
-                    ensure_not_cancelled(cancel)?;
-                    let next_cursor = rows.last().map(|(id, _)| id.clone());
-                    let complete_page = rows.len() == TITLE_SCAN_PAGE;
-                    scanned += rows.len();
-                    push_title_candidates(&mut top, rows, normalized, limits.lexical_per_variant);
-                    if title_scan_exhausted(purpose, scanned) {
-                        break;
-                    }
-                    match next_cursor {
-                        Some(id) if complete_page => cursor = id,
-                        _ => break,
-                    }
+        ensure_not_cancelled(cancel)?;
+        #[cfg(test)]
+        {
+            let sender = self
+                .title_scope_gate
+                .armed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(sender) = sender {
+                let _ = sender.send(());
+                tokio::select! {
+                    _ = self.title_scope_gate.release.notified() => {},
+                    _ = cancel.cancelled() => return Err(RetrievalError::Cancelled),
                 }
             }
+        }
+        // Folder expansion and every title window must share one SQLite
+        // read snapshot. A title/folder rewrite reinserts its mirror row at
+        // a new rowid; fresh statements on pooled connections would mix the
+        // old row with that replacement, corrupting the top-k cut.
+        let mut snapshot = pool.begin().await.map_err(db_error)?;
+        let scope_keys: Vec<String> = match &normalized.scope {
+            PersistedRetrievalScope::All => Vec::new(),
             PersistedRetrievalScope::Meeting(_) | PersistedRetrievalScope::AllowedMeetingIds(_) => {
                 let ScopeFilter::Meetings(ids) = &normalized.membership else {
                     return Ok(());
@@ -1193,67 +1186,142 @@ impl RetrievalService {
                 if ids.is_empty() {
                     return Ok(());
                 }
-                ensure_not_cancelled(cancel)?;
-                let mut query =
-                    QueryBuilder::<Sqlite>::new("SELECT id, title FROM meetings WHERE id IN (");
-                let mut binds = query.separated(", ");
-                for id in ids.iter() {
-                    binds.push_bind(id);
-                }
-                drop(binds);
-                query.push(")");
-                let rows: Vec<(String, String)> = query
-                    .build_query_as()
-                    .fetch_all(pool)
-                    .await
-                    .map_err(db_error)?;
-                ensure_not_cancelled(cancel)?;
-                push_title_candidates(&mut top, rows, normalized, limits.lexical_per_variant);
+                ids.iter()
+                    .map(|id| title_scope_token(TITLE_SCOPE_ID_PREFIX, id))
+                    .collect()
             }
-            PersistedRetrievalScope::All => {
-                let mut cursor = String::new();
-                loop {
-                    // A cancelled request must not continue to later SQL pages.
-                    ensure_not_cancelled(cancel)?;
-                    let mut query =
-                        QueryBuilder::<Sqlite>::new("SELECT id, title FROM meetings WHERE id > ");
-                    query.push_bind(&cursor);
-                    query.push(" ORDER BY id LIMIT ");
-                    query.push_bind(TITLE_SCAN_PAGE as i64);
-                    let rows: Vec<(String, String)> = query
-                        .build_query_as()
-                        .fetch_all(pool)
-                        .await
-                        .map_err(db_error)?;
-                    ensure_not_cancelled(cancel)?;
-                    let next_cursor = rows.last().map(|(id, _)| id.clone());
-                    let complete_page = rows.len() == TITLE_SCAN_PAGE;
-                    scanned += rows.len();
-                    push_title_candidates(&mut top, rows, normalized, limits.lexical_per_variant);
-                    if title_scan_exhausted(purpose, scanned) {
-                        break;
+            PersistedRetrievalScope::Folder(folder_id) => {
+                // The subtree's DIRECT folder IDs, expanded from the live
+                // meeting_folders table so a re-parented subtree needs no
+                // mirror maintenance; fail closed past the approved key bound.
+                let folder_ids: Vec<String> = sqlx::query_scalar(
+                    "WITH RECURSIVE folder_scope(id) AS \
+                     (SELECT id FROM meeting_folders WHERE id = ? \
+                     UNION ALL SELECT f.id FROM meeting_folders f JOIN folder_scope s ON f.parent_id = s.id) \
+                     SELECT id FROM folder_scope LIMIT ?",
+                )
+                .bind(folder_id)
+                .bind(MAX_TITLE_SCOPE_KEYS as i64 + 1)
+                .fetch_all(&mut *snapshot)
+                .await
+                .map_err(db_error)?;
+                // The folder can disappear after request normalization.
+                // An empty key list otherwise means All to title_match_query,
+                // so it must never represent an empty constrained scope.
+                if folder_ids.is_empty() {
+                    return Ok(());
+                }
+                if folder_ids.len() > MAX_TITLE_SCOPE_KEYS {
+                    return Err(RetrievalError::InvalidScope(format!(
+                        "folder scope exceeds the approved {} key bound",
+                        MAX_TITLE_SCOPE_KEYS
+                    )));
+                }
+                folder_ids
+                    .iter()
+                    .map(|id| title_scope_token(TITLE_SCOPE_FOLDER_PREFIX, id))
+                    .collect()
+            }
+        };
+        let match_queries = title_match_queries(&normalized.core_terms, &scope_keys)?;
+        let cap = limits.lexical_per_variant;
+        let mut heap: std::collections::BinaryHeap<TitleHit> = std::collections::BinaryHeap::new();
+        // Bounded rowid-window batches: the rowid constraint is pushed into
+        // FTS5 (the plan shows the index range marker), so each in-scope match
+        // is visited exactly once across batches; every candidate is scored
+        // with the title-only bm25 weights (zero for the scope column).
+        // Long schema-valid scope IDs can require multiple bounded MATCH
+        // expressions. Each unique meeting/direct-folder token belongs to
+        // exactly one group, so groups are disjoint. Their identical title
+        // terms and zero scope weight produce comparable scores under the
+        // same read snapshot; keep one global heap across every group.
+        for match_query in match_queries {
+            let mut cursor: i64 = 0;
+            loop {
+                ensure_not_cancelled(cancel)?;
+                let rows: Vec<(String, String, f64, i64)> = sqlx::query_as(
+                    "SELECT m.id, m.title, bm25(retrieval_title_fts, 1.0, 1.0, 0.0), \
+                 retrieval_title_fts.rowid \
+                 FROM retrieval_title_fts \
+                 JOIN meetings m ON m.id = retrieval_title_fts.meeting_id \
+                 WHERE retrieval_title_fts MATCH ? AND retrieval_title_fts.rowid > ? \
+                 LIMIT ?",
+                )
+                .bind(&match_query)
+                .bind(cursor)
+                .bind(TITLE_SCAN_BATCH_ROWS as i64)
+                .fetch_all(&mut *snapshot)
+                .await
+                .map_err(db_error)?;
+                if rows.is_empty() {
+                    break;
+                }
+                let mut batch_max = cursor;
+                for (meeting_id, title, score, rowid) in rows {
+                    batch_max = batch_max.max(rowid);
+                    // Belt-and-braces: request-start membership re-checks every
+                    // row for the meeting and allowed-ID scopes; the index scope
+                    // term already constrains the intersection.
+                    if let ScopeFilter::Meetings(ids) = &normalized.membership {
+                        if !ids.contains(meeting_id.as_str()) {
+                            continue;
+                        }
                     }
-                    match next_cursor {
-                        Some(id) if complete_page => cursor = id,
-                        _ => break,
+                    let hit = TitleHit {
+                        score,
+                        meeting_id,
+                        title,
+                    };
+                    if heap.len() < cap {
+                        heap.push(hit);
+                    } else if let Some(worst) = heap.peek() {
+                        if hit < *worst {
+                            heap.pop();
+                            heap.push(hit);
+                        }
+                    }
+                }
+                if batch_max <= cursor {
+                    // Defensive: no forward progress can only mean the window is
+                    // exhausted; the empty-batch break above is the normal exit.
+                    break;
+                }
+                cursor = batch_max;
+                #[cfg(test)]
+                {
+                    let sender = self
+                        .title_scan_gate
+                        .armed
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .take();
+                    if let Some(sender) = sender {
+                        let _ = sender.send(());
+                        tokio::select! {
+                            _ = self.title_scan_gate.release.notified() => {},
+                            _ = cancel.cancelled() => return Err(RetrievalError::Cancelled),
+                        }
                     }
                 }
             }
         }
-        let mut ranked: Vec<(usize, String, String)> = top
-            .into_iter()
-            .map(|entry| (entry.0.overlap, entry.0.meeting_id, entry.0.title))
-            .collect();
-        ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        for (rank, (_, meeting_id, title)) in ranked.into_iter().enumerate() {
+        snapshot.commit().await.map_err(db_error)?;
+        ensure_not_cancelled(cancel)?;
+        let mut ranked: Vec<TitleHit> = heap.into_vec();
+        ranked.sort_by(|left, right| {
+            left.score
+                .total_cmp(&right.score)
+                .then_with(|| left.meeting_id.cmp(&right.meeting_id))
+        });
+        for (index, hit) in ranked.into_iter().enumerate() {
             record_candidate(
                 candidates,
-                title_evidence(meeting_id, title),
+                title_evidence(hit.meeting_id, hit.title),
                 EvidenceProvenance {
                     channel: RetrievalChannel::Title,
                     variant: QueryVariantKind::CoreTerms,
                     mode: None,
-                    rank: rank + 1,
+                    rank: index + 1,
                     query_slot: 0,
                 },
             );
@@ -1640,6 +1708,174 @@ fn title_evidence(meeting_id: String, title: String) -> RetrievedEvidence {
     }
 }
 
+/// Rows per bounded rowid-window batch of the indexed title lookup. Purely a
+/// round-trip/memory lever: the batches jointly visit every in-scope match
+/// exactly once at any size, and the bounded top-k heap holds
+/// `lexical_per_variant` candidates regardless.
+pub(crate) const TITLE_SCAN_BATCH_ROWS: usize = 400;
+
+/// One title candidate in the bounded top-k heap. Ordered by (bm25 title
+/// score ascending, meeting ID ascending) - the meeting ID itself is the
+/// deterministic, collision-free tie-break for arbitrary TEXT IDs, so the
+/// selection never depends on insertion history or a derived hash key.
+#[derive(Debug, Clone, PartialEq)]
+struct TitleHit {
+    score: f64,
+    meeting_id: String,
+    title: String,
+}
+
+impl Eq for TitleHit {}
+
+impl Ord for TitleHit {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Max-heap over (score asc, id asc): the root is the WORST candidate
+        // (highest bm25 value - lower is better - then lexicographically
+        // largest id), so eviction always discards the least relevant row.
+        // bm25 scores are finite; total_cmp keeps the order total even for
+        // equal/near values.
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| self.meeting_id.cmp(&other.meeting_id))
+    }
+}
+
+impl PartialOrd for TitleHit {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Approved bounds for the indexed title scope: at most this many folder
+/// tokens expand for one folder-scoped lookup, and the assembled MATCH
+/// expression never exceeds this byte size. Both fail closed.
+pub(crate) const MAX_TITLE_SCOPE_KEYS: usize = 512;
+pub(crate) const MAX_TITLE_MATCH_QUERY_BYTES: usize = 65_536;
+/// Public Tauri/MCP scope identities allow 512 UTF-8 bytes; their encoded
+/// token adds one namespace byte to the two hex bytes per identity byte.
+const MAX_TITLE_SCOPE_KEY_BYTES: usize = 1 + 2 * 512;
+
+const TITLE_SCOPE_ID_PREFIX: char = 'm';
+const TITLE_SCOPE_FOLDER_PREFIX: char = 'f';
+
+/// The mirror's scope token for one stable string ID: the column-filtered
+/// `{scope}` term is the lowercase hex of the ID's UTF-8 bytes under a
+/// one-character namespace prefix, a bijection that cannot collide between
+/// IDs and cannot inject FTS5 query syntax. Must match the trigger-written
+/// scope column (`'m' || lower(hex(id)) ...`).
+pub(super) fn title_scope_token(prefix: char, id: &str) -> String {
+    let mut token = String::with_capacity(1 + 2 * id.len());
+    token.push(prefix);
+    for byte in id.as_bytes() {
+        token.push_str(&format!("{byte:02x}"));
+    }
+    token
+}
+
+/// Builds the indexed MATCH expression: every DISTINCT core term as a
+/// column-filtered `{title}` term (the normalized all-core-term gate), and
+/// for a constrained scope an ANDed group of column-filtered `{scope}`
+/// tokens so the FTS intersection itself is bounded by the requested scope.
+/// Core terms are split on non-alphanumeric characters before
+/// normalization and cannot carry FTS5 query syntax; the validation fails
+/// closed on anything that could, and the whole expression is size-bounded
+/// (see [`MAX_TITLE_MATCH_QUERY_BYTES`]).
+pub(super) fn title_match_query(
+    core_terms: &[String],
+    scope_keys: &[String],
+) -> Result<String, RetrievalError> {
+    for term in core_terms {
+        if term.is_empty() || !term.chars().all(char::is_alphanumeric) {
+            return Err(RetrievalError::InvalidQuery(
+                "core terms cannot carry FTS5 query syntax",
+            ));
+        }
+    }
+    for key in scope_keys {
+        let valid_prefix =
+            key.starts_with(TITLE_SCOPE_ID_PREFIX) || key.starts_with(TITLE_SCOPE_FOLDER_PREFIX);
+        if !valid_prefix
+            || key.len() < 3
+            || key.len() > MAX_TITLE_SCOPE_KEY_BYTES
+            || !key[1..]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte.is_ascii_hexdigit())
+        {
+            return Err(RetrievalError::InvalidScope(
+                "title scope key is not a valid encoded identity".to_string(),
+            ));
+        }
+    }
+    let distinct_terms: BTreeSet<&str> = core_terms.iter().map(String::as_str).collect();
+    let title_chain = distinct_terms
+        .into_iter()
+        .map(|term| format!("{{title}} : {term}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let query = if scope_keys.is_empty() {
+        title_chain
+    } else {
+        let scope_group = scope_keys
+            .iter()
+            .map(|key| format!("{{scope}} : {key}"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        format!("({title_chain}) AND ({scope_group})")
+    };
+    if query.len() > MAX_TITLE_MATCH_QUERY_BYTES {
+        return Err(RetrievalError::InvalidScope(format!(
+            "title match query exceeds the approved {} byte bound",
+            MAX_TITLE_MATCH_QUERY_BYTES
+        )));
+    }
+    Ok(query)
+}
+
+/// Split a constrained scope into disjoint, individually size-bounded MATCH
+/// expressions. Preserve the public 100-ID/512-folder scope contracts even
+/// when every identity reaches the supported 512-byte length. Empty keys
+/// represent All only; constrained callers must handle an empty scope first.
+pub(super) fn title_match_queries(
+    core_terms: &[String],
+    scope_keys: &[String],
+) -> Result<Vec<String>, RetrievalError> {
+    let title_chain = title_match_query(core_terms, &[])?;
+    if scope_keys.is_empty() {
+        return Ok(vec![title_chain]);
+    }
+    // FTS normalizes ASCII case. Canonicalize before deduplication so even
+    // equivalent upper/lowercase hex keys cannot create overlapping groups.
+    let unique_keys: BTreeSet<String> = scope_keys
+        .iter()
+        .map(|key| key.to_ascii_lowercase())
+        .collect();
+    let mut queries = Vec::new();
+    let mut group = Vec::new();
+    // Exact bytes of `(<title>) AND (<scope>)`, excluding scope terms.
+    let fixed_bytes = title_chain.len() + 9;
+    let mut group_bytes = fixed_bytes;
+    for key in unique_keys {
+        let term_bytes = "{scope} : ".len() + key.len();
+        let separator_bytes = if group.is_empty() { 0 } else { " OR ".len() };
+        if !group.is_empty()
+            && group_bytes + separator_bytes + term_bytes > MAX_TITLE_MATCH_QUERY_BYTES
+        {
+            queries.push(title_match_query(core_terms, &group)?);
+            group.clear();
+            group_bytes = fixed_bytes;
+        }
+        if !group.is_empty() {
+            group_bytes += " OR ".len();
+        }
+        group_bytes += term_bytes;
+        group.push(key);
+    }
+    if !group.is_empty() {
+        queries.push(title_match_query(core_terms, &group)?);
+    }
+    Ok(queries)
+}
+
 fn semantic_evidence(hit: &VectorHit, meeting_title: String, content: String) -> RetrievedEvidence {
     RetrievedEvidence {
         evidence_id: hit.document_id.clone(),
@@ -1775,98 +2011,6 @@ pub(crate) fn core_terms(query: &str, language: CoreTermLanguage) -> Vec<String>
         normalized
     } else {
         core
-    }
-}
-
-/// Scores one page/batch of `(id, title)` rows against the bounded top-k
-/// heap. Shared by the full-corpus streamed scan and the bounded-scope
-/// direct read so both apply identical scope, overlap, and eviction rules.
-fn push_title_candidates(
-    top: &mut std::collections::BinaryHeap<std::cmp::Reverse<TitleCandidate>>,
-    rows: Vec<(String, String)>,
-    normalized: &NormalizedRequest,
-    cap: usize,
-) {
-    for (meeting_id, title) in rows {
-        if !normalized.membership.allows(&meeting_id) {
-            continue;
-        }
-        let overlap = title_term_overlap(&normalized.core_terms, &title);
-        if overlap == 0 || overlap < normalized.title_min_overlap {
-            continue;
-        }
-        let candidate = TitleCandidate {
-            overlap,
-            meeting_id,
-            title,
-        };
-        if top.len() < cap {
-            top.push(std::cmp::Reverse(candidate));
-        } else if let Some(worst) = top.peek().map(|entry| &entry.0) {
-            if candidate.cmp(worst) == std::cmp::Ordering::Greater {
-                top.pop();
-                top.push(std::cmp::Reverse(candidate));
-            }
-        }
-    }
-}
-
-/// Whether an in-progress title scan has spent its row budget. Only the
-/// interactive purpose is capped: Chat and Context run the scan at most once
-/// per turn, while Search runs it on every debounced keystroke. See
-/// [`MAX_SEARCH_TITLE_SCAN_MEETINGS`].
-pub(super) fn title_scan_exhausted(purpose: RetrievalPurpose, scanned: usize) -> bool {
-    purpose == RetrievalPurpose::Search && scanned >= MAX_SEARCH_TITLE_SCAN_MEETINGS
-}
-
-fn title_term_overlap(terms: &[String], title: &str) -> usize {
-    let title_terms: HashSet<String> = title
-        .split(|character: char| !character.is_alphanumeric())
-        .map(normalize_core_token)
-        .collect();
-    let terms: HashSet<&String> = terms.iter().collect();
-    terms
-        .iter()
-        .filter(|term| title_terms.contains(**term))
-        .count()
-}
-
-/// One in-flight title candidate. Ascending quality (min-heap under
-/// `Reverse`): lower overlap first, and among equal overlaps the
-/// lexicographically LARGER meeting id is worse, so bounded eviction keeps
-/// the smaller id and the final order is overlap desc, meeting id asc.
-///
-/// `Eq`/`Ord` are both keyed on `(overlap, meeting_id)` only, matching each
-/// other exactly (`meetings.id` is a primary key, so `title` never varies
-/// for a fixed `meeting_id` and dropping it from equality changes nothing
-/// observable today - but it keeps the `BinaryHeap` invariant that equal
-/// `Ord` implies equal `Eq` true by construction rather than by coincidence).
-#[derive(Debug, Clone)]
-struct TitleCandidate {
-    overlap: usize,
-    meeting_id: String,
-    title: String,
-}
-
-impl PartialEq for TitleCandidate {
-    fn eq(&self, other: &Self) -> bool {
-        self.overlap == other.overlap && self.meeting_id == other.meeting_id
-    }
-}
-
-impl Eq for TitleCandidate {}
-
-impl Ord for TitleCandidate {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.overlap
-            .cmp(&other.overlap)
-            .then_with(|| other.meeting_id.cmp(&self.meeting_id))
-    }
-}
-
-impl PartialOrd for TitleCandidate {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
     }
 }
 

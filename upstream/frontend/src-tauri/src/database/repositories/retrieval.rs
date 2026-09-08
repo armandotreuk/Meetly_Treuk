@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use sqlx::{Error as SqlxError, QueryBuilder, Sqlite, SqlitePool, Transaction};
+use sqlx::{Error as SqlxError, QueryBuilder, Sqlite, SqliteConnection, SqlitePool, Transaction};
 use tokio_util::sync::CancellationToken;
 
 pub const GENERATION_STATES: [&str; 4] = ["building", "ready", "failed", "retired"];
@@ -278,6 +278,41 @@ pub struct ReplacementJob<'a> {
 pub enum ReplacementOutcome {
     Published { change_id: i64 },
     RevisionConflict { current_revision: Option<i64> },
+}
+
+/// Outcome of the atomic terminal work-failure record
+/// ([`RetrievalRepository::record_terminal_work_failure_and_maybe_terminalize`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalWorkFailureOutcome {
+    /// The terminal failure was recorded at the exact expected source
+    /// revision. `generation_terminalized` reports whether the generation was
+    /// also terminalized in the same transaction (non-active, building, and
+    /// otherwise idle).
+    Recorded { generation_terminalized: bool },
+    /// The source was gone (the meeting was deleted mid-flight and the
+    /// cascade removed the work row): there was nothing to record, and the
+    /// generation was terminalized only if it was otherwise idle, so a fully
+    /// consumed shadow never silently stalls in `building`.
+    SourceGone { generation_terminalized: bool },
+    /// The source revision moved past the failed work before the transaction
+    /// acquired the writer lock: the stale failure was rejected, the work was
+    /// requeued for the newer revision, and nothing was terminalized over the
+    /// newer revision.
+    StaleWorkRequeued,
+}
+
+/// The single publication-bound validator every publication consumer shares
+/// (status lag refresh, the activation preflight, and the final transactional
+/// activation gate): a non-negative canonical bound at or above the published
+/// bound yields the publication lag; negative bounds, a published bound ahead
+/// of canonical, and an overflowing or otherwise unrepresentable delta are
+/// malformed and yield `None` (report unknown / block activation, never clamp
+/// to zero/ready).
+pub(crate) fn validated_publication_delta(canonical: i64, published: i64) -> Option<i64> {
+    if canonical < 0 || published < 0 {
+        return None;
+    }
+    canonical.checked_sub(published).filter(|delta| *delta >= 0)
 }
 
 #[cfg(any(debug_assertions, test))]
@@ -573,7 +608,13 @@ impl RetrievalRepository {
     }
 
     /// Revalidates completeness and the caught-up publication bound while
-    /// atomically making a generation ready and active.
+    /// atomically making a generation ready and active. Both publication
+    /// bounds are re-read and validated INSIDE this `BEGIN IMMEDIATE`
+    /// transaction — negative bounds, a published bound ahead of canonical,
+    /// an unrepresentable delta, or a missing index-state row block the
+    /// activation (no ready/active transition, the prior generation keeps
+    /// serving) — closing the TOCTOU window between the preflight checks and
+    /// this final gate.
     pub(crate) async fn activate_generation_if_ready(
         pool: &SqlitePool,
         generation_id: &str,
@@ -604,16 +645,21 @@ impl RetrievalRepository {
         .bind(generation_id)
         .fetch_one(&mut *tx)
         .await?;
-        let canonical: Option<(i64,)> = sqlx::query_as(
-            "SELECT canonical_change_id FROM retrieval_index_state WHERE generation_id = ?",
+        let bounds: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT canonical_change_id, published_change_id FROM retrieval_index_state WHERE generation_id = ?",
         )
         .bind(generation_id)
         .fetch_optional(&mut *tx)
         .await?;
+        let caught_up = bounds.as_ref().is_some_and(|(canonical, published)| {
+            validated_publication_delta(*canonical, *published).is_some()
+                && *canonical <= caught_up_to
+        });
         if coverage.0 == 0
             || coverage.0 != coverage.1
             || coverage.2 > 0
-            || canonical.is_none_or(|(canonical,)| canonical > caught_up_to)
+            || bounds.is_none()
+            || !caught_up
         {
             tx.rollback().await?;
             return Ok(ActivationOutcome::NotCommitted);
@@ -2190,7 +2236,9 @@ impl RetrievalRepository {
     /// True while `generation_id` still has meetings that can make progress
     /// (pending or backing-off retry rows below their current source
     /// revision). One terminal per-meeting failure must never end a
-    /// generation that still has other work queued.
+    /// generation that still has other work queued; [`Self::
+    /// mark_shadow_generation_failed`] re-checks this predicate inside its own
+    /// write transaction before terminalizing.
     pub async fn generation_has_outstanding_work(
         pool: &SqlitePool,
         generation_id: &str,
@@ -2254,11 +2302,15 @@ impl RetrievalRepository {
         Ok(deleted > 0)
     }
 
-    pub async fn mark_shadow_generation_failed(
-        pool: &SqlitePool,
+    /// Terminalize step shared by every terminalization path, run inside the
+    /// caller's open `BEGIN IMMEDIATE` transaction: marks a non-active
+    /// `building` generation failed ONLY when no outstanding work exists at
+    /// its current source revisions. Returns whether the state moved to
+    /// `failed`.
+    async fn terminalize_idle_generation_tx(
+        tx: &mut SqliteConnection,
         generation_id: &str,
     ) -> Result<bool, SqlxError> {
-        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         let active: Option<(String,)> =
             sqlx::query_as("SELECT generation_id FROM retrieval_active_model WHERE singleton = 1")
                 .fetch_optional(&mut *tx)
@@ -2267,7 +2319,21 @@ impl RetrievalRepository {
             .as_ref()
             .is_some_and(|(active,)| active == generation_id)
         {
-            tx.rollback().await?;
+            return Ok(false);
+        }
+        let outstanding: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1
+             FROM retrieval_meeting_state ms
+             JOIN search_source_state s ON s.meeting_id = ms.meeting_id
+             WHERE ms.generation_id = ?
+               AND ms.state IN ('pending', 'retry')
+               AND ms.indexed_source_revision < s.source_revision
+             LIMIT 1",
+        )
+        .bind(generation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if outstanding.is_some() {
             return Ok(false);
         }
         let result = sqlx::query(
@@ -2279,8 +2345,99 @@ impl RetrievalRepository {
         .bind(generation_id)
         .execute(&mut *tx)
         .await?;
-        tx.commit().await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Terminalizes a non-active `building` generation ONLY when no
+    /// outstanding work exists at its current source revisions. The
+    /// outstanding-work check shares the one `BEGIN IMMEDIATE` transaction
+    /// with the failed write, so user work created before the write commits is
+    /// never stranded behind a split check-then-write.
+    pub async fn mark_shadow_generation_failed(
+        pool: &SqlitePool,
+        generation_id: &str,
+    ) -> Result<bool, SqlxError> {
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let terminalized = Self::terminalize_idle_generation_tx(&mut tx, generation_id).await?;
+        tx.commit().await?;
+        Ok(terminalized)
+    }
+
+    /// Records a TERMINAL work failure fully atomically with source-revision
+    /// fencing and conditional generation terminalization, in one
+    /// `BEGIN IMMEDIATE` transaction: (1) the current source revision is read
+    /// under the writer lock; (2) only when it still equals
+    /// `expected_source_revision` - the exact revision the failed work
+    /// targeted - is the terminal failure recorded for that meeting; (3) the
+    /// outstanding-work predicate is inspected in the same transaction; and
+    /// (4) a non-active `building` generation with nothing outstanding is
+    /// terminalized. If the source moved on before the writer lock was
+    /// acquired, the stale failure is rejected and the work requeued for the
+    /// newer revision; the newer revision is never terminalized over. A
+    /// meeting deleted mid-flight records nothing (its work row is
+    /// cascade-removed) and leaves only the idle terminalization decision.
+    /// `generation_has_outstanding_work` documents the shared predicate.
+    pub async fn record_terminal_work_failure_and_maybe_terminalize(
+        pool: &SqlitePool,
+        generation_id: &str,
+        meeting_id: &str,
+        expected_source_revision: i64,
+        safe_error: &str,
+        next_attempt_at: &str,
+    ) -> Result<TerminalWorkFailureOutcome, SqlxError> {
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let current: Option<(i64,)> =
+            sqlx::query_as("SELECT source_revision FROM search_source_state WHERE meeting_id = ?")
+                .bind(meeting_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let outcome = match current {
+            Some((current,)) if current == expected_source_revision => {
+                sqlx::query(
+                    "UPDATE retrieval_meeting_state
+                     SET state = 'failed', attempt_count = attempt_count + 1,
+                         next_attempt_at = ?, last_error = ?, updated_at = ?
+                     WHERE generation_id = ? AND meeting_id = ?",
+                )
+                .bind(next_attempt_at)
+                .bind(truncate_safe_error(safe_error))
+                .bind(Utc::now().to_rfc3339())
+                .bind(generation_id)
+                .bind(meeting_id)
+                .execute(&mut *tx)
+                .await?;
+                let generation_terminalized =
+                    Self::terminalize_idle_generation_tx(&mut tx, generation_id).await?;
+                TerminalWorkFailureOutcome::Recorded {
+                    generation_terminalized,
+                }
+            }
+            Some(_) => {
+                // The failed work is stale: requeue the meeting for the newer
+                // revision instead of pinning a terminal failure over it.
+                sqlx::query(
+                    "UPDATE retrieval_meeting_state
+                     SET state = 'pending', attempt_count = 0, next_attempt_at = NULL,
+                         last_error = NULL, updated_at = ?
+                     WHERE generation_id = ? AND meeting_id = ?",
+                )
+                .bind(Utc::now().to_rfc3339())
+                .bind(generation_id)
+                .bind(meeting_id)
+                .execute(&mut *tx)
+                .await?;
+                TerminalWorkFailureOutcome::StaleWorkRequeued
+            }
+            None => {
+                let generation_terminalized =
+                    Self::terminalize_idle_generation_tx(&mut tx, generation_id).await?;
+                TerminalWorkFailureOutcome::SourceGone {
+                    generation_terminalized,
+                }
+            }
+        };
+        tx.commit().await?;
+        Ok(outcome)
     }
 
     pub async fn retry_failed_generation(

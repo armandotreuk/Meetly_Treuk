@@ -3791,6 +3791,27 @@ mod tests {
             CREATE TABLE meeting_notes (meeting_id TEXT PRIMARY KEY, notes_markdown TEXT);
             CREATE TABLE summary_processes (meeting_id TEXT NOT NULL, template_id TEXT NOT NULL, updated_at TEXT NOT NULL, result TEXT, PRIMARY KEY (meeting_id, template_id));
             CREATE TABLE search_source_state (meeting_id TEXT PRIMARY KEY, source_revision INTEGER);
+            CREATE VIRTUAL TABLE retrieval_title_fts USING fts5(meeting_id UNINDEXED, title, scope, tokenize = 'unicode61');
+            CREATE TRIGGER retrieval_title_fts_ai AFTER INSERT ON meetings BEGIN
+                INSERT INTO retrieval_title_fts (meeting_id, title, scope)
+                VALUES (NEW.id, NEW.title,
+                        'm' || lower(hex(NEW.id)) || CASE WHEN NEW.folder_id IS NULL THEN ' pad pad' ELSE ' f' || lower(hex(NEW.folder_id)) || ' pad' END);
+            END;
+            CREATE TRIGGER retrieval_title_fts_ad AFTER DELETE ON meetings BEGIN
+                DELETE FROM retrieval_title_fts WHERE meeting_id = OLD.id;
+            END;
+            CREATE TRIGGER retrieval_title_fts_au AFTER UPDATE OF title ON meetings WHEN OLD.title IS NOT NEW.title BEGIN
+                DELETE FROM retrieval_title_fts WHERE meeting_id = NEW.id;
+                INSERT INTO retrieval_title_fts (meeting_id, title, scope)
+                VALUES (NEW.id, NEW.title,
+                        'm' || lower(hex(NEW.id)) || CASE WHEN NEW.folder_id IS NULL THEN ' pad pad' ELSE ' f' || lower(hex(NEW.folder_id)) || ' pad' END);
+            END;
+            CREATE TRIGGER retrieval_title_fts_af AFTER UPDATE OF folder_id ON meetings WHEN OLD.folder_id IS NOT NEW.folder_id BEGIN
+                DELETE FROM retrieval_title_fts WHERE meeting_id = NEW.id;
+                INSERT INTO retrieval_title_fts (meeting_id, title, scope)
+                VALUES (NEW.id, NEW.title,
+                        'm' || lower(hex(NEW.id)) || CASE WHEN NEW.folder_id IS NULL THEN ' pad pad' ELSE ' f' || lower(hex(NEW.folder_id)) || ' pad' END);
+            END;
             CREATE VIRTUAL TABLE meeting_fts USING fts5(
                 meeting_id UNINDEXED, chunk_type UNINDEXED, chunk_id UNINDEXED,
                 text, speaker UNINDEXED, timestamp_label UNINDEXED,
@@ -4500,6 +4521,138 @@ mod tests {
                 HYBRID_AFTER.to_string(),
             ],
         );
+    }
+
+    /// The Chat production route runs the indexed title lookup beyond the
+    /// retired 10,000-row cap, and the test is falsifiable: the target's
+    /// summary, notes, and transcript contain NONE of the query's core terms,
+    /// so only the title channel can find the meeting - disabling title
+    /// lookup fails the assertion. Per the frozen Task 3.3 boundary the
+    /// title-selected meeting's authoritative content is cited and the title
+    /// itself is never a source; folder scope fences the out-of-folder
+    /// title-only match.
+    #[tokio::test]
+    async fn saved_meeting_hybrid_chat_title_lookup_runs_beyond_the_scan_cap_and_fences_scope() {
+        let pool = hybrid_test_pool().await;
+        configure_hybrid_chat(&pool).await;
+        sqlx::query(
+            "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < ?)
+             INSERT INTO meetings (id, title, created_at, updated_at, saved_at)
+             SELECT 'filler-' || printf('%05d', n), 'Filler titulo', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z' FROM seq",
+        )
+        .bind(10_000i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO meeting_folders (id, name, parent_id, created_at)
+             VALUES ('fold', 'Folder', NULL, '2026-09-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO meetings (id, title, folder_id, created_at, updated_at, saved_at)
+             VALUES ('zz-target', 'Chaves de Acesso Rotation', 'fold', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Authoritative content that shares NO token with the query: only the
+        // title channel can select this meeting.
+        sqlx::query(
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp)
+             VALUES ('t-target', 'zz-target', 'fully unrelated budget decision', '10:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO meeting_fts (meeting_id, chunk_type, chunk_id, text)
+             VALUES ('zz-target', 'transcript', 't-target', 'fully unrelated budget decision')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO summary_processes (meeting_id, template_id, status, created_at, updated_at, result)
+             VALUES ('zz-target', 'summary', 'completed', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z', '{\"markdown\":\"Unrelated rollout summary\"}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // A title-only match without content or folder: a selection signal on
+        // Chat, never a citation.
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at, saved_at)
+             VALUES ('aa-outside', 'Chaves de Acesso Rotation', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let lifecycle = semantic_unavailable_lifecycle();
+        let inputs = prepare_chat_inputs_for_scope(
+            &pool,
+            None,
+            &reqwest::Client::new(),
+            "chaves de acesso",
+            None,
+            ChatRetrievalScope::All,
+            None,
+            Some(lifecycle.clone()),
+            None,
+            Some(ChatRetrievalMode::Fast),
+            None,
+        )
+        .await
+        .unwrap();
+        // Falsifiable: the target's content carries none of the query's core
+        // terms, so its presence proves the title channel selected it.
+        assert!(inputs
+            .sources
+            .iter()
+            .any(|source| source.meeting_id == "zz-target"));
+        assert!(
+            inputs.user_prompt.contains("Unrelated rollout summary")
+                || inputs
+                    .user_prompt
+                    .contains("fully unrelated budget decision")
+        );
+        // Task 3.3 boundary: the title is a selection signal, never a citation.
+        assert!(inputs
+            .sources
+            .iter()
+            .all(|source| source.source_kind.as_deref() != Some("title")));
+        // A content-free title-only match produces no Chat citation.
+        assert!(inputs
+            .sources
+            .iter()
+            .all(|source| source.meeting_id != "aa-outside"));
+
+        // Folder scope fences the out-of-folder title match.
+        let folder_inputs = prepare_chat_inputs_for_scope(
+            &pool,
+            None,
+            &reqwest::Client::new(),
+            "chaves de acesso",
+            None,
+            ChatRetrievalScope::Folder("fold".to_string()),
+            None,
+            Some(lifecycle),
+            None,
+            Some(ChatRetrievalMode::Fast),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(folder_inputs
+            .sources
+            .iter()
+            .any(|source| source.meeting_id == "zz-target"));
+        assert!(folder_inputs
+            .sources
+            .iter()
+            .all(|source| source.meeting_id != "aa-outside"));
     }
 
     #[tokio::test]

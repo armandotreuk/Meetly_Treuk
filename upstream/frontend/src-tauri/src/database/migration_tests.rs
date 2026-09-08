@@ -122,6 +122,146 @@ async fn force_lexical_setting_defaults_persists_and_survives_upgrade() {
         .unwrap());
 }
 
+/// The title mirror's upgrade and restart contract (HR-5.R7): meetings that
+/// existed BEFORE the migration are backfilled exactly once, the mirror
+/// survives a reopen unchanged, and title/folder/delete maintenance keeps it
+/// in sync afterwards.
+#[tokio::test]
+async fn title_mirror_backfills_legacy_meetings_exactly_once_across_reopen() {
+    let path = std::env::temp_dir().join(format!(
+        "meetly-title-upgrade-{}-{}.sqlite",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let options = || {
+        SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .foreign_keys(true)
+    };
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options())
+        .await
+        .unwrap();
+
+    // Apply every migration EXCEPT the title mirror migration, then create
+    // the legacy meetings the upgrade must backfill.
+    let migrator = sqlx::migrate!("./migrations");
+    let title_version = 20260908000000i64;
+    for migration in migrator
+        .migrations
+        .iter()
+        .filter(|migration| migration.version < title_version)
+    {
+        sqlx::raw_sql(&migration.sql).execute(&pool).await.unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO meeting_folders (id, name, parent_id, created_at)
+         VALUES ('fold', 'Folder', NULL, '2026-09-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for (id, title, folder) in [
+        ("legacy-a", "Comunicação Reunião", Some("fold")),
+        ("legacy-b", "Rootless meeting", None),
+    ] {
+        sqlx::query("INSERT INTO meetings (id, title, folder_id, created_at, updated_at) VALUES (?, ?, ?, '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z')")
+            .bind(id)
+            .bind(title)
+            .bind(folder)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    // Upgrade: the title migration's backfill seeds exactly one row per
+    // legacy meeting, with the identity and folder scope tokens.
+    let title_migration = migrator
+        .migrations
+        .iter()
+        .find(|migration| migration.version == title_version)
+        .unwrap();
+    sqlx::raw_sql(&title_migration.sql)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT meeting_id, scope FROM retrieval_title_fts ORDER BY meeting_id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "legacy-a".to_string(),
+                format!("m{} f{} pad", hex_lower("legacy-a"), hex_lower("fold")),
+            ),
+            (
+                "legacy-b".to_string(),
+                format!("m{} pad pad", hex_lower("legacy-b")),
+            ),
+        ]
+    );
+    pool.close().await;
+
+    // Reopen (restart): the mirror is durable and unchanged, and no
+    // maintenance double-applies.
+    let reopened = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options())
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM retrieval_title_fts")
+            .fetch_one(&reopened)
+            .await
+            .unwrap(),
+        2
+    );
+
+    // Maintenance after the upgrade: a title update, a folder move, and a
+    // deletion all follow the meeting rows.
+    sqlx::query("UPDATE meetings SET title = 'Renomeada Reunião' WHERE id = 'legacy-a'")
+        .execute(&reopened)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE meetings SET folder_id = NULL WHERE id = 'legacy-a'")
+        .execute(&reopened)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM meetings WHERE id = 'legacy-b'")
+        .execute(&reopened)
+        .await
+        .unwrap();
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT meeting_id, scope FROM retrieval_title_fts ORDER BY meeting_id")
+            .fetch_all(&reopened)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows,
+        vec![(
+            "legacy-a".to_string(),
+            format!("m{} pad pad", hex_lower("legacy-a")),
+        )]
+    );
+
+    reopened.close().await;
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+}
+
+fn hex_lower(value: &str) -> String {
+    value.bytes().map(|byte| format!("{byte:02x}")).collect()
+}
+
 #[tokio::test]
 async fn force_lexical_setting_missing_column_is_not_hidden() {
     let pool = connect().await;

@@ -37,8 +37,8 @@ use sqlx::SqlitePool;
 use tokio_util::sync::CancellationToken;
 
 use crate::database::repositories::retrieval::{
-    ActivationOutcome, CanonicalSnapshotRead, DerivedDiskUsage, GenerationStatus,
-    RetrievalRepository, SnapshotDocument,
+    validated_publication_delta, ActivationOutcome, CanonicalSnapshotRead, DerivedDiskUsage,
+    GenerationStatus, RetrievalRepository, SnapshotDocument,
 };
 use crate::model_bundle::{approved_retrieval_model_metadata, ApprovedRetrievalModelMetadata};
 use crate::retrieval::worker::{
@@ -968,6 +968,24 @@ impl QueryIndexService {
         }
     }
 
+    /// Test-only observation of the serving suppression a confirmed terminal
+    /// failure applies to the active snapshot.
+    #[cfg(test)]
+    pub(crate) fn terminal_failure_suppressed(
+        &self,
+        generation_id: &str,
+        meeting_id: &str,
+    ) -> bool {
+        self.lock_state()
+            .active
+            .as_ref()
+            .filter(|snapshot| snapshot.generation_id() == generation_id)
+            .is_some_and(|snapshot| {
+                snapshot.overlay.deleted.contains(meeting_id)
+                    && !snapshot.overlay.upserted.contains_key(meeting_id)
+            })
+    }
+
     pub(crate) fn set_loaded_model(&self, model_id: &str) {
         let mut state = self.lock_state();
         let inserted = state.loaded_model_ids.insert(model_id.to_string());
@@ -1500,11 +1518,16 @@ async fn publish_catch_up_snapshot(
         service.clear_published_stale(generation_id, bound);
     }
     // Surface the true lag immediately so queries pause while the journal
-    // beyond the installed bound replays.
-    if let Ok(Some((canonical, published))) =
-        RetrievalRepository::publication_lag(pool, generation_id).await
-    {
-        service.set_lag_for_generation(Some(generation_id), canonical - published);
+    // beyond the installed bound replays; malformed stored bounds report
+    // unknown instead of a clamped caught-up zero.
+    match RetrievalRepository::publication_lag(pool, generation_id).await {
+        Ok(Some((canonical, published))) => {
+            match validated_publication_delta(canonical, published) {
+                Some(delta) => service.set_lag_for_generation(Some(generation_id), delta),
+                None => service.mark_lag_unknown(),
+            }
+        }
+        _ => {}
     }
     log::info!("Published semantic snapshot for generation {generation_id}");
     Ok(())
@@ -2017,10 +2040,23 @@ async fn try_activate_shadow_generation(
             .ok_or_else(|| format!("generation '{generation_id}' vanished during activation"))?;
         let mut remaining = coverage_blockers(&status);
         match RetrievalRepository::publication_lag(pool, &generation_id).await {
-            Ok(Some((canonical_now, _))) if canonical_now > caught_up_to => {
-                remaining.push("publication journal not fully caught up".to_string());
+            Ok(Some((canonical_now, published_now))) => {
+                match validated_publication_delta(canonical_now, published_now) {
+                    Some(_) if canonical_now > caught_up_to => {
+                        remaining.push("publication journal not fully caught up".to_string());
+                    }
+                    // Malformed stored bounds (negative, published ahead of
+                    // canonical, unrepresentable delta) block the activation
+                    // and report degraded instead of admitting it as caught
+                    // up or ready.
+                    Some(_) => {}
+                    None => remaining.push("publication bounds invalid".to_string()),
+                }
             }
-            Ok(_) => {}
+            // A missing bounds row for a generation about to activate is
+            // unverifiable: block the activation instead of admitting it as
+            // caught up through the `Ok(_)` catch-all.
+            Ok(None) => remaining.push("publication bounds missing".to_string()),
             Err(error) => return Err(format!("reading publication lag failed: {error}")),
         }
         if !remaining.is_empty() {
@@ -2156,11 +2192,15 @@ async fn update_publication_lag(pool: &SqlitePool, service: &QueryIndexService) 
             return;
         }
     };
+    // Malformed lag is unverifiable lag; the shared bound validation decides.
     let lag = match RetrievalRepository::publication_lag(pool, &generation_id).await {
-        Ok(Some((canonical, published))) => (canonical - published).max(0),
-        _ => 0,
+        Ok(Some((canonical, published))) => validated_publication_delta(canonical, published),
+        _ => None,
     };
-    service.set_lag_for_generation(Some(&generation_id), lag);
+    match lag {
+        Some(delta) => service.set_lag_for_generation(Some(&generation_id), delta),
+        None => service.mark_lag_unknown(),
+    }
 }
 
 /// Terminal generations stop being served, but unacknowledged journal changes
@@ -4335,6 +4375,178 @@ mod tests {
             .is_none());
     }
 
+    /// The FINAL transactional activation gate re-reads and revalidates both
+    /// publication bounds inside its own BEGIN IMMEDIATE, so bounds corrupted
+    /// after the preflight (the TOCTOU window between the preliminary check
+    /// and the durable transition) are caught: no ready flip, no active
+    /// pointer move, the prior generation keeps serving. Deterministic:
+    /// each corruption is written directly before the gate is invoked.
+    #[tokio::test]
+    async fn activation_final_gate_blocks_malformed_or_advanced_bounds_after_preflight() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "m", "Malformed bounds").await;
+        register_test_model(&pool).await;
+        RetrievalRepository::ensure_generation(&pool, "gen-old", MODEL_ID)
+            .await
+            .unwrap();
+        publish_meeting(&pool, "gen-old", "m", &["old content"]).await;
+        let service = fresh_service();
+        publish_tick(&pool, &service).await.unwrap();
+        assert_eq!(service.active_generation().as_deref(), Some("gen-old"));
+
+        let shadow = request_rebuild(&pool).await.unwrap();
+        publish_meeting(&pool, &shadow, "m", &["new content"]).await;
+        let healthy: (i64, i64) = RetrievalRepository::publication_lag(&pool, &shadow)
+            .await
+            .unwrap()
+            .unwrap();
+        let cancel = CancellationToken::new();
+
+        for corruption in [
+            // A valid ordered pair must still be refused when a writer
+            // advanced canonical state beyond the loaded snapshot. The old
+            // lag-vs-watermark comparison admitted this case (lag = 1).
+            format!(
+                "UPDATE retrieval_index_state SET canonical_change_id = {}, published_change_id = {} WHERE generation_id = '{}'",
+                healthy.0 + 1,
+                healthy.0,
+                shadow
+            ),
+            format!(
+                "UPDATE retrieval_index_state SET canonical_change_id = {}, published_change_id = {} WHERE generation_id = '{}'",
+                healthy.0,
+                healthy.0 + 1,
+                shadow
+            ),
+            format!(
+                "UPDATE retrieval_index_state SET canonical_change_id = -5, published_change_id = -10 WHERE generation_id = '{}'",
+                shadow
+            ),
+        ] {
+            sqlx::query(&corruption).execute(&pool).await.unwrap();
+            let outcome = RetrievalRepository::activate_generation_if_ready(
+                &pool,
+                &shadow,
+                healthy.0,
+                &cancel,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                outcome,
+                ActivationOutcome::NotCommitted,
+                "the final gate must refuse malformed bounds or an unloaded canonical advance"
+            );
+            assert_eq!(
+                RetrievalRepository::generation_status(&pool, &shadow)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "building",
+                "the shadow must never be durably marked ready off malformed bounds"
+            );
+            assert_eq!(
+                RetrievalRepository::active_generation_id(&pool).await.unwrap().as_deref(),
+                Some("gen-old"),
+                "the prior active generation keeps serving"
+            );
+        }
+
+        // Repairing the stored bounds lets the same final gate commit.
+        sqlx::query(&format!(
+            "UPDATE retrieval_index_state SET canonical_change_id = {}, published_change_id = {} WHERE generation_id = '{}'",
+            healthy.0, healthy.1, shadow
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let outcome =
+            RetrievalRepository::activate_generation_if_ready(&pool, &shadow, healthy.0, &cancel)
+                .await
+                .unwrap();
+        assert_eq!(outcome, ActivationOutcome::Committed);
+        // The durable pointer moves with the committed gate; the in-memory
+        // install is promote_shadow_generation's next step.
+        assert_eq!(
+            RetrievalRepository::active_generation_id(&pool)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(shadow.as_str())
+        );
+    }
+
+    /// Malformed stored publication bounds block a shadow's activation and
+    /// report degraded, never ready: a published bound ahead of canonical and
+    /// negative bounds each keep the active generation serving until the
+    /// bounds are repaired, after which activation proceeds.
+    #[tokio::test]
+    async fn activation_blocks_on_malformed_publication_bounds() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "m", "Malformed bounds").await;
+        register_test_model(&pool).await;
+        RetrievalRepository::ensure_generation(&pool, "gen-old", MODEL_ID)
+            .await
+            .unwrap();
+        publish_meeting(&pool, "gen-old", "m", &["old content"]).await;
+        let service = fresh_service();
+        publish_tick(&pool, &service).await.unwrap();
+        assert_eq!(service.active_generation().as_deref(), Some("gen-old"));
+
+        let shadow = request_rebuild(&pool).await.unwrap();
+        assert_ne!(shadow, "gen-old");
+        publish_meeting(&pool, &shadow, "m", &["new content"]).await;
+        let healthy: (i64, i64) = RetrievalRepository::publication_lag(&pool, &shadow)
+            .await
+            .unwrap()
+            .unwrap();
+
+        for corruption in [
+            format!(
+                "UPDATE retrieval_index_state SET published_change_id = {} WHERE generation_id = '{}'",
+                healthy.0 + 1,
+                shadow
+            ),
+            format!(
+                "UPDATE retrieval_index_state SET canonical_change_id = -5, published_change_id = -10 WHERE generation_id = '{}'",
+                shadow
+            ),
+        ] {
+            sqlx::query(&corruption).execute(&pool).await.unwrap();
+            publish_tick(&pool, &service).await.unwrap();
+            assert_ne!(
+                service.active_generation().as_deref(),
+                Some(shadow.as_str()),
+                "malformed bounds must block activation"
+            );
+            assert_eq!(
+                RetrievalRepository::generation_status(&pool, &shadow)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "building",
+                "the shadow must not be marked ready off malformed bounds"
+            );
+        }
+
+        // Repairing the stored bounds lets the activation proceed.
+        sqlx::query(&format!(
+            "UPDATE retrieval_index_state SET canonical_change_id = {}, published_change_id = {} WHERE generation_id = '{}'",
+            healthy.0, healthy.1, shadow
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        publish_tick(&pool, &service).await.unwrap();
+        assert_eq!(
+            service.active_generation().as_deref(),
+            Some(shadow.as_str()),
+            "repaired bounds admit the activation"
+        );
+    }
+
     #[tokio::test]
     async fn rebuild_discards_a_failed_shadow_instead_of_resuming_it() {
         let pool = migrated_pool().await;
@@ -4348,6 +4560,19 @@ mod tests {
         publish_tick(&pool, &service).await.unwrap();
 
         let failed = request_rebuild(&pool).await.unwrap();
+        // A shadow only ever terminalizes once its work is exhausted (the
+        // repository refuses over outstanding work), so mirror the production
+        // flow: the seeded meeting fails terminally, then the mark lands.
+        RetrievalRepository::record_work_failure(
+            &pool,
+            &failed,
+            "m",
+            true,
+            "safe terminal failure",
+            "2099-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
         assert!(
             RetrievalRepository::mark_shadow_generation_failed(&pool, &failed)
                 .await
@@ -6028,6 +6253,90 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(old_state, "retired");
+    }
+
+    /// Deterministic repository failure and corruption injection: a published
+    /// bound ahead of canonical, negative bounds, a missing index-state row, a
+    /// failing lag read (dropped table), and a failing active-pointer read
+    /// (closed pool) must all mark the lag unknown instead of the swallowed
+    /// zero that would let `index_status` report "ready".
+    #[tokio::test]
+    async fn unverifiable_publication_lag_never_reports_caught_up() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "m", "Lag").await;
+        register_test_model(&pool).await;
+        RetrievalRepository::ensure_generation(&pool, "gen-lag", MODEL_ID)
+            .await
+            .unwrap();
+        publish_meeting(&pool, "gen-lag", "m", &["lag content"]).await;
+        let service = fresh_service();
+        publish_tick(&pool, &service).await.unwrap();
+        assert_eq!(service.publication_lag(), 0);
+
+        // Corrupt row: the published bound ahead of canonical.
+        service.set_lag_for_generation(Some("gen-lag"), 0);
+        sqlx::query(
+            "UPDATE retrieval_index_state
+             SET published_change_id = canonical_change_id + 1
+             WHERE generation_id = 'gen-lag'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        update_publication_lag(&pool, &service).await;
+        assert!(
+            service.publication_lag() >= 1,
+            "a published bound ahead of canonical must not report caught up"
+        );
+
+        // Corrupt row: negative bounds.
+        service.set_lag_for_generation(Some("gen-lag"), 0);
+        sqlx::query(
+            "UPDATE retrieval_index_state
+             SET canonical_change_id = -5, published_change_id = -10
+             WHERE generation_id = 'gen-lag'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        update_publication_lag(&pool, &service).await;
+        assert!(
+            service.publication_lag() >= 1,
+            "negative lag bounds must not report caught up"
+        );
+
+        // Missing index-state row for the active generation.
+        service.set_lag_for_generation(Some("gen-lag"), 0);
+        sqlx::query("DELETE FROM retrieval_index_state WHERE generation_id = 'gen-lag'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        update_publication_lag(&pool, &service).await;
+        assert!(
+            service.publication_lag() >= 1,
+            "a missing lag row must not report caught up"
+        );
+
+        // Failing lag read: the row's backing table is gone.
+        service.set_lag_for_generation(Some("gen-lag"), 0);
+        sqlx::query("DROP TABLE retrieval_index_state")
+            .execute(&pool)
+            .await
+            .unwrap();
+        update_publication_lag(&pool, &service).await;
+        assert!(
+            service.publication_lag() >= 1,
+            "a failed lag read must not report caught up"
+        );
+
+        // Failing active-pointer read: the pool can no longer serve queries.
+        service.set_lag_for_generation(Some("gen-lag"), 0);
+        pool.close().await;
+        update_publication_lag(&pool, &service).await;
+        assert!(
+            service.publication_lag() >= 1,
+            "a failed active-pointer read must not report caught up"
+        );
     }
 
     #[tokio::test]

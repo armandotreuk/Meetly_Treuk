@@ -826,7 +826,7 @@ async fn hydrate(
             .or_default()
             .push(entry);
     }
-    let selected: Vec<&RankedMeeting> = ranked
+    let mut selected: Vec<&RankedMeeting> = ranked
         .ranking
         .meetings
         .iter()
@@ -836,6 +836,34 @@ async fn hydrate(
         .filter(|meeting| items_by_meeting.contains_key(&meeting.meeting_id))
         .take(max_meetings)
         .collect();
+    // Title-selected meetings are SELECTION signals on the Chat/Context
+    // paths (the frozen Task 3.3 boundary: a title is never cited): a
+    // meeting the title channel found - and only the title channel found -
+    // joins the context with its authoritative summary/notes/leading
+    // transcript content, never with a title citation. The search path keeps
+    // its own dedicated title-source pass, so this extension applies only
+    // where no candidate allow-list was precomputed.
+    let title_selected: HashMap<&str, &str> = ranked
+        .ranking
+        .title_matches
+        .iter()
+        .map(|title| (title.meeting_id.as_str(), title.selected_title.as_str()))
+        .collect();
+    if candidate_meeting_ids.is_none() {
+        for meeting in ranked.ranking.meetings.iter() {
+            if selected.len() >= max_meetings {
+                break;
+            }
+            if title_selected.contains_key(meeting.meeting_id.as_str())
+                && !items_by_meeting.contains_key(&meeting.meeting_id)
+                && !selected
+                    .iter()
+                    .any(|selected| selected.meeting_id == meeting.meeting_id)
+            {
+                selected.push(meeting);
+            }
+        }
+    }
     if selected.is_empty() {
         return Ok(empty_context(max_context_chars));
     }
@@ -880,8 +908,15 @@ async fn hydrate(
 
     for (meeting, share) in selected.into_iter().zip(shares) {
         ensure_not_cancelled(&cancel)?;
+        // A title-selected meeting carries no ranked evidence: it publishes
+        // its authoritative content compactly (like broad-scope hydration),
+        // never a title citation.
+        let ranked_items: &[&RankedEvidence] = items_by_meeting
+            .get(&meeting.meeting_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         let mut transcript_ids = Vec::new();
-        for item in &items_by_meeting[&meeting.meeting_id] {
+        for item in ranked_items {
             let evidence = &item.evidence;
             if evidence.source_kind == "transcript" {
                 transcript_ids.extend(
@@ -905,13 +940,22 @@ async fn hydrate(
                 }
             }
         }
-        let Some(source) = RetrievalRepository::load_meeting_source_relevant_with_cancellation(
-            pool,
-            &meeting.meeting_id,
-            &transcript_ids,
-            &cancel,
-        )
-        .await
+        let Some(source) = if ranked_items.is_empty() {
+            RetrievalRepository::load_meeting_source_compact_with_cancellation(
+                pool,
+                &meeting.meeting_id,
+                &cancel,
+            )
+            .await
+        } else {
+            RetrievalRepository::load_meeting_source_relevant_with_cancellation(
+                pool,
+                &meeting.meeting_id,
+                &transcript_ids,
+                &cancel,
+            )
+            .await
+        }
         .map_err(db_error)?
         else {
             omitted += 1;
@@ -927,11 +971,21 @@ async fn hydrate(
         // Checkpoint 2: one authoritative scope/revision snapshot immediately
         // before retaining/publishing this meeting. A move, deletion, or
         // mid-load content change omits the meeting and every source.
-        let current = current_scope_and_revision(
+        let selected_title = if ranked_items.is_empty() {
+            title_selected.get(meeting.meeting_id.as_str()).copied()
+        } else {
+            None
+        };
+        if selected_title.is_some_and(|title| title != source.title) {
+            omitted += 1;
+            continue;
+        }
+        let current = current_scope_and_fences(
             pool,
             scope,
             &meeting.meeting_id,
-            source.source_revision,
+            RevisionFence::Exact(source.source_revision),
+            selected_title,
             &cancel,
         )
         .await?;
@@ -941,7 +995,7 @@ async fn hydrate(
             continue;
         }
 
-        let plan = plan_meeting_evidence(&source, &items_by_meeting[&meeting.meeting_id]);
+        let plan = plan_meeting_evidence(&source, ranked_items);
         let mut header = format!(
             "## Meeting {} — {}\n\n**ID:** `{}`\n",
             meeting_ordinal + 1,
@@ -960,14 +1014,38 @@ async fn hydrate(
             omitted += 1;
             continue;
         }
-        let sections = build_meeting_sections(
-            source.latest_summary_markdown.as_deref(),
-            source.notes_markdown.as_deref(),
-            &plan.segments,
-            source.transcript_segments_total,
-            used_chars.saturating_add(share),
-            used_chars + header.chars().count(),
-        );
+        let compact = ranked_items.is_empty();
+        // A title-selected meeting publishes the meeting's leading transcript
+        // window compactly (no ranked segments to ground); every other
+        // meeting publishes its ranked segments.
+        let compact_segments: Vec<FtsSearchResult> = if compact {
+            source
+                .transcripts
+                .iter()
+                .map(|transcript| broad_transcript_result(&source, transcript))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let sections = if compact {
+            build_meeting_sections(
+                source.latest_summary_markdown.as_deref(),
+                source.notes_markdown.as_deref(),
+                &compact_segments,
+                source.transcript_segments_total,
+                used_chars.saturating_add(share),
+                used_chars + header.chars().count(),
+            )
+        } else {
+            build_meeting_sections(
+                source.latest_summary_markdown.as_deref(),
+                source.notes_markdown.as_deref(),
+                &plan.segments,
+                source.transcript_segments_total,
+                used_chars.saturating_add(share),
+                used_chars + header.chars().count(),
+            )
+        };
         ensure_not_cancelled(&cancel)?;
 
         let retained_segments: HashSet<&str> = sections
@@ -980,7 +1058,14 @@ async fn hydrate(
         let mut meeting_sources: Vec<HydratedSource> = Vec::new();
         let mut meeting_evidence: Vec<String> = Vec::new();
         if let Some(snippet) = blank(sections.summary.as_deref()) {
-            let evidence_ids = plan.retained_summary_ids();
+            // Compact (title-selected) publications have no ranked evidence
+            // to ground their summary; the broad-scope contract publishes
+            // them with empty evidence IDs.
+            let evidence_ids = if compact {
+                Vec::new()
+            } else {
+                plan.retained_summary_ids()
+            };
             meeting_evidence.extend(evidence_ids.iter().cloned());
             meeting_sources.push(HydratedSource {
                 meeting_id: source.meeting_id.clone(),
@@ -995,7 +1080,11 @@ async fn hydrate(
             });
         }
         if let Some(snippet) = blank(sections.notes.as_deref()) {
-            let evidence_ids = plan.retained_note_ids();
+            let evidence_ids = if compact {
+                Vec::new()
+            } else {
+                plan.retained_note_ids()
+            };
             meeting_evidence.extend(evidence_ids.iter().cloned());
             meeting_sources.push(HydratedSource {
                 meeting_id: source.meeting_id.clone(),
@@ -1009,22 +1098,56 @@ async fn hydrate(
                 evidence_ids,
             });
         }
-        // Transcript sources: one per contiguous retained segment run, with
-        // the run's identity and every grounded ranked/alias candidate.
-        for group in plan.retained_groups(&retained_segments) {
-            ensure_not_cancelled(&cancel)?;
-            meeting_evidence.extend(group.evidence_ids.iter().cloned());
-            meeting_sources.push(HydratedSource {
-                meeting_id: source.meeting_id.clone(),
-                meeting_title: source.title.clone(),
-                folder_name: source.folder_name.clone(),
-                source_kind: "transcript".to_string(),
-                snippet: group.snippet.clone(),
-                source_start_id: Some(group.start_id.clone()),
-                source_end_id: Some(group.end_id.clone()),
-                source_template_id: None,
-                evidence_ids: group.evidence_ids,
-            });
+        // Transcript sources: for ranked meetings, one per contiguous
+        // retained segment run with every grounded ranked/alias candidate;
+        // for compact (title-selected) meetings, one run over the retained
+        // head with empty evidence IDs like the broad-scope contract.
+        if compact {
+            let retained_transcripts = source
+                .transcripts
+                .iter()
+                .filter(|transcript| {
+                    sections
+                        .retained_transcript_ids
+                        .iter()
+                        .any(|id| id == &transcript.id)
+                })
+                .collect::<Vec<_>>();
+            if let (Some(first), Some(last)) =
+                (retained_transcripts.first(), retained_transcripts.last())
+            {
+                meeting_sources.push(HydratedSource {
+                    meeting_id: source.meeting_id.clone(),
+                    meeting_title: source.title.clone(),
+                    folder_name: source.folder_name.clone(),
+                    source_kind: "transcript".to_string(),
+                    snippet: retained_transcripts
+                        .iter()
+                        .map(|transcript| transcript.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    source_start_id: Some(first.id.clone()),
+                    source_end_id: Some(last.id.clone()),
+                    source_template_id: None,
+                    evidence_ids: Vec::new(),
+                });
+            }
+        } else {
+            for group in plan.retained_groups(&retained_segments) {
+                ensure_not_cancelled(&cancel)?;
+                meeting_evidence.extend(group.evidence_ids.iter().cloned());
+                meeting_sources.push(HydratedSource {
+                    meeting_id: source.meeting_id.clone(),
+                    meeting_title: source.title.clone(),
+                    folder_name: source.folder_name.clone(),
+                    source_kind: "transcript".to_string(),
+                    snippet: group.snippet.clone(),
+                    source_start_id: Some(group.start_id.clone()),
+                    source_end_id: Some(group.end_id.clone()),
+                    source_template_id: None,
+                    evidence_ids: group.evidence_ids,
+                });
+            }
         }
         // A meeting with no retained content publishes nothing (no bare
         // headers, no coverage notice without content).
@@ -1082,7 +1205,7 @@ async fn hydrate_title_only_search_results(
     hydrated: &mut HydratedContext,
 ) -> Result<(), RetrievalError> {
     let cancel = cancellation.cloned().unwrap_or_default();
-    let title_matches: Vec<(String, String, usize)> = ranked
+    let title_matches: Vec<(String, String, String, usize)> = ranked
         .ranking
         .meetings
         .iter()
@@ -1097,13 +1220,14 @@ async fn hydrate_title_only_search_results(
                     (
                         meeting.meeting_id.clone(),
                         title.evidence_id.clone(),
+                        title.selected_title.clone(),
                         meeting.rank,
                     )
                 })
         })
         .collect();
 
-    for (meeting_id, evidence_id, rank) in title_matches {
+    for (meeting_id, evidence_id, selected_title, rank) in title_matches {
         ensure_not_cancelled(&cancel)?;
         if hydrated
             .meetings
@@ -1118,6 +1242,22 @@ async fn hydrate_title_only_search_results(
             else {
                 continue;
             };
+            // A mixed title/content meeting keeps its content evidence when
+            // renamed, but loses the title signal that the new title no
+            // longer justifies. Check both hydrated and current metadata.
+            if metadata.meeting_title != selected_title
+                || !current_scope_and_fences(
+                    pool,
+                    &ranked.scope.scope,
+                    &meeting_id,
+                    RevisionFence::Current,
+                    Some(&selected_title),
+                    &cancel,
+                )
+                .await?
+            {
+                continue;
+            }
             if let Some(meeting) = hydrated
                 .meetings
                 .iter_mut()
@@ -1161,14 +1301,16 @@ async fn hydrate_title_only_search_results(
         else {
             continue;
         };
-        if !current_scope_and_revision(
-            pool,
-            &ranked.scope.scope,
-            &meeting_id,
-            source.source_revision,
-            &cancel,
-        )
-        .await?
+        if source.title != selected_title
+            || !current_scope_and_fences(
+                pool,
+                &ranked.scope.scope,
+                &meeting_id,
+                RevisionFence::Exact(source.source_revision),
+                Some(&selected_title),
+                &cancel,
+            )
+            .await?
         {
             continue;
         }
@@ -1283,6 +1425,32 @@ async fn current_scope_and_revision(
     expected_revision: Option<i64>,
     cancel: &CancellationToken,
 ) -> Result<bool, RetrievalError> {
+    current_scope_and_fences(
+        pool,
+        scope,
+        meeting_id,
+        RevisionFence::Exact(expected_revision),
+        None,
+        cancel,
+    )
+    .await
+}
+
+enum RevisionFence {
+    /// Existing content hydration has already checked its revision. A title
+    /// metadata pass only needs to check current identity, title and scope.
+    Current,
+    Exact(Option<i64>),
+}
+
+async fn current_scope_and_fences(
+    pool: &SqlitePool,
+    scope: &PersistedRetrievalScope,
+    meeting_id: &str,
+    revision: RevisionFence,
+    expected_title: Option<&str>,
+    cancel: &CancellationToken,
+) -> Result<bool, RetrievalError> {
     ensure_not_cancelled(cancel)?;
     let mut query = QueryBuilder::<Sqlite>::new(match scope {
         PersistedRetrievalScope::Folder(_) => {
@@ -1300,8 +1468,14 @@ async fn current_scope_and_revision(
         "SELECT EXISTS(SELECT 1 FROM meetings m LEFT JOIN search_source_state s ON s.meeting_id = m.id WHERE m.id = ",
     );
     query.push_bind(meeting_id);
-    query.push(" AND s.source_revision IS ");
-    query.push_bind(expected_revision);
+    if let RevisionFence::Exact(expected_revision) = revision {
+        query.push(" AND s.source_revision IS ");
+        query.push_bind(expected_revision);
+    }
+    if let Some(title) = expected_title {
+        query.push(" AND m.title = ");
+        query.push_bind(title);
+    }
     match scope {
         PersistedRetrievalScope::Folder(_) => {
             query.push(" AND m.folder_id IN (SELECT id FROM folder_scope)");
@@ -1942,6 +2116,7 @@ mod tests {
                 title_matches.push(TitleMatch {
                     meeting_id: meeting_id.clone(),
                     evidence_id: format!("title:{meeting_id}"),
+                    selected_title: format!("Title {index}"),
                     provenance: Vec::new(),
                 });
             } else {

@@ -14,12 +14,12 @@ use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::SqlitePool;
 use tokio_util::sync::CancellationToken;
 
-use super::contracts::HybridScope;
+use super::contracts::{HybridRetrievalStatus, HybridScope};
 use super::model::RetrievalModelError;
 use super::service::{
-    title_scan_exhausted, CoreTermLanguage, LexicalMode, PersistedRetrievalScope, QueryVariantKind,
-    RetrievalChannel, RetrievalError, RetrievalLimits, RetrievalPurpose, RetrievalRequest,
-    RetrievalService, SemanticFallbackReason, MAX_SEARCH_TITLE_SCAN_MEETINGS,
+    CoreTermLanguage, LexicalMode, PersistedRetrievalScope, QueryVariantKind, RetrievalChannel,
+    RetrievalError, RetrievalLimits, RetrievalPurpose, RetrievalRequest, RetrievalService,
+    SemanticFallbackReason,
 };
 use super::worker::{quantize_int8, DocumentEmbedder, LifecycleConfig, RetrievalLifecycle};
 use crate::api::api::{
@@ -1324,38 +1324,34 @@ async fn mixed_title_and_content_search_preserves_independent_provenance() {
 }
 
 #[tokio::test]
-async fn unknown_language_title_matching_is_search_only() {
+async fn title_channel_runs_for_every_purpose() {
     let pool = migrated_pool().await;
     insert_meeting(&pool, "m-common", "What we decided").await;
     let service = RetrievalService::new(failing_lifecycle());
 
-    let mut context_request = request(
-        "what",
-        PersistedRetrievalScope::All,
-        RetrievalLimits::default(),
-        CoreTermLanguage::Unknown,
-        None,
-    );
-    context_request.purpose = RetrievalPurpose::Context;
-    let context = service.retrieve(&pool, context_request).await.unwrap();
-    assert!(!context
-        .candidates
-        .iter()
-        .any(|candidate| candidate.source_kind == "title"));
-
-    let mut search_request = request(
-        "what",
-        PersistedRetrievalScope::All,
-        RetrievalLimits::default(),
-        CoreTermLanguage::Unknown,
-        None,
-    );
-    search_request.purpose = RetrievalPurpose::Search;
-    let search = service.retrieve(&pool, search_request).await.unwrap();
-    assert!(search
-        .candidates
-        .iter()
-        .any(|candidate| candidate.meeting_id == "m-common" && candidate.source_kind == "title"));
+    for purpose in [
+        RetrievalPurpose::Chat,
+        RetrievalPurpose::Search,
+        RetrievalPurpose::Context,
+    ] {
+        let mut purpose_request = request(
+            "what",
+            PersistedRetrievalScope::All,
+            RetrievalLimits::default(),
+            CoreTermLanguage::Unknown,
+            None,
+        );
+        purpose_request.purpose = purpose;
+        let result = service.retrieve(&pool, purpose_request).await.unwrap();
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|candidate| candidate.meeting_id == "m-common"
+                    && candidate.source_kind == "title"),
+            "the indexed title lookup must run for {purpose:?}, not only Search"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1397,8 +1393,8 @@ async fn unknown_language_search_titles_need_every_distinct_core_term() {
     // A shared function word alone must not title-match without a stopword
     // list; that noise would otherwise outrank semantic evidence.
     assert!(title_hits(&search("what happened to retention").await).is_empty());
-    // A repeated query token still matches: the gate uses the DISTINCT count,
-    // which is what `title_term_overlap` can actually reach.
+    // A repeated query token still matches: the all-core-term gate uses the
+    // DISTINCT count, which a repeated token cannot inflate.
     assert_eq!(
         title_hits(&search("retention retention").await),
         vec!["m-exact".to_string()]
@@ -2670,23 +2666,33 @@ async fn semantic_gate_failure_keeps_lexical_candidates() {
         .all(|provenance| provenance.channel != RetrievalChannel::Semantic)));
 }
 
-// -- Bounded streaming title scan (R16 finding 6) --------------------------------------
+// -- Authoritative indexed title lookup (HR-5.R6) --------------------------------------
+
+/// Seeds the beyond-the-scan-cap corpus: 10,000 fillers plus two exact-title
+/// matches whose ids sort past the retired 10,000-row budget; one lives in a
+/// folder, one does not.
+async fn seed_beyond_cap_corpus(pool: &SqlitePool) {
+    sqlx::query(
+        "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < ?)
+         INSERT INTO meetings (id, title, created_at, updated_at)
+         SELECT 'filler-' || printf('%05d', n), 'Filler titulo', '2026-08-29T00:00:00Z', '2026-08-29T00:00:00Z' FROM seq",
+    )
+    .bind(10_000i64)
+    .execute(pool)
+    .await
+    .unwrap();
+    insert_folder(pool, "fold", "Folder", None).await;
+    insert_meeting(pool, "zz-target", "Chaves de Acesso Rotation").await;
+    set_meeting_folder(pool, "zz-target", Some("fold")).await;
+    insert_meeting(pool, "aa-outside", "Chaves de Acesso Rotation").await;
+}
 
 #[tokio::test]
-async fn title_scan_finds_matches_across_streamed_pages() {
+async fn title_lookup_production_routes_find_matches_beyond_the_scan_cap_and_fence_scope() {
     let pool = migrated_pool().await;
-    for index in 0..(super::service::TITLE_SCAN_PAGE + 40) {
-        insert_meeting(
-            &pool,
-            &format!("m-fill-{index}"),
-            &format!("filler titulo {index}"),
-        )
-        .await;
-    }
-    // The strongest title match is inserted last, so it lives in the final
-    // streamed page.
-    insert_meeting(&pool, "m-last", "Chaves de Acesso Rotation").await;
+    seed_beyond_cap_corpus(&pool).await;
 
+    // Service level: the indexed lookup has no row cap.
     let service = RetrievalService::new(query_lifecycle(&ServiceEmbedder::new()));
     let result = service
         .retrieve(
@@ -2701,35 +2707,1456 @@ async fn title_scan_finds_matches_across_streamed_pages() {
         )
         .await
         .unwrap();
+    let title_ids = result
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.source_kind == "title")
+        .map(|candidate| candidate.meeting_id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        title_ids,
+        vec!["aa-outside".to_string(), "zz-target".to_string()]
+    );
     let title_hit = result
         .candidates
         .iter()
-        .find(|candidate| candidate.meeting_id == "m-last")
-        .expect("the streamed scan must cover every page");
-    assert_eq!(title_hit.source_kind, "title");
+        .find(|candidate| candidate.meeting_id == "zz-target")
+        .expect("the indexed title lookup has no row cap");
     assert!(title_hit
         .provenance
         .iter()
-        .any(|provenance| provenance.channel == RetrievalChannel::Title && provenance.rank == 1));
+        .any(|provenance| provenance.channel == RetrievalChannel::Title));
     assert!(result
         .candidates
         .iter()
-        .all(|candidate| candidate.meeting_id == "m-last"));
+        .all(|candidate| candidate.source_kind == "title"));
+
+    // Tauri Search route: the exact title matches surface with title
+    // provenance, and the deterministic response order is (rank, meeting id)
+    // - the identical titles tie, so meeting id ascending decides.
+    let response = execute_hybrid_search(
+        &pool,
+        failing_lifecycle(),
+        &ChatRequestState::new(),
+        ChatRequestSurface::Sidebar,
+        "title-search-beyond-cap".to_string(),
+        "chaves de acesso".to_string(),
+        HybridScope::All {},
+        Some(50),
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        response
+            .results
+            .iter()
+            .map(|result| result.meeting_id.as_str())
+            .collect::<Vec<_>>(),
+        ["aa-outside", "zz-target"]
+    );
+    assert!(response.results[0]
+        .provenance
+        .iter()
+        .any(|provenance| provenance.channel == "title"));
+
+    // Scope fencing on the Tauri route: a folder scope returns only the
+    // in-folder match; a meeting or allowed-ID scope can never admit another
+    // meeting's title.
+    let folder_response = execute_hybrid_search(
+        &pool,
+        failing_lifecycle(),
+        &ChatRequestState::new(),
+        ChatRequestSurface::Sidebar,
+        "title-search-folder".to_string(),
+        "chaves de acesso".to_string(),
+        HybridScope::Folder {
+            folder_id: "fold".to_string(),
+        },
+        Some(50),
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        folder_response
+            .results
+            .iter()
+            .map(|result| result.meeting_id.as_str())
+            .collect::<Vec<_>>(),
+        ["zz-target"]
+    );
+    for scope in [
+        HybridScope::Meeting {
+            meeting_id: "filler-00001".to_string(),
+        },
+        HybridScope::AllowedMeetingIds {
+            meeting_ids: vec!["filler-00001".to_string()],
+        },
+    ] {
+        let fenced = execute_hybrid_search(
+            &pool,
+            failing_lifecycle(),
+            &ChatRequestState::new(),
+            ChatRequestSurface::Sidebar,
+            "title-search-fenced".to_string(),
+            "chaves de acesso".to_string(),
+            scope,
+            Some(50),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        assert!(
+            fenced
+                .results
+                .iter()
+                .all(|result| result.meeting_id != "zz-target"),
+            "scope fencing must exclude the out-of-scope title match"
+        );
+    }
+
+    // MCP route through the full JSON-RPC tool dispatch.
+    let response = call_mcp_tool(
+        mcp_state(&pool, &failing_lifecycle(), &ChatRequestState::new()),
+        "search_meetings_hybrid_v1",
+        json!({
+            "query": "chaves de acesso",
+            "scope": {"kind": "all"},
+            "limit": 50
+        }),
+    )
+    .await;
+    assert_eq!(response["result"]["isError"], false);
+    let payload: Value =
+        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["results"][0]["meetingId"], "aa-outside");
+    assert!(payload["results"][0]["provenance"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|provenance| provenance["channel"] == "title"));
+}
+
+/// Scope and output-cap regression, not a database-work bound. An FTS5
+/// EXPLAIN plan without a temp b-tree does not prove bounded visited work;
+/// the diagnostic below separately counts actual SQLite VM progress.
+#[tokio::test]
+async fn title_lookup_preserves_scope_and_candidate_cap_for_common_terms() {
+    let pool = migrated_pool().await;
+    // 10,000 out-of-scope titles share the common term `standup`; a handful
+    // of in-scope meetings share it too, so a scope-constrained lookup must
+    // never enumerate the global match set.
+    sqlx::query(
+        "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < ?)
+         INSERT INTO meetings (id, title, created_at, updated_at)
+         SELECT 'filler-' || printf('%05d', n), 'Standup meeting notes ' || n, '2026-08-29T00:00:00Z', '2026-08-29T00:00:00Z' FROM seq",
+    )
+    .bind(10_000i64)
+    .execute(&pool)
+    .await
+    .unwrap();
+    insert_folder(&pool, "other", "Other", None).await;
+    sqlx::query("UPDATE meetings SET folder_id = 'other' WHERE id LIKE 'filler-%'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    insert_folder(&pool, "fold", "Folder", None).await;
+    insert_folder(&pool, "child", "Child", Some("fold")).await;
+    for index in 0..30 {
+        let id = format!("in-fold-{index:02}");
+        insert_meeting(&pool, &id, "Standup meeting plan").await;
+        set_meeting_folder(
+            &pool,
+            &id,
+            Some(if index % 2 == 0 { "fold" } else { "child" }),
+        )
+        .await;
+    }
+    insert_meeting(&pool, "zz-agenda", "Standup meeting agenda").await;
+
+    let service = RetrievalService::new(query_lifecycle(&ServiceEmbedder::new()));
+    let title_hits = |result: &crate::retrieval::RetrievalResult| {
+        result
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.source_kind == "title")
+            .map(|candidate| candidate.meeting_id.clone())
+            .collect::<Vec<_>>()
+    };
+    let search = |query: &'static str, scope: PersistedRetrievalScope| {
+        let service = &service;
+        let pool = &pool;
+        async move {
+            let mut request = request(
+                query,
+                scope,
+                RetrievalLimits::default(),
+                CoreTermLanguage::English,
+                None,
+            );
+            request.purpose = RetrievalPurpose::Search;
+            service.retrieve(pool, request).await.unwrap()
+        }
+    };
+
+    // All scope: the common term matches every title; the response is the
+    // bounded per-variant cap.
+    let result = search("standup", PersistedRetrievalScope::All).await;
+    assert_eq!(
+        title_hits(&result).len(),
+        crate::retrieval::service::HYBRID_CANDIDATES_PER_VARIANT,
+        "the common term matches every title; the response is the bounded per-variant cap"
+    );
+
+    // Folder scope (direct + descendant folders): the scope term lives INSIDE
+    // the FTS match, so the intersection is the 30 in-scope meetings, never
+    // the 10,000 out-of-scope matches.
+    let result = search(
+        "standup",
+        PersistedRetrievalScope::Folder("fold".to_string()),
+    )
+    .await;
+    let hits = title_hits(&result);
+    assert_eq!(
+        hits.len(),
+        30,
+        "the folder-scoped intersection is the in-scope set"
+    );
+    assert!(hits.iter().all(|id| id.starts_with("in-fold-")));
+
+    // The same bounded plan shape for every scope: the scoped FTS match with
+    // the rowid-window constraint (no scope CTE, no matched-set sort - the
+    // scope lives inside the MATCH expression, so reverting to a post-filter
+    // or an ORDER BY over the matched set fails these assertions).
+    let folder_keys = vec![
+        crate::retrieval::service::title_scope_token('f', "fold"),
+        crate::retrieval::service::title_scope_token('f', "child"),
+    ];
+    let all_query =
+        crate::retrieval::service::title_match_query(&["standup".to_string()], &[]).unwrap();
+    let folder_query =
+        crate::retrieval::service::title_match_query(&["standup".to_string()], &folder_keys)
+            .unwrap();
+    let meeting_query = crate::retrieval::service::title_match_query(
+        &["standup".to_string()],
+        &[crate::retrieval::service::title_scope_token(
+            'm',
+            "in-fold-00",
+        )],
+    )
+    .unwrap();
+    let allowed_query = crate::retrieval::service::title_match_query(
+        &["standup".to_string()],
+        &[
+            crate::retrieval::service::title_scope_token('m', "in-fold-00"),
+            crate::retrieval::service::title_scope_token('m', "zz-agenda"),
+        ],
+    )
+    .unwrap();
+    for (label, match_query) in [
+        ("all", &all_query),
+        ("folder", &folder_query),
+        ("meeting", &meeting_query),
+        ("allowed", &allowed_query),
+    ] {
+        let plan = sqlx::query_as::<_, (i64, i64, i64, String)>(&format!(
+            "EXPLAIN QUERY PLAN SELECT m.id, m.title, bm25(retrieval_title_fts, 1.0, 1.0, 0.0), \
+             retrieval_title_fts.rowid \
+             FROM retrieval_title_fts \
+             JOIN meetings m ON m.id = retrieval_title_fts.meeting_id \
+             WHERE retrieval_title_fts MATCH ? AND retrieval_title_fts.rowid > ? \
+             LIMIT ?"
+        ))
+        .bind(match_query)
+        .bind(0i64)
+        .bind(100i64)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let details: Vec<&str> = plan.iter().map(|(.., detail)| detail.as_str()).collect();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("VIRTUAL TABLE INDEX") && detail.contains("M")),
+            "the {label} lookup must evaluate the scoped match inside FTS5: {details:?}"
+        );
+        assert!(
+            !details
+                .iter()
+                .any(|detail| detail.contains("USE TEMP B-TREE")),
+            "the {label} lookup must never sort the matched set: {details:?}"
+        );
+        assert!(
+            !details.iter().any(|detail| detail.contains("folder_scope")),
+            "the {label} lookup must keep the scope inside the FTS match, not a CTE: {details:?}"
+        );
+    }
+
+    // Meeting and allowed-ID scopes are exact: only the requested meetings.
+    let result = search(
+        "standup",
+        PersistedRetrievalScope::Meeting("in-fold-00".to_string()),
+    )
+    .await;
+    assert_eq!(title_hits(&result), vec!["in-fold-00".to_string()]);
+    let result = search(
+        "standup",
+        PersistedRetrievalScope::AllowedMeetingIds(vec!["zz-agenda".to_string()]),
+    )
+    .await;
+    assert_eq!(title_hits(&result), vec!["zz-agenda".to_string()]);
+
+    // The all-distinct-core-term gate still holds under the ranked form.
+    let result = search("standup agenda", PersistedRetrievalScope::All).await;
+    assert_eq!(title_hits(&result), vec!["zz-agenda".to_string()]);
+}
+
+/// Explicit, synthetic SQL diagnostic; it is not corpus/release acceptance
+/// evidence. Count SQLite VM progress, selected rows, and elapsed time for
+/// the current exhaustive pages and two exact single-statement alternatives.
+/// Keep the 250k fixture out of ordinary unit runs.
+#[tokio::test]
+#[ignore = "explicit 1k/10k/250k title SQL work diagnostic"]
+async fn title_lookup_measures_common_in_scope_sql_work() {
+    use futures_util::TryStreamExt;
+    use sqlx::Connection;
+    use std::collections::BinaryHeap;
+    use std::sync::atomic::AtomicU64;
+    use std::time::Instant;
+
+    #[derive(Debug, PartialEq)]
+    struct Hit(f64, String);
+    impl Eq for Hit {}
+    impl Ord for Hit {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.0
+                .total_cmp(&other.0)
+                .then_with(|| self.1.cmp(&other.1))
+        }
+    }
+    impl PartialOrd for Hit {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    fn retain(heap: &mut BinaryHeap<Hit>, hit: Hit) {
+        if heap.len() < 50 {
+            heap.push(hit);
+        } else if heap.peek().is_some_and(|worst| hit < *worst) {
+            heap.pop();
+            heap.push(hit);
+        }
+    }
+
+    let mut connection = sqlx::SqliteConnection::connect("sqlite::memory:")
+        .await
+        .unwrap();
+    // Only the tables needed by the production title migration and query;
+    // no model, transcript, semantic/evaluation fixture, or user data.
+    sqlx::raw_sql(
+        "CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT NOT NULL, folder_id TEXT);
+         CREATE TABLE meeting_folders (id TEXT PRIMARY KEY);",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../migrations/20260908000000_add_retrieval_title_fts.sql"
+    ))
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    let mut previous = 0i64;
+    let mut previous_steps = [0; 3];
+    for count in [1_000i64, 10_000, 250_000] {
+        sqlx::query(
+            "WITH RECURSIVE seq(n) AS (SELECT ? UNION ALL SELECT n + 1 FROM seq WHERE n < ?)
+             INSERT INTO meetings (id, title)
+             SELECT printf('common-%06d', n), 'Standup meeting notes ' || n FROM seq",
+        )
+        .bind(previous + 1)
+        .bind(count)
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        previous = count;
+        let query = super::service::title_match_query(&["standup".to_string()], &[]).unwrap();
+        let mut expected = None;
+        for (algorithm, name) in ["pages", "stream", "sql_top_k"].into_iter().enumerate() {
+            let steps = Arc::new(AtomicU64::new(0));
+            let observed = steps.clone();
+            connection
+                .lock_handle()
+                .await
+                .unwrap()
+                .set_progress_handler(100, move || {
+                    observed.fetch_add(100, Ordering::Relaxed);
+                    true
+                });
+            let started = Instant::now();
+            let mut heap = BinaryHeap::new();
+            let mut returned_rows = 0usize;
+            let mut statements = 0usize;
+            if algorithm == 0 {
+                let mut cursor = 0i64;
+                loop {
+                    let rows: Vec<(String, String, f64, i64)> = sqlx::query_as(
+                        "SELECT m.id, m.title, bm25(retrieval_title_fts, 1.0, 1.0, 0.0),
+                         retrieval_title_fts.rowid FROM retrieval_title_fts
+                         JOIN meetings m ON m.id = retrieval_title_fts.meeting_id
+                         WHERE retrieval_title_fts MATCH ? AND retrieval_title_fts.rowid > ? LIMIT ?",
+                    )
+                    .bind(&query)
+                    .bind(cursor)
+                    .bind(super::service::TITLE_SCAN_BATCH_ROWS as i64)
+                    .fetch_all(&mut connection)
+                    .await
+                    .unwrap();
+                    statements += 1;
+                    if rows.is_empty() {
+                        break;
+                    }
+                    returned_rows += rows.len();
+                    for (id, _title, score, rowid) in rows {
+                        cursor = cursor.max(rowid);
+                        retain(&mut heap, Hit(score, id));
+                    }
+                }
+            } else if algorithm == 1 {
+                let mut rows = sqlx::query_as::<_, (String, String, f64)>(
+                    "SELECT m.id, m.title, bm25(retrieval_title_fts, 1.0, 1.0, 0.0)
+                     FROM retrieval_title_fts JOIN meetings m ON m.id = retrieval_title_fts.meeting_id
+                     WHERE retrieval_title_fts MATCH ?",
+                )
+                .bind(&query)
+                .fetch(&mut connection);
+                statements += 1;
+                while let Some((id, _title, score)) = rows.try_next().await.unwrap() {
+                    returned_rows += 1;
+                    retain(&mut heap, Hit(score, id));
+                }
+            } else {
+                let rows: Vec<(String, String, f64)> = sqlx::query_as(
+                    "SELECT m.id, m.title, bm25(retrieval_title_fts, 1.0, 1.0, 0.0) AS score
+                     FROM retrieval_title_fts JOIN meetings m ON m.id = retrieval_title_fts.meeting_id
+                     WHERE retrieval_title_fts MATCH ? ORDER BY score, m.id LIMIT 50",
+                )
+                .bind(&query)
+                .fetch_all(&mut connection)
+                .await
+                .unwrap();
+                statements += 1;
+                returned_rows += rows.len();
+                for (id, _title, score) in rows {
+                    retain(&mut heap, Hit(score, id));
+                }
+            }
+            let elapsed = started.elapsed();
+            connection
+                .lock_handle()
+                .await
+                .unwrap()
+                .remove_progress_handler();
+            let measured_steps = steps.load(Ordering::Relaxed);
+            let result = heap.into_sorted_vec();
+            assert_eq!(result.len(), 50);
+            if let Some(expected) = &expected {
+                assert_eq!(&result, expected, "exact score/ID result parity for {name}");
+            } else {
+                expected = Some(result);
+            }
+            assert!(
+                measured_steps > previous_steps[algorithm],
+                "actual VM work grows for {name}; a capped result is not a work bound"
+            );
+            previous_steps[algorithm] = measured_steps;
+            eprintln!(
+                "TITLE_WORK in_scope={count} algorithm={name} vm_steps~={measured_steps} returned_rows={returned_rows} statements={statements} elapsed_ms={}",
+                elapsed.as_millis()
+            );
+        }
+    }
+    connection.close().await.unwrap();
+}
+
+/// A selected folder disappearing between normalization and the title
+/// snapshot is an empty constrained scope, never an unscoped MATCH query.
+#[tokio::test]
+async fn title_lookup_deleted_folder_before_title_snapshot_never_widens_scope() {
+    let pool = migrated_pool().await;
+    insert_folder(&pool, "selected", "Selected", None).await;
+    insert_folder(&pool, "other", "Other", None).await;
+    insert_meeting(&pool, "formerly-inside", "Needle meeting").await;
+    set_meeting_folder(&pool, "formerly-inside", Some("selected")).await;
+    insert_meeting(&pool, "always-outside", "Needle meeting").await;
+    set_meeting_folder(&pool, "always-outside", Some("other")).await;
+    let service = RetrievalService::new(query_lifecycle(&ServiceEmbedder::new()));
+    let (arrived, mut arrival) = tokio::sync::mpsc::unbounded_channel();
+    service.arm_title_scope_gate(arrived);
+    let mut search_request = request(
+        "needle",
+        PersistedRetrievalScope::Folder("selected".to_string()),
+        RetrievalLimits {
+            lexical_per_variant: 50,
+            vector_per_variant: 0,
+        },
+        CoreTermLanguage::Unknown,
+        None,
+    );
+    search_request.purpose = RetrievalPurpose::Search;
+    let running_service = service.clone();
+    let running_pool = pool.clone();
+    let running = tokio::spawn(async move {
+        running_service
+            .retrieve_ranked(&running_pool, search_request)
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(10), arrival.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("DELETE FROM meeting_folders WHERE id = 'selected'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let folder: Option<String> =
+        sqlx::query_scalar("SELECT folder_id FROM meetings WHERE id = 'formerly-inside'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        folder, None,
+        "the old member is now outside the deleted scope"
+    );
+    service.release_title_scope_gate();
+    let ranked = tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ranked.ranking.title_matches.is_empty());
+    assert!(ranked.ranking.evidence.is_empty());
+    assert!(
+        ranked.ranking.meetings.is_empty(),
+        "neither old members nor other global matches may enter ranking"
+    );
+}
+
+/// Public scope IDs support 512 bytes each, including all 100 allowed IDs
+/// and a large subtree of long direct-folder IDs. Partition MATCH expressions
+/// without changing the global title score/ID cut or widening membership.
+#[tokio::test]
+async fn title_lookup_long_public_scope_ids_partition_without_losing_global_top_k() {
+    use super::service::{
+        title_match_queries, title_match_query, title_scope_token, MAX_TITLE_MATCH_QUERY_BYTES,
+    };
+
+    fn long_id(prefix: &str, index: usize) -> String {
+        let prefix = format!("{prefix}-{index:03}-");
+        format!("{prefix}{}", "x".repeat(512 - prefix.len()))
+    }
+    let pool = migrated_pool().await;
+    let root = long_id("root", 0);
+    insert_folder(&pool, &root, "Selected root", None).await;
+    insert_folder(&pool, "outside", "Outside", None).await;
+    let mut ids = Vec::new();
+    let mut folder_keys = vec![title_scope_token('f', &root)];
+    for index in 0..100 {
+        let folder = long_id("folder", index);
+        insert_folder(&pool, &folder, "Child", Some(&root)).await;
+        folder_keys.push(title_scope_token('f', &folder));
+        // Reverse folder/meeting ordering: later folder groups contain
+        // smaller stable IDs. Stronger title winners also occur in later
+        // allowed-ID groups, so either per-group cutoff is falsifiable.
+        let id = long_id("meeting", 99 - index);
+        let title = if !(5..95).contains(&index) {
+            "Needle access"
+        } else {
+            "Needle access meeting notes budget plans"
+        };
+        insert_meeting(&pool, &id, title).await;
+        set_meeting_folder(&pool, &id, Some(&folder)).await;
+        ids.push(id);
+    }
+    insert_meeting(&pool, "000-outside", "Needle access needle access").await;
+    set_meeting_folder(&pool, "000-outside", Some("outside")).await;
+    ids.sort();
+    assert!(ids.iter().all(|id| id.len() == 512));
+    let core = vec!["needle".to_string(), "access".to_string()];
+    let reference_query = title_match_query(&core, &[]).unwrap();
+    let reference: Vec<(String, f64)> = sqlx::query_as(
+        "SELECT m.id, bm25(retrieval_title_fts, 1.0, 1.0, 0.0) AS score
+         FROM retrieval_title_fts JOIN meetings m ON m.id = retrieval_title_fts.meeting_id
+         WHERE retrieval_title_fts MATCH ? AND m.id != '000-outside'
+         ORDER BY score, m.id",
+    )
+    .bind(&reference_query)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let expected: Vec<String> = reference.iter().take(7).map(|(id, _)| id.clone()).collect();
+    assert_eq!(expected, [&ids[..5], &ids[95..97]].concat());
+
+    let meeting_keys: Vec<String> = ids.iter().map(|id| title_scope_token('m', id)).collect();
+    for keys in [&folder_keys, &meeting_keys] {
+        assert!(keys.iter().all(|key| key.len() == 1025));
+        let queries = title_match_queries(&core, keys).unwrap();
+        assert!(queries.len() > 1, "maximal identities require partitioning");
+        assert!(queries
+            .iter()
+            .all(|query| query.len() <= MAX_TITLE_MATCH_QUERY_BYTES));
+        let duplicates: Vec<String> = keys.iter().chain(keys.iter()).cloned().collect();
+        assert_eq!(title_match_queries(&core, &duplicates).unwrap(), queries);
+        let mut observed = Vec::new();
+        for query in queries {
+            let rows: Vec<(String, f64)> = sqlx::query_as(
+                "SELECT m.id, bm25(retrieval_title_fts, 1.0, 1.0, 0.0)
+                 FROM retrieval_title_fts JOIN meetings m ON m.id = retrieval_title_fts.meeting_id
+                 WHERE retrieval_title_fts MATCH ?",
+            )
+            .bind(query)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            observed.extend(rows);
+        }
+        observed.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        assert_eq!(
+            observed, reference,
+            "disjoint groups preserve every exact title score and ID"
+        );
+    }
+
+    let service = RetrievalService::new(query_lifecycle(&ServiceEmbedder::new()));
+    for scope in [
+        PersistedRetrievalScope::Folder(root.clone()),
+        PersistedRetrievalScope::AllowedMeetingIds(ids.clone()),
+    ] {
+        let result = service
+            .retrieve(
+                &pool,
+                request(
+                    "needle access",
+                    scope,
+                    RetrievalLimits {
+                        lexical_per_variant: 7,
+                        vector_per_variant: 0,
+                    },
+                    CoreTermLanguage::Unknown,
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+        let actual: Vec<String> = result
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.source_kind == "title")
+            .map(|candidate| candidate.meeting_id.clone())
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "the production channel retains one global top-k"
+        );
+    }
+
+    // Exercise validation and both public adapters with the supported
+    // maximum-length Meeting, Folder and full 100-ID allowed scope.
+    for (index, scope) in [
+        HybridScope::Meeting {
+            meeting_id: ids[99].clone(),
+        },
+        HybridScope::Folder {
+            folder_id: root.clone(),
+        },
+        HybridScope::AllowedMeetingIds {
+            meeting_ids: ids.clone(),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let expected_count = if index == 0 { 1 } else { 50 };
+        let response = execute_hybrid_search(
+            &pool,
+            failing_lifecycle(),
+            &ChatRequestState::new(),
+            ChatRequestSurface::Sidebar,
+            format!("title-max-id-{index}"),
+            "needle access".to_string(),
+            scope.clone(),
+            Some(50),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.results.len(), expected_count);
+        assert!(response
+            .results
+            .iter()
+            .all(|result| ids.contains(&result.meeting_id)));
+        if index == 0 {
+            assert_eq!(response.results[0].meeting_id, ids[99]);
+        }
+        let response = call_mcp_tool(
+            mcp_state(&pool, &failing_lifecycle(), &ChatRequestState::new()),
+            "search_meetings_hybrid_v1",
+            json!({ "query": "needle access", "scope": scope, "limit": 50 }),
+        )
+        .await;
+        assert_eq!(response["result"]["isError"], false);
+        let payload: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        let results = payload["results"].as_array().unwrap();
+        assert_eq!(results.len(), expected_count);
+        assert!(results.iter().all(|result| ids
+            .iter()
+            .any(|id| id == result["meetingId"].as_str().unwrap())));
+        if index == 0 {
+            assert_eq!(results[0]["meetingId"], ids[99]);
+        }
+    }
+}
+
+/// Retain the original title-match proof through ranking and fence it
+/// against authoritative metadata before Search or Chat/Context hydration.
+/// A title matching a Deep planner query must not be reinterpreted using
+/// the different core terms of the original question.
+#[tokio::test]
+async fn title_hydration_fences_renames_deletions_and_moves_after_ranking() {
+    use super::hydration::{hydrate_context, hydrate_search_context};
+
+    let pool = migrated_pool().await;
+    insert_folder(&pool, "inside", "Inside", None).await;
+    insert_folder(&pool, "outside", "Outside", None).await;
+    let selected_title = "Ação de Acesso";
+    for id in ["keep", "rename-away", "rename-match", "moved", "deleted"] {
+        insert_meeting(&pool, id, selected_title).await;
+        set_meeting_folder(&pool, id, Some("inside")).await;
+        add_transcript(&pool, &format!("t-{id}"), id, "Unrelated budget decision").await;
+    }
+    let service = RetrievalService::new(query_lifecycle(&ServiceEmbedder::new()));
+    let mut ranked = service
+        .retrieve_ranked(
+            &pool,
+            request(
+                "ação acesso",
+                PersistedRetrievalScope::Folder("inside".to_string()),
+                RetrievalLimits {
+                    lexical_per_variant: 50,
+                    vector_per_variant: 0,
+                },
+                CoreTermLanguage::Portuguese,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(ranked.ranking.evidence.is_empty());
+    assert_eq!(ranked.ranking.title_matches.len(), 5);
+    assert!(ranked
+        .ranking
+        .title_matches
+        .iter()
+        .all(|title| title.selected_title == selected_title));
+    // Model a title signal supplied by a different Deep planner query slot.
+    // The exact selected title already proved eligibility for that query.
+    ranked.ranking.core_terms = vec!["different".to_string()];
+    for title in &mut ranked.ranking.title_matches {
+        for provenance in &mut title.provenance {
+            provenance.query_slot = 1;
+        }
+    }
+    sqlx::raw_sql(
+        "UPDATE meetings SET title = 'Unrelated meeting' WHERE id = 'rename-away';
+         UPDATE meetings SET title = 'Ação de Acesso revisada' WHERE id = 'rename-match';
+         UPDATE meetings SET folder_id = 'outside' WHERE id = 'moved';
+         DELETE FROM meetings WHERE id = 'deleted';",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let context = hydrate_context(&pool, &ranked, 10_000, None).await.unwrap();
+    assert_eq!(
+        context
+            .meetings
+            .iter()
+            .map(|m| m.meeting_id.as_str())
+            .collect::<Vec<_>>(),
+        ["keep"],
+        "Chat/Context retain only the unchanged title-selected meeting"
+    );
+    assert!(context
+        .sources
+        .iter()
+        .all(|source| source.source_kind != "title"));
+    assert!(context.markdown.contains("Unrelated budget decision"));
+
+    let search = hydrate_search_context(&pool, &ranked, 10_000, 50, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        search
+            .meetings
+            .iter()
+            .map(|m| m.meeting_id.as_str())
+            .collect::<Vec<_>>(),
+        ["keep"],
+        "Search also drops renamed/moved/deleted title identities"
+    );
+    assert!(search
+        .retained_evidence_ids
+        .contains(&"title:keep".to_string()));
+    assert_eq!(search.sources[0].meeting_title, selected_title);
+}
+
+#[tokio::test]
+async fn title_hydration_drops_renamed_signal_but_keeps_matching_content() {
+    use super::hydration::hydrate_search_context;
+
+    let pool = migrated_pool().await;
+    insert_meeting(&pool, "mixed", "Ação de Acesso").await;
+    add_transcript(&pool, "t-mixed", "mixed", "Ação e acesso foram discutidos").await;
+    crate::database::repositories::fts::FtsRepository::refresh_meeting(&pool, "mixed")
+        .await
+        .unwrap();
+    let service = RetrievalService::new(query_lifecycle(&ServiceEmbedder::new()));
+    let mut search_request = request(
+        "ação acesso",
+        PersistedRetrievalScope::Meeting("mixed".to_string()),
+        RetrievalLimits {
+            lexical_per_variant: 50,
+            vector_per_variant: 0,
+        },
+        CoreTermLanguage::Portuguese,
+        None,
+    );
+    search_request.purpose = RetrievalPurpose::Search;
+    let ranked = service
+        .retrieve_ranked(&pool, search_request)
+        .await
+        .unwrap();
+    assert_eq!(ranked.ranking.title_matches.len(), 1);
+    assert!(!ranked.ranking.evidence.is_empty());
+    sqlx::query("UPDATE meetings SET title = 'Different title' WHERE id = 'mixed'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let search = hydrate_search_context(&pool, &ranked, 10_000, 50, None)
+        .await
+        .unwrap();
+    assert_eq!(search.meetings.len(), 1, "valid content remains eligible");
+    assert!(!search
+        .retained_evidence_ids
+        .contains(&"title:mixed".to_string()));
+    assert!(search
+        .sources
+        .iter()
+        .all(|source| source.source_kind != "title"));
+    assert!(search
+        .sources
+        .iter()
+        .all(|source| source.meeting_title == "Different title"));
+    assert!(!search.retained_evidence_ids.is_empty());
+}
+
+/// Every title page and folder expansion belongs to one read snapshot. A
+/// writer can commit between pages without replacing already-seen rows or
+/// letting a replacement consume a second top-k slot. The following request
+/// must then see the committed state, rather than retaining that snapshot.
+#[tokio::test]
+async fn title_lookup_uses_one_snapshot_across_rename_delete_and_folder_move() {
+    let directory = tempfile::tempdir().unwrap();
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(directory.path().join("title-snapshot.sqlite"))
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(2)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    insert_folder(&pool, "inside", "Inside", None).await;
+    insert_folder(&pool, "outside", "Outside", None).await;
+    sqlx::query(
+        "WITH RECURSIVE seq(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n < 429)
+         INSERT INTO meetings (id, title, folder_id, created_at, updated_at)
+         SELECT printf('snapshot-%05d', n), 'Needle meeting notes', 'inside',
+                '2026-09-08T00:00:00Z', '2026-09-08T00:00:00Z' FROM seq",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let service = RetrievalService::new(query_lifecycle(&ServiceEmbedder::new()));
+    let (arrived, mut arrival) = tokio::sync::mpsc::unbounded_channel();
+    service.arm_title_scan_gate(arrived);
+    let search_request = request(
+        "needle",
+        PersistedRetrievalScope::Folder("inside".to_string()),
+        RetrievalLimits {
+            lexical_per_variant: 5,
+            vector_per_variant: 0,
+        },
+        CoreTermLanguage::Unknown,
+        None,
+    );
+    let running_pool = pool.clone();
+    let running_service = service.clone();
+    let running_request = search_request.clone();
+    let running = tokio::spawn(async move {
+        running_service
+            .retrieve(&running_pool, running_request)
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(10), arrival.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    // All four rows were in page one. The matching rename reinserts at a
+    // larger FTS rowid: separate snapshots would visit the same ID twice.
+    sqlx::raw_sql(
+        "UPDATE meetings SET title = 'Needle meeting plans' WHERE id = 'snapshot-00000';
+         DELETE FROM meetings WHERE id = 'snapshot-00001';
+         UPDATE meetings SET title = 'Unrelated meeting notes' WHERE id = 'snapshot-00002';
+         UPDATE meetings SET folder_id = 'outside' WHERE id = 'snapshot-00003';",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    service.release_title_scan_gate();
+    let snapshot = tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .unwrap()
+        .unwrap();
+    let titles = |result: &crate::retrieval::RetrievalResult| {
+        result
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.source_kind == "title")
+            .map(|candidate| {
+                (
+                    candidate.meeting_id.clone(),
+                    candidate.meeting_title.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        titles(&snapshot),
+        (0..5)
+            .map(|index| (
+                format!("snapshot-{index:05}"),
+                "Needle meeting notes".to_string()
+            ))
+            .collect::<Vec<_>>(),
+        "all five distinct hits must come from the original read snapshot"
+    );
+    let current = service.retrieve(&pool, search_request).await.unwrap();
+    assert_eq!(
+        titles(&current),
+        vec![
+            (
+                "snapshot-00000".to_string(),
+                "Needle meeting plans".to_string()
+            ),
+            (
+                "snapshot-00004".to_string(),
+                "Needle meeting notes".to_string()
+            ),
+            (
+                "snapshot-00005".to_string(),
+                "Needle meeting notes".to_string()
+            ),
+            (
+                "snapshot-00006".to_string(),
+                "Needle meeting notes".to_string()
+            ),
+            (
+                "snapshot-00007".to_string(),
+                "Needle meeting notes".to_string()
+            ),
+        ],
+        "a new request observes the rename and excludes the deleted, nonmatching, and moved rows"
+    );
+    pool.close().await;
+}
+
+/// Equal-rank selection is deterministic from stable meeting identity: ten
+/// identically-shaped titles (equal bm25 scores) inserted in reverse produce
+/// the five lexicographically smallest meeting IDs in the bounded top-k, and
+/// a second database with the same meetings inserted in forward order
+/// produces the identical selection - the meeting ID itself is the
+/// tie-break, so insertion history is irrelevant and no ID can fail.
+#[tokio::test]
+async fn title_equal_rank_selection_follows_the_stable_identity_key() {
+    let pool = migrated_pool().await;
+    let mut tied: Vec<String> = (0..10).map(|index| format!("tie-{index:02}")).collect();
+    for id in tied.iter().rev() {
+        insert_meeting(&pool, id, "Identical title words").await;
+    }
+    tied.sort();
+
+    let service = RetrievalService::new(query_lifecycle(&ServiceEmbedder::new()));
+    let mut request1 = request(
+        "identical title",
+        PersistedRetrievalScope::All,
+        RetrievalLimits {
+            lexical_per_variant: 5,
+            vector_per_variant: 0,
+        },
+        CoreTermLanguage::Unknown,
+        None,
+    );
+    request1.purpose = RetrievalPurpose::Search;
+    let result = service.retrieve(&pool, request1).await.unwrap();
+    let hits: Vec<String> = result
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.source_kind == "title")
+        .map(|candidate| candidate.meeting_id.clone())
+        .collect();
+    assert_eq!(hits.len(), 5);
+    assert_eq!(
+        hits,
+        tied[..5].to_vec(),
+        "the equal-rank cut follows the stable meeting identity, not insertion history"
+    );
+    let mut sorted_hits = hits.clone();
+    sorted_hits.sort();
+    assert_eq!(
+        hits, sorted_hits,
+        "the response order is meeting id ascending among equal ranks"
+    );
+
+    // Identical input, identical output: a fresh database with the same
+    // meetings inserted in forward order yields the same selected set.
+    let pool2 = migrated_pool().await;
+    for id in tied.iter() {
+        insert_meeting(&pool2, id, "Identical title words").await;
+    }
+    let mut request2 = request(
+        "identical title",
+        PersistedRetrievalScope::All,
+        RetrievalLimits {
+            lexical_per_variant: 5,
+            vector_per_variant: 0,
+        },
+        CoreTermLanguage::Unknown,
+        None,
+    );
+    request2.purpose = RetrievalPurpose::Search;
+    let service2 = RetrievalService::new(query_lifecycle(&ServiceEmbedder::new()));
+    let result = service2.retrieve(&pool2, request2).await.unwrap();
+    let hits2: Vec<String> = result
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.source_kind == "title")
+        .map(|candidate| candidate.meeting_id.clone())
+        .collect();
+    assert_eq!(
+        hits, hits2,
+        "equal-rank selection is independent of insertion history"
+    );
+}
+
+/// Impossible inputs fail closed: a scope key that would exceed the approved
+/// encoded size is rejected before any FTS query, and a folder subtree with
+/// more than the approved number of direct folders fails closed.
+#[tokio::test]
+async fn title_scope_and_match_inputs_fail_closed_on_impossible_inputs() {
+    let pool = migrated_pool().await;
+    let service = RetrievalService::new(query_lifecycle(&ServiceEmbedder::new()));
+    let search = |scope: PersistedRetrievalScope| {
+        let service = &service;
+        let pool = &pool;
+        async move {
+            let mut request = request(
+                "needle",
+                scope,
+                RetrievalLimits::default(),
+                CoreTermLanguage::Unknown,
+                None,
+            );
+            request.purpose = RetrievalPurpose::Search;
+            service.retrieve(pool, request).await
+        }
+    };
+
+    // An oversized meeting ID produces an oversized encoded scope key, which
+    // is rejected before any FTS query.
+    let oversized = "x".repeat(2_000);
+    insert_meeting(&pool, &oversized, "Oversized").await;
+    let error = search(PersistedRetrievalScope::Meeting(oversized))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, RetrievalError::InvalidScope(_)));
+
+    // A folder subtree with more than the approved number of direct folders
+    // fails closed once a meeting inside it is looked up (an empty subtree has
+    // no work to bound and legitimately returns nothing).
+    let mut last = "root-fold".to_string();
+    insert_folder(&pool, &last, "Root", None).await;
+    for index in 0..crate::retrieval::service::MAX_TITLE_SCOPE_KEYS {
+        let id = format!("sub-fold-{index}");
+        insert_folder(&pool, &id, &id, Some(&last)).await;
+        last = id;
+    }
+    insert_meeting(&pool, "deep-meeting", "Needle title").await;
+    set_meeting_folder(&pool, "deep-meeting", Some(&last)).await;
+    let error = search(PersistedRetrievalScope::Folder("root-fold".to_string()))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, RetrievalError::InvalidScope(_)));
+}
+
+/// Arbitrary schema-valid meeting IDs are collision-free by construction
+/// (the ID itself is the tie-break; no derived key exists): adversarial
+/// ordinary IDs that would collide under a case-folding or polynomial hash
+/// ('Aa' and 'BB' both fold to 2112 under a 31-polynomial) coexist, are all
+/// findable, and rank deterministically by (score, meeting ID).
+#[tokio::test]
+async fn title_arbitrary_ids_are_collision_free_and_rank_deterministically() {
+    let pool = migrated_pool().await;
+    for (id, title) in [
+        ("Aa", "Alpha Needle"),
+        ("BB", "Alpha Needle"),
+        ("\u{3}\u{4}", "Alpha Needle"),
+        ("a", "Alpha Needle"),
+        ("zz-ordinary", "Other meeting"),
+    ] {
+        insert_meeting(&pool, id, title).await;
+    }
+    let service = RetrievalService::new(query_lifecycle(&ServiceEmbedder::new()));
+    let mut request = request(
+        "alpha needle",
+        PersistedRetrievalScope::All,
+        RetrievalLimits::default(),
+        CoreTermLanguage::Unknown,
+        None,
+    );
+    request.purpose = RetrievalPurpose::Search;
+    let result = service.retrieve(&pool, request).await.unwrap();
+    let hits: Vec<String> = result
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.source_kind == "title")
+        .map(|candidate| candidate.meeting_id.clone())
+        .collect();
+    // Identical titles -> identical scores -> meeting ID ascending; every
+    // adversarial ID is present and nothing failed insertion.
+    assert_eq!(
+        hits,
+        vec![
+            "\u{3}\u{4}".to_string(),
+            "Aa".to_string(),
+            "BB".to_string(),
+            "a".to_string(),
+        ]
+    );
+}
+/// Context production route: the title channel runs on Context and the test
+/// is falsifiable - the in-folder target's summary and transcript share NO
+/// token with the query, so only the title channel can select it, its
+/// authoritative content is cited, the title itself is never a citation (the
+/// frozen Task 3.3 boundary), and the allowed-ID scope fences other matches.
+#[tokio::test]
+async fn hybrid_context_tauri_route_runs_the_title_lookup_beyond_the_scan_cap() {
+    let pool = migrated_pool().await;
+    seed_beyond_cap_corpus(&pool).await;
+    // FALSIFIABLE: the target's content shares no token with the query, so
+    // the lexical channel cannot find it - only the title channel can.
+    add_transcript(
+        &pool,
+        "t-target",
+        "zz-target",
+        "fully unrelated budget decision",
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO summary_processes (meeting_id, template_id, status, created_at, updated_at, result)
+         VALUES ('zz-target', 'summary', 'completed', '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z', '{\"markdown\":\"Unrelated rollout summary\"}')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    crate::database::repositories::fts::FtsRepository::refresh_meeting(&pool, "zz-target")
+        .await
+        .unwrap();
+    let response = execute_hybrid_context(
+        &pool,
+        failing_lifecycle(),
+        &ChatRequestState::new(),
+        ChatRequestSurface::Sidebar,
+        "title-context-beyond-cap".to_string(),
+        "chaves de acesso".to_string(),
+        HybridScope::Folder {
+            folder_id: "fold".to_string(),
+        },
+        Some(32_000),
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        response.retrieval_status,
+        HybridRetrievalStatus::LexicalFallback
+    );
+    assert!(
+        response
+            .sources
+            .iter()
+            .any(|source| source.meeting_id == "zz-target"),
+        "the title-selected meeting must reach the context"
+    );
+    assert!(
+        response.context.contains("Unrelated rollout summary"),
+        "the title-selected meeting's authoritative content is cited"
+    );
+    // Titles are selection signals on Context, never citations.
+    assert!(response
+        .sources
+        .iter()
+        .all(|source| source.source_kind != "title"));
+    // Folder fencing: the out-of-folder title match never reaches Context.
+    assert!(response
+        .sources
+        .iter()
+        .all(|source| source.meeting_id != "aa-outside"));
+
+    // The allowed-ID scope route stays within its allow-list.
+    let allowed = execute_hybrid_context(
+        &pool,
+        failing_lifecycle(),
+        &ChatRequestState::new(),
+        ChatRequestSurface::Sidebar,
+        "title-context-allowed".to_string(),
+        "chaves de acesso".to_string(),
+        HybridScope::AllowedMeetingIds {
+            meeting_ids: vec!["zz-target".to_string()],
+        },
+        Some(32_000),
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert!(allowed
+        .sources
+        .iter()
+        .all(|source| source.meeting_id == "zz-target"));
+    assert!(allowed
+        .sources
+        .iter()
+        .all(|source| source.source_kind != "title"));
+}
+
+/// Scope tokens carry ZERO bm25 weight, so their document frequencies cannot
+/// influence title relevance or order: a meeting in a rare child folder (its
+/// folder token's document frequency is 1) must NOT outrank an
+/// identically-titled meeting in a populous sibling folder merely because of
+/// that rarity - the bounded top-k follows (title score, meeting ID), which
+/// would fail under default bm25 weights.
+#[tokio::test]
+async fn title_scope_token_document_frequencies_do_not_change_ranking() {
+    let pool = migrated_pool().await;
+    insert_folder(&pool, "parent", "Parent", None).await;
+    insert_folder(&pool, "common", "Common", Some("parent")).await;
+    insert_folder(&pool, "rare", "Rare", Some("parent")).await;
+    // The populous sibling: 40 identically-titled meetings.
+    for index in 0..40 {
+        let id = format!("c-{index:02}");
+        insert_meeting(&pool, &id, "Alpha Beta").await;
+        set_meeting_folder(&pool, &id, Some("common")).await;
+    }
+    // The rare folder's only meeting, identical title.
+    insert_meeting(&pool, "bbb", "Alpha Beta").await;
+    set_meeting_folder(&pool, "bbb", Some("rare")).await;
+    // An id that sorts FIRST among the tied set, in the populous folder.
+    insert_meeting(&pool, "aaa", "Alpha Beta").await;
+    set_meeting_folder(&pool, "aaa", Some("common")).await;
+
+    let service = RetrievalService::new(query_lifecycle(&ServiceEmbedder::new()));
+    let mut request = request(
+        "alpha beta",
+        PersistedRetrievalScope::Folder("parent".to_string()),
+        RetrievalLimits::default(),
+        CoreTermLanguage::Unknown,
+        None,
+    );
+    request.purpose = RetrievalPurpose::Search;
+    let result = service.retrieve(&pool, request).await.unwrap();
+    let hits: Vec<String> = result
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.source_kind == "title")
+        .map(|candidate| candidate.meeting_id.clone())
+        .collect();
+    assert_eq!(hits.len(), 42);
+    assert_eq!(
+        hits.first(),
+        Some(&"aaa".to_string()),
+        "title relevance (and the identity tie-break) decides the order, not folder-token rarity"
+    );
+    // The rare-folder meeting ranks by its title alone: identical title ->
+    // identical score -> meeting-ID ascending places it second, ahead of the
+    // populous folder's meetings. Under default bm25 weights its rare folder
+    // token would inflate the score and rank it FIRST.
+    assert_eq!(hits.get(1), Some(&"bbb".to_string()));
+}
+
+/// Exercises the mirror contract end to end: diacritic-folded matching,
+/// repeated query terms, transactional maintenance on title update and
+/// delete, folder-move scope intersection, and per-scope authorization.
+#[tokio::test]
+async fn title_mirror_lookup_tracks_updates_deletes_and_scope() {
+    let pool = migrated_pool().await;
+    insert_meeting(&pool, "m-fold", "Comunicação Reunião").await;
+    insert_meeting(&pool, "m-out", "Comunicação Reunião").await;
+    insert_meeting(&pool, "m-solo", "Comunicação Solo").await;
+    insert_meeting(&pool, "m-del", "Comunicação Apagada").await;
+    insert_folder(&pool, "fold", "Folder", None).await;
+    set_meeting_folder(&pool, "m-fold", Some("fold")).await;
+    let service = RetrievalService::new(query_lifecycle(&ServiceEmbedder::new()));
+
+    let search = |query: &'static str, scope: PersistedRetrievalScope| {
+        let service = &service;
+        let pool = &pool;
+        async move {
+            let mut request = request(
+                query,
+                scope,
+                RetrievalLimits::default(),
+                CoreTermLanguage::Unknown,
+                None,
+            );
+            request.purpose = RetrievalPurpose::Search;
+            let result = service.retrieve(pool, request).await.unwrap();
+            result
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.source_kind == "title")
+                .map(|candidate| candidate.meeting_id.clone())
+                .collect::<Vec<_>>()
+        }
+    };
+
+    // Diacritics fold both ways and ordering is meeting id ascending.
+    assert_eq!(
+        search("comunicação reunião", PersistedRetrievalScope::All).await,
+        vec!["m-fold".to_string(), "m-out".to_string()]
+    );
+    // A repeated query token is deduplicated, not a second required term.
+    assert_eq!(
+        search("reunião reunião", PersistedRetrievalScope::All).await,
+        vec!["m-fold".to_string(), "m-out".to_string()]
+    );
+    // Folder scope intersects current membership; a meeting scope can only
+    // ever return its own meeting, even when others share the exact title.
+    assert_eq!(
+        search(
+            "comunicação",
+            PersistedRetrievalScope::Folder("fold".to_string())
+        )
+        .await,
+        vec!["m-fold".to_string()]
+    );
+    assert_eq!(
+        search(
+            "comunicação",
+            PersistedRetrievalScope::Meeting("m-out".to_string())
+        )
+        .await,
+        vec!["m-out".to_string()]
+    );
+
+    // A title update moves the mirror: the old words stop matching and the
+    // new ones start, in the same transaction as the meetings row, and the
+    // update leaves exactly one live mirror row for the meeting.
+    sqlx::query("UPDATE meetings SET title = 'Comunicação Editada' WHERE id = 'm-fold'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mirror_rows: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM retrieval_title_fts WHERE meeting_id = 'm-fold'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(mirror_rows.0, 1, "exactly one live mirror row per meeting");
+    assert_eq!(
+        search("comunicação reunião", PersistedRetrievalScope::All).await,
+        vec!["m-out".to_string()]
+    );
+    assert_eq!(
+        search("comunicação editada", PersistedRetrievalScope::All).await,
+        vec!["m-fold".to_string()]
+    );
+
+    // A folder move changes current membership, not the mirror.
+    set_meeting_folder(&pool, "m-out", Some("fold")).await;
+    assert_eq!(
+        search(
+            "comunicação",
+            PersistedRetrievalScope::Folder("fold".to_string())
+        )
+        .await,
+        vec!["m-fold".to_string(), "m-out".to_string()]
+    );
+
+    // A deletion removes the meeting from every scope.
+    sqlx::query("DELETE FROM meetings WHERE id = 'm-del'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        search("comunicação", PersistedRetrievalScope::All).await,
+        vec![
+            "m-fold".to_string(),
+            "m-out".to_string(),
+            "m-solo".to_string()
+        ]
+    );
+    let mirror_rows: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM retrieval_title_fts WHERE meeting_id = 'm-del'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(mirror_rows.0, 0, "a deletion removes every mirror row");
+
+    // Recreating the same meeting id leaves exactly one live mirror row.
+    insert_meeting(&pool, "m-del", "Comunicação Retornada").await;
+    let mirror_rows: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM retrieval_title_fts WHERE meeting_id = 'm-del'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(mirror_rows.0, 1, "exactly one live mirror row per meeting");
+    assert_eq!(
+        search("comunicação retornada", PersistedRetrievalScope::All).await,
+        vec!["m-del".to_string()]
+    );
 }
 
 async fn bounded_folder_title_ids(reverse_insert: bool) -> Vec<String> {
     let pool = migrated_pool().await;
     insert_folder(&pool, "title-root", "Title Root", None).await;
-    let mut meetings: Vec<(String, String)> = (0..super::service::TITLE_SCAN_PAGE)
-        .map(|index| (format!("filler-{index:03}"), format!("Filler {index}")))
-        .collect();
-    meetings.extend([
-        ("match-best".to_string(), "Alpha Beta".to_string()),
-        ("match-a".to_string(), "Alpha".to_string()),
-        ("match-b".to_string(), "Alpha".to_string()),
-        ("match-c".to_string(), "Alpha".to_string()),
+    // Distinct token counts give the five matches strictly distinct bm25
+    // ranks (shorter titles rank better), so the expected order is
+    // insert-order independent by construction rather than by tie luck.
+    let mut meetings: Vec<(String, String)> = vec![
+        ("match-1".to_string(), "Alpha Beta".to_string()),
+        ("match-2".to_string(), "Alpha Beta c".to_string()),
+        ("match-3".to_string(), "Alpha Beta c d".to_string()),
+        ("match-4".to_string(), "Alpha Beta c d e".to_string()),
+        ("match-5".to_string(), "Alpha Beta c d e f".to_string()),
+        ("match-partial".to_string(), "Alpha".to_string()),
         ("match-zero".to_string(), "Gamma".to_string()),
-    ]);
+    ];
     if reverse_insert {
         meetings.reverse();
     }
@@ -2763,24 +4190,16 @@ async fn bounded_folder_title_ids(reverse_insert: bool) -> Vec<String> {
         .collect()
 }
 
+/// The all-core-term lookup returns the per-variant cap of matching meeting
+/// ids in ascending order, independent of insertion order; partial and
+/// zero-overlap titles are excluded by the same gate.
 #[tokio::test]
 async fn folder_title_top_k_is_bounded_deterministic_and_page_order_independent() {
-    let mut oracle = vec![
-        ("match-best", 2),
-        ("match-a", 1),
-        ("match-b", 1),
-        ("match-c", 1),
+    let expected = vec![
+        "match-1".to_string(),
+        "match-2".to_string(),
+        "match-3".to_string(),
     ];
-    oracle.sort_by(|(left_id, left_overlap), (right_id, right_overlap)| {
-        right_overlap
-            .cmp(left_overlap)
-            .then_with(|| left_id.cmp(right_id))
-    });
-    let expected: Vec<String> = oracle
-        .into_iter()
-        .take(3)
-        .map(|(meeting_id, _)| meeting_id.to_string())
-        .collect();
     assert_eq!(bounded_folder_title_ids(false).await, expected);
     assert_eq!(bounded_folder_title_ids(true).await, expected);
 }
@@ -3258,27 +4677,4 @@ async fn fast_hybrid_query_counter_counts_only_clean_completions() {
         .provenance
         .iter()
         .any(|provenance| provenance.channel == RetrievalChannel::Lexical)));
-}
-
-/// The title channel has no index to seek on, so its scan is linear in the
-/// meeting count. Search runs it per debounced keystroke and must stop; the
-/// per-turn purposes must not, because truncating them would silently drop
-/// title candidates from Chat and Context answers.
-#[test]
-fn only_the_interactive_purpose_bounds_the_title_scan() {
-    assert!(!title_scan_exhausted(
-        RetrievalPurpose::Search,
-        MAX_SEARCH_TITLE_SCAN_MEETINGS - 1
-    ));
-    assert!(title_scan_exhausted(
-        RetrievalPurpose::Search,
-        MAX_SEARCH_TITLE_SCAN_MEETINGS
-    ));
-    for purpose in [RetrievalPurpose::Chat, RetrievalPurpose::Context] {
-        assert!(!title_scan_exhausted(
-            purpose,
-            MAX_SEARCH_TITLE_SCAN_MEETINGS
-        ));
-        assert!(!title_scan_exhausted(purpose, usize::MAX));
-    }
 }

@@ -243,6 +243,11 @@ pub struct TitleMatch {
     pub meeting_id: String,
     pub evidence_id: String,
     pub provenance: Vec<EvidenceProvenance>,
+    /// Exact title that satisfied its originating query's all-core-term
+    /// gate. Hydration fences renames against this value, including Deep
+    /// planner query slots whose terms can differ from the original query.
+    /// Internal only: this is never serialized as a public result field.
+    pub selected_title: String,
 }
 
 /// One meeting in the aggregated ranking order.
@@ -1252,6 +1257,7 @@ fn collect_title_matches(candidates: &[RetrievedEvidence]) -> Vec<TitleMatch> {
             meeting_id: candidate.meeting_id.clone(),
             evidence_id: candidate.evidence_id.clone(),
             provenance: candidate.provenance.clone(),
+            selected_title: candidate.meeting_title.clone(),
         })
         .collect::<Vec<_>>();
     matches.sort_by(|left, right| {

@@ -7,6 +7,10 @@ use env_logger;
 use log;
 
 fn main() {
+    if app_lib::retrieval_smoke::requested(std::env::args_os()) {
+        std::process::exit(app_lib::retrieval_smoke::run());
+    }
+
     // Only the first argument selects the packaged diagnostic. Tauri forwards
     // argv for single-instance activation and deep links, so matching the flag
     // anywhere in the list would let a forwarded payload exit the app instead

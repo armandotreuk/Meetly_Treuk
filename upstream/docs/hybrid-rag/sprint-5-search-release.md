@@ -11,6 +11,24 @@ Tasks 5.4a-5.4c. The split changes review and handoff boundaries, not the
 approved Windows-only outcome or any release gate. Each subtask requires its
 own implementation session, acceptance review, and execution-log entry.
 
+Verified implementation state on 2026-09-08 in `fix/sprint-5-review-r5`
+(HEAD `f5fa329` plus uncommitted remediation; no output commit or push):
+
+| Area | Current state | Remaining gate |
+|---|---|---|
+| 5.1-5.3 search/API/index UI | Implemented in `c8504a7`, `5bf5ced`, and `baf9b47`; subsequent cross-cutting R5 remediations are present. | HR-5.R10 title-work requirement and final integration/release acceptance. |
+| HR-5.R10 correctness | Activation watermarks, title snapshot/hydration fences, deleted-folder handling, and maximum public-ID scopes independently approved. | Exact title top-k still has linear matching-set work; the requirement decision remains with the user. |
+| 5.4a package authority | Accepted after real Tauri expansion, staging/recovery tests, and independent review. | Installed-package evidence belongs to 5.4c. |
+| 5.4b retrieval diagnostic | Accepted after pinned Rust 1.88 tests, real source-side package-layout inference, fallback tests, and independent review. | Source-layout inference is not MSI/NSIS installation evidence. |
+| 5.4c installer CI | Ownership remediation implemented and independently approved by code and architecture reviewers; 205 assertions passed in worker, primary and both review sessions. | Actual installed smokes/registration and filesystem teardown on the exact reviewed Actions commit; source approval is not installed-package acceptance. |
+| 5.5 release qualification | Not started; dependencies and inherited evidence remain open. | Independent corpus, production quality/provider answers, native/R13 sessions, full qualification matrix, exact final-head Actions, and user close approval. |
+
+The latest explicit Rust 1.88 integration run passed 920 library tests (four
+ignored), 18 model tests, 22 staged-bundle tests, cargo check, frontend
+typecheck, and scoped formatting. The frontend suite passed 168 tests in 23
+files. These checks provide local regression evidence, not release acceptance;
+see the immutable execution entries for test and evidence limitations.
+
 Revised 2026-08-21 after pre-implementation critique: packaging descoped to
 Windows x64, derived-disk gate added, kill-switch UI added, and a sidebar
 reranking guard added. Estimate: 8-12 working days.
@@ -61,7 +79,11 @@ not close Sprint 3 release acceptance.
   `architecture.md` "Platform Scope". Do not add root-level workflows for those
   targets in this sprint, and do not claim support for them.
 
-## Current State And Evidence
+## Pre-implementation Baseline And Evidence
+
+The touchpoints below describe the planning baseline, not a current status
+report. Use the verified status above and the latest immutable execution and
+review entries for the implemented state.
 
 - `frontend/src/components/Sidebar/SidebarProvider.tsx:233-252` retains current
   search results for the sidebar.
@@ -122,7 +144,10 @@ may substitute for them.
   retrieval so queued/running scheduler and ONNX work terminates without a
   public MCP cancel API.
 
-## Task List
+## Task Definitions And Planned Ownership
+
+The original worker assignments below describe implementation boundaries;
+they are not a completion tracker. Current acceptance is recorded above.
 
 | ID | Feature | Task | Size | Owner | Dependencies | Acceptance check | Rollback |
 |---|---|---:|---|---|---|---|---|
@@ -923,13 +948,15 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 | 2026-08-21 | Add derived-disk qualification at every scale, including the rebuild peak. | Derived text plus vectors plus two retained generations plausibly reach ~2 GiB with no prior ceiling anywhere in the program. | Report disk as an unanchored metric. | Main agent, pending sprint approval |
 | 2026-08-21 | Guard sidebar reranking with a minimum query length, `Search` depth, and in-flight cancellation. | Sidebar runs the cross-encoder per debounced keystroke; an empty-query check alone does not bound that cost. | Rely on debounce and the empty-query guard. | Main agent, pending sprint approval |
 | 2026-09-04 | Set the approved sidebar inference minimum to one non-empty Unicode character. | Preserve exact title matching for short names while avoiding model inference for empty input. | Require two or more characters; rely only on debounce. | User |
-| 2026-09-05 | Raise the sidebar inference minimum from one character to three (`SIDEBAR_SEARCH_MIN_QUERY_LENGTH` / `SEARCH_MIN_MODEL_QUERY_CHARS`), and keep the 2026-09-04 rationale satisfied by matching titles locally by substring in every retrieval state rather than by query length. | At one character the guard is the empty-query check under another name, so Task 5.1's "minimum query length" mitigation bounded nothing; the original rationale was short-name title matching, which the client-side title union now preserves at any length, including lengths below the minimum. | Keep the approved minimum at one and accept unbounded cross-encoder inference per debounced keystroke; rely on debounce alone. | **Pending user approval** - supersedes the 2026-09-04 row above, which the user approved. |
+| 2026-09-05 | Raise the sidebar inference minimum from one character to three (`SIDEBAR_SEARCH_MIN_QUERY_LENGTH` / `SEARCH_MIN_MODEL_QUERY_CHARS`), and keep the 2026-09-04 rationale satisfied by matching titles locally by substring in every retrieval state rather than by query length. | At one character the guard is the empty-query check under another name, so Task 5.1's "minimum query length" mitigation bounded nothing; the original rationale was short-name title matching, which the client-side title union now preserves at any length, including lengths below the minimum. | Keep the approved minimum at one and accept unbounded cross-encoder inference per debounced keystroke; rely on debounce alone. | OpenCode under the user's delegated decision authority through 07:00 UTC-03, per the 2026-09-08 row below; supersedes the 2026-09-04 row above, which the user approved. |
 | 2026-09-02 | Carry Sprint 3's open release gates into Task 5.5 and release close while retaining commits `62d7730` and `1047367` as the reviewed implementation baseline. | R40 separates implementation dependencies from release acceptance; valid corpus, production-path quality/provider-answer, native Windows/R13 hermetic session, and exact-head Actions evidence remain mandatory. | Treat Sprint 4/5 implementation results or broad architecture wording as release evidence. | User-authorized R40 |
 | 2026-09-02 | Reuse one Rust ownership/cancellation mechanism and Chat publication fence for sidebar/Tauri/MCP work, including internal MCP deadline cancellation. | Prevents parallel registries, stale progress, and timeouts that merely drop results while preserving Fast-only MCP compatibility. | Add another request registry or public MCP cancel API. | User-authorized R40 |
 | 2026-09-02 | Carry the single persisted `force_lexical_retrieval` decision through all Deep rounds and sidebar/Tauri/MCP hybrid requests. | Shared-boundary reads, typed `ForcedLexical`, and next-request/restart/disable-restore checks keep rollback consistent without a second service. | Per-surface settings or diagnostics. | User-authorized R40 |
 | 2026-09-04 | Permit Tasks 5.1-5.4 to proceed from code-ready Sprint 4 baseline `29df304` while retaining every Sprint 4/Sprint 3 release gate for Task 5.5, Sprint 5 close, and release claims. | The user explicitly authorized implementation to continue; separating code readiness from release acceptance preserves the inherited evidence gates. | Require Sprint 4 release closure before all Sprint 5 implementation. | User |
 | 2026-09-04 | Decompose Task 5.4 into sequential Tasks 5.4a package authority, 5.4b packaged diagnostic, and 5.4c installed MSI/NSIS CI smoke. | Artifact trust, runtime inference/fallback, and signed installer evidence have distinct failure modes and acceptance evidence. Separate handoffs prevent source-only checks from being mistaken for installed-package proof and isolate signing-sensitive workflow changes. | Keep one broad Task 5.4 implementation session; split only the CI step. | User |
 | 2026-09-04 | Reclassify Tasks 5.4b and 5.4c as L and assign each directly to a distinct `worker-l` session after its dependency is accepted. | The installed-resource diagnostic and signed-installer workflow are cross-cutting native/package evidence changes and require higher-risk implementation/review ownership. A worker owns one task; it does not delegate nested worker sessions. | Retain M `worker-m` ownership; use one worker-l as a delegating manager. | User |
+| 2026-09-08 | Approve a three-character sidebar model-inference minimum (`SIDEBAR_SEARCH_MIN_QUERY_LENGTH` / `SEARCH_MIN_MODEL_QUERY_CHARS`). | A one-character minimum did not reduce per-keystroke cross-encoder work; exact title matching remains available without model inference for shorter non-empty queries, while the three-character guard bounds interactive ONNX cost. | Restore a one-character model-inference minimum; rely only on debounce. | OpenCode under the user's delegated decision authority through 07:00 UTC-03 |
+| 2026-09-08 | Add an additive `retrieval_title_fts` mirror for authoritative bounded hybrid title lookup. | The current ID-ordered title scan is incomplete above its arbitrary row limit and is unsuitable for MCP/Context. A separately maintained FTS5 title mirror supports normalized all-core-term lookup without changing the existing public `meeting_fts` lexical commands, semantic document set, vector inputs, or title provenance semantics. | Keep a capped scan with an incomplete-result flag; add title rows to existing `meeting_fts`; add title vectors. | OpenCode under the user's delegated decision authority through 07:00 UTC-03 |
 
 ## Task Execution Log
 
@@ -960,13 +987,430 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 - ...
 ```
 
+### Task HR-5.R5 - R5 independent-review remediation: indexed title mirror, lag fail-closed, single-transaction terminalization, three-character authorization
+
+**Status:** Complete (implementation and mandatory verification; pending independent review; no release claim and no gate re-opened)
+**Owner:** `worker-m` (HR-5.R5)
+**Completed:** 2026-09-08
+**Implemented:**
+- Authoritative indexed title lookup: the Search/Chat/Context title channel no
+  longer scans `meetings` in ID order under a 10,000-row budget. It runs one
+  FTS5 `MATCH` seek against the new additive `retrieval_title_fts` mirror for
+  every purpose and scope (Tauri sidebar, Chat/Context, and MCP share the same
+  service), joined to current `meetings` by mirrored rowid so identity, title
+  text, and folder membership are always the live rows. Deleted meetings, old
+  titles, and out-of-scope folder membership can never be served. Ranking is
+  unchanged in observable behavior: every match contains all distinct core
+  terms, so the retired (overlap desc, meeting id asc) order collapses to
+  meeting id ascending, applied by SQL `ORDER BY`/`LIMIT` with the per-variant
+  candidate cap.
+- Migration `20260908000000_add_retrieval_title_fts.sql`: additive FTS5
+  virtual table (`title`, `unicode61` tokenizer, the same tokenizer family as
+  `meeting_fts`), one backfill from `meetings`, and three triggers
+  (insert/title-update/delete) that maintain the mirror inside the writer's
+  own transaction. No title rows enter `meeting_fts`, no public lexical FTS
+  command changes, no semantic document or vector changes, no model identity
+  or package artifact changes.
+- `update_publication_lag` fail-closed: a failed `publication_lag` read and a
+  missing index-state row for the active generation now call
+  `mark_lag_unknown` instead of the swallowed zero, so `index_status` cannot
+  report ready off an unverifiable state. Regression
+  `unverifiable_publication_lag_never_reports_caught_up` injects all three
+  failures deterministically (row deleted, backing table dropped, pool
+  closed).
+- Single-transaction shadow terminalization:
+  `mark_shadow_generation_failed` now checks the non-active pointer, the
+  outstanding-work predicate (pending/retry rows below current source
+  revisions), and performs the failed write inside one `BEGIN IMMEDIATE`;
+  `record_item_failure` invokes it directly. Work created before the write
+  commits keeps the generation building; user mutation and retry semantics
+  after a genuinely terminal failed state are unchanged. Regression
+  `terminalization_never_marks_a_generation_failed_over_work_created_while_it_waited`
+  drives the real repository flow against a file-backed pool where a barrier
+  connection holds the SQLite write lock while a user mutation commits.
+- Three-character model-inference guard preserved as approved
+  (`SIDEBAR_SEARCH_MIN_QUERY_LENGTH = 3` / `SEARCH_MIN_MODEL_QUERY_CHARS = 3`)
+  and the 2026-09-05 decision row revised from pending to authorized by the
+  user-delegated 2026-09-08 decision recorded above.
+**Implementation:**
+- Files: `frontend/src-tauri/migrations/20260908000000_add_retrieval_title_fts.sql`
+  (new), `frontend/src-tauri/src/retrieval/service.rs`, `frontend/src-tauri/src/retrieval/tests.rs`,
+  `frontend/src-tauri/src/retrieval/index.rs`, `frontend/src-tauri/src/retrieval/worker.rs`,
+  `frontend/src-tauri/src/database/repositories/retrieval.rs`, `frontend/src-tauri/src/mcp/server.rs`,
+  this doc, `docs/notes-chat-improvement-execution.md`.
+- Approach: reuse the repository's existing `BEGIN IMMEDIATE` patterns and the
+  FTS5/trigger idiom of the semantic-retrieval migration; the title lookup is a
+  service-level `QueryBuilder` query per scope (folder recursive-CTE, meeting/allowed-ID
+  `IN` list from request-start membership, all) with cancellation checks and
+  the existing `record_candidate` provenance path.
+**Not implemented:**
+- No title rows in `meeting_fts`; no new public lexical commands; no
+  semantic/vector/model/package changes; no change to force-lexical, lexical
+  fallback, deletion/scope/privacy/cancellation behavior, or the 5.4 package
+  constraints.
+**Why not implemented:**
+- Explicitly excluded by the 2026-09-08 authorized decision (alternative
+  rejected: title rows in `meeting_fts`, title vectors).
+**Verification:**
+- `cargo check` - pass (only the pre-existing `retrieval/model.rs` warning).
+- `cargo test --lib` - 892 passed / 0 failed / 2 ignored (one recorded
+  wall-clock Deep-deadline flake on the first pass passed unchanged on the
+  clean re-run; the flake predates this task and is in `retrieval/agent`).
+- `cargo fmt --check` - pass.
+- `pnpm run typecheck` - pass; `pnpm exec vitest run` - 168 passed / 23 files.
+- `git diff --check` - pass.
+- New/updated regressions: `title_lookup_finds_a_match_beyond_the_retired_ten_thousand_row_scan_cap`,
+  `title_mirror_lookup_tracks_updates_deletes_and_scope` (diacritics, repeated
+  terms, title update, folder move, deletion, meeting/folder/all scope),
+  `folder_title_top_k_is_bounded_deterministic_and_page_order_independent`
+  (rewritten to the all-core-term gate),
+  `unverifiable_publication_lag_never_reports_caught_up`,
+  `terminalization_never_marks_a_generation_failed_over_work_created_while_it_waited`,
+  `hybrid_search_mcp_route_finds_a_matching_title_beyond_the_retired_scan_cap`
+  (MCP route, 10,000+ filler meetings, title provenance `channelRank` 1).
+**Rollback:**
+- Forward-only migration per policy: restore the verified pre-upgrade database
+  backup before running a pre-migration binary. Code-only revert of the
+  service/repo/worker commits restores the previous scan/lag/terminalization
+  behavior; the mirror table and triggers are additive and inert for the old
+  code path.
+**Decisions and follow-ups:**
+- The title lookup uses all-core-term (implicit AND) semantics for every
+  purpose, per the authorized decision. Production callers (Search/Chat/Context,
+  Tauri and MCP) all pass `CoreTermLanguage::Unknown`, which is exactly the
+  gate the retired scan enforced for Search; partial-overlap title matching
+  for stated-language library callers is retired with the scan. The
+  three-character minimum preserves short-query lexical/title behavior.
+- Deterministic ranking, cancellation checks, per-variant caps, folder
+  recursive-CTE membership, and allowed-ID bounds are unchanged from the scan
+  contract; the lookup cost is proportional to the exact-match set, never a
+  full table scan or candidate overfetch.
+- Inherited gates unchanged: independently authored corpus, production-path
+  quality/provider-answer evidence, native Windows/R13 hermetic session,
+  exact-head Actions evidence, installed-package smoke. No release claim.
+
+### Task HR-5.R6 - R5.R5 changes-requested remediation: purpose-complete ranked title lookup, string-ID mirror, bounded ranked fetch, atomic fenced terminal failure, malformed-lag fail-closed
+
+**Status:** Complete, then changes-requested by Review R5.R6 - the scoped-work, tie-determinism, and Chat/Context-falsifiability claims below were corrected by Task HR-5.R7 (2026-09-08), which Review R5.R7 then partially superseded (see Task HR-5.R8); see that entry for the reviewed state.
+**Owner:** `worker-m` (HR-5.R6)
+**Completed:** 2026-09-08
+**Implemented:**
+- Purpose-complete title lookup: the `CoreTermLanguage::Unknown`/purpose
+  bypass that skipped the title channel for Chat and Context is removed. The
+  channel now runs for Search, Chat, and Context on the shared service, so
+  Tauri and MCP alike get authoritative title candidates everywhere; the
+  unknown-language all-core-term gate is unchanged. The approved
+  search-only model-inference minimum (`SEARCH_MIN_MODEL_QUERY_CHARS`) is
+  untouched: the title lookup is pure indexed SQL and never touches the model
+  runtime.
+- Mirror identity redesign: `retrieval_title_fts` stores the stable meeting
+  string ID (`meeting_id UNINDEXED`) instead of mirroring `meetings.rowid`;
+  the lookup joins live `meetings` on `m.id = meeting_id` for current
+  identity, title, and folder membership. The uncommitted migration
+  `20260908000000_add_retrieval_title_fts.sql` was amended in place (no
+  database outside this tree applied an earlier revision, so no repair
+  migration is stacked). Triggers enforce exactly one live mirror row per
+  meeting across backfill (one row per `meetings.id` PK), insert,
+  title-update (delete-then-insert), delete, and restart; a meeting deleted
+  mid-flight leaves zero rows and can never be served through the live join.
+- Bounded ranked fetch: the lookup is
+  `... WHERE retrieval_title_fts MATCH ? [AND scope] ORDER BY rank LIMIT ?`
+  over FTS5's `rank` (negated bm25, lower is better). This selects the FTS5
+  rank-ordered cursor strategy (observed as `VIRTUAL TABLE INDEX 32:` in
+  `EXPLAIN QUERY PLAN`), so rows stream best-ranked first, scope filters
+  apply per row, and the per-variant LIMIT terminates the scan after the cap
+  - with NO `USE TEMP B-TREE FOR ORDER BY`, which the previous
+  `ORDER BY m.id` form required to sort the whole matched set. The bounded
+  fetch is re-ordered in memory by (rank, meeting id ascending) - a
+  documented deterministic response order; exactly-equal ranks straddling the
+  fetch cut resolve by the mirror's index order, so the result is a
+  deterministic function of the database state. Visiting matching index
+  entries is intrinsic to ranking them; non-matching rows are never scanned.
+- Atomic fenced terminal failure:
+  `record_terminal_work_failure_and_maybe_terminalize` performs, in ONE
+  `BEGIN IMMEDIATE`: read the meeting's current source revision under the
+  writer lock; only when it equals the exact revision the failed work
+  targeted, record the terminal failure; inspect the outstanding-work
+  predicate; and conditionally terminalize a non-active building generation
+  (shared private `terminalize_idle_generation_tx`, also used by
+  `mark_shadow_generation_failed`). If the source moved past the failed work
+  before the lock was acquired, the stale failure is REJECTED, the work is
+  requeued pending for the newer revision (attempt budget reset), and nothing
+  is terminalized over the newer revision. A meeting deleted mid-flight
+  records nothing (its work row is cascade-removed) and leaves only the idle
+  terminalization decision, so a fully consumed shadow never stalls in
+  `building`. `record_item_failure` invokes the operation and runs
+  `suppress_terminal_failure` only AFTER a confirmed applicable record - a
+  rejected stale record never suppresses serving.
+- Malformed lag fail-closed: `update_publication_lag` treats a published bound
+  ahead of canonical, negative bounds, an overflowing/invalid delta (via
+  `checked_sub` + sign check), a missing index-state row, and read failures
+  as `mark_lag_unknown` - never clamped to zero/ready.
+**Implementation:**
+- Files: `frontend/src-tauri/migrations/20260908000000_add_retrieval_title_fts.sql`
+  (amended), `frontend/src-tauri/src/retrieval/service.rs`, `frontend/src-tauri/src/retrieval/tests.rs`,
+  `frontend/src-tauri/src/retrieval/index.rs`, `frontend/src-tauri/src/retrieval/worker.rs`,
+  `frontend/src-tauri/src/database/repositories/retrieval.rs`, `frontend/src-tauri/src/api/chat.rs`,
+  `frontend/src-tauri/src/mcp/server.rs`, this doc, `docs/notes-chat-improvement-execution.md`.
+- Approach: reuse the repository's `BEGIN IMMEDIATE` patterns and FTS5/trigger
+  idioms; the ranked lookup SQL is built by one shared `build_title_lookup`
+  helper that the plan-shape regression explains with an `EXPLAIN QUERY PLAN`
+  prefix, so the asserted plan IS the production statement.
+**Not implemented:**
+- No title rows in `meeting_fts`; no public lexical command, semantic
+  document, vector, model identity, or package artifact changes; no change to
+  force-lexical, lexical fallback, deletion/scope/privacy/cancellation
+  behavior, or the Task 3.3 contract that title candidates are selection
+  signals, never citations, on the Chat/Context paths.
+**Why not implemented:**
+- Explicitly out of the authorized decision scope and guarded by existing
+  reviewed contracts.
+**Verification:**
+- `cargo check` - pass (only the pre-existing `retrieval/model.rs` warning).
+- `cargo test --lib` - 897 passed / 0 failed / 2 ignored.
+- `cargo fmt --check` - pass; `git diff --check` - pass.
+- `pnpm run typecheck` - pass; `pnpm exec vitest run` - 168 passed / 23 files.
+- New/updated regressions: production Chat route (`api/chat.rs`, 10,000+
+  fillers, title-matched meeting cited, title-only match not cited, folder
+  fencing), production Context route (`execute_hybrid_context`, beyond-cap
+  selection, no title citations, folder fencing), Tauri Search +
+  `handle_jsonrpc` MCP routes with beyond-cap matches, title provenance, and
+  meeting/allowed-ID/folder fencing (`retrieval/tests.rs`), common-term bound
+  proof with `EXPLAIN QUERY PLAN` assertions (rank-ordered cursor strategy
+  present, no matched-set temp b-tree sort - reverting to `ORDER BY m.id`
+  fails it), mirror one-live-row enforcement after title update, delete, and
+  same-id re-insert, real `record_item_failure` concurrent same-meeting
+  mutation barrier (file-backed pool, stale record rejected, work requeued,
+  serving NOT suppressed, active generation untouched), real
+  `record_item_failure` applicable flow (record confirmed, serving suppressed
+  after confirmation, idle non-active generation terminalized), and lag
+  corruption/failure injection (published ahead of canonical, negative
+  bounds, missing row, dropped table, closed pool).
+**Rollback:**
+- Forward-only migration per policy: restore the verified pre-upgrade database
+  backup before running a pre-migration binary. Code-only revert restores the
+  prior lookup/lag/terminalization behavior; the mirror table and triggers
+  are additive and inert for the old code path.
+**Decisions and follow-ups:**
+- The equal-rank fetch cut resolves by the mirror's index order (documented);
+  resolving arbitrary rank ties by meeting id without a matched-set sort is
+  not possible in FTS5, and the ranked form is the review-directed trade.
+- `mark_shadow_generation_failed` remains the standalone idle-gated
+  terminalize primitive sharing `terminalize_idle_generation_tx`; the
+  production failure path uses the atomic record-and-terminalize operation.
+- Inherited gates unchanged: independently authored corpus, production-path
+  quality/provider-answer evidence, native Windows/R13 hermetic session,
+  exact-head Actions evidence, installed-package smoke. No release claim.
+
+
+### Task HR-5.R7 - R5.R6 changes-requested remediation: in-index scoped ranked title lookup, identity-key tie order, activation-grade bound validation, falsifiable Chat/Context routes, upgrade/restart migration proof
+
+**Status:** Complete, then changes-requested by Review R5.R7 - the scope-column bm25 coupling, the derived ranking-key collision policy, and the missing final-gate revalidation below were corrected by Task HR-5.R8 (2026-09-08); see that entry for the reviewed state.
+**Owner:** `worker-m` (HR-5.R7)
+**Completed:** 2026-09-08
+**Implemented:**
+- In-index scope restriction: the mirror gains an indexed `scope` column
+  (identity token `m` + lowercase hex of the stable meeting string ID, plus
+  the direct-folder token `f` + hex); the MATCH expression ANDs
+  column-filtered `{title}` terms with column-filtered `{scope}` tokens, so
+  the FTS intersection is the in-scope candidate set - a narrow folder with
+  10,000 out-of-scope common matches returns only its own rows. Meeting and
+  allowed-ID scopes intersect identity tokens (the approved 100-ID bound); a
+  folder scope intersects the subtree's DIRECT folder tokens expanded from
+  the LIVE `meeting_folders` table at query time, bounded by
+  `MAX_TITLE_SCOPE_KEYS` (512, fail-closed) with a 65,536-byte cap on the
+  assembled expression (fail-closed). Descendant folders are correct through
+  the query-time expansion; a re-parented subtree needs no mirror
+  maintenance; a folder deletion rewrites its direct meetings' tokens ahead
+  of the ON DELETE SET NULL action.
+- Identity-deterministic equal-rank selection: the mirror rowid is a stable
+  ranking key derived from the full meeting ID (two 31-polynomial folds of
+  its UTF-8 bytes combined into one 63-bit integer, computed by the backfill
+  and triggers via one recursive CTE). The rank-ordered cursor breaks
+  equal-rank ties by stable identity, never insertion history; the response
+  re-sorts the bounded fetch by (rank, meeting id ascending). Key collisions
+  are impossible inputs that fail closed at the mutating statement (FTS5
+  rowid uniqueness), proven with the deterministic pair `a` and `U+0003
+  U+0004` (both fold to 97). The scope column always carries exactly three
+  tokens (identity, folder when present, padding) so document length is
+  uniform and bm25 stays title-driven.
+- Activation-grade bound validation: `validated_publication_delta` is the
+  single validator; the activation gate blocks malformed stored pairs
+  (negative, published ahead of canonical, unrepresentable delta) and
+  missing rows, the post-install lag setter routes malformed pairs to
+  `mark_lag_unknown`, and the status refresh shares the same validator.
+- Falsifiable Chat/Context title routes: the target's summary, notes, and
+  transcript share NO token with the query, so only the title channel can
+  select the meeting; its authoritative content is cited and the title
+  itself is never a citation (frozen Task 3.3 boundary); folder and
+  allowed-ID scopes fence other matches.
+- Upgrade/restart migration proof: a pre-migration populated file database is
+  upgraded by the title migration, the backfill seeds exactly one correctly
+  scoped row per legacy meeting, a reopen asserts persistence, and title
+  update, folder removal, and meeting deletion are followed by the mirror.
+- Execution record repair: control characters replaced, HR-5.R6 claims
+  narrowed via an explicit supersession banner, and this entry records the
+  corrected contracts.
+**Implementation:**
+- Files: `frontend/src-tauri/migrations/20260908000000_add_retrieval_title_fts.sql`
+  (amended in place), `frontend/src-tauri/src/retrieval/service.rs`,
+  `frontend/src-tauri/src/retrieval/tests.rs`,
+  `frontend/src-tauri/src/retrieval/hydration.rs`,
+  `frontend/src-tauri/src/retrieval/index.rs`,
+  `frontend/src-tauri/src/api/chat.rs`,
+  `frontend/src-tauri/src/mcp/server.rs`,
+  `frontend/src-tauri/src/database/migration_tests.rs`,
+  `docs/hybrid-rag/sprint-5-search-release.md`,
+  `docs/notes-chat-improvement-execution.md`.
+- Approach: scope keys and the ranking key live in the additive mirror and
+  are maintained transactionally by triggers; the shared `build_title_lookup`
+  helper emits one scope-independent statement and the plan-shape regression
+  explains the identical SQL.
+**Not implemented:**
+- No title rows in `meeting_fts`; no public lexical command, semantic
+  document, vector, model identity, or package artifact changes; no change to
+  force-lexical, lexical fallback, deletion/scope/privacy/cancellation
+  behavior, or the Task 3.3 title selection/citation boundary.
+**Why not implemented:**
+- Explicitly out of the authorized decision scope and guarded by existing
+  reviewed contracts.
+**Verification:**
+- `cargo check` - pass (only the pre-existing `retrieval/model.rs` warning).
+- `cargo test --lib` - 902 passed / 0 failed / 2 ignored.
+- `cargo fmt --check` - pass; `git diff --check` - pass.
+- `pnpm run typecheck` - pass; `pnpm exec vitest run` - 168 passed / 23 files.
+- New/updated regressions: narrow-folder bounded lookup over 10,000
+  out-of-scope common matches with `EXPLAIN QUERY PLAN` assertions for all
+  four scopes (rank-ordered cursor strategy present; no temp B-tree sort; no
+  scope CTE - reverting to a post-filter or `ORDER BY m.id` fails them);
+  meeting/allowed-ID exactness; equal-rank selection following the stable
+  identity key across insertion orders; key-collision fail-closed; oversized
+  scope key and >512-folder subtree fail-closed; mirror maintenance under
+  folder move/delete/re-parent; falsifiable production Chat and Context
+  routes (All/Folder/Allowed); activation blocking on malformed stored bounds
+  with a repaired-bounds control; legacy upgrade/restart/backfill migration
+  coverage.
+**Rollback:**
+- Forward-only migration per policy: restore the verified pre-upgrade
+  database backup before running a pre-migration binary. Code-only revert
+  restores the prior lookup/lag/terminalization behavior; the mirror table
+  and triggers are additive and inert for the old code path.
+**Decisions and follow-ups:**
+- The scope-token/identity-key design is a durable schema trade: one additive
+  FTS table carries the scope and ranking keys (maintained transactionally by
+  triggers) so query work is bounded by the requested scope and candidate
+  limit; the review's rejected alternative (a hard scan budget with
+  incomplete results) was not used.
+- bm25 ordering is unchanged relative to title content (uniform three-token
+  scope shape), and equal-rank ties resolve by stable identity, never
+  insertion history.
+- Inherited gates unchanged: independently authored corpus, production-path
+  quality/provider-answer evidence, native Windows/R13 hermetic session,
+  exact-head Actions evidence, installed-package smoke. No release claim.
+
+### Task HR-5.R8 - R5.R7 changes-requested remediation: final-gate publication-bound revalidation, zero-weight scope ranking, collision-free meeting-ID tie-break
+
+**Status:** Historical implementation; superseded by R5.R8 and R5.R9 changes-requested reviews. The activation and work-bound claims below were not accepted. Current remediation is HR-5.R10.
+**Owner:** `worker-m` (HR-5.R8)
+**Completed:** 2026-09-08
+**Implemented:**
+- Final-gate publication-bound revalidation: `activate_generation_if_ready`
+  now reads BOTH publication bounds inside its `BEGIN IMMEDIATE` and
+  validates them with the shared `validated_publication_delta` (moved to the
+  repository module as the single validator used by the status refresh, the
+  activation preflight, and this final gate). Negative bounds, a published
+  bound ahead of canonical, an unrepresentable delta, or a missing
+  index-state row block the activation: no ready flip, no active-pointer
+  move, the prior generation keeps serving. This closes the TOCTOU between
+  the preflight and the durable transition.
+- Zero-weight scope ranking: every candidate is scored with the explicit
+  per-query weight vector `bm25(retrieval_title_fts, 1.0, 1.0, 0.0)` - the
+  scope column's weight is zero - so scope-token document frequencies cannot
+  influence title relevance, order, or the bounded top-k. Probe-verified: a
+  candidate's score is bit-identical across a 50x change in its folder
+  token's document frequency. The three-token scope shape is kept so the
+  ranking document length stays uniform across rows.
+- Collision-free tie-break: the derived 63-bit ranking-key scheme (whose
+  31-polynomial fold collided on ordinary IDs `Aa`/`BB`) is removed. Mirror
+  rows carry no derived key; the rowid is FTS5-assigned and meaningless.
+  Deterministic selection comes from a bounded rowid-window batch scan
+  (`TITLE_SCAN_BATCH_ROWS` = 400; the rowid range constraint is pushed into
+  FTS5, so each in-scope match is visited exactly once) feeding a bounded
+  top-k heap ordered by (bm25 title score, meeting ID ascending) - the
+  meeting ID itself is the bijective, collision-free tie-break, making the
+  selection a deterministic function of database content independent of
+  insertion history, and no schema-valid TEXT meeting ID can fail insertion,
+  upgrade, or backfill.
+**Implementation:**
+- Files: `frontend/src-tauri/migrations/20260908000000_add_retrieval_title_fts.sql`
+  (amended in place), `frontend/src-tauri/src/database/repositories/retrieval.rs`,
+  `frontend/src-tauri/src/retrieval/index.rs`,
+  `frontend/src-tauri/src/retrieval/service.rs`,
+  `frontend/src-tauri/src/retrieval/tests.rs`,
+  `docs/hybrid-rag/sprint-5-search-release.md`,
+  `docs/notes-chat-improvement-execution.md`.
+- Approach: the centralized validator lives in the repository module beside
+  the final gate; the lookup's batch query and the bounded heap live in the
+  title channel, with the plan-shape regression explaining the identical
+  SQL.
+**Not implemented:**
+- No title rows in `meeting_fts`; no public lexical command, semantic
+  document, vector, model identity, or package artifact changes; no change to
+  force-lexical, lexical fallback, deletion/scope/privacy/cancellation
+  behavior, or the Task 3.3 title selection/citation boundary.
+**Why not implemented:**
+- Explicitly out of the authorized decision scope and guarded by existing
+  reviewed contracts.
+**Verification:**
+- `cargo check` - pass (only the pre-existing `retrieval/model.rs` warning).
+- `cargo test --lib` - 904 passed / 0 failed / 2 ignored.
+- `cargo fmt --check` - pass; `git diff --check` - pass.
+- `pnpm run typecheck` - pass; `pnpm exec vitest run` - 168 passed / 23 files.
+- New/updated regressions: the final-gate race regression
+  (`activation_final_gate_blocks_malformed_bounds_after_preflight` - bounds
+  corrupted directly before the gate: refusal, building state, prior
+  generation serving, repaired-bounds commit control); the uneven
+  parent/child folder-frequency regression
+  (`title_scope_token_document_frequencies_do_not_change_ranking`) that
+  fails under default bm25 weights; the adversarial-ID test
+  (`title_arbitrary_ids_are_collision_free_and_rank_deterministically` - `Aa`,
+  `BB`, `U+0003 U+0004`, `a` coexist and rank by ID); reverse-insertion
+  deterministic top-k
+  (`title_equal_rank_selection_follows_the_stable_identity_key`); the
+  10,000-out-of-scope common-title plan/bound test updated to the batch SQL
+  for all four scopes; and the legacy upgrade/reopen backfill coverage.
+**Rollback:**
+- Forward-only migration per policy: restore the verified pre-upgrade
+  database backup before running a pre-migration binary. Code-only revert
+  restores the prior lookup/lag/activation behavior; the mirror table and
+  triggers are additive and inert for the old code path.
+**Decisions and follow-ups:**
+- The meeting ID itself is the tie-break (bijective over the ID space), so
+  no collision class exists and no valid ID can be rejected; determinism is
+  by content (score, ID), not insertion history.
+- The rank-ordered cursor was replaced by the rowid-window batch scan +
+  client heap: both visit exactly the in-scope match set, but only the batch
+  design admits an arbitrary-ID collision-free tie-break. Per-request FTS
+  work stays bounded by the in-scope match set; memory by the candidate cap
+  plus one batch.
+- The FTS5 rank-configuration INSERT does not persist across database reopen
+  (probe-verified), so the weights are supplied per query through the
+  `bm25()` auxiliary function instead of a stored configuration.
+- Inherited gates unchanged: independently authored corpus, production-path
+  quality/provider-answer evidence, native Windows/R13 hermetic session,
+  exact-head Actions evidence, installed-package smoke. No release claim.
+
 ## Sprint Reviews
 
 ### Code Review
 
 **Reviewer:** `anthropic/claude-opus-5` (Claude Code, `/code-review xhigh`), four rounds
-**Verdict:** Implementation findings resolved; sprint close still blocked by the
-release-qualification gates below, which this review did not and cannot clear.
+**Verdict:** Implementation findings resolved through HR-5.R4; subsequent
+reviews through R5.R9 returned changes-requested. HR-5.R10 now corrects the
+absolute activation watermark and title snapshot/publication races, with
+independent scoped approval and passing boundary regressions. Candidate-
+bounded title work has not been achieved; an explicit user design decision
+is pending. Sprint close remains blocked by the separate release gates.
 
 **Findings:**
 
@@ -993,25 +1437,109 @@ release-qualification gates below, which this review did not and cannot clear.
   reserved head counted candidates instead of rendered rows, so repeats could
   push every other missed title match past the final slice. All 4 fixed in
   Task HR-5.R4, both behavioural ones proven by negative control.
+- **R5.R5** (independent review of the user commits `2d640c6..f5fa329`):
+  changes-requested - 6 findings: (1) the unknown-language/purpose bypass
+  dropped the title channel for Chat and Context entirely; (2) the title
+  mirror used `meetings.rowid` as identity, which is not the stable meeting
+  ID and is not preserved across vacuum-style rebuilds; (3) the lookup
+  ordered the whole matched set by `m.id` (`USE TEMP B-TREE FOR ORDER BY`),
+  so a common title term still forced a full matched-set sort; (4) the
+  terminal work failure was still split across an unfenced failure record and
+  a separate terminalize, and `suppress_terminal_failure` ran before the
+  record was confirmed applicable; (5) `update_publication_lag` clamped
+  malformed lag rows (negative bounds, published ahead of canonical) to zero;
+  (6) the docs recorded HR-5.R5 as implemented-and-pending without the review
+  verdict. All 6 fixed in Task HR-5.R6; the R5.R6 review then returned
+  changes-requested on that remediation (see R5.R6 below).
+- **R5.R6** (review of the HR-5.R6 remediation diff): changes-requested - 5
+  findings: (1) scoped lookups still rank-scanned the global FTS match set
+  before applying the scope predicate (about 400,000 VM steps at 10,000
+  out-of-scope matches for `LIMIT 3`) and equal-rank selection followed FTS
+  insertion history; (2) malformed publication bounds still passed the
+  activation gates (only the status refresh validated them); (3) the new
+  Chat/Context title-route tests were not falsifiable (target content carried
+  the query terms); (4) no legacy pre-migration upgrade/restart/backfill
+  coverage existed; (5) the execution record contained control characters and
+  overstated claims. All 5 fixed in Task HR-5.R7; the R5.R7 review then
+  returned changes-requested on that remediation (see R5.R7 below).
+- **R5.R7** (review of the HR-5.R7 remediation diff): changes-requested - 3
+  findings: (1) the final transactional activation gate read only the
+  canonical bound, so malformed state introduced after the preflight could
+  still be durably marked ready and activated (TOCTOU); (2) scope tokens
+  shared the default bm25 weights, so a rare folder token's document
+  frequency could inflate a meeting's score and change the bounded top-k;
+  (3) the derived 63-bit ranking-key scheme rejected schema-valid meeting
+  IDs on collision (ordinary IDs `Aa` and `BB` both fold to 2112) and could
+  brick the upgrade backfill. HR-5.R8 addressed these but its subsequent
+  R5.R8/R5.R9 reviews found a wrong-dimension activation comparison,
+  exhaustive title work, cross-page mutation races, and overstated records.
 
 Both rounds, their per-finding corrections, verification output, and the
 environment/flake caveats are recorded in
 [`notes-chat-improvement-execution.md`](../notes-chat-improvement-execution.md)
 under `R5.R1`, `HR-5.R1`, `R5.R2`, `HR-5.R2`, `R5.R3`, `HR-5.R3`,
-`HR-5.R3b`, `R5.R4`, and `HR-5.R4`.
+`HR-5.R3b`, `R5.R4`, `HR-5.R4`, `R5.R5`, `HR-5.R6`, `R5.R6`, `HR-5.R7`,
+`R5.R7`, and `HR-5.R8`.
 
 **Verification after remediation:** `cargo check` pass; `cargo test --lib` 889
 passed / 0 failed / 2 ignored; `cargo fmt --check` pass; `pnpm run typecheck`
 pass; `pnpm exec vitest run` 168 passed / 23 files; `git diff --check` pass.
 
-**Open items:** (1) the 2026-09-05 Decisions row raising the sidebar inference
-minimum from one character to three supersedes a user-approved row and is
-marked pending user approval. (2) Meeting titles are in no index -
-`meeting_fts` covers transcript, summary and note text only - which is the
-root cause behind both the bounded Rust title scan and the client-side
-substring pass. Indexing titles under a distinct `chunk_type` would remove
-both, but it changes a guarded lexical contract and is recorded as a Task 5.5
-dependency awaiting user approval, not as done.
+**Verification after HR-5.R6 (2026-09-08, this working tree):** `cargo check`
+pass (only the pre-existing `retrieval/model.rs` warning); `cargo test --lib`
+897 passed / 0 failed / 2 ignored; `cargo fmt --check` pass; `pnpm run
+typecheck` pass; `pnpm exec vitest run` 168 passed / 23 files; `git diff
+--check` pass.
+
+**Verification after HR-5.R8 (2026-09-08, this working tree):** `cargo check`
+pass (only the pre-existing `retrieval/model.rs` warning); `cargo test --lib`
+904 passed / 0 failed / 2 ignored; `cargo fmt --check` pass; `pnpm run
+typecheck` pass; `pnpm exec vitest run` 168 passed / 23 files; `git diff
+--check` pass. The previously recorded timing-flake class (manual pause,
+MCP deadline capacity, Deep deadline tests - none touched by the HR-5.R8
+diff) has surfaced single-test failures under full-suite load across
+repeated runs; each passes unchanged in isolation and on clean re-runs.
+
+**Open items:** (1) the 2026-09-05 three-character minimum-length decision row
+is authorized by the user-delegated 2026-09-08 decision recorded above; the
+guard stays approved at three characters. (2) Meeting titles are indexed in
+the additive `retrieval_title_fts` mirror (migration `20260908000000`, amended
+in place while uncommitted) keyed by the stable meeting string ID and
+maintained transactionally by triggers. The current lookup uses scoped
+rowid-window statements and a bounded top-k heap under one read snapshot;
+it is NOT a rank-ordered cursor and it scores all matching in-scope rows.
+Snapshot consistency and current-title hydration fences are tested, but
+bounded output/memory do not establish candidate-bounded database work. The public
+`meeting_fts` lexical contract, the semantic document set, and the vectors
+are unchanged, and the client-side substring union remains as the bounded
+presentation-layer complement, not a completeness safety net. HR-5.R10
+correctness/boundary review is approved; the title-work design decision
+remains open. Maximum-length public scopes use disjoint bounded MATCH
+groups under the same snapshot/global heap, preserving exact score/ID order.
+
+**Package-authority handoff (2026-09-08):** Task 5.4a remediation
+HR-5.4a.R3 is independently approved (review R5.4a.R4). Actual Tauri
+resource expansion, eight filesystem-backed helper regressions, complete
+stager recovery/rollback SelfTest, 22 application bundle tests with real
+staged artifacts, cargo check, and warm-cache publication passed. The
+manifest/model/signing identities are unchanged. Task 5.4b is also accepted
+after independent review: the additive installed-resource diagnostic passes
+real source-side package-layout inference (six embedding references, five
+reranker pairs, two retained sources), normal lexical fallback and bounded
+failure checks. Fresh pinned Rust 1.88 verification passed 920 library tests
+with four ignored; the real diagnostic was explicitly run separately. A
+file-symlink test skipped for missing Windows privilege is disclosed, not
+counted as executed evidence. Task 5.4c's separate code and architecture reviews
+requested a registration-based installation-ownership correction before any
+real installer run. That correction now passes 205 assertions in both worker
+and primary runs, including native MSI metadata extraction, hidden process
+mechanics, fail-closed registration preflight and ownership-proved cleanup.
+The local all-user MSI inventory probe is permission-limited and not counted
+as passing native inventory evidence. YAML/Bash syntax checks also passed.
+Independent code and architecture re-reviews now approve implementation
+commit/dispatch. Actual installed MSI/NSIS and parent 5.4 acceptance remain
+open. The execution log records
+the complete verification and exclusions.
 
 **Required follow-ups:** Task 5.4 packaging, Task 5.5 release qualification, and
 sprint close remain blocked by their own unchanged evidence gates (independently
