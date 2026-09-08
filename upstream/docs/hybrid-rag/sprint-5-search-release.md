@@ -12,7 +12,8 @@ approved Windows-only outcome or any release gate. Each subtask requires its
 own implementation session, acceptance review, and execution-log entry.
 
 Verified implementation state on 2026-09-08 in `fix/sprint-5-review-r5`
-(HEAD `f5fa329` plus uncommitted remediation; no output commit or push):
+(reviewed implementation committed/pushed as `02309c5`; first Windows run
+`34267100849` reached a frozen frontend-lock configuration failure):
 
 | Area | Current state | Remaining gate |
 |---|---|---|
@@ -20,7 +21,7 @@ Verified implementation state on 2026-09-08 in `fix/sprint-5-review-r5`
 | HR-5.R10 correctness | Activation watermarks, title snapshot/hydration fences, deleted-folder handling, and maximum public-ID scopes independently approved. | Exact title top-k still has linear matching-set work; the requirement decision remains with the user. |
 | 5.4a package authority | Accepted after real Tauri expansion, staging/recovery tests, and independent review. | Installed-package evidence belongs to 5.4c. |
 | 5.4b retrieval diagnostic | Accepted after pinned Rust 1.88 tests, real source-side package-layout inference, fallback tests, and independent review. | Source-layout inference is not MSI/NSIS installation evidence. |
-| 5.4c installer CI | Ownership remediation implemented and independently approved by code and architecture reviewers; 205 assertions passed in worker, primary and both review sessions. | Actual installed smokes/registration and filesystem teardown on the exact reviewed Actions commit; source approval is not installed-package acceptance. |
+| 5.4c installer CI | Ownership remediation independently approved; 205 assertions passed in four sessions. CI1 exposed a pnpm override/lock mismatch; its seven-line metadata fix now passes exact pnpm 9.15.9 frozen checks and both independent reviews. | CI retry, then actual installed smokes/registration and filesystem teardown on the exact reviewed Actions commit. |
 | 5.5 release qualification | Not started; dependencies and inherited evidence remain open. | Independent corpus, production quality/provider answers, native/R13 sessions, full qualification matrix, exact final-head Actions, and user close approval. |
 
 The latest explicit Rust 1.88 integration run passed 920 library tests (four
