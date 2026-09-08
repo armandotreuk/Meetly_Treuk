@@ -21,7 +21,7 @@ $originalBundleOverride = $env:MEETLY_RAG_BUNDLE_DIR
 $originalModelsOverride = $env:MEETLY_RAG_MODELS_DIR
 $originalSigning = $env:DIGICERT_KEYPAIR_ALIAS
 $measurementEnvironment = @{}
-foreach ($name in @('GITHUB_SHA', 'GITHUB_SERVER_URL', 'GITHUB_REPOSITORY', 'GITHUB_RUN_ID', 'GITHUB_STEP_SUMMARY', 'MODEL_CACHE_PATH', 'MODEL_CACHE_HIT')) {
+foreach ($name in @('GITHUB_ACTIONS', 'GITHUB_WORKSPACE', 'RUNNER_TEMP', 'GITHUB_SHA', 'GITHUB_SERVER_URL', 'GITHUB_REPOSITORY', 'GITHUB_RUN_ID', 'GITHUB_STEP_SUMMARY', 'MODEL_CACHE_PATH', 'MODEL_CACHE_HIT')) {
     $measurementEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
 }
 
@@ -415,12 +415,48 @@ try {
     $env:GITHUB_SHA = (& git rev-parse HEAD | Out-String).Trim()
     $env:GITHUB_SERVER_URL = 'https://github.com'; $env:GITHUB_REPOSITORY = 'example/repo'; $env:GITHUB_RUN_ID = '1'
     $env:GITHUB_STEP_SUMMARY = Join-Path $script:TestRoot 'sizes-summary.md'
+    $coldMeasurementRoot = Join-Path $script:TestRoot 'cold-miss-measurement'
+    $coldWorkspace = Join-Path $coldMeasurementRoot 'workspace'
+    $coldTemporary = Join-Path $coldMeasurementRoot 'temporary'
+    New-Item -ItemType Directory -Path $coldWorkspace, $coldTemporary -Force | Out-Null
+    $env:MODEL_CACHE_PATH = Join-Path $coldMeasurementRoot 'absent-model-cache'; $env:MODEL_CACHE_HIT = $null
+    Invoke-SizeEvidence 'before' $coldWorkspace $coldTemporary
+    $coldSizes = Get-Content -LiteralPath (Join-Path $coldTemporary 'meetily-package-sizes.json') -Raw | ConvertFrom-Json -AsHashtable
+    Assert-Check ($coldSizes.model_cache_restore -eq 'miss' -and $coldSizes.before.model_cache.bytes -eq 0 -and
+        $coldSizes.before.model_cache.files -eq 0 -and $coldSizes.before.staged_bundle.files -eq 0 -and
+        $coldSizes.before.rust_cache.files -eq 0 -and $coldSizes.before.build_output.files -eq 0) 'cold_miss_absent_cache_and_trees_measure_zero'
+    Assert-Check ((Get-SanitizedMeasurementReason ([UnauthorizedAccessException]::new())) -eq 'access_denied' -and
+        (Get-SanitizedMeasurementReason ([IO.IOException]::new())) -eq 'io_failure' -and
+        (Get-SanitizedMeasurementReason ([Exception]::new('reparse_rejected'))) -eq 'reparse_rejected' -and
+        (Get-SanitizedMeasurementReason ([Exception]::new('C:\\private\\path'))) -eq 'unexpected_failure') 'measurement_failure_reason_is_typed_and_private'
+    $env:GITHUB_ACTIONS = 'false'
+    $boundaryOutput = (& pwsh -NoProfile -File (Join-Path $PSScriptRoot 'windows-package-smoke.ps1') -Mode MeasureBefore 2>&1 | Out-String).Trim()
+    $boundaryExit = $LASTEXITCODE
+    Assert-Check ($boundaryExit -eq 1 -and
+        $boundaryOutput -ceq 'installed-smoke-harness: operation=MeasureBefore status=failed stage=workflow_guard reason=unexpected_failure' -and
+        -not $boundaryOutput.Contains($script:TestRoot)) 'measurement_top_level_unknown_error_is_typed_and_private'
     $env:MODEL_CACHE_PATH = Join-Path $fakeWorkspace 'model-cache'; $env:MODEL_CACHE_HIT = 'true'
     New-Item -ItemType Directory -Path $env:MODEL_CACHE_PATH -Force | Out-Null
     $staged = Join-Path $fakeWorkspace 'upstream/frontend/src-tauri/resources/retrieval/bundle'
     New-Item -ItemType Directory -Path $staged -Force | Out-Null
     Copy-Item -LiteralPath $msi.manifest -Destination (Join-Path $staged 'model-bundle.manifest.json')
     Invoke-SizeEvidence 'before' $fakeWorkspace $script:TestRoot
+    # Metadata remains readable while this native handle denies deletion.
+    # Exercise the real top-level cleanup error, not only the stage helper.
+    New-Item -ItemType Directory -Path $target -Force | Out-Null
+    $lockedOutput = Join-Path $target 'locked-output.bin'
+    [IO.File]::WriteAllText($lockedOutput, '123')
+    $outputLock = [IO.File]::Open($lockedOutput, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $env:GITHUB_ACTIONS = 'true'; $env:GITHUB_WORKSPACE = $fakeWorkspace; $env:RUNNER_TEMP = $script:TestRoot
+        $cleanupOutput = (& pwsh -NoProfile -File (Join-Path $PSScriptRoot 'windows-package-smoke.ps1') -Mode PrepareBuild 2>&1 | Out-String).Trim()
+        $cleanupExit = $LASTEXITCODE
+        Assert-Check ($cleanupExit -eq 1 -and
+            $cleanupOutput -match '^installed-smoke-harness: operation=PrepareBuild status=failed stage=clear_build_output reason=(access_denied|io_failure|unexpected_failure)$' -and
+            -not $cleanupOutput.Contains($script:TestRoot)) 'prepare_build_cleanup_failure_has_its_own_private_stage'
+        Assert-Check (Test-Path -LiteralPath $lockedOutput -PathType Leaf) 'failed_build_cleanup_does_not_claim_removal'
+    } finally { $outputLock.Dispose() }
+    Clear-ExactFrontendBuildOutput $fakeWorkspace $target
     Invoke-SizeEvidence 'prepare_build' $fakeWorkspace $script:TestRoot
     New-Item -ItemType Directory -Path $target -Force | Out-Null
     [IO.File]::WriteAllText((Join-Path $target 'new-output.bin'), '12345')

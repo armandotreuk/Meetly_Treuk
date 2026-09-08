@@ -56,6 +56,20 @@ function Get-EvidenceIdentity {
     return @{ commit = $sha; run_url = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID" }
 }
 
+function Get-SanitizedMeasurementReason($Exception) {
+    # Keep the workflow log useful without serializing paths, captured data,
+    # signer values, or exception text from the runner.
+    $message = [string]$Exception.Message
+    if ($message -match '^(commit_identity_unavailable|commit_identity_mismatch|run_identity_unavailable|size_identity_mismatch|manifest_identity_mismatch|reparse_rejected)$') {
+        return $Matches[1]
+    }
+    if ($Exception -is [System.UnauthorizedAccessException]) { return 'access_denied' }
+    if ($Exception -is [System.ArgumentException] -or $Exception -is [System.NotSupportedException]) { return 'invalid_path' }
+    if ($Exception -is [System.Management.Automation.ItemNotFoundException]) { return 'item_not_found' }
+    if ($Exception -is [System.IO.IOException]) { return 'io_failure' }
+    return 'unexpected_failure'
+}
+
 function Convert-SignatureState([string]$Status) {
     switch ($Status) {
         'Valid' { return 'valid' }
@@ -678,20 +692,35 @@ function Test-EvidenceGate([string]$Outcome, [string]$Path, [string]$PackageKind
 }
 
 function Invoke-SizeEvidence([string]$Phase, [string]$Workspace, [string]$TemporaryRoot) {
+    $script:MeasurementStage = 'identity'
     $path = Join-Path $TemporaryRoot 'meetily-package-sizes.json'
     $identity = Get-EvidenceIdentity
     if ($Phase -eq 'before') {
+        $script:MeasurementStage = 'restore_state'
         $cacheState = switch ($env:MODEL_CACHE_HIT) { 'true' { 'exact_hit' }; 'false' { 'prefix_restore' }; default { 'miss' } }
         $data = @{ schema = 1; commit = $identity.commit; run_url = $identity.run_url; model_cache_restore = $cacheState }
-    } else { $data = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable }
+    } else {
+        $script:MeasurementStage = 'read_evidence'
+        $data = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable
+    }
+    $script:MeasurementStage = 'identity_check'
     if ($data.commit -cne $identity.commit) { throw 'size_identity_mismatch' }
+    $script:MeasurementStage = 'measure_staged_bundle'
+    $stagedBundle = Get-TreeMeasurement (Join-Path $Workspace "upstream/frontend/src-tauri/$script:ResourceRelative")
+    $script:MeasurementStage = 'measure_model_cache'
+    $modelCache = Get-TreeMeasurement $env:MODEL_CACHE_PATH
+    $script:MeasurementStage = 'measure_rust_cache'
+    $rustCache = Get-TreeMeasurement (Join-Path $Workspace 'upstream/target')
+    $script:MeasurementStage = 'measure_build_output'
+    $buildOutput = Get-TreeMeasurement (Join-Path $Workspace 'upstream/frontend/target')
     $data[$Phase] = @{
-        staged_bundle = Get-TreeMeasurement (Join-Path $Workspace "upstream/frontend/src-tauri/$script:ResourceRelative")
-        model_cache = Get-TreeMeasurement $env:MODEL_CACHE_PATH
-        rust_cache = Get-TreeMeasurement (Join-Path $Workspace 'upstream/target')
-        build_output = Get-TreeMeasurement (Join-Path $Workspace 'upstream/frontend/target')
+        staged_bundle = $stagedBundle
+        model_cache = $modelCache
+        rust_cache = $rustCache
+        build_output = $buildOutput
     }
     if ($Phase -eq 'after') {
+        $script:MeasurementStage = 'manifest'
         $data.manifest_sha256 = (Get-FileHash -LiteralPath (Join-Path $Workspace "upstream/frontend/src-tauri/$script:ResourceRelative/model-bundle.manifest.json") -Algorithm SHA256).Hash.ToLowerInvariant()
         if ($data.manifest_sha256 -cne $script:ManifestDigest) { throw 'manifest_identity_mismatch' }
         $data.model_cache_delta_bytes = $data.after.model_cache.bytes - $data.before.model_cache.bytes
@@ -702,8 +731,12 @@ function Invoke-SizeEvidence([string]$Phase, [string]$Workspace, [string]$Tempor
             "- Staged bundle bytes=$($data.after.staged_bundle.bytes); files=$($data.after.staged_bundle.files); manifest SHA-256=$($data.manifest_sha256)",
             "- Cargo cache before_bytes=$($data.before.rust_cache.bytes); after_bytes=$($data.after.rust_cache.bytes); delta_bytes=$($data.rust_cache_delta_bytes)",
             "- Build output before_bytes=$($data.before.build_output.bytes); removed_before_build_bytes=$($data.prepare_build.build_output.bytes); after_bytes=$($data.after.build_output.bytes); delta_bytes=$($data.build_output_delta_bytes)", '')
-        if ($env:GITHUB_STEP_SUMMARY) { [IO.File]::AppendAllLines($env:GITHUB_STEP_SUMMARY, [string[]]$lines) }
+        if ($env:GITHUB_STEP_SUMMARY) {
+            $script:MeasurementStage = 'write_summary'
+            [IO.File]::AppendAllLines($env:GITHUB_STEP_SUMMARY, [string[]]$lines)
+        }
     }
+    $script:MeasurementStage = 'write_evidence'
     [IO.File]::WriteAllText($path, ($data | ConvertTo-Json -Depth 8))
 }
 
@@ -722,6 +755,7 @@ function Clear-ExactFrontendBuildOutput([string]$Workspace, [string]$Target) {
 
 if ($Mode -eq 'Library') { return }
 try {
+    $script:MeasurementStage = 'workflow_guard'
     if ($env:GITHUB_ACTIONS -ne 'true') { throw 'workflow_only' }
     $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
     $temporary = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
@@ -729,6 +763,7 @@ try {
         'MeasureBefore' { Invoke-SizeEvidence 'before' $workspace $temporary }
         'PrepareBuild' {
             Invoke-SizeEvidence 'prepare_build' $workspace $temporary
+            $script:MeasurementStage = 'clear_build_output'
             Clear-ExactFrontendBuildOutput $workspace (Join-Path $workspace 'upstream/frontend/target')
         }
         'MeasureAfter' { Invoke-SizeEvidence 'after' $workspace $temporary }
@@ -761,6 +796,8 @@ try {
         }
     }
 } catch {
-    Write-Host "installed-smoke-harness: operation=$Mode status=failed"
+    $reason = Get-SanitizedMeasurementReason $_.Exception
+    $stage = if ($Mode -in @('MeasureBefore', 'PrepareBuild', 'MeasureAfter')) { $script:MeasurementStage } else { 'operation' }
+    Write-Host "installed-smoke-harness: operation=$Mode status=failed stage=$stage reason=$reason"
     exit 1
 }

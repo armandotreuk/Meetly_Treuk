@@ -12,16 +12,16 @@ approved Windows-only outcome or any release gate. Each subtask requires its
 own implementation session, acceptance review, and execution-log entry.
 
 Verified implementation state on 2026-09-08 in `fix/sprint-5-review-r5`
-(reviewed implementation committed/pushed as `02309c5`; first Windows run
-`34267100849` reached a frozen frontend-lock configuration failure):
+(reviewed implementation `02309c5` plus independently reviewed lock correction
+`72b8005`, both pushed; Windows retry `34268825013` failed before staging):
 
 | Area | Current state | Remaining gate |
 |---|---|---|
 | 5.1-5.3 search/API/index UI | Implemented in `c8504a7`, `5bf5ced`, and `baf9b47`; subsequent cross-cutting R5 remediations are present. | HR-5.R10 title-work requirement and final integration/release acceptance. |
-| HR-5.R10 correctness | Activation watermarks, title snapshot/hydration fences, deleted-folder handling, and maximum public-ID scopes independently approved. | Exact title top-k still has linear matching-set work; the requirement decision remains with the user. |
+| HR-5.R10 correctness | Activation, snapshot/hydration, folder and public-ID fixes approved. User approved exact SQL title top-k with an explicit linear-work limitation on 2026-09-08. | Implement and independently review that approved query change after the current packaging batch; preserve cancellation and all other gates. |
 | 5.4a package authority | Accepted after real Tauri expansion, staging/recovery tests, and independent review. | Installed-package evidence belongs to 5.4c. |
 | 5.4b retrieval diagnostic | Accepted after pinned Rust 1.88 tests, real source-side package-layout inference, fallback tests, and independent review. | Source-layout inference is not MSI/NSIS installation evidence. |
-| 5.4c installer CI | Ownership remediation independently approved; 205 assertions passed in four sessions. CI1 exposed a pnpm override/lock mismatch; its seven-line metadata fix now passes exact pnpm 9.15.9 frozen checks and both independent reviews. | CI retry, then actual installed smokes/registration and filesystem teardown on the exact reviewed Actions commit. |
+| 5.4c installer CI | CI2 passed frozen setup, native harness and Rust check, then failed before staging. Privacy-safe measurement diagnostics now pass 210 assertions and both independent reviews. | Diagnostic CI retry to identify/fix the actual cause, then exact-reviewed Actions MSI/NSIS smokes/teardown. |
 | 5.5 release qualification | Not started; dependencies and inherited evidence remain open. | Independent corpus, production quality/provider answers, native/R13 sessions, full qualification matrix, exact final-head Actions, and user close approval. |
 
 The latest explicit Rust 1.88 integration run passed 920 library tests (four
@@ -958,6 +958,7 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 | 2026-09-04 | Reclassify Tasks 5.4b and 5.4c as L and assign each directly to a distinct `worker-l` session after its dependency is accepted. | The installed-resource diagnostic and signed-installer workflow are cross-cutting native/package evidence changes and require higher-risk implementation/review ownership. A worker owns one task; it does not delegate nested worker sessions. | Retain M `worker-m` ownership; use one worker-l as a delegating manager. | User |
 | 2026-09-08 | Approve a three-character sidebar model-inference minimum (`SIDEBAR_SEARCH_MIN_QUERY_LENGTH` / `SEARCH_MIN_MODEL_QUERY_CHARS`). | A one-character minimum did not reduce per-keystroke cross-encoder work; exact title matching remains available without model inference for shorter non-empty queries, while the three-character guard bounds interactive ONNX cost. | Restore a one-character model-inference minimum; rely only on debounce. | OpenCode under the user's delegated decision authority through 07:00 UTC-03 |
 | 2026-09-08 | Add an additive `retrieval_title_fts` mirror for authoritative bounded hybrid title lookup. | The current ID-ordered title scan is incomplete above its arbitrary row limit and is unsuitable for MCP/Context. A separately maintained FTS5 title mirror supports normalized all-core-term lookup without changing the existing public `meeting_fts` lexical commands, semantic document set, vector inputs, or title provenance semantics. | Keep a capped scan with an incomplete-result flag; add title rows to existing `meeting_fts`; add title vectors. | OpenCode under the user's delegated decision authority through 07:00 UTC-03 |
+| 2026-09-08 | Adopt exact SQL score-and-ID title top-k and document its linear matching-set work, amending the strict candidate-limit database-work requirement for this channel. | The synthetic 250k-title diagnostic measured about 436 ms versus 5,960 ms for snapshot-paged scans with identical exact top-k. Output/retained memory remain bounded, but every match is scored; preserve scope/snapshot/hydration/cancellation and all other release gates. | Retain the strict work requirement and leave title search pending a new index design. | User |
 
 ## Task Execution Log
 
@@ -1514,8 +1515,10 @@ bounded output/memory do not establish candidate-bounded database work. The publ
 `meeting_fts` lexical contract, the semantic document set, and the vectors
 are unchanged, and the client-side substring union remains as the bounded
 presentation-layer complement, not a completeness safety net. HR-5.R10
-correctness/boundary review is approved; the title-work design decision
-remains open. Maximum-length public scopes use disjoint bounded MATCH
+correctness/boundary review is approved. On 2026-09-08 the user approved exact
+SQL top-k with the explicit linear-work limitation; implementation and
+independent review of that change remain pending after the packaging batch.
+Maximum-length public scopes use disjoint bounded MATCH
 groups under the same snapshot/global heap, preserving exact score/ID order.
 
 **Package-authority handoff (2026-09-08):** Task 5.4a remediation
