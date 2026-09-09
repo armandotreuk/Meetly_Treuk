@@ -15,8 +15,11 @@ Verified implementation state on 2026-09-09 in `fix/sprint-5-review-r5`:
 Windows CI7 and CI8 each ended after about 91–92 minutes with hosted-runner
 communication loss during MSI installed smoke. Neither interruption establishes
 an installer, retrieval, inference, teardown, or package-layout verdict. R10
-isolates each installed smoke onto a fresh downstream runner after the build;
-its acceptance remains pending an exact-head CI run.
+then isolated each installed smoke onto a fresh downstream runner after the
+build. Exact-head CI9 at `bc1dd943652b5c358412baa03158733878072a4c` passed
+the package producer, fresh MSI and NSIS installed smokes, and the terminal
+fail-closed evidence gate. Task 5.4c is accepted as Windows installed-package
+evidence only; it does not close Sprint 5 or any release gate.
 
 | Area | Current state | Remaining gate |
 |---|---|---|
@@ -24,7 +27,7 @@ its acceptance remains pending an exact-head CI run.
 | HR-5.R10 correctness | Activation, snapshot/hydration, folder and public-ID fixes approved. User approved exact SQL title top-k with an explicit linear-work limitation on 2026-09-08. | Implement and independently review that approved query change after the current packaging batch; preserve cancellation and all other gates. |
 | 5.4a package authority | Accepted after real Tauri expansion, staging/recovery tests, and independent review. | Installed-package evidence belongs to 5.4c. |
 | 5.4b retrieval diagnostic | Accepted after pinned Rust 1.88 tests, real source-side package-layout inference, fallback tests, and independent review. | Source-layout inference is not MSI/NSIS installation evidence. |
-| 5.4c installer CI | CI6 proved MSI and NSIS installation ownership, installed resource shape, dbstat, teardown and absence of residue. R8 corrected the present-empty override bug with 237 local assertions and both reviews. CI7 and CI8 each then lost hosted-runner communication during MSI installed smoke, so neither yields an installer, diagnostic, inference, teardown, or package-layout result. R9 added fixed phase telemetry and a 20-minute per-smoke ceiling. R10 moves MSI and NSIS smoke to fresh downstream runners behind a narrow package-smoke artifact and preserves the fail-closed evidence gate; acceptance is pending CI. | Exact-head MSI/NSIS run with both diagnostics passing. |
+| 5.4c installer CI | Accepted. CI9 at exact R10 head `bc1dd943652b5c358412baa03158733878072a4c` passed package production, fresh MSI and NSIS installed smokes, and terminal evidence gate. Both evidence records are schema 2/current-commit, use the approved 12-file / 430,993,263-byte bundle and manifest `8a375106…264ff4`, and pass isolated discovery, ownership, dbstat, real retrieval, teardown, residue, and signing policy. This records policy satisfaction, not a positive signature claim. | 5.4c is complete; Task 5.5 and all inherited release gates remain open. |
 | 5.5 release qualification | Not started; dependencies and inherited evidence remain open. | Independent corpus, production quality/provider answers, native/R13 sessions, full qualification matrix, exact final-head Actions, and user close approval. |
 
 The latest explicit Rust 1.88 integration run passed 920 library tests (four
