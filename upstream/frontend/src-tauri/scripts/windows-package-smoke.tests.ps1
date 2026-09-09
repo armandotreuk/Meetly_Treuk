@@ -168,8 +168,8 @@ try {
         return @()
     }
     function Invoke-SmokeProcess([string]$FilePath, [string]$Arguments, [int]$TimeoutMs, [string]$CaptureRoot) {
-        Assert-Check (-not [Environment]::GetEnvironmentVariable('MEETLY_RAG_BUNDLE_DIR', 'Process') -and
-            -not [Environment]::GetEnvironmentVariable('MEETLY_RAG_MODELS_DIR', 'Process')) 'overrides_cleared_before_launch'
+        Assert-Check ($null -eq [Environment]::GetEnvironmentVariable('MEETLY_RAG_BUNDLE_DIR', 'Process') -and
+            $null -eq [Environment]::GetEnvironmentVariable('MEETLY_RAG_MODELS_DIR', 'Process')) 'overrides_absent_before_launch'
         $f = $script:Fixture
         $reply = @{ status = 'completed'; exit_code = 0; stdout = 'PRIVATE_RAW_CAPTURE'; stderr = ''; capture_valid = $true }
         $actualRoot = $f.roots[$f.install_root_index]
@@ -212,7 +212,10 @@ try {
         } else { throw 'unexpected_mock_invocation' }
         return $reply
     }
-    $env:MEETLY_RAG_BUNDLE_DIR = 'private-development-path'
+    $composedBundleOverride = 'private-development-path-' + [char]0x00E9
+    $decomposedBundleOverride = 'private-development-path-e' + [char]0x0301
+    Assert-Check (-not [string]::Equals($composedBundleOverride, $decomposedBundleOverride, [StringComparison]::Ordinal)) 'ordinal_override_comparison_is_normalization_sensitive'
+    $env:MEETLY_RAG_BUNDLE_DIR = $composedBundleOverride
     $env:MEETLY_RAG_MODELS_DIR = 'private-cache-path'
     $env:DIGICERT_KEYPAIR_ALIAS = $null
 
@@ -240,8 +243,25 @@ try {
     $msi.install_root_index = 1
     $pass = Invoke-MockPackage $msi
     Assert-Check ($pass.overall -eq 'passed' -and $pass.discovery.root -eq 'program_files' -and ($msi.calls -join ',') -eq 'install,dbstat,retrieval,uninstall') 'msi_default_root_and_both_diagnostics'
-    Assert-Check ($env:MEETLY_RAG_BUNDLE_DIR -eq 'private-development-path' -and $env:MEETLY_RAG_MODELS_DIR -eq 'private-cache-path') 'overrides_restored'
+    Assert-Check ([string]::Equals([Environment]::GetEnvironmentVariable('MEETLY_RAG_BUNDLE_DIR', 'Process'), $composedBundleOverride, [StringComparison]::Ordinal) -and
+        [string]::Equals([Environment]::GetEnvironmentVariable('MEETLY_RAG_MODELS_DIR', 'Process'), 'private-cache-path', [StringComparison]::Ordinal)) 'overrides_restored'
     Assert-Check ($pass.installer_sha256 -match '^[a-f0-9]{64}$' -and $pass.installer_bytes -gt 0) 'artifact_hash_and_native_size'
+
+    Remove-Item -LiteralPath 'Env:\MEETLY_RAG_BUNDLE_DIR', 'Env:\MEETLY_RAG_MODELS_DIR' -ErrorAction SilentlyContinue
+    $absentOverrides = Invoke-MockPackage (New-MockFixture 'absent-overrides')
+    Assert-Check ($absentOverrides.overall -eq 'passed' -and
+        $null -eq [Environment]::GetEnvironmentVariable('MEETLY_RAG_BUNDLE_DIR', 'Process') -and
+        $null -eq [Environment]::GetEnvironmentVariable('MEETLY_RAG_MODELS_DIR', 'Process')) 'absent_overrides_restored_as_absent'
+
+    [Environment]::SetEnvironmentVariable('MEETLY_RAG_BUNDLE_DIR', '', 'Process')
+    [Environment]::SetEnvironmentVariable('MEETLY_RAG_MODELS_DIR', '', 'Process')
+    $emptyOverrides = Invoke-MockPackage (New-MockFixture 'empty-overrides')
+    $restoredEmptyBundle = [Environment]::GetEnvironmentVariable('MEETLY_RAG_BUNDLE_DIR', 'Process')
+    $restoredEmptyModels = [Environment]::GetEnvironmentVariable('MEETLY_RAG_MODELS_DIR', 'Process')
+    Assert-Check ($emptyOverrides.overall -eq 'passed' -and $null -ne $restoredEmptyBundle -and
+        $restoredEmptyBundle.Length -eq 0 -and $null -ne $restoredEmptyModels -and
+        $restoredEmptyModels.Length -eq 0) 'empty_overrides_cleared_then_restored_as_empty'
+
     $nsis = New-MockFixture 'nsis-pass' 'nsis'
     $nsisPass = Invoke-MockPackage $nsis
     Assert-Check ($nsisPass.overall -eq 'passed' -and $nsisPass.residue -eq 'passed') 'nsis_complete_lifecycle'

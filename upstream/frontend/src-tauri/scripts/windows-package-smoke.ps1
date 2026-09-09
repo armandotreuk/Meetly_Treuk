@@ -549,7 +549,13 @@ function Invoke-PackageSmoke([string]$PackageKind, [string]$BundleDirectory, [st
     try {
         foreach ($name in @('MEETLY_RAG_BUNDLE_DIR', 'MEETLY_RAG_MODELS_DIR')) {
             $overrides[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
-            [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+            # .NET 9+ preserves an empty process variable when this API receives
+            # null. Remove through PowerShell's environment provider so the
+            # installed diagnostic sees the override as genuinely absent.
+            Remove-Item -LiteralPath "Env:\$name" -ErrorAction SilentlyContinue
+            if ($null -ne [Environment]::GetEnvironmentVariable($name, 'Process')) {
+                throw 'override_clear_failed'
+            }
         }
         Assert-NoReparseAncestors $BundleDirectory
         $extension = if ($PackageKind -eq 'msi') { '*.msi' } else { '*.exe' }
@@ -658,7 +664,20 @@ function Invoke-PackageSmoke([string]$PackageKind, [string]$BundleDirectory, [st
             # Deliberately do not Remove-Item any installation root. Residue
             # remains available for private runner investigation and is a fail.
         }
-        foreach ($name in $overrides.Keys) { [Environment]::SetEnvironmentVariable($name, $overrides[$name], 'Process') }
+        foreach ($name in $overrides.Keys) {
+            if ($null -eq $overrides[$name]) {
+                Remove-Item -LiteralPath "Env:\$name" -ErrorAction SilentlyContinue
+                if ($null -ne [Environment]::GetEnvironmentVariable($name, 'Process')) {
+                    throw 'override_restore_failed'
+                }
+            } else {
+                [Environment]::SetEnvironmentVariable($name, $overrides[$name], 'Process')
+                $restoredValue = [Environment]::GetEnvironmentVariable($name, 'Process')
+                if ($null -eq $restoredValue -or -not [string]::Equals($restoredValue, $overrides[$name], [StringComparison]::Ordinal)) {
+                    throw 'override_restore_failed'
+                }
+            }
+        }
         $result.signing.policy = Get-SigningPolicy $result.signing
         if (Test-SmokePassed $result) { $result.overall = 'passed' }
     }

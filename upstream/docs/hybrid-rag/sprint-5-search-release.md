@@ -11,9 +11,10 @@ Tasks 5.4a-5.4c. The split changes review and handoff boundaries, not the
 approved Windows-only outcome or any release gate. Each subtask requires its
 own implementation session, acceptance review, and execution-log entry.
 
-Verified implementation state on 2026-09-08 in `fix/sprint-5-review-r5`
-(reviewed implementation `02309c5` plus independently reviewed lock correction
-`72b8005`, both pushed; Windows retry `34268825013` failed before staging):
+Verified implementation state on 2026-09-09 in `fix/sprint-5-review-r5`
+(remediation through independently reviewed commit `2a6156f`, pushed; Windows
+run `34317823933` completed both installer lifecycles but failed the retrieval
+diagnostic because the harness left empty override variables present):
 
 | Area | Current state | Remaining gate |
 |---|---|---|
@@ -21,7 +22,7 @@ Verified implementation state on 2026-09-08 in `fix/sprint-5-review-r5`
 | HR-5.R10 correctness | Activation, snapshot/hydration, folder and public-ID fixes approved. User approved exact SQL title top-k with an explicit linear-work limitation on 2026-09-08. | Implement and independently review that approved query change after the current packaging batch; preserve cancellation and all other gates. |
 | 5.4a package authority | Accepted after real Tauri expansion, staging/recovery tests, and independent review. | Installed-package evidence belongs to 5.4c. |
 | 5.4b retrieval diagnostic | Accepted after pinned Rust 1.88 tests, real source-side package-layout inference, fallback tests, and independent review. | Source-layout inference is not MSI/NSIS installation evidence. |
-| 5.4c installer CI | CI5 completed the build and invoked both smokes, but MSI ownership inspection failed after install and NSIS then failed preflight. The machine-context native-SID marshaling correction passes 214 assertions and both independent reviews. | Exact-commit MSI/NSIS installs, diagnostics and teardown. |
+| 5.4c installer CI | CI6 proved MSI and NSIS installation ownership, installed resource shape, dbstat, teardown and absence of residue. Both retrieval diagnostics exited 21 before resource access because .NET 9+ turned the harness's null-valued process-variable clear into present empty overrides. The provider-based clear/restore correction passes 237 assertions, a real installed-shaped retrieval probe, and both independent reviews. | Exact-commit MSI/NSIS run with both diagnostics passing. |
 | 5.5 release qualification | Not started; dependencies and inherited evidence remain open. | Independent corpus, production quality/provider answers, native/R13 sessions, full qualification matrix, exact final-head Actions, and user close approval. |
 
 The latest explicit Rust 1.88 integration run passed 920 library tests (four
