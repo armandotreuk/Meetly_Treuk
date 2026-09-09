@@ -316,12 +316,14 @@ jobs:
       - name: Install and run MSI dbstat and retrieval smoke
         id: smoke-msi
         shell: pwsh
+        timeout-minutes: 20
         continue-on-error: true
         run: ./upstream/frontend/src-tauri/scripts/windows-package-smoke.ps1 -Mode Smoke -Kind msi
 
       - name: Install and run NSIS dbstat and retrieval smoke
         id: smoke-nsis
         shell: pwsh
+        timeout-minutes: 20
         continue-on-error: true
         run: ./upstream/frontend/src-tauri/scripts/windows-package-smoke.ps1 -Mode Smoke -Kind nsis
 

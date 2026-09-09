@@ -524,6 +524,26 @@ function Get-SigningPolicy($Signing) {
     return 'passed'
 }
 
+function Get-SmokeProgressMarker([ValidateSet('preflight', 'install', 'ownership', 'resource', 'dbstat', 'retrieval', 'teardown', 'residue')][string]$Phase) {
+    # These are intentionally fixed workflow-log strings. Do not add paths,
+    # installer names, captured output, exception details, environment values,
+    # identities, or other runtime data to an interruption marker.
+    switch ($Phase) {
+        'preflight' { return 'installed-smoke-progress: phase=preflight' }
+        'install' { return 'installed-smoke-progress: phase=install' }
+        'ownership' { return 'installed-smoke-progress: phase=ownership' }
+        'resource' { return 'installed-smoke-progress: phase=resource' }
+        'dbstat' { return 'installed-smoke-progress: phase=dbstat' }
+        'retrieval' { return 'installed-smoke-progress: phase=retrieval' }
+        'teardown' { return 'installed-smoke-progress: phase=teardown' }
+        'residue' { return 'installed-smoke-progress: phase=residue' }
+    }
+}
+
+function Write-SmokeProgressMarker([ValidateSet('preflight', 'install', 'ownership', 'resource', 'dbstat', 'retrieval', 'teardown', 'residue')][string]$Phase) {
+    Write-Host (Get-SmokeProgressMarker $Phase)
+}
+
 function Invoke-PackageSmoke([string]$PackageKind, [string]$BundleDirectory, [string]$InstallDirectory,
     [string[]]$SearchRoots, [string]$CaptureRoot, $Identity, $ExpectedBundle, [int]$ResidueTimeoutMs = 60000) {
     $result = [ordered]@{
@@ -547,6 +567,7 @@ function Invoke-PackageSmoke([string]$PackageKind, [string]$BundleDirectory, [st
     $cleanupTarget = $null
     $overrides = @{}
     try {
+        Write-SmokeProgressMarker 'preflight'
         foreach ($name in @('MEETLY_RAG_BUNDLE_DIR', 'MEETLY_RAG_MODELS_DIR')) {
             $overrides[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
             # .NET 9+ preserves an empty process variable when this API receives
@@ -590,6 +611,7 @@ function Invoke-PackageSmoke([string]$PackageKind, [string]$BundleDirectory, [st
             if (Test-Path -LiteralPath $root) { $result.harness = 'preexisting_install'; return $result }
         }
         $invoked = $true
+        Write-SmokeProgressMarker 'install'
         if ($PackageKind -eq 'msi') {
             $process = Invoke-SmokeProcess 'msiexec.exe' "/i `"$installer`" /qn /norestart INSTALLDIR=`"$InstallDirectory`"" 300000 $CaptureRoot
         } else {
@@ -597,6 +619,7 @@ function Invoke-PackageSmoke([string]$PackageKind, [string]$BundleDirectory, [st
             $process = Invoke-SmokeProcess $installer "/S /D=$InstallDirectory" 300000 $CaptureRoot
         }
         $result.install = @{ status = $process.status; exit_code = $process.exit_code }
+        Write-SmokeProgressMarker 'ownership'
         try { $postInstall = @(Get-InstallerRegistrationInventory $packageIdentity $PackageKind) }
         catch { $result.registration.ownership = 'inspection_failed'; throw }
         $postBlocking = @($postInstall | Where-Object { $_.kind -ne 'nsis_manufacturer' -or $_.active })
@@ -610,6 +633,7 @@ function Invoke-PackageSmoke([string]$PackageKind, [string]$BundleDirectory, [st
         if ($process.status -ne 'completed' -or $process.exit_code -ne 0) { return $result }
         $result.install.status = 'passed'
         if ($null -eq $cleanupTarget) { $result.harness = 'cleanup_ownership_unproven'; return $result }
+        Write-SmokeProgressMarker 'resource'
         $result.discovery.status = 'failed'
         $executable = Get-InstalledExecutable $SearchRoots
         $result.discovery = @{ status = 'passed'; executable_relative = $executable.relative
@@ -630,7 +654,9 @@ function Invoke-PackageSmoke([string]$PackageKind, [string]$BundleDirectory, [st
         # Both diagnostics run, even if dbstat returns non-zero, preserving each
         # independent verdict, including retrieval's own invalid-resource code.
         # No argument can point retrieval at source/cache.
+        Write-SmokeProgressMarker 'dbstat'
         $result.dbstat = Convert-DiagnosticResult (Invoke-SmokeProcess $executable.path '--smoke-dbstat' 120000 $CaptureRoot) 'dbstat'
+        Write-SmokeProgressMarker 'retrieval'
         $result.retrieval = Convert-DiagnosticResult (Invoke-SmokeProcess $executable.path '--smoke-retrieval' 120000 $CaptureRoot) 'retrieval'
         $result.harness = 'passed'
     } catch {
@@ -640,6 +666,7 @@ function Invoke-PackageSmoke([string]$PackageKind, [string]$BundleDirectory, [st
             # Cleanup runs only after post-invocation registration proves that
             # this run owns the exact isolated installation.
             try {
+                Write-SmokeProgressMarker 'teardown'
                 if ($null -eq $cleanupTarget) {
                     $result.teardown = @{ status = 'cleanup_skipped'; exit_code = $null }
                 } elseif ($PackageKind -eq 'msi') {
@@ -657,6 +684,7 @@ function Invoke-PackageSmoke([string]$PackageKind, [string]$BundleDirectory, [st
                 }
             } catch { $result.teardown.status = 'failed' }
             $waitTimeout = if ($null -eq $cleanupTarget) { 0 } else { $ResidueTimeoutMs }
+            Write-SmokeProgressMarker 'residue'
             $teardownState = Wait-PackageTeardown $SearchRoots $packageIdentity $PackageKind $waitTimeout
             $result.registration.post_teardown = $teardownState.registration
             $result.registration.auxiliary = $teardownState.auxiliary

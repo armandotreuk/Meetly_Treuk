@@ -10,6 +10,26 @@ function Assert-Check([bool]$Condition, [string]$Name) {
     $script:Checks++
 }
 
+$expectedProgressMarkers = @(
+    'installed-smoke-progress: phase=preflight'
+    'installed-smoke-progress: phase=install'
+    'installed-smoke-progress: phase=ownership'
+    'installed-smoke-progress: phase=resource'
+    'installed-smoke-progress: phase=dbstat'
+    'installed-smoke-progress: phase=retrieval'
+    'installed-smoke-progress: phase=teardown'
+    'installed-smoke-progress: phase=residue'
+)
+$actualProgressMarkers = foreach ($phase in @('preflight', 'install', 'ownership', 'resource', 'dbstat', 'retrieval', 'teardown', 'residue')) {
+    Get-SmokeProgressMarker $phase
+}
+Assert-Check (($actualProgressMarkers -join "`n") -ceq ($expectedProgressMarkers -join "`n")) 'progress_markers_are_fixed_and_complete'
+$progressWriterOutput = (& { Write-SmokeProgressMarker 'preflight' } 6>&1 | Out-String).Trim()
+Assert-Check ($progressWriterOutput -ceq 'installed-smoke-progress: phase=preflight') 'progress_marker_writer_is_bounded'
+$progressRejected = $false
+try { $null = Get-SmokeProgressMarker 'private-runtime-value' } catch { $progressRejected = $true }
+Assert-Check $progressRejected 'progress_marker_rejects_untrusted_phase'
+
 $temporaryParent = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
 $script:TestRoot = Join-Path $temporaryParent ('meetily-package-smoke-selftest-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $script:TestRoot | Out-Null
