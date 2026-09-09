@@ -2925,10 +2925,10 @@ async fn title_lookup_preserves_scope_and_candidate_cap_for_common_terms() {
     );
     assert!(hits.iter().all(|id| id.starts_with("in-fold-")));
 
-    // The same bounded plan shape for every scope: the scoped FTS match with
-    // the rowid-window constraint (no scope CTE, no matched-set sort - the
-    // scope lives inside the MATCH expression, so reverting to a post-filter
-    // or an ORDER BY over the matched set fails these assertions).
+    // The same exact ranked plan shape for every scope: scope lives inside
+    // MATCH and SQLite sorts the matching set by explicit score and stable
+    // string ID before applying the output cap. This intentionally has linear
+    // matching-set work; the result cap is not a database-work bound.
     let folder_keys = vec![
         crate::retrieval::service::title_scope_token('f', "fold"),
         crate::retrieval::service::title_scope_token('f', "child"),
@@ -2961,15 +2961,14 @@ async fn title_lookup_preserves_scope_and_candidate_cap_for_common_terms() {
         ("allowed", &allowed_query),
     ] {
         let plan = sqlx::query_as::<_, (i64, i64, i64, String)>(&format!(
-            "EXPLAIN QUERY PLAN SELECT m.id, m.title, bm25(retrieval_title_fts, 1.0, 1.0, 0.0), \
-             retrieval_title_fts.rowid \
+            "EXPLAIN QUERY PLAN SELECT m.id, m.title, bm25(retrieval_title_fts, 1.0, 1.0, 0.0) \
              FROM retrieval_title_fts \
              JOIN meetings m ON m.id = retrieval_title_fts.meeting_id \
-             WHERE retrieval_title_fts MATCH ? AND retrieval_title_fts.rowid > ? \
+             WHERE retrieval_title_fts MATCH ? \
+             ORDER BY bm25(retrieval_title_fts, 1.0, 1.0, 0.0) ASC, m.id COLLATE BINARY ASC \
              LIMIT ?"
         ))
         .bind(match_query)
-        .bind(0i64)
         .bind(100i64)
         .fetch_all(&pool)
         .await
@@ -2982,10 +2981,10 @@ async fn title_lookup_preserves_scope_and_candidate_cap_for_common_terms() {
             "the {label} lookup must evaluate the scoped match inside FTS5: {details:?}"
         );
         assert!(
-            !details
+            details
                 .iter()
                 .any(|detail| detail.contains("USE TEMP B-TREE")),
-            "the {label} lookup must never sort the matched set: {details:?}"
+            "the {label} lookup must sort exact BM25/ID top-k in SQLite: {details:?}"
         );
         assert!(
             !details.iter().any(|detail| detail.contains("folder_scope")),
@@ -3109,7 +3108,7 @@ async fn title_lookup_measures_common_in_scope_sql_work() {
                     )
                     .bind(&query)
                     .bind(cursor)
-                    .bind(super::service::TITLE_SCAN_BATCH_ROWS as i64)
+                        .bind(400i64)
                     .fetch_all(&mut connection)
                     .await
                     .unwrap();
@@ -3140,7 +3139,8 @@ async fn title_lookup_measures_common_in_scope_sql_work() {
                 let rows: Vec<(String, String, f64)> = sqlx::query_as(
                     "SELECT m.id, m.title, bm25(retrieval_title_fts, 1.0, 1.0, 0.0) AS score
                      FROM retrieval_title_fts JOIN meetings m ON m.id = retrieval_title_fts.meeting_id
-                     WHERE retrieval_title_fts MATCH ? ORDER BY score, m.id LIMIT 50",
+                     WHERE retrieval_title_fts MATCH ?
+                     ORDER BY score ASC, m.id COLLATE BINARY ASC LIMIT 50",
                 )
                 .bind(&query)
                 .fetch_all(&mut connection)
@@ -3563,10 +3563,10 @@ async fn title_hydration_drops_renamed_signal_but_keeps_matching_content() {
     assert!(!search.retained_evidence_ids.is_empty());
 }
 
-/// Every title page and folder expansion belongs to one read snapshot. A
-/// writer can commit between pages without replacing already-seen rows or
-/// letting a replacement consume a second top-k slot. The following request
-/// must then see the committed state, rather than retaining that snapshot.
+/// Folder expansion and exact title top-k belong to one read snapshot. A
+/// writer can commit after the title query without changing its selected rows.
+/// The following request must then see the committed state, rather than
+/// retaining that snapshot.
 #[tokio::test]
 async fn title_lookup_uses_one_snapshot_across_rename_delete_and_folder_move() {
     let directory = tempfile::tempdir().unwrap();
@@ -3594,7 +3594,7 @@ async fn title_lookup_uses_one_snapshot_across_rename_delete_and_folder_move() {
     .unwrap();
     let service = RetrievalService::new(query_lifecycle(&ServiceEmbedder::new()));
     let (arrived, mut arrival) = tokio::sync::mpsc::unbounded_channel();
-    service.arm_title_scan_gate(arrived);
+    service.arm_title_query_gate(arrived);
     let search_request = request(
         "needle",
         PersistedRetrievalScope::Folder("inside".to_string()),
@@ -3619,8 +3619,8 @@ async fn title_lookup_uses_one_snapshot_across_rename_delete_and_folder_move() {
         .unwrap()
         .unwrap();
 
-    // All four rows were in page one. The matching rename reinserts at a
-    // larger FTS rowid: separate snapshots would visit the same ID twice.
+    // The matching rename reinserts the mirror row. The query snapshot must
+    // retain its old exact top-k, while the next request sees this commit.
     sqlx::raw_sql(
         "UPDATE meetings SET title = 'Needle meeting plans' WHERE id = 'snapshot-00000';
          DELETE FROM meetings WHERE id = 'snapshot-00001';
@@ -3630,7 +3630,7 @@ async fn title_lookup_uses_one_snapshot_across_rename_delete_and_folder_move() {
     .execute(&pool)
     .await
     .unwrap();
-    service.release_title_scan_gate();
+    service.release_title_query_gate();
     let snapshot = tokio::time::timeout(Duration::from_secs(10), running)
         .await
         .unwrap()
@@ -4190,11 +4190,11 @@ async fn bounded_folder_title_ids(reverse_insert: bool) -> Vec<String> {
         .collect()
 }
 
-/// The all-core-term lookup returns the per-variant cap of matching meeting
-/// ids in ascending order, independent of insertion order; partial and
-/// zero-overlap titles are excluded by the same gate.
+/// Exact SQL score-and-ID top-k returns the same per-variant cap regardless
+/// of insertion/page order; partial and zero-overlap titles are excluded by
+/// the same all-core-term gate.
 #[tokio::test]
-async fn folder_title_top_k_is_bounded_deterministic_and_page_order_independent() {
+async fn folder_title_sql_top_k_is_exact_and_insertion_order_independent() {
     let expected = vec![
         "match-1".to_string(),
         "match-2".to_string(),
@@ -4202,6 +4202,48 @@ async fn folder_title_top_k_is_bounded_deterministic_and_page_order_independent(
     ];
     assert_eq!(bounded_folder_title_ids(false).await, expected);
     assert_eq!(bounded_folder_title_ids(true).await, expected);
+}
+
+/// Cancellation is observed at the safe boundary immediately after exact
+/// title SQL returns and before its snapshot can publish candidates.
+#[tokio::test]
+async fn title_lookup_cancels_after_exact_sql_before_snapshot_commit() {
+    let pool = migrated_pool().await;
+    insert_meeting(&pool, "cancel-title", "Needle meeting").await;
+    let service = RetrievalService::new(query_lifecycle(&ServiceEmbedder::new()));
+    let (arrived, mut arrival) = tokio::sync::mpsc::unbounded_channel();
+    service.arm_title_query_gate(arrived);
+    let cancel = CancellationToken::new();
+    let running_service = service.clone();
+    let running_pool = pool.clone();
+    let running_cancel = cancel.clone();
+    let running = tokio::spawn(async move {
+        running_service
+            .retrieve(
+                &running_pool,
+                request(
+                    "needle",
+                    PersistedRetrievalScope::All,
+                    RetrievalLimits {
+                        lexical_per_variant: 10,
+                        vector_per_variant: 0,
+                    },
+                    CoreTermLanguage::English,
+                    Some(running_cancel),
+                ),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), arrival.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    cancel.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("cancellation at the title SQL boundary must resolve")
+        .unwrap();
+    assert!(matches!(result, Err(RetrievalError::Cancelled)));
 }
 
 #[tokio::test]

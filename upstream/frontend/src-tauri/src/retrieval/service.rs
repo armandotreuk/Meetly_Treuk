@@ -325,7 +325,7 @@ pub struct RetrievalService {
     #[cfg(test)]
     scan_gate: Arc<SemanticScanGate>,
     #[cfg(test)]
-    title_scan_gate: Arc<SemanticScanGate>,
+    title_query_gate: Arc<SemanticScanGate>,
     #[cfg(test)]
     title_scope_gate: Arc<SemanticScanGate>,
 }
@@ -357,7 +357,7 @@ impl RetrievalService {
             #[cfg(test)]
             scan_gate: Arc::new(SemanticScanGate::new()),
             #[cfg(test)]
-            title_scan_gate: Arc::new(SemanticScanGate::new()),
+            title_query_gate: Arc::new(SemanticScanGate::new()),
             #[cfg(test)]
             title_scope_gate: Arc::new(SemanticScanGate::new()),
         }
@@ -379,20 +379,20 @@ impl RetrievalService {
         self.scan_gate.release.notify_one();
     }
 
-    /// Pauses after the first title page so concurrent database mutations
-    /// can be committed deterministically by a second WAL connection.
+    /// Pauses after the exact title SQL query and before snapshot commit, so
+    /// concurrent database mutations and cancellation are deterministic.
     #[cfg(test)]
-    pub(crate) fn arm_title_scan_gate(&self, sender: tokio::sync::mpsc::UnboundedSender<()>) {
+    pub(crate) fn arm_title_query_gate(&self, sender: tokio::sync::mpsc::UnboundedSender<()>) {
         *self
-            .title_scan_gate
+            .title_query_gate
             .armed
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(sender);
     }
 
     #[cfg(test)]
-    pub(crate) fn release_title_scan_gate(&self) {
-        self.title_scan_gate.release.notify_one();
+    pub(crate) fn release_title_query_gate(&self) {
+        self.title_query_gate.release.notify_one();
     }
 
     /// Pauses after request normalization but before the title read snapshot.
@@ -1135,15 +1135,17 @@ impl RetrievalService {
     /// scope column's fixed three-token shape keeps the ranking document
     /// length uniform across rows.
     ///
-    /// Deterministic, collision-free selection: the candidate stream is read
-    /// in bounded rowid-window batches (the rowid constraint is pushed into
-    /// FTS5, so the scan visits each in-scope match exactly once and never
-    /// re-scans, and no SQL sort materializes the matched set) and the
-    /// bounded top-k heap ranks by (bm25 title score, meeting ID ascending).
-    /// The meeting ID itself is the tie-break - a bijective, collision-free
-    /// identity for arbitrary TEXT IDs - so the selection is a deterministic
-    /// function of the database content, independent of insertion history,
-    /// and no meeting ID can fail insertion, upgrade, or backfill.
+    /// Deterministic, collision-free selection is exact SQL top-k: SQLite
+    /// scores the complete in-scope match set and orders by `(bm25 title
+    /// score, meeting ID BINARY ascending)` before applying the output cap.
+    /// The stable string meeting ID is the tie-break, so the result is a
+    /// deterministic function of database content, independent of insertion
+    /// history, and no meeting ID can fail insertion, upgrade, or backfill.
+    ///
+    /// This deliberately has linear matching-set database work: FTS5 must
+    /// score each match before it can sort exact BM25 top-k. The user approved
+    /// that limitation for this title channel; output and retained Rust memory
+    /// stay capped, but the candidate cap is not a database-work bound.
     async fn title_channel(
         &self,
         pool: &SqlitePool,
@@ -1225,94 +1227,64 @@ impl RetrievalService {
         };
         let match_queries = title_match_queries(&normalized.core_terms, &scope_keys)?;
         let cap = limits.lexical_per_variant;
-        let mut heap: std::collections::BinaryHeap<TitleHit> = std::collections::BinaryHeap::new();
-        // Bounded rowid-window batches: the rowid constraint is pushed into
-        // FTS5 (the plan shows the index range marker), so each in-scope match
-        // is visited exactly once across batches; every candidate is scored
-        // with the title-only bm25 weights (zero for the scope column).
-        // Long schema-valid scope IDs can require multiple bounded MATCH
-        // expressions. Each unique meeting/direct-folder token belongs to
-        // exactly one group, so groups are disjoint. Their identical title
-        // terms and zero scope weight produce comparable scores under the
-        // same read snapshot; keep one global heap across every group.
+        let mut ranked: Vec<TitleHit> = Vec::with_capacity(cap);
+        // Each long-scope MATCH partition is disjoint. SQL computes its exact
+        // score-and-ID top-k; no rowid paging or Rust candidate scan is used.
+        // A global top-k can contain no row below a partition's own top-k, so
+        // merge at most two cap-sized vectors at a time to preserve the Rust
+        // retained-memory cap across all partitions.
         for match_query in match_queries {
-            let mut cursor: i64 = 0;
-            loop {
-                ensure_not_cancelled(cancel)?;
-                let rows: Vec<(String, String, f64, i64)> = sqlx::query_as(
-                    "SELECT m.id, m.title, bm25(retrieval_title_fts, 1.0, 1.0, 0.0), \
-                 retrieval_title_fts.rowid \
+            ensure_not_cancelled(cancel)?;
+            let rows: Vec<(String, String, f64)> = sqlx::query_as(
+                "SELECT m.id, m.title, bm25(retrieval_title_fts, 1.0, 1.0, 0.0) AS score \
                  FROM retrieval_title_fts \
                  JOIN meetings m ON m.id = retrieval_title_fts.meeting_id \
-                 WHERE retrieval_title_fts MATCH ? AND retrieval_title_fts.rowid > ? \
+                 WHERE retrieval_title_fts MATCH ? \
+                 ORDER BY score ASC, m.id COLLATE BINARY ASC \
                  LIMIT ?",
-                )
-                .bind(&match_query)
-                .bind(cursor)
-                .bind(TITLE_SCAN_BATCH_ROWS as i64)
-                .fetch_all(&mut *snapshot)
-                .await
-                .map_err(db_error)?;
-                if rows.is_empty() {
-                    break;
-                }
-                let mut batch_max = cursor;
-                for (meeting_id, title, score, rowid) in rows {
-                    batch_max = batch_max.max(rowid);
-                    // Belt-and-braces: request-start membership re-checks every
-                    // row for the meeting and allowed-ID scopes; the index scope
-                    // term already constrains the intersection.
-                    if let ScopeFilter::Meetings(ids) = &normalized.membership {
-                        if !ids.contains(meeting_id.as_str()) {
-                            continue;
-                        }
-                    }
-                    let hit = TitleHit {
-                        score,
-                        meeting_id,
-                        title,
-                    };
-                    if heap.len() < cap {
-                        heap.push(hit);
-                    } else if let Some(worst) = heap.peek() {
-                        if hit < *worst {
-                            heap.pop();
-                            heap.push(hit);
-                        }
-                    }
-                }
-                if batch_max <= cursor {
-                    // Defensive: no forward progress can only mean the window is
-                    // exhausted; the empty-batch break above is the normal exit.
-                    break;
-                }
-                cursor = batch_max;
-                #[cfg(test)]
-                {
-                    let sender = self
-                        .title_scan_gate
-                        .armed
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .take();
-                    if let Some(sender) = sender {
-                        let _ = sender.send(());
-                        tokio::select! {
-                            _ = self.title_scan_gate.release.notified() => {},
-                            _ = cancel.cancelled() => return Err(RetrievalError::Cancelled),
-                        }
+            )
+            .bind(&match_query)
+            .bind(cap as i64)
+            .fetch_all(&mut *snapshot)
+            .await
+            .map_err(db_error)?;
+            ensure_not_cancelled(cancel)?;
+            let mut partition: Vec<TitleHit> = rows
+                .into_iter()
+                .map(|(meeting_id, title, score)| TitleHit {
+                    score,
+                    meeting_id,
+                    title,
+                })
+                .collect();
+            // Belt-and-braces: request-start membership re-checks every row
+            // for meeting and allowed-ID scopes; the index scope term already
+            // constrains the intersection.
+            if let ScopeFilter::Meetings(ids) = &normalized.membership {
+                partition.retain(|hit| ids.contains(hit.meeting_id.as_str()));
+            }
+            ranked.append(&mut partition);
+            ranked.sort_by(title_hit_order);
+            ranked.truncate(cap);
+            #[cfg(test)]
+            {
+                let sender = self
+                    .title_query_gate
+                    .armed
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                if let Some(sender) = sender {
+                    let _ = sender.send(());
+                    tokio::select! {
+                        _ = self.title_query_gate.release.notified() => {},
+                        _ = cancel.cancelled() => return Err(RetrievalError::Cancelled),
                     }
                 }
             }
         }
         snapshot.commit().await.map_err(db_error)?;
         ensure_not_cancelled(cancel)?;
-        let mut ranked: Vec<TitleHit> = heap.into_vec();
-        ranked.sort_by(|left, right| {
-            left.score
-                .total_cmp(&right.score)
-                .then_with(|| left.meeting_id.cmp(&right.meeting_id))
-        });
         for (index, hit) in ranked.into_iter().enumerate() {
             record_candidate(
                 candidates,
@@ -1708,16 +1680,8 @@ fn title_evidence(meeting_id: String, title: String) -> RetrievedEvidence {
     }
 }
 
-/// Rows per bounded rowid-window batch of the indexed title lookup. Purely a
-/// round-trip/memory lever: the batches jointly visit every in-scope match
-/// exactly once at any size, and the bounded top-k heap holds
-/// `lexical_per_variant` candidates regardless.
-pub(crate) const TITLE_SCAN_BATCH_ROWS: usize = 400;
-
-/// One title candidate in the bounded top-k heap. Ordered by (bm25 title
-/// score ascending, meeting ID ascending) - the meeting ID itself is the
-/// deterministic, collision-free tie-break for arbitrary TEXT IDs, so the
-/// selection never depends on insertion history or a derived hash key.
+/// One exact SQL title result. The stable string ID is the deterministic
+/// tie-break for arbitrary TEXT IDs.
 #[derive(Debug, Clone, PartialEq)]
 struct TitleHit {
     score: f64,
@@ -1725,25 +1689,10 @@ struct TitleHit {
     title: String,
 }
 
-impl Eq for TitleHit {}
-
-impl Ord for TitleHit {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Max-heap over (score asc, id asc): the root is the WORST candidate
-        // (highest bm25 value - lower is better - then lexicographically
-        // largest id), so eviction always discards the least relevant row.
-        // bm25 scores are finite; total_cmp keeps the order total even for
-        // equal/near values.
-        self.score
-            .total_cmp(&other.score)
-            .then_with(|| self.meeting_id.cmp(&other.meeting_id))
-    }
-}
-
-impl PartialOrd for TitleHit {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
+fn title_hit_order(left: &TitleHit, right: &TitleHit) -> std::cmp::Ordering {
+    left.score
+        .total_cmp(&right.score)
+        .then_with(|| left.meeting_id.cmp(&right.meeting_id))
 }
 
 /// Approved bounds for the indexed title scope: at most this many folder

@@ -23,8 +23,8 @@ evidence only; it does not close Sprint 5 or any release gate.
 
 | Area | Current state | Remaining gate |
 |---|---|---|
-| 5.1-5.3 search/API/index UI | Implemented in `c8504a7`, `5bf5ced`, and `baf9b47`; subsequent cross-cutting R5 remediations are present. | HR-5.R10 title-work requirement and final integration/release acceptance. |
-| HR-5.R10 correctness | Activation, snapshot/hydration, folder and public-ID fixes approved. User approved exact SQL title top-k with an explicit linear-work limitation on 2026-09-08. | Implement and independently review that approved query change after the current packaging batch; preserve cancellation and all other gates. |
+| 5.1-5.3 search/API/index UI | Implemented in `c8504a7`, `5bf5ced`, and `baf9b47`; subsequent cross-cutting R5 remediations are present. | Exact-head CI for the R10 commit and final release acceptance. |
+| HR-5.R10 correctness | Activation, snapshot/hydration, folder and public-ID fixes approved. The user-approved exact SQL title top-k is implemented and independently reviewed: each scope/query partition orders by zero-scope-weight BM25 and stable string meeting ID before `LIMIT`; targeted retrieval regressions and `cargo check --lib` pass. | Exact-head CI and final Task 5.5/release gates; title matching-set work remains explicitly linear and is not a candidate-limit work bound. |
 | 5.4a package authority | Accepted after real Tauri expansion, staging/recovery tests, and independent review. | Installed-package evidence belongs to 5.4c. |
 | 5.4b retrieval diagnostic | Accepted after pinned Rust 1.88 tests, real source-side package-layout inference, fallback tests, and independent review. | Source-layout inference is not MSI/NSIS installation evidence. |
 | 5.4c installer CI | Accepted. CI9 at exact R10 head `bc1dd943652b5c358412baa03158733878072a4c` passed package production, fresh MSI and NSIS installed smokes, and terminal evidence gate. Both evidence records are schema 2/current-commit, use the approved 12-file / 430,993,263-byte bundle and manifest `8a375106…264ff4`, and pass isolated discovery, ownership, dbstat, real retrieval, teardown, residue, and signing policy. This records policy satisfaction, not a positive signature claim. | 5.4c is complete; Task 5.5 and all inherited release gates remain open. |
@@ -1511,21 +1511,25 @@ repeated runs; each passes unchanged in isolation and on clean re-runs.
 **Open items:** (1) the 2026-09-05 three-character minimum-length decision row
 is authorized by the user-delegated 2026-09-08 decision recorded above; the
 guard stays approved at three characters. (2) Meeting titles are indexed in
-the additive `retrieval_title_fts` mirror (migration `20260908000000`, amended
-in place while uncommitted) keyed by the stable meeting string ID and
-maintained transactionally by triggers. The current lookup uses scoped
-rowid-window statements and a bounded top-k heap under one read snapshot;
-it is NOT a rank-ordered cursor and it scores all matching in-scope rows.
-Snapshot consistency and current-title hydration fences are tested, but
-bounded output/memory do not establish candidate-bounded database work. The public
-`meeting_fts` lexical contract, the semantic document set, and the vectors
-are unchanged, and the client-side substring union remains as the bounded
-presentation-layer complement, not a completeness safety net. HR-5.R10
-correctness/boundary review is approved. On 2026-09-08 the user approved exact
-SQL top-k with the explicit linear-work limitation; implementation and
-independent review of that change remain pending after the packaging batch.
-Maximum-length public scopes use disjoint bounded MATCH
-groups under the same snapshot/global heap, preserving exact score/ID order.
+the additive `retrieval_title_fts` mirror (migration `20260908000000`) keyed
+by the stable meeting string ID and maintained transactionally by triggers.
+The migration's rowid-window comment records the historical R8 implementation
+and is deliberately immutable now that its source is committed remotely:
+editing even a comment changes SQLx's checksum for databases that applied it.
+The current lookup is instead one scoped exact SQLite
+`ORDER BY bm25(...), m.id COLLATE BINARY LIMIT` statement per existing
+disjoint scope group, followed by a cap-sized Rust merge under one read
+snapshot. SQLite scores/sorts every matching in-scope row before `LIMIT`, so
+the approved output/memory bound is not a candidate-bounded database-work
+claim. Snapshot consistency and current-title hydration fences are tested.
+The public `meeting_fts` lexical contract, the semantic document set, and the
+vectors are unchanged, and the client-side substring union remains as the
+bounded presentation-layer complement, not a completeness safety net.
+HR-5.R10 correctness/boundary review is approved; its exact-SQL implementation
+is independently reviewed and targeted integration checks pass. Exact-head CI
+and the separate final release gates remain open. Maximum-length public scopes
+use disjoint bounded MATCH groups under the same snapshot and cap-sized merge,
+preserving exact score/ID order.
 
 **Package-authority handoff (2026-09-08):** Task 5.4a remediation
 HR-5.4a.R3 is independently approved (review R5.4a.R4). Actual Tauri

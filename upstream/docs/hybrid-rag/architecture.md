@@ -1280,12 +1280,14 @@ For each request:
 6. Apply scope filters before candidates enter fusion.
 7. Deduplicate by stable evidence identity.
 
-**Title-channel work decision (user-approved 2026-09-08; implementation
-pending):** Use exact SQL title score-and-meeting-ID top-k rather than paged
+**Title-channel work decision (user-approved 2026-09-08; implemented and
+independently reviewed, with exact-head CI/release verification still
+required):** Use exact SQL title score-and-meeting-ID top-k rather than paged
 rowid scans. This is explicitly an output/retained-memory bound, not a
 candidate-limit database-work bound: SQLite still scores every matching
-in-scope title. Disjoint oversized scope-expression groups must share one
-authoritative read snapshot and merge into the same exact global top-k.
+in-scope title.
+Disjoint oversized scope-expression groups share one authoritative read
+snapshot and merge into the same exact global top-k.
 Zero scope-column BM25 weight, stable ID tie-breaking, current-title hydration
 fences, public scope limits and cancellation/deadline reclamation remain
 required. The synthetic 250k-title comparison (about 436 ms SQL top-k versus
@@ -2384,4 +2386,4 @@ Any failure to resolve one of these gates blocks Sprint 2 approval.
 | 2026-09-02 | Make Fast/Deep compatibility deterministic and extend one Rust ownership/cancellation publication fence from Sprint 3 to Chat and sidebar. | Explicit interactive modes, omitted-mode Fast compatibility, live Fast/no-Deep behavior, fenced progress, cleanup, and bounded ownership prevent accidental Deep calls, stale publication, and parallel registries. | User-authorized R40 |
 | 2026-09-02 | Require bounded Deep generation options in the shared LLM client, a provider capability/fallback matrix, and candidate/evidence authority bounds. | Provider-specific output limits, hard byte/parser caps, deadline cancellation, and per-round offered-ID validation preserve the 512-token/8 KiB/15-second/30-second contract without a second client or scope widening. | User-authorized R40 |
 | 2026-09-02 | Carry the single persisted `force_lexical_retrieval` decision through every hybrid round/surface and give MCP timeouts an internal shared-retrieval cancellation token. | The typed `ForcedLexical` fallback remains reversible across requests/restarts, while server timeouts terminate queued/running work without claiming a public MCP cancel API. | User-authorized R40 |
-| 2026-09-08 | Adopt exact SQL title top-k and explicitly accept linear matching-set scoring work instead of the strict candidate-limit work requirement for this channel. | The synthetic 250k-title diagnostic returned identical exact top-k in about 436 ms versus 5,960 ms for paged scans; all measured exact approaches still score every match. Retain snapshot/scope correctness, ID ordering, cancellation and every other release gate. Implementation and independent review remain pending. | User |
+| 2026-09-08 | Adopt exact SQL title top-k and explicitly accept linear matching-set scoring work instead of the strict candidate-limit work requirement for this channel. | The synthetic 250k-title diagnostic returned identical exact top-k in about 436 ms versus 5,960 ms for paged scans; all measured exact approaches still score every match. Retain snapshot/scope correctness, ID ordering, cancellation and every other release gate. Implementation is independently reviewed and targeted integration checks pass; exact-head CI/release verification remains required. | User |
