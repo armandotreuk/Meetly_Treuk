@@ -1434,11 +1434,18 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 - `cargo fmt --manifest-path frontend/src-tauri/Cargo.toml --check` - pass.
 - `node node_modules/typescript/bin/tsc --noEmit` from `frontend` - pass.
 - `git diff --check` - pass.
-- `cargo test --locked --manifest-path frontend/src-tauri/Cargo.toml --lib` -
-  incomplete: the harness started 925 tests and reported progress past 870,
-  then remained active without a completion summary; its exact process was
-  stopped after extended CPU-active runtime. Do not infer a pass from partial
-  output.
+- `cargo test --locked --manifest-path frontend/src-tauri/Cargo.toml --lib --
+  --test-threads=1` - pass: 921 passed / 0 failed / 4 ignored in 115.37 s.
+  The serial run was launched at 16:56:28 and its captured stdout completed at
+  16:58:42 (134 s wall time including a 18.26 s compile). It crossed the
+  diagnostic 120-second launch-to-deadline, but had already exited before
+  cleanup inspection; the result is local suite integrity evidence, not a
+  latency or release-performance measurement.
+- `cargo test --locked --manifest-path frontend/src-tauri/Cargo.toml --lib
+  retrieval::agent::tests::initial_failure_after_crossing_the_boundary_keeps_the_underlying_error
+  -- --test-threads=1` - pass: 1 passed / 0 failed / 924 filtered in 1.69 s.
+  This was the provisional boundary test observed during the initial sampled
+  serial output; it is not a hanging test.
 - `pnpm --dir frontend run typecheck` - unavailable in this worktree: pnpm
   requested a non-interactive modules-directory replacement. No install or
   replacement was authorized for this baseline.
@@ -1450,8 +1457,9 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 - The independent corpus, production/provider quality-answer evidence, native
   Windows/R13 full-application session, full Task 5.5 matrix, installed-package
   smoke, final reviewed-head Actions, reviews, and user closure remain open.
-- First resolve the hanging Rust library-test tail with a bounded, separately
-  observable invocation before treating the local library suite as passing.
+- No non-completing library test was found: the serial log ends with the full
+  passing harness summary. The longer serial wall time is diagnostic only and
+  does not replace any scale or performance qualification.
 
 ## Sprint Reviews
 
