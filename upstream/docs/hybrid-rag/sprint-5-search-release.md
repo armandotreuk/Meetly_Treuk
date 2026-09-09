@@ -1422,9 +1422,13 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 **Implemented:**
 - No product-code correction. This entry records only the reproducible,
   non-corpus local qualification subset.
+- One guarded local source-path 250k active-plus-shadow activation-envelope
+  measurement, using the existing production activation test and approved
+  staged bundle.
 **Not implemented:**
-- The scale, latency/resource, concurrency, crash/restart, recording,
-  provider-answer, package-smoke, and full-matrix qualifications.
+- The 12k and 50k scale rows; remaining latency/resource, concurrency,
+  crash/restart, recording, provider-answer, package-smoke, and full-matrix
+  qualifications.
 **Why not implemented:**
 - They require dedicated controlled data, native/package sessions, or external
   evidence not available to this local baseline.
@@ -1447,6 +1451,21 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
   -- --test-threads=1` - pass: 1 passed / 0 failed / 924 filtered in 1.69 s.
   This was the provisional boundary test observed during the initial sampled
   serial output; it is not a hanging test.
+- `MEETLY_RAG_INDEX_BENCH=1 cargo test --release --locked --manifest-path
+  frontend/src-tauri/Cargo.toml --lib
+  retrieval::index::tests::bench_2r6_production_activation_envelope --
+  --nocapture` - pass: 1 passed / 0 failed / 924 filtered in 56.47 s after a
+  1m 28s release compile, inside the 20-minute watchdog. The embedding session
+  loaded and warmed in 1,160 ms; its working set was 567.4 MiB (745.7 MiB
+  peak), with a 554.7 MiB embedding-only delta. The 250k active snapshot
+  activated in 8,963 ms. The 250k active-plus-shadow activation window measured
+  1,166,311,424 bytes / 1,112.3 MiB peak working set over 9,419 ms, leaving
+  229,552,947 bytes / 218.9 MiB under the test's 1.30 GiB transient ceiling.
+  The deferred post-activation reranker load took 707 ms, added 370.0 MiB,
+  and reported 1,190.9 MiB working set / 1,274.1 MiB process peak. This is one
+  local source-path measurement, not a reference-hardware or p95 result.
+  Temporary benchmark database files remaining after completion: 0; no cargo,
+  compiler, or benchmark-test process remained.
 - `pnpm --dir frontend run typecheck` - unavailable in this worktree: pnpm
   requested a non-interactive modules-directory replacement. No install or
   replacement was authorized for this baseline.
@@ -1457,11 +1476,15 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 **Decisions and follow-ups:**
 - A valid independently authored Portuguese corpus, production-path quality and
   final provider-answer evidence, a native Windows/R13 full loaded-application
-  session, the full Task 5.5 matrix, installed-package smoke, final
-  reviewed-head Actions, final reviews, and user closure remain open.
+  session, the remaining 12k/50k scale rows and full Task 5.5 matrix,
+  installed-package smoke, final reviewed-head Actions, final reviews, and
+  user closure remain open.
 - No non-completing library test was found: the serial log ends with the full
   passing harness summary. The longer serial wall time is diagnostic only and
   does not replace any scale or performance qualification.
+- The 250k activation-envelope result does not establish corpus quality,
+  Fast/Deep quality or p95 latency, reference-hardware performance, package
+  behavior, or release acceptance.
 
 ## Sprint Reviews
 
