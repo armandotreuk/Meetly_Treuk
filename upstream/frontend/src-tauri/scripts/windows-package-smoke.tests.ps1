@@ -112,6 +112,14 @@ try {
         # The runner may not be elevated enough for all-user enumeration. The
         # production smoke fails closed; the self-test reports the limitation.
     }
+    # This exact-product machine-context query is permission independent. Keep
+    # it outside the tolerated all-user probe so a native-null regression fails.
+    $unknownLocation = [Text.StringBuilder]::new(32768)
+    $unknownLocationLength = [uint32]$unknownLocation.Capacity
+    $unknownLocationStatus = [Meetily.WindowsInstallerInventory]::GetProductInstallLocation(
+        '{AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA}', [uint32]4, [Text.StringBuilder]::new(0),
+        $unknownLocation, [ref]$unknownLocationLength)
+    Assert-Check ($unknownLocationStatus -eq 1605) 'native_machine_context_uses_null_sid'
 
     function Get-SignatureState([string]$Path) { return 'unsigned' }
     function Get-MsiPackageIdentity([string]$Path) {

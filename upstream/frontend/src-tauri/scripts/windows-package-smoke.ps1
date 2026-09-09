@@ -225,8 +225,15 @@ namespace Meetily {
       uint index, StringBuilder installedProductCode, out uint installedContext,
       StringBuilder sid, ref uint sidLength);
     [DllImport("msi.dll", CharSet = CharSet.Unicode)]
-    public static extern uint MsiGetProductInfoEx(string productCode, string userSid, uint context,
+    private static extern uint MsiGetProductInfoEx(string productCode, string userSid, uint context,
       string property, StringBuilder value, ref uint valueLength);
+    public static uint GetProductInstallLocation(string productCode, uint context, StringBuilder sid,
+      StringBuilder value, ref uint valueLength) {
+      // PowerShell marshals a null string argument as String.Empty. Windows
+      // Installer requires a native NULL UserSid for machine context.
+      string userSid = context == 4 ? null : (sid == null ? null : sid.ToString());
+      return MsiGetProductInfoEx(productCode, userSid, context, "InstallLocation", value, ref valueLength);
+    }
     [DllImport("msi.dll", CharSet = CharSet.Unicode)]
     public static extern uint MsiEnumRelatedProducts(string upgradeCode, uint reserved, uint index,
       StringBuilder productCode);
@@ -248,9 +255,8 @@ namespace Meetily {
         if ($status -ne 0) { throw "windows_installer_inventory_failed_$status" }
         $location = [Text.StringBuilder]::new(32768)
         $locationLength = [uint32]$location.Capacity
-        $instanceSid = if ($context -eq 4 -or $sid.Length -eq 0) { $null } else { $sid.ToString() }
-        $locationStatus = [Meetily.WindowsInstallerInventory]::MsiGetProductInfoEx(
-            $code.ToString(), $instanceSid, $context, 'InstallLocation', $location, [ref]$locationLength)
+        $locationStatus = [Meetily.WindowsInstallerInventory]::GetProductInstallLocation(
+            $code.ToString(), $context, $sid, $location, [ref]$locationLength)
         if ($locationStatus -ne 0) { throw "windows_installer_inventory_failed_$locationStatus" }
         $records += @{ kind = 'msi_product'; product_code = $code.ToString().ToUpperInvariant(); context = $context
             install_location = $location.ToString() }
