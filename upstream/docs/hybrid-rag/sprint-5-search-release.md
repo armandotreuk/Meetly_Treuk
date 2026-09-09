@@ -34,7 +34,7 @@ proof, or any release gate.
 | 5.4a package authority | Accepted after real Tauri expansion, staging/recovery tests, and independent review. | Installed-package evidence belongs to 5.4c. |
 | 5.4b retrieval diagnostic | Accepted after pinned Rust 1.88 tests, real source-side package-layout inference, fallback tests, and independent review. | Source-layout inference is not MSI/NSIS installation evidence. |
 | 5.4c installer CI | Accepted. CI9 at exact R10 head `bc1dd943652b5c358412baa03158733878072a4c` passed package production, fresh MSI and NSIS installed smokes, and terminal evidence gate. Both evidence records are schema 2/current-commit, use the approved 12-file / 430,993,263-byte bundle and manifest `8a375106…264ff4`, and pass isolated discovery, ownership, dbstat, real retrieval, teardown, residue, and signing policy. This records policy satisfaction, not a positive signature claim. | 5.4c is complete; Task 5.5 and all inherited release gates remain open. |
-| 5.5 release qualification | Not started; dependencies and inherited evidence remain open. | Independent corpus, production quality/provider answers, native/R13 sessions, full qualification matrix, exact final-head Actions, and user close approval. |
+| 5.5 release qualification | Full release qualification not started; a limited non-corpus local baseline is recorded. Dependencies and inherited evidence remain open. | Valid independently authored Portuguese corpus, production-path quality and final provider-answer evidence, native Windows/R13 full loaded-application session, full qualification matrix, final reviewed-head Actions, final reviews, and user close approval. |
 
 The latest explicit Rust 1.88 integration run passed 920 library tests (four
 ignored), 18 model tests, 22 staged-bundle tests, cargo check, frontend
@@ -1432,7 +1432,8 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 - `cargo check --locked --manifest-path frontend/src-tauri/Cargo.toml --lib`
   - pass.
 - `cargo fmt --manifest-path frontend/src-tauri/Cargo.toml --check` - pass.
-- `node node_modules/typescript/bin/tsc --noEmit` from `frontend` - pass.
+- Direct `node node_modules/typescript/bin/tsc --noEmit` from `frontend` -
+  pass; this is not `pnpm --dir frontend run typecheck`.
 - `git diff --check` - pass.
 - `cargo test --locked --manifest-path frontend/src-tauri/Cargo.toml --lib --
   --test-threads=1` - pass: 921 passed / 0 failed / 4 ignored in 115.37 s.
@@ -1449,14 +1450,15 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 - `pnpm --dir frontend run typecheck` - unavailable in this worktree: pnpm
   requested a non-interactive modules-directory replacement. No install or
   replacement was authorized for this baseline.
-- The unbounded frontend test suite was not run because this qualification pass
-  does not establish a safely separable non-corpus invocation.
+- Vitest was not run because this qualification pass does not establish a
+  safely separable non-corpus invocation.
 **Rollback:**
 - None; no product code changed.
 **Decisions and follow-ups:**
-- The independent corpus, production/provider quality-answer evidence, native
-  Windows/R13 full-application session, full Task 5.5 matrix, installed-package
-  smoke, final reviewed-head Actions, reviews, and user closure remain open.
+- A valid independently authored Portuguese corpus, production-path quality and
+  final provider-answer evidence, a native Windows/R13 full loaded-application
+  session, the full Task 5.5 matrix, installed-package smoke, final
+  reviewed-head Actions, final reviews, and user closure remain open.
 - No non-completing library test was found: the serial log ends with the full
   passing harness summary. The longer serial wall time is diagnostic only and
   does not replace any scale or performance qualification.
