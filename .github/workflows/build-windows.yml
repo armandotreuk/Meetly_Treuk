@@ -24,8 +24,10 @@ env:
 
 jobs:
   build-windows:
-    name: Build Windows x64 (CPU)
+    name: Package Windows x64 (CPU)
     runs-on: windows-latest
+    outputs:
+      build-profile: ${{ steps.build-profile.outputs.profile }}
     permissions:
       contents: write
 
@@ -313,42 +315,34 @@ jobs:
         shell: pwsh
         run: ./upstream/frontend/src-tauri/scripts/windows-package-smoke.ps1 -Mode MeasureAfter
 
-      - name: Install and run MSI dbstat and retrieval smoke
-        id: smoke-msi
+      - name: Prepare package-smoke handoff
         shell: pwsh
-        timeout-minutes: 20
-        continue-on-error: true
-        run: ./upstream/frontend/src-tauri/scripts/windows-package-smoke.ps1 -Mode Smoke -Kind msi
+        run: |
+          # The installed smokes run on fresh runners. Hand off only their two
+          # package directories and sanitized measurement evidence.
+          $handoff = Join-Path $env:RUNNER_TEMP 'meetily-package-smoke-input'
+          $bundle = Join-Path $env:GITHUB_WORKSPACE "$env:ARTIFACT_DIR/bundle"
+          if (-not (Test-Path -LiteralPath (Join-Path $bundle 'msi') -PathType Container) -or
+              -not (Test-Path -LiteralPath (Join-Path $bundle 'nsis') -PathType Container) -or
+              -not (Test-Path -LiteralPath (Join-Path $env:RUNNER_TEMP 'meetily-package-sizes.json') -PathType Leaf)) {
+            throw 'package_smoke_handoff_input_missing'
+          }
+          New-Item -ItemType Directory -Path (Join-Path $handoff 'packages') -Force | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $handoff 'evidence') -Force | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $handoff 'packages/bundle') -Force | Out-Null
+          Copy-Item -LiteralPath (Join-Path $bundle 'msi') -Destination (Join-Path $handoff 'packages/bundle/msi') -Recurse
+          Copy-Item -LiteralPath (Join-Path $bundle 'nsis') -Destination (Join-Path $handoff 'packages/bundle/nsis') -Recurse
+          Copy-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'meetily-package-sizes.json') -Destination (Join-Path $handoff 'evidence/meetily-package-sizes.json')
 
-      - name: Install and run NSIS dbstat and retrieval smoke
-        id: smoke-nsis
-        shell: pwsh
-        timeout-minutes: 20
-        continue-on-error: true
-        run: ./upstream/frontend/src-tauri/scripts/windows-package-smoke.ps1 -Mode Smoke -Kind nsis
-
-      - name: Upload sanitized installed-package evidence
-        if: always()
+      - name: Upload package-smoke input
         uses: actions/upload-artifact@v4
         with:
-          name: meetily-windows-installed-smoke-evidence
+          name: meetily-windows-package-smoke-input
           path: |
-            ${{ runner.temp }}/meetily-smoke-msi-result.json
-            ${{ runner.temp }}/meetily-smoke-nsis-result.json
-            ${{ runner.temp }}/meetily-package-sizes.json
-          if-no-files-found: warn
-          retention-days: 30
-
-      - name: Fail if an executed installed-package smoke failed
-        if: always()
-        shell: pwsh
-        env:
-          MSI_SMOKE_OUTCOME: ${{ steps.smoke-msi.outcome }}
-          NSIS_SMOKE_OUTCOME: ${{ steps.smoke-nsis.outcome }}
-        run: |
-          # Skipped smokes leave earlier build failures intact. Executed smokes
-          # must have current-SHA evidence for BOTH diagnostics and teardown.
-          ./upstream/frontend/src-tauri/scripts/windows-package-smoke.ps1 -Mode Gate -MsiOutcome $env:MSI_SMOKE_OUTCOME -NsisOutcome $env:NSIS_SMOKE_OUTCOME
+            ${{ runner.temp }}/meetily-package-smoke-input/packages
+            ${{ runner.temp }}/meetily-package-smoke-input/evidence
+          if-no-files-found: error
+          retention-days: 1
 
       # --- Upload ---
       - name: Upload MSI installer
@@ -377,6 +371,163 @@ jobs:
           path: ${{ env.ARTIFACT_DIR }}/meetily.exe
           if-no-files-found: warn
           retention-days: 14
+
+  smoke-msi:
+    name: Installed MSI smoke (Windows)
+    needs: build-windows
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download package-smoke input
+        uses: actions/download-artifact@v4
+        with:
+          name: meetily-windows-package-smoke-input
+          path: ${{ runner.temp }}/meetily-package-smoke-input
+
+      - name: Restore MSI smoke input
+        shell: pwsh
+        env:
+          ARTIFACT_DIR: upstream/frontend/target/${{ needs.build-windows.outputs.build-profile }}
+        run: |
+          $input = Join-Path $env:RUNNER_TEMP 'meetily-package-smoke-input'
+          $sourceBundle = Join-Path $input 'packages/bundle'
+          $sourceSizes = Join-Path $input 'evidence/meetily-package-sizes.json'
+          $targetBundle = Join-Path $env:GITHUB_WORKSPACE "$env:ARTIFACT_DIR/bundle"
+          if (-not (Test-Path -LiteralPath (Join-Path $sourceBundle 'msi') -PathType Container) -or
+              -not (Test-Path -LiteralPath $sourceSizes -PathType Leaf)) { throw 'package_smoke_input_invalid' }
+          New-Item -ItemType Directory -Path (Split-Path -Parent $targetBundle) -Force | Out-Null
+          Copy-Item -LiteralPath $sourceBundle -Destination $targetBundle -Recurse
+          Copy-Item -LiteralPath $sourceSizes -Destination (Join-Path $env:RUNNER_TEMP 'meetily-package-sizes.json')
+
+      - name: Install and run MSI dbstat and retrieval smoke
+        id: smoke-msi
+        shell: pwsh
+        timeout-minutes: 20
+        continue-on-error: true
+        env:
+          ARTIFACT_DIR: upstream/frontend/target/${{ needs.build-windows.outputs.build-profile }}
+        run: ./upstream/frontend/src-tauri/scripts/windows-package-smoke.ps1 -Mode Smoke -Kind msi
+
+      - name: Upload sanitized MSI installed-package evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: meetily-windows-installed-smoke-msi-evidence
+          path: |
+            ${{ runner.temp }}/meetily-smoke-msi-result.json
+            ${{ runner.temp }}/meetily-package-sizes.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  smoke-nsis:
+    name: Installed NSIS smoke (Windows)
+    needs: build-windows
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download package-smoke input
+        uses: actions/download-artifact@v4
+        with:
+          name: meetily-windows-package-smoke-input
+          path: ${{ runner.temp }}/meetily-package-smoke-input
+
+      - name: Restore NSIS smoke input
+        shell: pwsh
+        env:
+          ARTIFACT_DIR: upstream/frontend/target/${{ needs.build-windows.outputs.build-profile }}
+        run: |
+          $input = Join-Path $env:RUNNER_TEMP 'meetily-package-smoke-input'
+          $sourceBundle = Join-Path $input 'packages/bundle'
+          $sourceSizes = Join-Path $input 'evidence/meetily-package-sizes.json'
+          $targetBundle = Join-Path $env:GITHUB_WORKSPACE "$env:ARTIFACT_DIR/bundle"
+          if (-not (Test-Path -LiteralPath (Join-Path $sourceBundle 'nsis') -PathType Container) -or
+              -not (Test-Path -LiteralPath $sourceSizes -PathType Leaf)) { throw 'package_smoke_input_invalid' }
+          New-Item -ItemType Directory -Path (Split-Path -Parent $targetBundle) -Force | Out-Null
+          Copy-Item -LiteralPath $sourceBundle -Destination $targetBundle -Recurse
+          Copy-Item -LiteralPath $sourceSizes -Destination (Join-Path $env:RUNNER_TEMP 'meetily-package-sizes.json')
+
+      - name: Install and run NSIS dbstat and retrieval smoke
+        id: smoke-nsis
+        shell: pwsh
+        timeout-minutes: 20
+        continue-on-error: true
+        env:
+          ARTIFACT_DIR: upstream/frontend/target/${{ needs.build-windows.outputs.build-profile }}
+        run: ./upstream/frontend/src-tauri/scripts/windows-package-smoke.ps1 -Mode Smoke -Kind nsis
+
+      - name: Upload sanitized NSIS installed-package evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: meetily-windows-installed-smoke-nsis-evidence
+          path: |
+            ${{ runner.temp }}/meetily-smoke-nsis-result.json
+            ${{ runner.temp }}/meetily-package-sizes.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  gate-installed-package-smoke:
+    # Retain the established required-check identity on the terminal verdict,
+    # not merely on the package-producing predecessor.
+    name: Build Windows x64 (CPU)
+    needs: [build-windows, smoke-msi, smoke-nsis]
+    if: always()
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download MSI smoke evidence
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: meetily-windows-installed-smoke-msi-evidence
+          path: ${{ runner.temp }}/meetily-smoke-msi-evidence
+
+      - name: Download NSIS smoke evidence
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: meetily-windows-installed-smoke-nsis-evidence
+          path: ${{ runner.temp }}/meetily-smoke-nsis-evidence
+
+      - name: Restore gate evidence
+        shell: pwsh
+        run: |
+          Copy-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'meetily-smoke-msi-evidence/meetily-smoke-msi-result.json') -Destination (Join-Path $env:RUNNER_TEMP 'meetily-smoke-msi-result.json') -ErrorAction SilentlyContinue
+          Copy-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'meetily-smoke-nsis-evidence/meetily-smoke-nsis-result.json') -Destination (Join-Path $env:RUNNER_TEMP 'meetily-smoke-nsis-result.json') -ErrorAction SilentlyContinue
+          Copy-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'meetily-smoke-msi-evidence/meetily-package-sizes.json') -Destination (Join-Path $env:RUNNER_TEMP 'meetily-package-sizes.json') -ErrorAction SilentlyContinue
+
+      - name: Fail if Windows package build did not pass
+        if: needs.build-windows.result != 'success'
+        shell: pwsh
+        run: exit 1
+
+      - name: Fail if an executed installed-package smoke failed
+        shell: pwsh
+        env:
+          MSI_SMOKE_OUTCOME: ${{ needs.smoke-msi.result }}
+          NSIS_SMOKE_OUTCOME: ${{ needs.smoke-nsis.result }}
+        run: |
+          # Skipped smokes leave earlier build failures intact. Executed smokes
+          # must have current-SHA evidence for BOTH diagnostics and teardown.
+          ./upstream/frontend/src-tauri/scripts/windows-package-smoke.ps1 -Mode Gate -MsiOutcome $env:MSI_SMOKE_OUTCOME -NsisOutcome $env:NSIS_SMOKE_OUTCOME
+
+      - name: Upload sanitized installed-package evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: meetily-windows-installed-smoke-evidence
+          path: |
+            ${{ runner.temp }}/meetily-smoke-msi-result.json
+            ${{ runner.temp }}/meetily-smoke-nsis-result.json
+            ${{ runner.temp }}/meetily-package-sizes.json
+          if-no-files-found: warn
+          retention-days: 30
 
   # Quick cargo check on every push (faster than full build)
   check-rust:
