@@ -1414,6 +1414,45 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
   quality/provider-answer evidence, native Windows/R13 hermetic session,
   exact-head Actions evidence, installed-package smoke. No release claim.
 
+### Task 5.5 - initial local qualification baseline
+
+**Status:** Blocked (local baseline recorded; no release or sprint-close claim)
+**Owner:** `worker-l` (Task 5.5 initial qualification pass)
+**Completed:** 2026-09-09
+**Implemented:**
+- No product-code correction. This entry records only the reproducible,
+  non-corpus local qualification subset.
+**Not implemented:**
+- The scale, latency/resource, concurrency, crash/restart, recording,
+  provider-answer, package-smoke, and full-matrix qualifications.
+**Why not implemented:**
+- They require dedicated controlled data, native/package sessions, or external
+  evidence not available to this local baseline.
+**Verification:**
+- `cargo check --locked --manifest-path frontend/src-tauri/Cargo.toml --lib`
+  - pass.
+- `cargo fmt --manifest-path frontend/src-tauri/Cargo.toml --check` - pass.
+- `node node_modules/typescript/bin/tsc --noEmit` from `frontend` - pass.
+- `git diff --check` - pass.
+- `cargo test --locked --manifest-path frontend/src-tauri/Cargo.toml --lib` -
+  incomplete: the harness started 925 tests and reported progress past 870,
+  then remained active without a completion summary; its exact process was
+  stopped after extended CPU-active runtime. Do not infer a pass from partial
+  output.
+- `pnpm --dir frontend run typecheck` - unavailable in this worktree: pnpm
+  requested a non-interactive modules-directory replacement. No install or
+  replacement was authorized for this baseline.
+- The unbounded frontend test suite was not run because this qualification pass
+  does not establish a safely separable non-corpus invocation.
+**Rollback:**
+- None; no product code changed.
+**Decisions and follow-ups:**
+- The independent corpus, production/provider quality-answer evidence, native
+  Windows/R13 full-application session, full Task 5.5 matrix, installed-package
+  smoke, final reviewed-head Actions, reviews, and user closure remain open.
+- First resolve the hanging Rust library-test tail with a bounded, separately
+  observable invocation before treating the local library suite as passing.
+
 ## Sprint Reviews
 
 ### Code Review
