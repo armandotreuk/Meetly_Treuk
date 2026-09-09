@@ -4114,11 +4114,19 @@ etrieval/model.rs:1714 unused_parens warning).
 ### Task HR-5.R10.R11 — Exact SQL title top-k implementation
 
 - Date: 2026-09-09
-- Status: implemented locally and independently reviewed; targeted title regressions and `cargo check --lib` pass. Exact-head Windows CI and final integration/release verification remain open. No release claim is made by this entry.
+- Status: implemented, independently reviewed, and CI10-integrated at its exact source head; targeted title regressions and `cargo check --lib` pass. Final Task 5.5/release verification remains open. No release claim is made by this entry.
 - Change: retired the production rowid-window scan and client candidate heap. For every existing disjoint scope/query partition, one SQLite statement now computes `bm25(retrieval_title_fts, 1.0, 1.0, 0.0)`, orders by score then `m.id COLLATE BINARY`, and applies the existing `lexical_per_variant` limit. The partition winners are merged under the existing cap, so partitioned long public/folder scopes retain exact global score-and-ID top-k while response and retained Rust memory stay bounded.
 - Limitation: this is intentionally exact SQL top-k, not a candidate-work bound. SQLite scores/sorts each matching in-scope title before `LIMIT`; matching-set work is linear. The prior synthetic 250k-title diagnostic compared about 436 ms for this shape with about 5,960 ms snapshot-paged, with identical exact top-k. Those host/debug timings are diagnostic only, not production p95 or release acceptance.
 - Preserved: MATCH core-term semantics, index-contained scope intersections, zero scope-column BM25 weight, one read snapshot for folder expansion and every partition, live `meetings` identity/title join, selected-title hydration fences, public-ID ID tie order, output/memory caps, and no model inference. Cancellation remains checked before and after each title SQL query and before publication; a targeted regression holds the post-query/pre-commit boundary and proves cancellation returns `Cancelled` without publishing title candidates.
 - Regression updates: the title top-k regression now establishes exact score-and-ID result parity across reverse insertion order, and the common-term plan regression asserts the intentional SQLite exact-order shape rather than the retired no-sort rowid-window shape.
+
+### Result HR-5.R10.CI10 — Exact-head title integration and Windows/package evidence
+
+- Date: 2026-09-09
+- Run: [CI10](https://github.com/armandotreuk/Meetly_Treuk/actions/runs/34390581763), exact source head `512daf9e158ea8207cf2c37a009cb61f9c32c305` (`fix(retrieval): use exact SQL title top-k`), completed successfully.
+- Jobs: Cargo Check passed; `Package Windows x64 (CPU)` passed; fresh `Installed MSI smoke (Windows)` and `Installed NSIS smoke (Windows)` passed; terminal `Build Windows x64 (CPU)` evidence gate passed. Public artifact metadata lists current MSI, NSIS, package-smoke handoff, per-smoke, and combined-evidence artifacts. Direct authenticated download of the combined evidence was GitHub-forbidden (403), so this entry relies on the exact-head terminal gate and public artifact metadata rather than independently parsed record contents.
+- Independent acceptance review: `ci10_acceptance_review` (GPT-5.6 Terra / high, selected for release-sensitive evidence assessment) approved HR-5.R10 exact SQL title-top-k integration and exact-head Windows/package integration only. It confirmed the terminal gate still requires the package producer and both fresh smokes, rejects producer failure, and invokes fail-closed Gate mode.
+- Boundary: CI10 is not Sprint 5, Task 5.5, package-signing, or release acceptance. Signing remains a policy/gate result rather than a positive signature assertion; the independent corpus, production/provider-quality, native Windows/R13, full qualification matrix, final reviewed-head CI, and user close approval remain required.
 
 ### Result HR-5.4c.CI2 — Frozen setup and native harness pass; measurement fails before staging
 - Date: 2026-09-08

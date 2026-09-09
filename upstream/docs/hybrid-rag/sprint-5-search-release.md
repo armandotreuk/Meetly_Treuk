@@ -21,10 +21,16 @@ the package producer, fresh MSI and NSIS installed smokes, and the terminal
 fail-closed evidence gate. Task 5.4c is accepted as Windows installed-package
 evidence only; it does not close Sprint 5 or any release gate.
 
+CI10 at exact HR-5.R10 source head `512daf9e158ea8207cf2c37a009cb61f9c32c305`
+also passed Cargo Check, package production, both fresh installed smokes, and
+the terminal evidence gate. This accepts title-top-k and Windows/package
+integration at that commit only; it does not close Task 5.5, Sprint 5, signing
+proof, or any release gate.
+
 | Area | Current state | Remaining gate |
 |---|---|---|
-| 5.1-5.3 search/API/index UI | Implemented in `c8504a7`, `5bf5ced`, and `baf9b47`; subsequent cross-cutting R5 remediations are present. | Exact-head CI for the R10 commit and final release acceptance. |
-| HR-5.R10 correctness | Activation, snapshot/hydration, folder and public-ID fixes approved. The user-approved exact SQL title top-k is implemented and independently reviewed: each scope/query partition orders by zero-scope-weight BM25 and stable string meeting ID before `LIMIT`; targeted retrieval regressions and `cargo check --lib` pass. | Exact-head CI and final Task 5.5/release gates; title matching-set work remains explicitly linear and is not a candidate-limit work bound. |
+| 5.1-5.3 search/API/index UI | Implemented in `c8504a7`, `5bf5ced`, and `baf9b47`; subsequent cross-cutting R5 remediations are present. CI10 passed at the exact R10 source head. | Final Task 5.5/release qualification and its final exact-head CI. |
+| HR-5.R10 correctness | Activation, snapshot/hydration, folder and public-ID fixes approved. The user-approved exact SQL title top-k is implemented, independently reviewed, and CI10-integrated at its exact source head: each scope/query partition orders by zero-scope-weight BM25 and stable string meeting ID before `LIMIT`; targeted retrieval regressions and `cargo check --lib` pass. | Final Task 5.5/release gates; title matching-set work remains explicitly linear and is not a candidate-limit work bound. |
 | 5.4a package authority | Accepted after real Tauri expansion, staging/recovery tests, and independent review. | Installed-package evidence belongs to 5.4c. |
 | 5.4b retrieval diagnostic | Accepted after pinned Rust 1.88 tests, real source-side package-layout inference, fallback tests, and independent review. | Source-layout inference is not MSI/NSIS installation evidence. |
 | 5.4c installer CI | Accepted. CI9 at exact R10 head `bc1dd943652b5c358412baa03158733878072a4c` passed package production, fresh MSI and NSIS installed smokes, and terminal evidence gate. Both evidence records are schema 2/current-commit, use the approved 12-file / 430,993,263-byte bundle and manifest `8a375106…264ff4`, and pass isolated discovery, ownership, dbstat, real retrieval, teardown, residue, and signing policy. This records policy satisfaction, not a positive signature claim. | 5.4c is complete; Task 5.5 and all inherited release gates remain open. |
@@ -1526,10 +1532,10 @@ The public `meeting_fts` lexical contract, the semantic document set, and the
 vectors are unchanged, and the client-side substring union remains as the
 bounded presentation-layer complement, not a completeness safety net.
 HR-5.R10 correctness/boundary review is approved; its exact-SQL implementation
-is independently reviewed and targeted integration checks pass. Exact-head CI
-and the separate final release gates remain open. Maximum-length public scopes
-use disjoint bounded MATCH groups under the same snapshot and cap-sized merge,
-preserving exact score/ID order.
+is independently reviewed, targeted integration checks pass, and CI10 passed
+at its exact source head. The separate final Task 5.5/release gates remain
+open. Maximum-length public scopes use disjoint bounded MATCH groups under the
+same snapshot and cap-sized merge, preserving exact score/ID order.
 
 **Package-authority handoff (2026-09-08):** Task 5.4a remediation
 HR-5.4a.R3 is independently approved (review R5.4a.R4). Actual Tauri
