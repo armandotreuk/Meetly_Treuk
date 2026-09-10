@@ -1417,7 +1417,7 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 ### Task 5.5 - initial local qualification baseline
 
 **Status:** Blocked (local activation/disk, reranker-p95, cross-surface
-scheduler, and three narrow crash/restart diagnostic rows recorded; no release or
+scheduler, and four narrow crash/restart diagnostic rows recorded; no release or
 sprint-close claim)
 **Owner:** `worker-l` (Task 5.5 initial qualification pass)
 **Completed:** 2026-09-09–10
@@ -1480,6 +1480,16 @@ sprint-close claim)
   and sets the expected document count. The test-only barrier has a bounded
   wait and RAII cleanup for the matching global registration, task, and
   temporary database files.
+- A fourth file-backed source-level regression pauses a complete staging batch
+  after all staging inserts but before its transaction commits. It aborts the
+  task, closes/drops the one-connection pool, and reopens the WAL database. It
+  proves the primary meeting/transcript, canonical document, ready/indexed
+  meeting work state, retry metadata, document count, journal, and bounds stay
+  unchanged; a previously committed staging job survives while the interrupted
+  batch contributes no rows. A normal restage then yields the exact expected
+  staging identities without duplicates and without premature canonical or
+  index-state changes. Its test-only barrier and failure cleanup are bounded
+  and RAII-protected.
 **Not implemented:**
 - Sustained typing against a live Chat stream, real reranker cancellation,
   concurrent indexing, the remaining crash/restart points (chunking,
@@ -1534,6 +1544,16 @@ sprint-close claim)
 - Existing
   `database::repositories::retrieval::tests::poisoned_page_aborts_replacement_and_keeps_prior_documents_and_staging_resumable`
   also passes: 1 / 0 / 931 filtered.
+- `cargo test --locked --manifest-path frontend/src-tauri/Cargo.toml --lib
+  database::repositories::retrieval::tests::sqlite_staging_task_abort_before_commit_rolls_back_and_restages_exactly_once
+  -- --exact` - pass: 1 / 0 / 932 filtered. It holds the complete-inserted,
+  pre-commit staging barrier, aborts the task, explicitly closes/drops and
+  reopens the file-backed WAL pool, then proves all pre-existing state and
+  committed staging persist while the aborted batch rolls back and restaging is
+  exact.
+- Current-head rerun of
+  `database::repositories::retrieval::tests::sqlite_replacement_task_abort_after_delete_rolls_back_and_retries_exactly_once`
+  also passes: 1 / 0 / 932 filtered.
 - Exact-source Windows integration run [CI59](https://github.com/armandotreuk/Meetly_Treuk/actions/runs/34481012557)
   passed at `935558bc688d69ae3d58fbcba85fc583a2aca168`: Cargo Check, Windows
   CPU packaging, fresh installed MSI and NSIS smokes, and the terminal evidence
@@ -1652,6 +1672,13 @@ sprint-close claim)
   test passed code re-review and architecture re-review. It models task abort,
   graceful pool close, and reopen after the destructive delete, not an OS or
   power-loss crash, hot-WAL replay, filesystem durability, or corruption.
+- The staging-batch regression is likewise local source-test evidence only.
+  Independent code review first required direct meeting-row and complete
+  meeting-work/retry-state preservation assertions; code re-review and
+  architecture re-review approved the corrected test. It models task abort,
+  graceful pool close, and reopen after inserts and before commit, not an OS or
+  power-loss crash, hot-WAL replay, filesystem durability, worker orchestration,
+  or embedding behavior.
 - CI59 passed Windows packaging, both fresh installer smokes, and the terminal
   evidence gate at the exact Q3 source commit. It supplies current-source
   package integration evidence only; it neither runs Q2/Q3 inside an installed

@@ -391,6 +391,114 @@ async fn pause_after_replacement_delete(job: &ReplacementJob<'_>) {
     }
 }
 
+/// Test-only, one-shot pause after a staging transaction has inserted its
+/// complete batch but before it commits. This is deliberately scoped to one
+/// staging job so unrelated tests and production builds cannot observe it.
+#[cfg(test)]
+#[derive(Debug)]
+struct StagingCommitBarrier {
+    reached: Notify,
+    release: Notify,
+    armed: AtomicBool,
+}
+
+#[cfg(test)]
+impl StagingCommitBarrier {
+    fn new() -> Self {
+        Self {
+            reached: Notify::new(),
+            release: Notify::new(),
+            armed: AtomicBool::new(true),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct StagingCommitBarrierRegistration {
+    generation_id: String,
+    meeting_id: String,
+    job_id: String,
+    barrier: Arc<StagingCommitBarrier>,
+}
+
+#[cfg(test)]
+struct StagingCommitBarrierGuard {
+    barrier: Arc<StagingCommitBarrier>,
+}
+
+#[cfg(test)]
+impl StagingCommitBarrierGuard {
+    fn barrier(&self) -> &Arc<StagingCommitBarrier> {
+        &self.barrier
+    }
+}
+
+#[cfg(test)]
+impl Drop for StagingCommitBarrierGuard {
+    fn drop(&mut self) {
+        let mut slot = staging_commit_barrier_slot()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|registration| Arc::ptr_eq(&registration.barrier, &self.barrier))
+        {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+static STAGING_COMMIT_BARRIER: OnceLock<Mutex<Option<StagingCommitBarrierRegistration>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn staging_commit_barrier_slot() -> &'static Mutex<Option<StagingCommitBarrierRegistration>> {
+    STAGING_COMMIT_BARRIER.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn install_staging_commit_barrier(
+    generation_id: &str,
+    meeting_id: &str,
+    job_id: &str,
+) -> StagingCommitBarrierGuard {
+    let barrier = Arc::new(StagingCommitBarrier::new());
+    let mut slot = staging_commit_barrier_slot().lock().unwrap();
+    assert!(
+        slot.is_none(),
+        "staging commit barrier is already installed"
+    );
+    *slot = Some(StagingCommitBarrierRegistration {
+        generation_id: generation_id.to_string(),
+        meeting_id: meeting_id.to_string(),
+        job_id: job_id.to_string(),
+        barrier: Arc::clone(&barrier),
+    });
+    StagingCommitBarrierGuard { barrier }
+}
+
+#[cfg(test)]
+async fn pause_after_staging_inserts(generation_id: &str, meeting_id: &str, job_id: &str) {
+    let barrier = staging_commit_barrier_slot()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|registration| {
+            registration.generation_id == generation_id
+                && registration.meeting_id == meeting_id
+                && registration.job_id == job_id
+        })
+        .map(|registration| Arc::clone(&registration.barrier));
+    if let Some(barrier) = barrier {
+        if barrier.armed.swap(false, Ordering::AcqRel) {
+            barrier.reached.notify_one();
+            barrier.release.notified().await;
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReplacementOutcome {
     Published { change_id: i64 },
@@ -1749,6 +1857,8 @@ impl RetrievalRepository {
             .execute(&mut *tx)
             .await?;
         }
+        #[cfg(test)]
+        pause_after_staging_inserts(generation_id, meeting_id, job_id).await;
         tx.commit().await?;
         Ok(())
     }
@@ -4407,6 +4517,380 @@ mod tests {
             1,
             "the aborted replacement must not journal anything"
         );
+    }
+
+    #[tokio::test]
+    async fn sqlite_staging_task_abort_before_commit_rolls_back_and_restages_exactly_once() {
+        // This is a deterministic source-level task-cancellation boundary,
+        // not an OS crash, power-loss, hot-WAL, durability, or release test:
+        // it aborts a live staging task only after every INSERT and before its
+        // transaction commits.
+        let db_path = std::env::temp_dir().join(format!(
+            "meetly-retrieval-stage-abort-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        // Declared before pools so RAII removes this database and its WAL/SHM
+        // siblings after every pool is closed, even on a test-body panic.
+        let files = TempSqliteFiles::new(db_path.clone());
+        let options = SqliteConnectOptions::from_str(db_path.to_str().unwrap())
+            .unwrap()
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone())
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        let staging_test_pool = pool.clone();
+        let test_result = tokio::spawn(async move {
+            let pool = staging_test_pool;
+            RetrievalRepository::register_model(&pool, &f32_spec("model", 2))
+                .await
+                .unwrap();
+            insert_meeting(&pool, "m", "Staging Abort").await;
+            add_transcript(&pool, "primary", "m", "primary transcript survives").await;
+            let source_revision = source_state(&pool, "m").await.unwrap().0;
+            let baseline_meeting: (String, String) =
+                sqlx::query_as("SELECT id, title FROM meetings WHERE id = 'm'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            RetrievalRepository::register_generation(&pool, "gen-stage-abort", "model")
+                .await
+                .unwrap();
+
+            // Establish durable canonical state with known journal, bounds,
+            // and exact count before exercising a different staging job.
+            let old = [doc(
+                "old",
+                2,
+                VectorEncoding::F32,
+                normalized_f32(&[1.0, 0.0]),
+            )];
+            RetrievalRepository::stage_documents(
+                &pool,
+                "job-old",
+                "gen-stage-abort",
+                "m",
+                source_revision,
+                &old,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                RetrievalRepository::replace_meeting_documents(
+                    &pool,
+                    ReplacementJob {
+                        generation_id: "gen-stage-abort",
+                        meeting_id: "m",
+                        expected_source_revision: source_revision,
+                        job_id: "job-old",
+                    },
+                )
+                .await
+                .unwrap(),
+                ReplacementOutcome::Published { .. }
+            ));
+            let baseline_journal = scalar_count(
+                &pool,
+                "SELECT COUNT(*) FROM retrieval_index_changes WHERE generation_id = 'gen-stage-abort'",
+            )
+            .await;
+            let baseline_bounds: (i64, i64) = sqlx::query_as(
+                "SELECT canonical_change_id, published_change_id
+                 FROM retrieval_index_state WHERE generation_id = 'gen-stage-abort'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let baseline_count = scalar_count(
+                &pool,
+                "SELECT document_count FROM retrieval_generations WHERE generation_id = 'gen-stage-abort'",
+            )
+            .await;
+            let baseline_work: (String, i64, i64, Option<String>, Option<String>) = sqlx::query_as(
+                "SELECT state, indexed_source_revision, attempt_count, next_attempt_at, last_error
+                     FROM retrieval_meeting_state
+                     WHERE generation_id = 'gen-stage-abort' AND meeting_id = 'm'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(baseline_journal, 1);
+            assert_eq!(baseline_bounds, (1, 0));
+            assert_eq!(baseline_count, 1);
+            assert_eq!(
+                baseline_work,
+                ("ready".to_string(), source_revision, 0, None, None),
+                "the old canonical replacement leaves ready work with no retry state"
+            );
+
+            // A different job was fully committed before the interrupted one;
+            // its rows must survive both the abort and the reopen unchanged.
+            let committed = [
+                doc(
+                    "committed-a",
+                    2,
+                    VectorEncoding::F32,
+                    normalized_f32(&[0.0, 1.0]),
+                ),
+                doc(
+                    "committed-b",
+                    2,
+                    VectorEncoding::F32,
+                    normalized_f32(&[1.0, 0.0]),
+                ),
+            ];
+            RetrievalRepository::stage_documents(
+                &pool,
+                "job-committed",
+                "gen-stage-abort",
+                "m",
+                source_revision,
+                &committed,
+            )
+            .await
+            .unwrap();
+
+            let interrupted = [
+                doc(
+                    "interrupted-a",
+                    2,
+                    VectorEncoding::F32,
+                    normalized_f32(&[1.0, 0.0]),
+                ),
+                doc(
+                    "interrupted-b",
+                    2,
+                    VectorEncoding::F32,
+                    normalized_f32(&[0.0, 1.0]),
+                ),
+            ];
+            let barrier = install_staging_commit_barrier("gen-stage-abort", "m", "job-interrupted");
+            let staging_pool = pool.clone();
+            let staging_documents = interrupted.to_vec();
+            let staging_task = tokio::spawn(async move {
+                RetrievalRepository::stage_documents(
+                    &staging_pool,
+                    "job-interrupted",
+                    "gen-stage-abort",
+                    "m",
+                    source_revision,
+                    &staging_documents,
+                )
+                .await
+            });
+            let mut staging_abort = AbortOnDrop::new(staging_task.abort_handle());
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                barrier.barrier().reached.notified(),
+            )
+            .await
+            .expect(
+                "staging did not reach the post-INSERT/pre-commit test barrier within 5 seconds",
+            );
+            staging_task.abort();
+            assert!(
+                staging_task.await.unwrap_err().is_cancelled(),
+                "the staging task must be aborted while its transaction holds inserted rows"
+            );
+            staging_abort.disarm();
+            drop(barrier);
+
+            // Explicitly close/drop the sole pool before opening the same WAL
+            // database again, so the reopened handle observes no partial batch.
+            pool.close().await;
+            drop(pool);
+            let reopened = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(options)
+                .await
+                .unwrap();
+
+            let meeting_after_abort: (String, String) =
+                sqlx::query_as("SELECT id, title FROM meetings WHERE id = 'm'")
+                    .fetch_one(&reopened)
+                    .await
+                    .unwrap();
+            assert_eq!(meeting_after_abort, baseline_meeting);
+            let transcript: String = sqlx::query_scalar(
+                "SELECT transcript FROM transcripts WHERE id = 'primary' AND meeting_id = 'm'",
+            )
+            .fetch_one(&reopened)
+            .await
+            .unwrap();
+            assert_eq!(transcript, "primary transcript survives");
+            let canonical_after_abort: Vec<String> = sqlx::query_scalar(
+                "SELECT document_id FROM retrieval_documents
+                 WHERE generation_id = 'gen-stage-abort' AND meeting_id = 'm'
+                 ORDER BY document_id",
+            )
+            .fetch_all(&reopened)
+            .await
+            .unwrap();
+            assert_eq!(canonical_after_abort, ["old"]);
+            assert_eq!(
+                scalar_count(
+                    &reopened,
+                    "SELECT COUNT(*) FROM retrieval_index_changes WHERE generation_id = 'gen-stage-abort'",
+                )
+                .await,
+                baseline_journal,
+                "aborted staging cannot append a journal record"
+            );
+            let bounds_after_abort: (i64, i64) = sqlx::query_as(
+                "SELECT canonical_change_id, published_change_id
+                 FROM retrieval_index_state WHERE generation_id = 'gen-stage-abort'",
+            )
+            .fetch_one(&reopened)
+            .await
+            .unwrap();
+            assert_eq!(bounds_after_abort, baseline_bounds);
+            assert_eq!(
+                scalar_count(
+                    &reopened,
+                    "SELECT document_count FROM retrieval_generations WHERE generation_id = 'gen-stage-abort'",
+                )
+                .await,
+                baseline_count,
+                "staging never changes canonical document accounting"
+            );
+            let work_after_abort: (String, i64, i64, Option<String>, Option<String>) =
+                sqlx::query_as(
+                    "SELECT state, indexed_source_revision, attempt_count, next_attempt_at, last_error
+                     FROM retrieval_meeting_state
+                     WHERE generation_id = 'gen-stage-abort' AND meeting_id = 'm'",
+                )
+                .fetch_one(&reopened)
+                .await
+                .unwrap();
+            assert_eq!(
+                work_after_abort, baseline_work,
+                "aborted staging cannot alter ready/indexed or retry work state"
+            );
+            assert_eq!(
+                RetrievalRepository::list_staged_document_ids(&reopened, "job-committed")
+                    .await
+                    .unwrap(),
+                ["committed-a", "committed-b"],
+                "the earlier committed staging batch survives"
+            );
+            assert_eq!(
+                scalar_count(
+                    &reopened,
+                    "SELECT COUNT(*) FROM retrieval_document_staging WHERE job_id = 'job-interrupted'",
+                )
+                .await,
+                0,
+                "the interrupted batch contributes neither complete nor partial rows"
+            );
+            assert_eq!(
+                scalar_count(&reopened, "SELECT COUNT(*) FROM retrieval_document_staging").await,
+                committed.len() as i64,
+                "only the earlier committed staging batch remains"
+            );
+
+            // A later normal staging attempt is the resume path: it has the
+            // exact four expected rows, no duplicates, and still does not
+            // touch canonical state before an eventual replacement.
+            RetrievalRepository::stage_documents(
+                &reopened,
+                "job-interrupted",
+                "gen-stage-abort",
+                "m",
+                source_revision,
+                &interrupted,
+            )
+            .await
+            .unwrap();
+            let staged_after_retry: Vec<String> = sqlx::query_scalar(
+                "SELECT job_id || ':' || document_id FROM retrieval_document_staging
+                 WHERE generation_id = 'gen-stage-abort' AND meeting_id = 'm'
+                 ORDER BY job_id, document_id",
+            )
+            .fetch_all(&reopened)
+            .await
+            .unwrap();
+            assert_eq!(
+                staged_after_retry,
+                [
+                    "job-committed:committed-a",
+                    "job-committed:committed-b",
+                    "job-interrupted:interrupted-a",
+                    "job-interrupted:interrupted-b",
+                ]
+            );
+            assert_eq!(
+                scalar_count(
+                    &reopened,
+                    "SELECT COUNT(*) FROM (SELECT job_id, document_id FROM retrieval_document_staging GROUP BY job_id, document_id)",
+                )
+                .await,
+                staged_after_retry.len() as i64,
+                "the resumed staging set has no duplicate job/document identities"
+            );
+            let canonical_after_restaging: Vec<String> = sqlx::query_scalar(
+                "SELECT document_id FROM retrieval_documents
+                 WHERE generation_id = 'gen-stage-abort' AND meeting_id = 'm'
+                 ORDER BY document_id",
+            )
+            .fetch_all(&reopened)
+            .await
+            .unwrap();
+            assert_eq!(canonical_after_restaging, ["old"]);
+            assert_eq!(
+                scalar_count(
+                    &reopened,
+                    "SELECT COUNT(*) FROM retrieval_index_changes WHERE generation_id = 'gen-stage-abort'",
+                )
+                .await,
+                baseline_journal
+            );
+            let bounds_after_restaging: (i64, i64) = sqlx::query_as(
+                "SELECT canonical_change_id, published_change_id
+                 FROM retrieval_index_state WHERE generation_id = 'gen-stage-abort'",
+            )
+            .fetch_one(&reopened)
+            .await
+            .unwrap();
+            assert_eq!(bounds_after_restaging, baseline_bounds);
+            assert_eq!(
+                scalar_count(
+                    &reopened,
+                    "SELECT document_count FROM retrieval_generations WHERE generation_id = 'gen-stage-abort'",
+                )
+                .await,
+                baseline_count
+            );
+            let work_after_restaging: (String, i64, i64, Option<String>, Option<String>) =
+                sqlx::query_as(
+                    "SELECT state, indexed_source_revision, attempt_count, next_attempt_at, last_error
+                     FROM retrieval_meeting_state
+                     WHERE generation_id = 'gen-stage-abort' AND meeting_id = 'm'",
+                )
+                .fetch_one(&reopened)
+                .await
+                .unwrap();
+            assert_eq!(
+                work_after_restaging, baseline_work,
+                "normal staging also leaves work state untouched until replacement"
+            );
+
+            reopened.close().await;
+            drop(reopened);
+        });
+
+        // The supervisor remains outside the fallible test body so RAII can
+        // close/drop every pool before the database/WAL/SHM cleanup runs.
+        let test_result = test_result.await;
+        pool.close().await;
+        drop(pool);
+        files.cleanup().unwrap();
+        test_result.unwrap();
     }
 
     #[tokio::test]
