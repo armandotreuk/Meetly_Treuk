@@ -3186,6 +3186,214 @@ mod tests {
         assert!(contains_hit(&hits, "doc-crashed-1"));
     }
 
+    /// Source-level crash/restart mechanics only: this is not installed-package,
+    /// native/R13, corpus, provider, or release evidence.
+    #[tokio::test]
+    async fn publication_barrier_service_loss_replays_durable_journal_once_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("publication-restart.sqlite");
+        let options = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone())
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        insert_meeting(&pool, "restart", "Restart").await;
+        add_transcript(
+            &pool,
+            "restart-transcript",
+            "restart",
+            "primary meeting transcript survives restart",
+        )
+        .await;
+        register_test_model(&pool).await;
+        RetrievalRepository::ensure_generation(&pool, "gen-publication-restart", MODEL_ID)
+            .await
+            .unwrap();
+        publish_meeting(
+            &pool,
+            "gen-publication-restart",
+            "restart",
+            &["restart primary content", "restart secondary content"],
+        )
+        .await;
+
+        let before_bounds = RetrievalRepository::publication_lag(&pool, "gen-publication-restart")
+            .await
+            .unwrap()
+            .unwrap();
+        let primary_transcript_before: String =
+            sqlx::query_scalar("SELECT transcript FROM transcripts WHERE id = ?")
+                .bind("restart-transcript")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let canonical_document_before: String = sqlx::query_scalar(
+            "SELECT content FROM retrieval_documents
+             WHERE generation_id = ? AND document_id = ?",
+        )
+        .bind("gen-publication-restart")
+        .bind("doc-restart-0")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            before_bounds.0 > before_bounds.1,
+            "canonical journal work must be durable before the blocked publisher starts"
+        );
+        assert_eq!(
+            before_bounds.0 - before_bounds.1,
+            1,
+            "the fixture must contain exactly one unacknowledged journal change"
+        );
+        sqlx::query(
+            "CREATE TABLE publication_restart_ack_audit (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                published_bound_updates INTEGER NOT NULL DEFAULT 0
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO publication_restart_ack_audit (id) VALUES (1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER publication_restart_ack_audit_trigger
+             AFTER UPDATE OF published_change_id ON retrieval_index_state
+             WHEN OLD.generation_id = 'gen-publication-restart'
+                  AND NEW.published_change_id > OLD.published_change_id
+             BEGIN
+                 UPDATE publication_restart_ack_audit
+                 SET published_bound_updates = published_bound_updates + 1
+                 WHERE id = 1;
+             END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let blocked_service = Arc::new(fresh_service());
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        blocked_service.set_publish_barrier(Arc::clone(&barrier));
+        let publish_started = blocked_service.publish_started();
+        let publisher_pool = pool.clone();
+        let publisher_service = Arc::clone(&blocked_service);
+        let publisher =
+            tokio::spawn(async move { publish_tick(&publisher_pool, &publisher_service).await });
+        publish_started.notified().await;
+
+        // The barrier is before any snapshot installation or acknowledgement.
+        // Do not release it: terminating the blocked task and dropping its
+        // service model abrupt process loss without an acknowledgement.
+        assert_eq!(
+            RetrievalRepository::publication_lag(&pool, "gen-publication-restart")
+                .await
+                .unwrap(),
+            Some(before_bounds),
+            "publication may not advance while the publisher is blocked"
+        );
+        assert!(
+            blocked_service.active_snapshot().is_none(),
+            "the blocked publisher must not install a reader snapshot"
+        );
+        publisher.abort();
+        assert!(publisher.await.unwrap_err().is_cancelled());
+        drop(blocked_service);
+        drop(barrier);
+        pool.close().await;
+        drop(pool);
+
+        let recovered_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let recovered_service = fresh_service();
+        publish_tick(&recovered_pool, &recovered_service)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            RetrievalRepository::publication_lag(&recovered_pool, "gen-publication-restart")
+                .await
+                .unwrap(),
+            Some((before_bounds.0, before_bounds.0)),
+            "fresh-service recovery must acknowledge the durable journal exactly once"
+        );
+        assert_eq!(recovered_service.publication_lag(), 0);
+        assert_eq!(
+            recovered_service.active_generation().as_deref(),
+            Some("gen-publication-restart")
+        );
+        assert_eq!(
+            recovered_service
+                .active_snapshot()
+                .unwrap()
+                .document_count(),
+            2
+        );
+        let (document_rows, vector_rows): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COUNT(vector) FROM retrieval_documents
+             WHERE generation_id = ?",
+        )
+        .bind("gen-publication-restart")
+        .fetch_one(&recovered_pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (document_rows, vector_rows),
+            (2, 2),
+            "restart replay must not duplicate canonical document or vector rows"
+        );
+        let primary_transcript_after: String =
+            sqlx::query_scalar("SELECT transcript FROM transcripts WHERE id = ?")
+                .bind("restart-transcript")
+                .fetch_one(&recovered_pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            primary_transcript_after, primary_transcript_before,
+            "primary meeting transcript changed"
+        );
+        let canonical_document_after: String = sqlx::query_scalar(
+            "SELECT content FROM retrieval_documents
+             WHERE generation_id = ? AND document_id = ?",
+        )
+        .bind("gen-publication-restart")
+        .bind("doc-restart-0")
+        .fetch_one(&recovered_pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            canonical_document_after, canonical_document_before,
+            "canonical derived document changed"
+        );
+        let acknowledgement_updates: i64 = sqlx::query_scalar(
+            "SELECT published_bound_updates FROM publication_restart_ack_audit WHERE id = 1",
+        )
+        .fetch_one(&recovered_pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            acknowledgement_updates, 1,
+            "fresh-service recovery must durably advance the published bound once"
+        );
+        assert!(contains_hit(
+            &search_all(&recovered_service, "restart").await.unwrap(),
+            "doc-restart-0"
+        ));
+
+        recovered_pool.close().await;
+        directory.close().unwrap();
+    }
+
     #[tokio::test]
     async fn sparse_ids_repeated_upserts_and_upsert_delete_ordering_converge() {
         let pool = migrated_pool().await;

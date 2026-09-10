@@ -1416,8 +1416,9 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 
 ### Task 5.5 - initial local qualification baseline
 
-**Status:** Blocked (local activation/disk, reranker-p95, and cross-surface
-scheduler diagnostic rows recorded; no release or sprint-close claim)
+**Status:** Blocked (local activation/disk, reranker-p95, cross-surface
+scheduler, and one publication-restart diagnostic row recorded; no release or
+sprint-close claim)
 **Owner:** `worker-l` (Task 5.5 initial qualification pass)
 **Completed:** 2026-09-09–10
 **Implemented:**
@@ -1452,9 +1453,19 @@ scheduler diagnostic rows recorded; no release or sprint-close claim)
   a fresh real Sidebar search then completes with both the scheduler queue and
   request registry empty. It makes no per-surface-priority or stream-latency
   claim.
+- A separate file-backed source-level regression leaves exactly one canonical
+  journal change unacknowledged, holds publication before reader installation
+  or acknowledgement, aborts and drops that publisher/service, and reopens the
+  database with a fresh service. Recovery reaches zero lag with the same two
+  canonical documents/vectors, preserves the primary transcript and derived
+  document, returns a search hit, and uses a durable local audit trigger to
+  observe one published-bound advance. Its isolated temporary database is
+  explicitly closed and removed.
 **Not implemented:**
 - Sustained typing against a live Chat stream, real reranker cancellation,
-  concurrent indexing, crash/restart, recording, provider-answer,
+  concurrent indexing, the remaining crash/restart points (chunking,
+  embedding, SQLite replacement, post-installation, sidecar/cache, activation,
+  and steady-state overlay replay), recording, provider-answer,
   package-smoke, and the remaining full-matrix qualifications.
 **Why not implemented:**
 - They require dedicated controlled data, native/package sessions, or external
@@ -1476,6 +1487,14 @@ scheduler diagnostic rows recorded; no release or sprint-close claim)
   (1 / 0 / 928 filtered) and
   `retrieval::worker::tests::interactive_queue_caps_at_eight_and_cancels_deterministically`
   (1 / 0 / 928 filtered).
+- `cargo test --locked --manifest-path frontend/src-tauri/Cargo.toml --lib
+  retrieval::index::tests::publication_barrier_service_loss_replays_durable_journal_once_after_restart
+  -- --exact` - pass: 1 / 0 / 929 filtered. The pre-publication barrier,
+  service/task abandonment, fresh file-backed pool/service, durable-bound audit,
+  primary-transcript preservation, canonical-row bounds, and semantic query
+  are all exercised through the production `publish_tick` path.
+- Existing `retrieval::index::tests::journal_crash_replay_publishes_missing_changes_on_restart`
+  also passes: 1 / 0 / 929 filtered.
 - The pre-selector serial library baseline passed 921 / 0 / 4 ignored in
   115.37 s. The current selector change has focused selector and scale-test
   coverage below; no broad current-head library-suite result is claimed because
@@ -1564,6 +1583,12 @@ scheduler diagnostic rows recorded; no release or sprint-close claim)
   architecture review approved its shared-permit/cancellation scope and its
   explicit absence of a priority, package, performance, corpus, or release
   claim.
+- The publication-restart regression is local source-test evidence only. Both
+  independent reviews approved it after the test added an isolated
+  filename-based SQLite connection, a durable acknowledgement audit, actual
+  primary-transcript preservation, and visible temporary-directory cleanup. It
+  models task cancellation plus a graceful database close, not an OS/process
+  kill, and covers only the pre-publication/initial-generation point.
 
 ## Sprint Reviews
 
