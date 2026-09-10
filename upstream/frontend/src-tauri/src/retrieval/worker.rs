@@ -1357,6 +1357,13 @@ async fn process_semantic_item(
             }
         };
 
+        // An embedder can complete its bounded blocking call concurrently
+        // with lifecycle shutdown. Do not validate, convert, or stage a
+        // successful response once that cancellation is visible.
+        if cancel.is_cancelled() {
+            return;
+        }
+
         // A partial or mis-shaped embedding response must never publish a
         // partial meeting: require exactly one correctly-dimensioned vector
         // per requested document, else durable retry with prior documents
@@ -1813,6 +1820,8 @@ mod tests {
         park_first_token_count: StdMutex<Option<std::sync::mpsc::Receiver<()>>>,
         entered_first_token_count: Arc<AtomicBool>,
         response_fault: StdMutex<Option<ResponseFault>>,
+        cancel_before_first_document_return:
+            StdMutex<Option<(CancellationToken, std::sync::mpsc::Sender<()>)>>,
     }
 
     /// Simulates a malformed embedding response so the worker's exact-count /
@@ -1836,6 +1845,7 @@ mod tests {
                 park_first_token_count: StdMutex::new(None),
                 entered_first_token_count: Arc::new(AtomicBool::new(false)),
                 response_fault: StdMutex::new(None),
+                cancel_before_first_document_return: StdMutex::new(None),
             })
         }
 
@@ -1859,6 +1869,14 @@ mod tests {
 
         fn completed_document_calls(&self) -> u64 {
             self.completed_document_calls.load(Ordering::SeqCst)
+        }
+
+        fn cancel_before_first_document_return(
+            &self,
+            cancel: CancellationToken,
+            cancelled: std::sync::mpsc::Sender<()>,
+        ) {
+            *self.cancel_before_first_document_return.lock().unwrap() = Some((cancel, cancelled));
         }
     }
 
@@ -1934,7 +1952,19 @@ mod tests {
                 }
                 None => {}
             }
-            self.completed_document_calls.fetch_add(1, Ordering::SeqCst);
+            if self.completed_document_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                if let Some((cancel, cancelled)) = self
+                    .cancel_before_first_document_return
+                    .lock()
+                    .unwrap()
+                    .take()
+                {
+                    // The completed first inference response races exactly at
+                    // the worker's post-embedding cancellation fence.
+                    cancel.cancel();
+                    let _ = cancelled.send(());
+                }
+            }
             Ok(vectors)
         }
 
@@ -4739,6 +4769,135 @@ mod tests {
             published_bounds(&pool, &generation).await,
             (1, 1),
             "only the resumed replacement journals and advances publication"
+        );
+        assert_eq!(
+            scalar(&pool, "SELECT COUNT(*) FROM retrieval_document_staging").await,
+            0
+        );
+        resumed_lifecycle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_successful_embedding_return_fences_staging_and_resumes_once() {
+        let pool = migrated_pool().await;
+        let cancelled_embedder = FakeEmbedder::new();
+        let cancelled_lifecycle =
+            lifecycle_for_test(free_pressure(), ok_loader(&cancelled_embedder));
+
+        // Register first while there is no due source, then install the
+        // fake's one-shot post-embedding cancellation seam before work can
+        // begin.
+        cancelled_lifecycle.attach_database(pool.clone());
+        let generation = worker_generation(&pool).await;
+        let worker_cancel = locked(&cancelled_lifecycle.0.attached)
+            .as_ref()
+            .expect("test lifecycle is attached")
+            .cancel
+            .clone();
+        let (cancelled, cancellation_observed) = std::sync::mpsc::channel();
+        cancelled_embedder.cancel_before_first_document_return(worker_cancel, cancelled);
+
+        insert_meeting(&pool, "m", "Post-embedding cancellation").await;
+        add_transcript(
+            &pool,
+            "t1",
+            "m",
+            "vetores aceitos nao devem ser persistidos",
+        )
+        .await;
+
+        // The fake emits only after completing the first successful document
+        // batch and cancelling the shared lifecycle token immediately before
+        // it returns those vectors.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || cancellation_observed.recv()),
+        )
+        .await
+        .expect("fake reaches its post-embedding cancellation seam")
+        .expect("cancellation observer task does not panic")
+        .expect("fake reports the lifecycle cancellation");
+        tokio::time::timeout(Duration::from_secs(5), cancelled_lifecycle.shutdown())
+            .await
+            .expect("cancelled worker joins after returning vectors");
+
+        assert_eq!(cancelled_embedder.completed_document_calls(), 1);
+        assert!(
+            !cancelled_embedder.embedded_texts().is_empty(),
+            "the fake completed a successful document embedding before cancellation"
+        );
+        assert_eq!(
+            scalar(&pool, "SELECT COUNT(*) FROM retrieval_document_staging").await,
+            0,
+            "post-embedding cancellation must not stage returned vectors"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM retrieval_documents WHERE generation_id = ? AND meeting_id = 'm'",
+            )
+            .bind(&generation)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0,
+            "post-embedding cancellation must not replace canonical documents"
+        );
+        assert_eq!(
+            published_bounds(&pool, &generation).await,
+            (0, 0),
+            "post-embedding cancellation must not journal or advance bounds"
+        );
+        let retry_state: (String, i64, i64, String, String) = sqlx::query_as(
+            "SELECT state, attempt_count, indexed_source_revision,
+                    COALESCE(next_attempt_at, ''), COALESCE(last_error, '')
+             FROM retrieval_meeting_state WHERE generation_id = ? AND meeting_id = 'm'",
+        )
+        .bind(&generation)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            retry_state,
+            ("pending".to_string(), 0, 0, String::new(), String::new()),
+            "post-embedding cancellation is not a retry failure"
+        );
+
+        // A fresh lifecycle starts from the untouched pending state and
+        // performs the single normal replacement/journal publication.
+        let resumed_embedder = FakeEmbedder::new();
+        let resumed_lifecycle = lifecycle_for_test(free_pressure(), ok_loader(&resumed_embedder));
+        resumed_lifecycle.attach_database(pool.clone());
+        assert_eq!(worker_generation(&pool).await, generation);
+        let pool_ref = &pool;
+        let generation_ref = &generation;
+        wait_until(async || {
+            matches!(
+                meeting_state(pool_ref, generation_ref, "m").await,
+                (state, _, _) if state == "ready"
+            )
+        })
+        .await;
+        assert_eq!(
+            resumed_embedder.completed_document_calls(),
+            1,
+            "the clean resume completes exactly one document embedding batch"
+        );
+        wait_fully_acknowledged(&pool, &generation).await;
+        assert_eq!(
+            published_bounds(&pool, &generation).await,
+            (1, 1),
+            "only the clean resume publishes and journals once"
+        );
+        assert!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM retrieval_documents WHERE generation_id = ? AND meeting_id = 'm'",
+            )
+            .bind(&generation)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+                > 0,
+            "the clean resume publishes canonical documents"
         );
         assert_eq!(
             scalar(&pool, "SELECT COUNT(*) FROM retrieval_document_staging").await,

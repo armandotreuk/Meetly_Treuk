@@ -1417,14 +1417,15 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 ### Task 5.5 - initial local qualification baseline
 
 **Status:** Blocked (local activation/disk, reranker-p95, cross-surface
-scheduler, and eight narrow crash/restart diagnostic rows recorded; no release or
+scheduler, and nine narrow recovery/cancellation diagnostic rows recorded; no release or
 sprint-close claim)
 **Owner:** `worker-l` (Task 5.5 initial qualification pass)
 **Completed:** 2026-09-09–10
 **Implemented:**
-- Apart from Q8's narrow post-chunk cancellation fence, this entry records only
-  the reproducible, non-corpus local qualification subset and its test-only
-  harness extensions; Q9 is test-only and makes no production-runtime change.
+- Apart from Q8's post-chunk and Q10's post-embedding cancellation fences, this
+  entry records only the reproducible, non-corpus local qualification subset and
+  its test-only harness extensions; Q9 is test-only and makes no production-runtime
+  change.
 - The guarded source-path activation-envelope test now accepts only the three
   approved synthetic corpus sizes (`12000`, `50000`, and `250000`), defaulting
   to its prior 250k behavior when unset. Its exact-axis query cap is now bounded
@@ -1528,13 +1529,19 @@ sprint-close claim)
   unique durable document/vector identities, and serves the novel document.
   The pre-existing adjacent regression separately covers same-service recovery
   after a synthetic acknowledgement error.
+- A ninth in-memory source-level worker regression completes one fake document
+  embedding, cancels the lifecycle token immediately before returning
+  its vectors, and reaches a production fence before vector validation or
+  staging SQL. It proves no staging, canonical replacement, journal/bound, or
+  retry-state mutation. A fresh lifecycle on the same live pool completes one
+  clean embedding and acknowledgement; it is not file-backed recovery evidence.
 **Not implemented:**
 - Sustained typing against a live Chat stream, real reranker cancellation,
   concurrent indexing, the remaining crash/restart points (other chunking
   interruption/failure paths, other embedding interruption/failure paths,
   sidecar/cache, other activation interruption points,
   other same-service acknowledgement interruption/retry paths, and other
-  overlay interruption points), recording, provider-answer, Q2-Q9 behavior in
+  overlay interruption points), recording, provider-answer, Q2-Q10 behavior in
   an installed application, and the remaining full-matrix qualifications.
 **Why not implemented:**
 - They require dedicated controlled data, native/package sessions, or external
@@ -1621,6 +1628,13 @@ sprint-close claim)
 - Adjacent `retrieval::index::tests::publisher_installs_before_acknowledging_and_retries_failed_acks`
   also passes: 1 / 0 / 936 filtered, retaining separate same-service synthetic
   acknowledgement-error retry coverage.
+- `cargo test --manifest-path frontend/src-tauri/Cargo.toml --lib
+  retrieval::worker::tests::cancellation_after_successful_embedding_return_fences_staging_and_resumes_once
+  -- --exact` - pass: 1 / 0 / 937 filtered. It cancels exactly after vectors
+  return from successful inference and proves the new pre-staging fence leaves
+  no durable or retry mutation before a single clean lifecycle resume.
+- Adjacent `retrieval::worker::tests::shutdown_before_staging_leaves_pending_work_for_a_single_clean_resume`
+  also passes: 1 / 0 / 937 filtered.
 - Exact-source Windows integration run [CI59](https://github.com/armandotreuk/Meetly_Treuk/actions/runs/34481012557)
   passed at `935558bc688d69ae3d58fbcba85fc583a2aca168`: Cargo Check, Windows
   CPU packaging, fresh installed MSI and NSIS smokes, and the terminal evidence
@@ -1644,7 +1658,7 @@ sprint-close claim)
   Signing policy passed while credentials/tooling were unavailable and the
   packages were unsigned, so this is not positive signing evidence. CI60 is
   Windows/package evidence only for its exact Q4 source; it does not execute
-  or qualify Q5-Q9, an installed restart path, or any release gate.
+  or qualify Q5-Q10, an installed restart path, or any release gate.
 - The pre-selector serial library baseline passed 921 / 0 / 4 ignored in
   115.37 s. The current selector change has focused selector and scale-test
   coverage below; no broad current-head library-suite result is claimed because
