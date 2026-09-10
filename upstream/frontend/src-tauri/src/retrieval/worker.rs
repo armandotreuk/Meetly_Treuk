@@ -1801,6 +1801,7 @@ mod tests {
     struct FakeEmbedder {
         fail_substring: StdMutex<Option<String>>,
         embedded: StdMutex<Vec<String>>,
+        completed_document_calls: AtomicU64,
         park_first_call: StdMutex<Option<std::sync::mpsc::Receiver<()>>>,
         entered_first_call: Arc<AtomicBool>,
         response_fault: StdMutex<Option<ResponseFault>>,
@@ -1821,6 +1822,7 @@ mod tests {
             Arc::new(Self {
                 fail_substring: StdMutex::new(None),
                 embedded: StdMutex::new(Vec::new()),
+                completed_document_calls: AtomicU64::new(0),
                 park_first_call: StdMutex::new(None),
                 entered_first_call: Arc::new(AtomicBool::new(false)),
                 response_fault: StdMutex::new(None),
@@ -1843,6 +1845,10 @@ mod tests {
 
         fn embedded_texts(&self) -> Vec<String> {
             self.embedded.lock().unwrap().clone()
+        }
+
+        fn completed_document_calls(&self) -> u64 {
+            self.completed_document_calls.load(Ordering::SeqCst)
         }
     }
 
@@ -1906,6 +1912,7 @@ mod tests {
                 }
                 None => {}
             }
+            self.completed_document_calls.fetch_add(1, Ordering::SeqCst);
             Ok(vectors)
         }
 
@@ -4450,6 +4457,150 @@ mod tests {
         )
         .await;
         assert_eq!(processed, 0, "no work may run after shutdown fencing");
+    }
+
+    #[tokio::test]
+    async fn shutdown_before_staging_leaves_pending_work_for_a_single_clean_resume() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "m", "Interrupted Before Staging").await;
+        add_transcript(&pool, "t1", "m", "primeira janela para interromper").await;
+        add_transcript(&pool, "t2", "m", "segunda janela para retomar").await;
+
+        // Establish the complete expected document set without invoking model
+        // inference. Keeping this below one batch makes the resumed inference
+        // call count an exact, observable part of the regression.
+        let parked_embedder = FakeEmbedder::new();
+        let expected_documents = chunk_with_fake(&pool, "m", &parked_embedder).await;
+        assert!(
+            expected_documents.len() >= 2 && expected_documents.len() <= MAX_STAGE_DOCUMENTS,
+            "the fixture must produce one multi-document embedding batch"
+        );
+        let expected_texts: Vec<String> = expected_documents
+            .iter()
+            .map(|document| document.content.clone())
+            .collect();
+        let mut expected_ids: Vec<String> = expected_documents
+            .iter()
+            .map(|document| document.document_id.clone())
+            .collect();
+        expected_ids.sort();
+
+        // Park the actual first inference before it can yield vectors, so no
+        // `stage_documents` transaction can begin. Shutdown must cancel and
+        // join this real lifecycle worker at the model's bounded boundary.
+        let (_park_sender, park_receiver) = std::sync::mpsc::channel::<()>();
+        *parked_embedder.park_first_call.lock().unwrap() = Some(park_receiver);
+        let first_lifecycle = lifecycle_for_test(free_pressure(), ok_loader(&parked_embedder));
+        first_lifecycle.attach_database(pool.clone());
+        wait_until(async || parked_embedder.entered_first_call.load(Ordering::SeqCst)).await;
+
+        let generation = worker_generation(&pool).await;
+        let retry_before: (String, i64, i64, String, String) = sqlx::query_as(
+            "SELECT state, attempt_count, indexed_source_revision,
+                    COALESCE(next_attempt_at, ''), COALESCE(last_error, '')
+             FROM retrieval_meeting_state WHERE generation_id = ? AND meeting_id = 'm'",
+        )
+        .bind(&generation)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(retry_before.0, "pending");
+        assert_eq!(retry_before.1, 0);
+        assert_eq!(retry_before.2, 0);
+
+        tokio::time::timeout(Duration::from_secs(5), first_lifecycle.shutdown())
+            .await
+            .expect("shutdown cancels and joins the parked pre-staging inference");
+        assert!(!first_lifecycle.is_running());
+        assert_eq!(
+            parked_embedder.completed_document_calls(),
+            0,
+            "the parked inference was cancelled before it completed"
+        );
+        assert!(
+            parked_embedder.embedded_texts().is_empty(),
+            "the cancelled inference must not yield embeddable output"
+        );
+
+        // Cancellation before staging is non-failure control flow: no staging,
+        // canonical replacement, journal/bound advance, or retry mutation.
+        assert_eq!(
+            scalar(&pool, "SELECT COUNT(*) FROM retrieval_document_staging").await,
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM retrieval_documents
+                 WHERE generation_id = ? AND meeting_id = 'm'",
+            )
+            .bind(&generation)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(published_bounds(&pool, &generation).await, (0, 0));
+        let retry_after: (String, i64, i64, String, String) = sqlx::query_as(
+            "SELECT state, attempt_count, indexed_source_revision,
+                    COALESCE(next_attempt_at, ''), COALESCE(last_error, '')
+             FROM retrieval_meeting_state WHERE generation_id = ? AND meeting_id = 'm'",
+        )
+        .bind(&generation)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            retry_after, retry_before,
+            "shutdown must leave work pending"
+        );
+
+        // A new lifecycle over the same live pool resumes the untouched work.
+        // Its fresh fake is unparked, making completed inference calls
+        // distinguishable from the cancelled invocation above.
+        let resumed_embedder = FakeEmbedder::new();
+        let resumed_lifecycle = lifecycle_for_test(free_pressure(), ok_loader(&resumed_embedder));
+        resumed_lifecycle.attach_database(pool.clone());
+        let resumed_generation = worker_generation(&pool).await;
+        assert_eq!(resumed_generation, generation);
+        let pool_ref = &pool;
+        let generation_ref = &generation;
+        wait_until(async || {
+            matches!(
+                meeting_state(pool_ref, generation_ref, "m").await,
+                (state, _, _) if state == "ready"
+            )
+        })
+        .await;
+
+        assert_eq!(
+            resumed_embedder.completed_document_calls(),
+            1,
+            "the resumed one-batch meeting must complete exactly one embedding call"
+        );
+        assert_eq!(resumed_embedder.embedded_texts(), expected_texts);
+        let published = RetrievalRepository::read_validated_documents(&pool, &generation, "m")
+            .await
+            .unwrap();
+        let mut published_ids: Vec<String> = published
+            .iter()
+            .map(|(document_id, _)| document_id.clone())
+            .collect();
+        published_ids.sort();
+        assert_eq!(
+            published_ids, expected_ids,
+            "resume publishes the expected set once"
+        );
+        wait_fully_acknowledged(&pool, &generation).await;
+        assert_eq!(
+            published_bounds(&pool, &generation).await,
+            (1, 1),
+            "only the resumed replacement journals and advances publication"
+        );
+        assert_eq!(
+            scalar(&pool, "SELECT COUNT(*) FROM retrieval_document_staging").await,
+            0
+        );
+        resumed_lifecycle.shutdown().await;
     }
 
     #[tokio::test]

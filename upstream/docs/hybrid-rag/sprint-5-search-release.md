@@ -34,7 +34,7 @@ proof, or any release gate.
 | 5.4a package authority | Accepted after real Tauri expansion, staging/recovery tests, and independent review. | Installed-package evidence belongs to 5.4c. |
 | 5.4b retrieval diagnostic | Accepted after pinned Rust 1.88 tests, real source-side package-layout inference, fallback tests, and independent review. | Source-layout inference is not MSI/NSIS installation evidence. |
 | 5.4c installer CI | Accepted. CI9 at exact R10 head `bc1dd943652b5c358412baa03158733878072a4c` passed package production, fresh MSI and NSIS installed smokes, and terminal evidence gate. Both evidence records are schema 2/current-commit, use the approved 12-file / 430,993,263-byte bundle and manifest `8a375106…264ff4`, and pass isolated discovery, ownership, dbstat, real retrieval, teardown, residue, and signing policy. This records policy satisfaction, not a positive signature claim. | 5.4c is complete; Task 5.5 and all inherited release gates remain open. |
-| 5.5 release qualification | Partially begun: limited non-corpus local source-level diagnostics and CI59 exact-source Windows/package integration are recorded. Dependencies and inherited evidence remain open. | Valid independently authored Portuguese corpus, production-path quality and final provider-answer evidence, native Windows/R13 full loaded-application session, full qualification matrix, final reviewed-head Actions, final reviews, and user close approval. |
+| 5.5 release qualification | Partially begun: limited non-corpus local source-level diagnostics and CI59/CI60 exact-source Windows/package integration are recorded. Dependencies and inherited evidence remain open. | Valid independently authored Portuguese corpus, production-path quality and final provider-answer evidence, native Windows/R13 full loaded-application session, full qualification matrix, final reviewed-head Actions, final reviews, and user close approval. |
 
 The latest explicit Rust 1.88 integration run passed 920 library tests (four
 ignored), 18 model tests, 22 staged-bundle tests, cargo check, frontend
@@ -1417,7 +1417,7 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 ### Task 5.5 - initial local qualification baseline
 
 **Status:** Blocked (local activation/disk, reranker-p95, cross-surface
-scheduler, and five narrow crash/restart diagnostic rows recorded; no release or
+scheduler, and six narrow crash/restart diagnostic rows recorded; no release or
 sprint-close claim)
 **Owner:** `worker-l` (Task 5.5 initial qualification pass)
 **Completed:** 2026-09-09–10
@@ -1500,12 +1500,21 @@ sprint-close claim)
   acknowledgement, and preserves canonical document/vector and primary rows
   without duplicates. The fixture self-proves it began with exactly one pending
   canonical change.
+- A sixth in-memory source-level worker regression parks the real first
+  lifecycle embedding invocation before it can yield vectors or start staging,
+  then performs cooperative shutdown and joins that lifecycle. It proves the
+  meeting remains pending with unchanged retry metadata, zero staging and
+  canonical rows, and unadvanced publication bounds. A fresh lifecycle on the
+  same live pool then completes exactly one embedding call, publishes the
+  expected documents once, acknowledges one publication, and leaves staging
+  empty. This is a graceful worker-cancellation/resume row, not a durable
+  file-backed reopen or process-crash row.
 **Not implemented:**
 - Sustained typing against a live Chat stream, real reranker cancellation,
-  concurrent indexing, the remaining crash/restart points (chunking,
-  embedding, sidecar/cache, other activation interruption points,
+  concurrent indexing, the remaining crash/restart points (chunking, other
+  embedding interruption/failure paths, sidecar/cache, other activation interruption points,
   same-service acknowledgement retry, and other overlay interruption points),
-  recording, provider-answer, Q2-Q6 behavior in an installed
+  recording, provider-answer, Q2-Q7 behavior in an installed
   application, and the remaining full-matrix qualifications.
 **Why not implemented:**
 - They require dedicated controlled data, native/package sessions, or external
@@ -1571,6 +1580,14 @@ sprint-close claim)
   change pending, proves the live overlay is queryable while durable lag remains,
   then aborts/reopens and verifies fresh recovery acknowledges exactly once
   without duplicate canonical or primary rows.
+- `cargo test --manifest-path frontend/src-tauri/Cargo.toml --lib
+  shutdown_before_staging_leaves_pending_work_for_a_single_clean_resume` -
+  pass: 1 / 0 / 934 filtered. It parks the actual pre-staging fake embedding,
+  cooperatively shuts down the lifecycle, proves the untouched pending work,
+  then starts a fresh lifecycle which embeds and publishes the expected set
+  exactly once.
+- Adjacent `crash_resume_reuses_valid_staging_without_duplicate_embedding`
+  also passes: 1 / 0 / 934 filtered.
 - Exact-source Windows integration run [CI59](https://github.com/armandotreuk/Meetly_Treuk/actions/runs/34481012557)
   passed at `935558bc688d69ae3d58fbcba85fc583a2aca168`: Cargo Check, Windows
   CPU packaging, fresh installed MSI and NSIS smokes, and the terminal evidence
@@ -1582,6 +1599,19 @@ sprint-close claim)
   not positive signing evidence. The installed smokes package the current
   source; they do not execute or qualify the Q2/Q3 service-loss scenarios in
   an installed application.
+- Exact-source Windows integration run [CI60](https://github.com/armandotreuk/Meetly_Treuk/actions/runs/34509275618)
+  passed at `0aff8537da125d231d36fc9f6ac6b3af6159f8ac`: Cargo Check (13m 51s),
+  Windows CPU packaging (48m 29s), fresh installed MSI smoke (1m 14s), fresh
+  installed NSIS smoke (1m 35s), and the terminal evidence gate (14s) passed
+  in 50m 31s, producing ten artifacts. Both smokes reported the approved
+  12-file / 430,993,263-byte bundle and manifest
+  `8a3751069f4c77ddec4db7c92f75d99900525bbe48e00e28ec1cf3ffff264ff4`;
+  combined installed-smoke-evidence artifact digest
+  `cc14154a63537b0dacd3f0273521aca734f42283fdf70477b0f64f2c39ec80e2`.
+  Signing policy passed while credentials/tooling were unavailable and the
+  packages were unsigned, so this is not positive signing evidence. CI60 is
+  Windows/package evidence only for its exact Q4 source; it does not execute
+  or qualify Q5-Q7, an installed restart path, or any release gate.
 - The pre-selector serial library baseline passed 921 / 0 / 4 ignored in
   115.37 s. The current selector change has focused selector and scale-test
   coverage below; no broad current-head library-suite result is claimed because
