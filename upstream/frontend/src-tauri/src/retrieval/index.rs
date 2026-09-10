@@ -6556,21 +6556,58 @@ mod tests {
     // ```powershell
     // $env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA "meetily-cargo-target"
     // $env:MEETLY_RAG_INDEX_BENCH = "1"
+    // $env:MEETLY_RAG_INDEX_BENCH_DOCUMENTS = "12000" # 12000, 50000, or 250000; defaults to 250000
     // cargo test --release --manifest-path "frontend/src-tauri/Cargo.toml" `
     //     --lib retrieval::index::tests::bench_2r6_production_activation_envelope -- --nocapture
     // Remove-Item Env:MEETLY_RAG_INDEX_BENCH -ErrorAction SilentlyContinue
+    // Remove-Item Env:MEETLY_RAG_INDEX_BENCH_DOCUMENTS -ErrorAction SilentlyContinue
     // ```
     // -----------------------------------------------------------------------
 
-    /// Approved e5-base corpus scale: 250,000 documents per generation, so the
-    /// active and the shadow snapshots are simultaneously full-size at peak.
-    const BENCH_CORPUS: usize = 250_000;
+    /// The three approved synthetic scale rows. A missing selector preserves
+    /// the historical 250k activation-envelope invocation.
+    const BENCH_DEFAULT_CORPUS: usize = 250_000;
+    const BENCH_SUPPORTED_CORPORA: [usize; 3] = [12_000, 50_000, BENCH_DEFAULT_CORPUS];
     /// 251 meetings x ~995 documents (same corpus shape as the retained lock
     /// span fixture); fewer meetings bound fixture time while every
     /// representation-level property of the snapshots stays identical.
     const BENCH_MEETINGS: usize = 251;
     /// Approved model dimensionality (e5-base).
     const BENCH_DIMS: usize = 768;
+
+    fn parse_bench_corpus(raw: Option<&str>) -> Result<usize, String> {
+        match raw {
+            None => Ok(BENCH_DEFAULT_CORPUS),
+            Some("12000") => Ok(BENCH_SUPPORTED_CORPORA[0]),
+            Some("50000") => Ok(BENCH_SUPPORTED_CORPORA[1]),
+            Some("250000") => Ok(BENCH_DEFAULT_CORPUS),
+            Some(_) => {
+                Err("MEETLY_RAG_INDEX_BENCH_DOCUMENTS must be 12000, 50000, or 250000".to_string())
+            }
+        }
+    }
+
+    fn bench_corpus_size() -> usize {
+        let raw = match std::env::var("MEETLY_RAG_INDEX_BENCH_DOCUMENTS") {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => panic!("MEETLY_RAG_INDEX_BENCH_DOCUMENTS is unavailable: {error}"),
+        };
+        parse_bench_corpus(raw.as_deref()).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    #[test]
+    fn bench_corpus_selector_accepts_only_approved_scale_rows() {
+        assert_eq!(parse_bench_corpus(None), Ok(250_000));
+        assert_eq!(parse_bench_corpus(Some("12000")), Ok(12_000));
+        assert_eq!(parse_bench_corpus(Some("50000")), Ok(50_000));
+        assert_eq!(parse_bench_corpus(Some("250000")), Ok(250_000));
+        assert!(parse_bench_corpus(Some("12001")).is_err());
+        assert!(parse_bench_corpus(Some("+12000")).is_err());
+        assert!(parse_bench_corpus(Some("012000")).is_err());
+        assert!(parse_bench_corpus(Some("")).is_err());
+        assert!(parse_bench_corpus(Some("invalid")).is_err());
+    }
 
     struct BenchProcessMemory {
         working_set: u64,
@@ -6686,6 +6723,26 @@ mod tests {
         }
     }
 
+    fn bench_meeting_document_count(corpus: usize, meeting_index: usize) -> usize {
+        let per_meeting = corpus / BENCH_MEETINGS;
+        per_meeting + usize::from(meeting_index < corpus % BENCH_MEETINGS)
+    }
+
+    fn bench_exact_axis_hit_count(corpus: usize) -> usize {
+        (0..BENCH_MEETINGS)
+            .map(|meeting_index| {
+                let document_count = bench_meeting_document_count(corpus, meeting_index);
+                let first_matching_ordinal =
+                    (BENCH_DIMS - (meeting_index * 4_099) % BENCH_DIMS) % BENCH_DIMS;
+                if first_matching_ordinal >= document_count {
+                    0
+                } else {
+                    1 + (document_count - 1 - first_matching_ordinal) / BENCH_DIMS
+                }
+            })
+            .sum()
+    }
+
     /// Backfills one meeting of one generation through the production staging
     /// plus revision-fenced atomic replacement transaction, so canonical rows,
     /// meeting state, journal entry, validation, and the incremental counter
@@ -6728,12 +6785,9 @@ mod tests {
         ));
     }
 
-    async fn bench_seed_generation(pool: &SqlitePool, generation_id: &str) {
-        let per_meeting = BENCH_CORPUS / BENCH_MEETINGS;
-        let mut remainder = BENCH_CORPUS % BENCH_MEETINGS;
+    async fn bench_seed_generation(pool: &SqlitePool, generation_id: &str, corpus: usize) {
         for index in 0..BENCH_MEETINGS {
-            let count = per_meeting + usize::from(remainder > 0);
-            remainder = remainder.saturating_sub(1);
+            let count = bench_meeting_document_count(corpus, index);
             bench_publish_meeting(pool, generation_id, index, count).await;
         }
         let rows: i64 =
@@ -6742,7 +6796,7 @@ mod tests {
                 .fetch_one(pool)
                 .await
                 .unwrap();
-        assert_eq!(rows, BENCH_CORPUS as i64, "{generation_id} corpus drifted");
+        assert_eq!(rows, corpus as i64, "{generation_id} corpus drifted");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6751,6 +6805,7 @@ mod tests {
             println!("SKIP 2.R6 production-envelope benchmark (set MEETLY_RAG_INDEX_BENCH=1)");
             return;
         }
+        let corpus = bench_corpus_size();
         let baseline = bench_process_memory()
             .expect("process memory counters unavailable; 2.R6 requires Windows process metrics");
 
@@ -6841,7 +6896,7 @@ mod tests {
         RetrievalRepository::ensure_generation(&pool, "gen-bench-active", &model_id)
             .await
             .unwrap();
-        bench_seed_generation(&pool, "gen-bench-active").await;
+        bench_seed_generation(&pool, "gen-bench-active", corpus).await;
         let service = QueryIndexService::new(RetrievalScheduler::new());
         service.set_loaded_model(&model_id);
 
@@ -6859,12 +6914,12 @@ mod tests {
             let active = service
                 .active_snapshot()
                 .expect("active snapshot installed");
-            assert_eq!(active.document_count(), BENCH_CORPUS);
+            assert_eq!(active.document_count(), corpus);
             assert_eq!(active.overlay_documents, 0);
             assert_eq!(active.model_id(), model_id);
         }
         println!(
-            "[active] production snapshot activated ({BENCH_CORPUS} documents) in {:.0} ms",
+            "[active] production snapshot activated ({corpus} documents) in {:.0} ms",
             t_active.elapsed().as_secs_f64() * 1000.0
         );
 
@@ -6874,7 +6929,7 @@ mod tests {
         RetrievalRepository::ensure_generation(&pool, "gen-bench-shadow", &model_id)
             .await
             .unwrap();
-        bench_seed_generation(&pool, "gen-bench-shadow").await;
+        bench_seed_generation(&pool, "gen-bench-shadow", corpus).await;
 
         // Phase C - measured activation window: the publisher reloads and
         // journal-catches-up the whole shadow candidate WHILE the active
@@ -6938,7 +6993,7 @@ mod tests {
                 .active_snapshot()
                 .expect("shadow snapshot installed");
             assert_eq!(shadow.generation_id(), "gen-bench-shadow");
-            assert_eq!(shadow.document_count(), BENCH_CORPUS);
+            assert_eq!(shadow.document_count(), corpus);
             assert_eq!(shadow.overlay_documents, 0);
         }
         assert!(
@@ -6960,16 +7015,22 @@ mod tests {
 
         // Readers serve straight out of the freshly activated production
         // snapshot through the normal query path.
+        let exact_axis_hits = bench_exact_axis_hit_count(corpus);
+        let query_limit = MAX_QUERY_LIMIT.min(exact_axis_hits);
+        assert!(
+            query_limit > 0,
+            "synthetic corpus must contain at least one exact-axis document"
+        );
         let hits = service
             .search(
                 &bench_unit_embedding(0),
                 ScopeFilter::All,
-                MAX_QUERY_LIMIT,
+                query_limit,
                 &CancellationToken::new(),
             )
             .await
             .unwrap();
-        assert_eq!(hits.len(), MAX_QUERY_LIMIT.min(BENCH_CORPUS));
+        assert_eq!(hits.len(), query_limit);
         assert!(
             hits.iter()
                 .all(|hit| hit.score > 0.95 && hit.meeting_id.starts_with("bench-")),
