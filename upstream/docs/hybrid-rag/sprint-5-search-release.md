@@ -1416,9 +1416,9 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 
 ### Task 5.5 - initial local qualification baseline
 
-**Status:** Blocked (local baseline and synthetic activation/disk scale rows recorded; no release or sprint-close claim)
+**Status:** Blocked (local activation/disk and reranker-p95 diagnostic rows recorded; no release or sprint-close claim)
 **Owner:** `worker-l` (Task 5.5 initial qualification pass)
-**Completed:** 2026-09-09
+**Completed:** 2026-09-09–10
 **Implemented:**
 - No production-runtime correction. This entry records only the reproducible,
   non-corpus local qualification subset and its test-only harness extension.
@@ -1432,9 +1432,19 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
   paths. A successful run fails if its own temporary database remains.
 - All three guarded local source-path active-plus-shadow activation and exact
   derived-disk-envelope rows passed using the approved staged bundle.
+- A separately guarded, corpus-free reranker harness now uses the production
+  asynchronous `RetrievalModels::rerank` path. It performs an explicit warm-up,
+  then 50 complete Chat-depth (50-pair) and Search-depth (25-pair) samples,
+  requires finite output for every pair, and reports p50/p95/max using the
+  documented nearest-rank method (the 25th and 48th ordered samples for 50).
+  Its safe aggregate output records the verified bundle, manifest SHA-256, and
+  derived model identity; CPU provider/thread settings; OS; parsed CPU
+  vendor/family/model/stepping; and logical-processor and physical-memory
+  hardware details. It never logs synthetic text, filesystem paths, or a raw
+  environment variable.
 **Not implemented:**
-- P95 latency, concurrency, crash/restart, recording, provider-answer,
-  package-smoke, and the remaining full-matrix qualifications.
+- Concurrency, crash/restart, recording, provider-answer, package-smoke, and
+  the remaining full-matrix qualifications.
 **Why not implemented:**
 - They require dedicated controlled data, native/package sessions, or external
   evidence not available to this local baseline.
@@ -1482,6 +1492,32 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
   earlier pre-fix failed run remain outside the worktree because this execution
   environment forbids their manual deletion; they are not qualification
   evidence and no process holds them.
+- `cargo test --locked --manifest-path frontend/src-tauri/Cargo.toml --lib
+  retrieval::index::tests::bench_5_5_production_reranker_p95 -- --nocapture`
+  with the guard unset - pass: the benchmark skipped by design, confirming it
+  cannot run a costly measurement in an ordinary test invocation.
+- `MEETLY_RAG_RERANK_BENCH=1` ran `cargo test --release --locked
+  --manifest-path frontend/src-tauri/Cargo.toml --lib
+  retrieval::index::tests::bench_5_5_production_reranker_p95 -- --nocapture`
+  - pass after a 1m 01s release compile; the measured test phase was 13.25 s.
+  The hash-verified staged production bundle reported
+  `meetily-retrieval-bundle-1`, manifest SHA-256
+  `8a3751069f4c77ddec4db7c92f75d99900525bbe48e00e28ec1cf3ffff264ff4`,
+  and derived model identity
+  `mid-meetily-retrieval-bundle-1-int8-c1-690e2ddf719dbc45`; CPU provider,
+  intra-op 4, inter-op 1; Windows 11 Home x64 build 26200; Intel Core Ultra 7
+  255HX (20 logical processors, 20 cores; 31.4 GiB RAM). Warm-up is excluded
+  from the 50 measurements for each purpose.
+
+  | Purpose | Complete samples | Actual pairs/request | p50 | p95 | Max | Local comparison with 900 ms |
+  |---|---:|---:|---:|---:|---:|---|
+  | Chat | 50 | 50 | 153 ms | 163 ms | 169 ms | PASS |
+  | Search | 50 | 25 | 74 ms | 82 ms | 82 ms | PASS |
+
+  This is a local source-path diagnostic, not reference-hardware or
+  installed-package acceptance evidence. It includes production tokenizer,
+  blocking-pool dispatch, and ONNX inference; it excludes scheduler queue wait
+  and all other Fast-preparation stages by design.
 - `pnpm --dir frontend run typecheck` - unavailable in this worktree: pnpm
   requested a non-interactive modules-directory replacement. No install or
   replacement was authorized for this baseline.
@@ -1492,14 +1528,15 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 **Decisions and follow-ups:**
 - A valid independently authored Portuguese corpus, production-path quality and
   final provider-answer evidence, a native Windows/R13 full loaded-application
-  session, p95 and the remaining Task 5.5 matrix, installed-package smoke,
-  final reviewed-head Actions, final reviews, and user closure remain open.
+  session, reference-hardware/package reranker p95 and the remaining Task 5.5
+  matrix, installed-package smoke, final reviewed-head Actions, final reviews,
+  and user closure remain open.
 - No non-completing library test was found: the serial log ends with the full
   passing harness summary. The longer serial wall time is diagnostic only and
   does not replace any scale or performance qualification.
-- The three activation/disk-envelope rows do not establish corpus quality,
-  Fast/Deep quality or p95 latency, reference-hardware performance, package
-  behavior, or release acceptance.
+- The local activation/disk and reranker rows do not establish corpus quality,
+  Fast/Deep quality, reference-hardware performance, package behavior, or
+  release acceptance.
 
 ## Sprint Reviews
 

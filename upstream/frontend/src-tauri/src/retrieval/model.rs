@@ -25,6 +25,8 @@ use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::tensor::TensorElementType;
 use ort::value::{TensorRef, ValueType};
+#[cfg(test)]
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -128,6 +130,11 @@ struct Engine {
 
 struct RuntimeInner {
     identity: BundleIdentity,
+    /// Test-only digest of the exact manifest bytes parsed for this cached
+    /// runtime. Kept beside the loaded sessions so an evidence harness cannot
+    /// misidentify a later on-disk replacement as the measured manifest.
+    #[cfg(test)]
+    manifest_sha256: String,
     embedding: Engine,
     reranker: Mutex<Option<Arc<Engine>>>,
     manifest: Arc<ModelBundleManifest>,
@@ -192,6 +199,11 @@ pub fn get_or_load(bundle_root: &Path) -> Result<RetrievalModels, RetrievalModel
     // just the directory: identities collide only when every identity field
     // matches.
     let manifest = Arc::new(parse_manifest(&json)?);
+    #[cfg(test)]
+    let manifest_sha256: String = Sha256::digest(json.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     let identity = BundleIdentity {
         bundle_id: manifest.bundle_id.clone(),
         root: canonical,
@@ -211,6 +223,8 @@ pub fn get_or_load(bundle_root: &Path) -> Result<RetrievalModels, RetrievalModel
         &identity.root,
         Arc::clone(&manifest),
         identity.clone(),
+        #[cfg(test)]
+        manifest_sha256,
     )?));
     models.embed_documents_sync(
         &["meetly retrieval embedding warmup"],
@@ -259,6 +273,7 @@ fn load_runtime(
     root: &Path,
     manifest: Arc<ModelBundleManifest>,
     identity: BundleIdentity,
+    #[cfg(test)] manifest_sha256: String,
 ) -> Result<RuntimeInner, RetrievalModelError> {
     let intra_threads = approved_intra_threads();
     let embedding_contract = &manifest.embedding_model;
@@ -295,6 +310,8 @@ fn load_runtime(
 
     Ok(RuntimeInner {
         identity,
+        #[cfg(test)]
+        manifest_sha256,
         embedding,
         reranker: Mutex::new(None),
         manifest,
@@ -609,6 +626,26 @@ impl Engine {
 impl RetrievalModels {
     pub fn identity(&self) -> &BundleIdentity {
         &self.0.identity
+    }
+
+    /// Test-only view of the fixed CPU execution-provider settings used by
+    /// the production reranker. Benchmark output can prove the measured
+    /// runtime without exposing a second configurable execution path.
+    #[cfg(test)]
+    pub(crate) fn reranker_benchmark_runtime_settings() -> (&'static str, usize, usize) {
+        (
+            "CPU",
+            approved_intra_threads(),
+            APPROVED_ORT_INTER_OP_THREADS,
+        )
+    }
+
+    /// Digest of the exact manifest bytes this cached test runtime parsed.
+    /// The production loader has already verified every manifest-declared
+    /// artifact before the runtime can be constructed.
+    #[cfg(test)]
+    pub(crate) fn manifest_sha256(&self) -> &str {
+        &self.0.manifest_sha256
     }
 
     #[cfg(test)]

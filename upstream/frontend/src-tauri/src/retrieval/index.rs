@@ -6574,6 +6574,13 @@ mod tests {
     const BENCH_MEETINGS: usize = 251;
     /// Approved model dimensionality (e5-base).
     const BENCH_DIMS: usize = 768;
+    /// Sprint 5 release-evidence sample count. The authoritative external run
+    /// needs at least this many complete requests after warm-up.
+    const BENCH_RERANK_P95_SAMPLES: usize = 50;
+    /// Approved production reranking depths for the two interactive purposes.
+    const BENCH_RERANK_CHAT_DEPTH: usize = crate::retrieval::CHAT_RERANK_DEPTH;
+    const BENCH_RERANK_SEARCH_DEPTH: usize = crate::retrieval::SEARCH_RERANK_DEPTH;
+    const BENCH_RERANK_P95_TARGET: Duration = Duration::from_millis(900);
 
     fn parse_bench_corpus(raw: Option<&str>) -> Result<usize, String> {
         match raw {
@@ -6725,6 +6732,77 @@ mod tests {
         dir
     }
 
+    /// Windows exposes processor hardware through a process environment
+    /// variable. Parse only its bounded numeric fields and recognized vendor;
+    /// never pass the raw caller-controlled string through benchmark output.
+    fn bench_cpu_identifier() -> (&'static str, u32, u32, u32) {
+        let value = std::env::var("PROCESSOR_IDENTIFIER")
+            .expect("Windows PROCESSOR_IDENTIFIER is required for reranker timing evidence");
+        let vendor = if value.ends_with(", GenuineIntel") {
+            "GenuineIntel"
+        } else if value.ends_with(", AuthenticAMD") {
+            "AuthenticAMD"
+        } else {
+            panic!("unsupported CPU vendor for reranker timing evidence");
+        };
+        let parse_field = |label: &str| {
+            value
+                .split(label)
+                .nth(1)
+                .and_then(|tail| {
+                    let digits: String = tail
+                        .chars()
+                        .take_while(|character| character.is_ascii_digit())
+                        .collect();
+                    digits.parse::<u32>().ok()
+                })
+                .unwrap_or_else(|| panic!("malformed PROCESSOR_IDENTIFIER {label} field"))
+        };
+        (
+            vendor,
+            parse_field("Family "),
+            parse_field("Model "),
+            parse_field("Stepping "),
+        )
+    }
+
+    #[cfg(windows)]
+    fn bench_total_physical_memory_bytes() -> Option<u64> {
+        #[repr(C)]
+        struct MemoryStatusEx {
+            length: u32,
+            memory_load: u32,
+            total_physical: u64,
+            available_physical: u64,
+            total_page_file: u64,
+            available_page_file: u64,
+            total_virtual: u64,
+            available_virtual: u64,
+            available_extended_virtual: u64,
+        }
+        extern "system" {
+            fn GlobalMemoryStatusEx(status: *mut MemoryStatusEx) -> i32;
+        }
+        let mut status = MemoryStatusEx {
+            length: std::mem::size_of::<MemoryStatusEx>() as u32,
+            memory_load: 0,
+            total_physical: 0,
+            available_physical: 0,
+            total_page_file: 0,
+            available_page_file: 0,
+            total_virtual: 0,
+            available_virtual: 0,
+            available_extended_virtual: 0,
+        };
+        let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+        (ok != 0 && status.total_physical > 0).then_some(status.total_physical)
+    }
+
+    #[cfg(not(windows))]
+    fn bench_total_physical_memory_bytes() -> Option<u64> {
+        None
+    }
+
     /// Loads the single approved bundle through the exact production cache path
     /// (`model::get_or_load`), which warms only the embedding session. The
     /// reranker is deliberately not touched until the post-activation check.
@@ -6733,6 +6811,101 @@ mod tests {
             .expect("approved staged retrieval bundle must load through the production path");
         assert!(!models.reranker_loaded());
         models
+    }
+
+    /// Synthetic content keeps the opt-in timing harness corpus-free. The
+    /// only reported values are aggregate counts and timings; neither query
+    /// nor evidence text leaves this process through benchmark output.
+    fn bench_rerank_pairs(depth: usize) -> Vec<(String, String)> {
+        (0..depth)
+            .map(|index| {
+                (
+                    "retrieval latency benchmark query".to_string(),
+                    format!("synthetic retrieval benchmark evidence {index}"),
+                )
+            })
+            .collect()
+    }
+
+    fn bench_percentile_nearest_rank(samples: &mut [Duration], percentile: usize) -> Duration {
+        assert!(
+            !samples.is_empty(),
+            "percentile requires at least one sample"
+        );
+        assert!(percentile > 0 && percentile <= 100);
+        samples.sort_unstable();
+        let rank = (samples.len() * percentile).div_ceil(100);
+        samples[rank - 1]
+    }
+
+    #[test]
+    fn bench_percentile_uses_documented_nearest_rank() {
+        let samples: Vec<Duration> = (1..=BENCH_RERANK_P95_SAMPLES)
+            .map(|millis| Duration::from_millis(millis as u64))
+            .collect();
+        assert_eq!(
+            bench_percentile_nearest_rank(&mut samples.clone(), 50),
+            Duration::from_millis(25)
+        );
+        assert_eq!(
+            bench_percentile_nearest_rank(&mut samples.clone(), 95),
+            Duration::from_millis(48)
+        );
+        assert_eq!(
+            bench_percentile_nearest_rank(&mut samples.clone(), 100),
+            Duration::from_millis(50)
+        );
+    }
+
+    async fn bench_reranker_p95_samples(
+        models: &crate::retrieval::model::RetrievalModels,
+        purpose: &str,
+        pair_count: usize,
+    ) -> (Duration, Duration, Duration) {
+        let warmup_pairs = bench_rerank_pairs(pair_count);
+        let warmup_scores = models
+            .rerank(warmup_pairs, CancellationToken::new())
+            .await
+            .expect("approved reranker warm-up must complete");
+        assert_eq!(
+            warmup_scores.len(),
+            pair_count,
+            "{purpose} warm-up must score every requested pair"
+        );
+        assert!(
+            warmup_scores.iter().all(|score| score.is_finite()),
+            "{purpose} warm-up produced a non-finite score"
+        );
+
+        let mut samples = Vec::with_capacity(BENCH_RERANK_P95_SAMPLES);
+        for _ in 0..BENCH_RERANK_P95_SAMPLES {
+            let pairs = bench_rerank_pairs(pair_count);
+            let started = Instant::now();
+            let scores = models
+                .rerank(pairs, CancellationToken::new())
+                .await
+                .expect("production reranker sample must complete");
+            let elapsed = started.elapsed();
+            assert_eq!(
+                scores.len(),
+                pair_count,
+                "{purpose} sample must score every requested pair"
+            );
+            assert!(
+                scores.iter().all(|score| score.is_finite()),
+                "{purpose} sample produced a non-finite score"
+            );
+            samples.push(elapsed);
+        }
+        assert_eq!(
+            samples.len(),
+            BENCH_RERANK_P95_SAMPLES,
+            "p95 evidence requires every configured complete sample"
+        );
+        let max = *samples.iter().max().expect("non-empty samples");
+        let p50 = bench_percentile_nearest_rank(&mut samples.clone(), 50);
+        let p95 = bench_percentile_nearest_rank(&mut samples, 95);
+        (p50, p95, max)
     }
 
     fn bench_unit_embedding(axis: usize) -> Vec<f32> {
@@ -7140,5 +7313,64 @@ mod tests {
             cleanup.remove_all(),
             "benchmark database cleanup left temporary database files behind"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Sprint 5 reranker p95 diagnostic. Run explicitly (from `upstream/`):
+    //
+    // ```powershell
+    // $env:MEETLY_RAG_RERANK_BENCH = "1"
+    // cargo test --release --locked --manifest-path "frontend/src-tauri/Cargo.toml" `
+    //     --lib retrieval::index::tests::bench_5_5_production_reranker_p95 -- --nocapture
+    // Remove-Item Env:MEETLY_RAG_RERANK_BENCH -ErrorAction SilentlyContinue
+    // ```
+    //
+    // This deliberately has no scheduler queue, repository, or Fast-stage
+    // work. It exercises only the exact production `RetrievalModels::rerank`
+    // path, including tokenization, blocking-pool dispatch, and ONNX. The
+    // staged bundle is required when the run is enabled: absence or artifact
+    // failure is evidence failure, not a skip. A local result is diagnostic;
+    // only the separately declared Windows x64 reference-hardware run can
+    // close the release gate.
+    // -----------------------------------------------------------------------
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bench_5_5_production_reranker_p95() {
+        if std::env::var("MEETLY_RAG_RERANK_BENCH").as_deref() != Ok("1") {
+            println!("SKIP Sprint 5 reranker p95 benchmark (set MEETLY_RAG_RERANK_BENCH=1)");
+            return;
+        }
+
+        let models = bench_load_warm_embedding();
+        let bundle_id = &models.identity().bundle_id;
+        let model_id = crate::retrieval::worker::bundled_model_identity();
+        let manifest_sha256 = models.manifest_sha256();
+        let (provider, intra_threads, inter_threads) =
+            crate::retrieval::model::RetrievalModels::reranker_benchmark_runtime_settings();
+        let logical_cpus = std::thread::available_parallelism().map_or(1, |count| count.get());
+        let (cpu_vendor, cpu_family, cpu_model, cpu_stepping) = bench_cpu_identifier();
+        let total_memory = bench_total_physical_memory_bytes()
+            .expect("total physical memory is required for reranker timing evidence");
+
+        for (purpose, pair_count) in [
+            ("chat", BENCH_RERANK_CHAT_DEPTH),
+            ("search", BENCH_RERANK_SEARCH_DEPTH),
+        ] {
+            let (p50, p95, max) = bench_reranker_p95_samples(&models, purpose, pair_count).await;
+            println!(
+                "[reranker-p95] purpose={purpose}; samples={BENCH_RERANK_P95_SAMPLES}; pairs={pair_count}; p50={:.0} ms; p95={:.0} ms; max={:.0} ms; target={:.0} ms; local-target={}; bundle={bundle_id}; manifest_sha256={manifest_sha256}; model={model_id}; provider={provider}; intra_threads={intra_threads}; inter_threads={inter_threads}; os={}; cpu_vendor={cpu_vendor}; cpu_family={cpu_family}; cpu_model={cpu_model}; cpu_stepping={cpu_stepping}; logical_cpus={logical_cpus}; total_memory_bytes={total_memory}",
+                p50.as_secs_f64() * 1000.0,
+                p95.as_secs_f64() * 1000.0,
+                max.as_secs_f64() * 1000.0,
+                BENCH_RERANK_P95_TARGET.as_secs_f64() * 1000.0,
+                if p95 < BENCH_RERANK_P95_TARGET { "PASS" } else { "FAIL" },
+                std::env::consts::OS,
+            );
+            assert!(
+                p95 < BENCH_RERANK_P95_TARGET,
+                "[blocked-reranker-p95] {purpose} p95 {:.0} ms meets or exceeds the approved {:.0} ms reranking sub-budget",
+                p95.as_secs_f64() * 1000.0,
+                BENCH_RERANK_P95_TARGET.as_secs_f64() * 1000.0,
+            );
+        }
     }
 }
