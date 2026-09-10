@@ -34,7 +34,7 @@ proof, or any release gate.
 | 5.4a package authority | Accepted after real Tauri expansion, staging/recovery tests, and independent review. | Installed-package evidence belongs to 5.4c. |
 | 5.4b retrieval diagnostic | Accepted after pinned Rust 1.88 tests, real source-side package-layout inference, fallback tests, and independent review. | Source-layout inference is not MSI/NSIS installation evidence. |
 | 5.4c installer CI | Accepted. CI9 at exact R10 head `bc1dd943652b5c358412baa03158733878072a4c` passed package production, fresh MSI and NSIS installed smokes, and terminal evidence gate. Both evidence records are schema 2/current-commit, use the approved 12-file / 430,993,263-byte bundle and manifest `8a375106…264ff4`, and pass isolated discovery, ownership, dbstat, real retrieval, teardown, residue, and signing policy. This records policy satisfaction, not a positive signature claim. | 5.4c is complete; Task 5.5 and all inherited release gates remain open. |
-| 5.5 release qualification | Partially begun: limited non-corpus local source-level diagnostics and CI59/CI60 exact-source Windows/package integration are recorded. Dependencies and inherited evidence remain open. | Valid independently authored Portuguese corpus, production-path quality and final provider-answer evidence, native Windows/R13 full loaded-application session, full qualification matrix, final reviewed-head Actions, final reviews, and user close approval. |
+| 5.5 release qualification | Partially begun: limited non-corpus local source-level diagnostics and CI59-CI61 exact-source Windows/package integration are recorded. Dependencies and inherited evidence remain open. | Valid independently authored Portuguese corpus, production-path quality and final provider-answer evidence, native Windows/R13 full loaded-application session, full qualification matrix, final reviewed-head Actions, final reviews, and user close approval. |
 
 The latest explicit Rust 1.88 integration run passed 920 library tests (four
 ignored), 18 model tests, 22 staged-bundle tests, cargo check, frontend
@@ -1659,6 +1659,19 @@ sprint-close claim)
   packages were unsigned, so this is not positive signing evidence. CI60 is
   Windows/package evidence only for its exact Q4 source; it does not execute
   or qualify Q5-Q10, an installed restart path, or any release gate.
+- Exact-source Windows integration run [CI61](https://github.com/armandotreuk/Meetly_Treuk/actions/runs/34516268616)
+  passed at `b5ac3cb77fe4ca87806550c07e809dc60a19577a`: Cargo Check (13m 40s),
+  Windows CPU packaging (40m 20s), fresh installed MSI smoke (1m 11s), fresh
+  installed NSIS smoke (1m 34s), and the terminal evidence gate (16s) passed
+  in 42m 21s, producing ten artifacts. Both smokes reported the approved
+  12-file / 430,993,263-byte bundle and manifest
+  `8a3751069f4c77ddec4db7c92f75d99900525bbe48e00e28ec1cf3ffff264ff4`;
+  the combined installed-smoke-evidence artifact digest was
+  `0fec4b0661a52a0d1332def0da9b3d62edac153f7d7dae583dc190a2c7f0ace1`.
+  Signing policy passed while credentials/tooling were unavailable and the
+  applications were unsigned, so this is not positive signing evidence. CI61
+  is Windows/package evidence only for its exact Q7 source; it does not execute
+  or qualify Q8-Q10, an installed restart path, or any release gate.
 - The pre-selector serial library baseline passed 921 / 0 / 4 ignored in
   115.37 s. The current selector change has focused selector and scale-test
   coverage below; no broad current-head library-suite result is claimed because
