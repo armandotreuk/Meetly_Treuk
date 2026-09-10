@@ -1417,7 +1417,7 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 ### Task 5.5 - initial local qualification baseline
 
 **Status:** Blocked (local activation/disk, reranker-p95, cross-surface
-scheduler, and four narrow crash/restart diagnostic rows recorded; no release or
+scheduler, and five narrow crash/restart diagnostic rows recorded; no release or
 sprint-close claim)
 **Owner:** `worker-l` (Task 5.5 initial qualification pass)
 **Completed:** 2026-09-09–10
@@ -1490,12 +1490,22 @@ sprint-close claim)
   staging identities without duplicates and without premature canonical or
   index-state changes. Its test-only barrier and failure cleanup are bounded
   and RAII-protected.
+- A fifth file-backed source-level regression starts from an already active and
+  fully acknowledged generation, then pauses steady-state replay immediately
+  after the new reader snapshot is installed and before durable journal
+  acknowledgement. It proves the old service can serve the new overlay while
+  durable lag and an acknowledgement audit remain unchanged, then aborts that
+  task/service and reopens the WAL database with a fresh service. Recovery
+  serves the new overlay, converges the bound with exactly one audit-recorded
+  acknowledgement, and preserves canonical document/vector and primary rows
+  without duplicates. The fixture self-proves it began with exactly one pending
+  canonical change.
 **Not implemented:**
 - Sustained typing against a live Chat stream, real reranker cancellation,
   concurrent indexing, the remaining crash/restart points (chunking,
-  embedding, post-installation/acknowledgement,
-  sidecar/cache, other activation interruption points, and steady-state overlay
-  replay), recording, provider-answer, Q2/Q3 behavior in an installed
+  embedding, sidecar/cache, other activation interruption points,
+  same-service acknowledgement retry, and other overlay interruption points),
+  recording, provider-answer, Q2-Q6 behavior in an installed
   application, and the remaining full-matrix qualifications.
 **Why not implemented:**
 - They require dedicated controlled data, native/package sessions, or external
@@ -1554,6 +1564,13 @@ sprint-close claim)
 - Current-head rerun of
   `database::repositories::retrieval::tests::sqlite_replacement_task_abort_after_delete_rolls_back_and_retries_exactly_once`
   also passes: 1 / 0 / 932 filtered.
+- `cargo test --locked --manifest-path frontend/src-tauri/Cargo.toml --lib
+  retrieval::index::tests::task_5_5_q6_replayed_snapshot_install_before_ack_recovers_once_after_abort
+  -- --exact` - pass: 1 / 0 / 933 filtered. It holds the service's
+  post-reader-install/pre-acknowledgement barrier with exactly one durable
+  change pending, proves the live overlay is queryable while durable lag remains,
+  then aborts/reopens and verifies fresh recovery acknowledges exactly once
+  without duplicate canonical or primary rows.
 - Exact-source Windows integration run [CI59](https://github.com/armandotreuk/Meetly_Treuk/actions/runs/34481012557)
   passed at `935558bc688d69ae3d58fbcba85fc583a2aca168`: Cargo Check, Windows
   CPU packaging, fresh installed MSI and NSIS smokes, and the terminal evidence
@@ -1679,6 +1696,13 @@ sprint-close claim)
   graceful pool close, and reopen after inserts and before commit, not an OS or
   power-loss crash, hot-WAL replay, filesystem durability, worker orchestration,
   or embedding behavior.
+- The post-install/pre-acknowledgement replay regression is also local
+  source-test evidence only. Both independent reviews approved after it added
+  an explicit one-pending-change fixture assertion. It covers fresh-service
+  recovery from an installed-ahead-of-bound steady-state overlay, not same-
+  service retry after an acknowledgement failure, and not an OS/power-loss
+  crash, hot-WAL replay, filesystem durability, worker/package, or release
+  behavior.
 - CI59 passed Windows packaging, both fresh installer smokes, and the terminal
   evidence gate at the exact Q3 source commit. It supplies current-source
   package integration evidence only; it neither runs Q2/Q3 inside an installed

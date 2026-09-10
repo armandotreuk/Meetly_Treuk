@@ -590,6 +590,10 @@ pub struct QueryIndexService {
     #[cfg(test)]
     publish_started_notify: Arc<tokio::sync::Notify>,
     #[cfg(test)]
+    replayed_snapshot_install_barrier: StdMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    replayed_snapshot_installed_notify: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
     activation_commit_barrier: StdMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     activation_committed_notify: Arc<tokio::sync::Notify>,
@@ -613,6 +617,10 @@ impl QueryIndexService {
             publish_barrier: StdMutex::new(None),
             #[cfg(test)]
             publish_started_notify: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            replayed_snapshot_install_barrier: StdMutex::new(None),
+            #[cfg(test)]
+            replayed_snapshot_installed_notify: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             activation_commit_barrier: StdMutex::new(None),
             #[cfg(test)]
@@ -1186,6 +1194,26 @@ impl QueryIndexService {
         Arc::clone(&self.publish_started_notify)
     }
 
+    /// One-shot source-level test seam for the replay boundary after readers
+    /// received their complete snapshot and before durable acknowledgement.
+    #[cfg(test)]
+    pub(crate) fn set_replayed_snapshot_install_barrier(&self, barrier: Arc<tokio::sync::Barrier>) {
+        *self.replayed_snapshot_install_barrier.lock().unwrap() = Some(barrier);
+    }
+
+    #[cfg(test)]
+    fn take_replayed_snapshot_install_barrier(&self) -> Option<Arc<tokio::sync::Barrier>> {
+        self.replayed_snapshot_install_barrier
+            .lock()
+            .unwrap()
+            .take()
+    }
+
+    #[cfg(test)]
+    fn replayed_snapshot_installed(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.replayed_snapshot_installed_notify)
+    }
+
     /// Process-start proxy for garbage-collection eligibility: anything
     /// retired after this instant was retired inside the current process and
     /// has not yet survived a restart.
@@ -1580,6 +1608,11 @@ async fn publish_replayed_batch(
     }
     if !service.replace_snapshot_if_allowed(Arc::clone(next), cancel) {
         return Ok(false);
+    }
+    #[cfg(test)]
+    if let Some(barrier) = service.take_replayed_snapshot_install_barrier() {
+        service.replayed_snapshot_installed().notify_one();
+        barrier.wait().await;
     }
     if cancel.is_cancelled() {
         // Installed ahead of the durable bound; replay resynchronizes the
@@ -2722,6 +2755,33 @@ mod tests {
         service
     }
 
+    /// Ensures a deliberately paused publisher cannot outlive a failing test.
+    /// Dropping a `JoinHandle` alone detaches it, so this guard aborts the
+    /// task during unwinding as well as on the normal recovery path.
+    struct AbortOnDrop<T> {
+        task: Option<tokio::task::JoinHandle<T>>,
+    }
+
+    impl<T> AbortOnDrop<T> {
+        fn new(task: tokio::task::JoinHandle<T>) -> Self {
+            Self { task: Some(task) }
+        }
+
+        async fn abort_and_join(&mut self) -> Result<T, tokio::task::JoinError> {
+            let task = self.task.take().expect("publisher task must be present");
+            task.abort();
+            task.await
+        }
+    }
+
+    impl<T> Drop for AbortOnDrop<T> {
+        fn drop(&mut self) {
+            if let Some(task) = self.task.as_ref() {
+                task.abort();
+            }
+        }
+    }
+
     /// Deterministic derived-disk measurement source reading the CURRENT
     /// value of `bytes` (tests may grow/shrink it mid-scenario to prove the
     /// gate reacts to written data rather than cached numbers) and recording
@@ -3389,6 +3449,264 @@ mod tests {
             &search_all(&recovered_service, "restart").await.unwrap(),
             "doc-restart-0"
         ));
+
+        recovered_pool.close().await;
+        directory.close().unwrap();
+    }
+
+    /// Source-level deterministic task-abort/reopen mechanics only: this is
+    /// not OS-crash, power-loss, hot-WAL, durability, package, native/R13,
+    /// corpus, performance, or release evidence.
+    #[tokio::test]
+    async fn task_5_5_q6_replayed_snapshot_install_before_ack_recovers_once_after_abort() {
+        // `TempDir` is the RAII cleanup for all SQLite files if any assertion
+        // below fails; the normal path also closes both pools before removal.
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("replayed-snapshot-install.sqlite");
+        let options = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone())
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        insert_meeting(&pool, "post-install", "Post install").await;
+        add_transcript(
+            &pool,
+            "post-install-primary",
+            "post-install",
+            "primary meeting transcript survives replay recovery",
+        )
+        .await;
+        register_test_model(&pool).await;
+        RetrievalRepository::ensure_generation(&pool, "gen-post-install", MODEL_ID)
+            .await
+            .unwrap();
+        publish_meeting(
+            &pool,
+            "gen-post-install",
+            "post-install",
+            &["alpha baseline document"],
+        )
+        .await;
+
+        // Establish an already-active, fully acknowledged generation. The
+        // following change therefore exercises steady-state replay rather
+        // than initial loading or pointer activation.
+        let service = fresh_service();
+        publish_tick(&pool, &service).await.unwrap();
+        let baseline_bounds = RetrievalRepository::publication_lag(&pool, "gen-post-install")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(baseline_bounds.0, baseline_bounds.1);
+        assert_eq!(
+            service.active_generation().as_deref(),
+            Some("gen-post-install")
+        );
+        let primary_transcript_before: String =
+            sqlx::query_scalar("SELECT transcript FROM transcripts WHERE id = ?")
+                .bind("post-install-primary")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        // Persistent audit state records only durable published-bound advances
+        // for this generation. It starts after initial activation so recovery
+        // must account for exactly the one unacknowledged canonical change.
+        sqlx::query(
+            "CREATE TABLE post_install_ack_audit (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                published_bound_updates INTEGER NOT NULL DEFAULT 0
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO post_install_ack_audit (id) VALUES (1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER post_install_ack_audit_trigger
+             AFTER UPDATE OF published_change_id ON retrieval_index_state
+             WHEN OLD.generation_id = 'gen-post-install'
+                  AND NEW.published_change_id > OLD.published_change_id
+             BEGIN
+                 UPDATE post_install_ack_audit
+                 SET published_bound_updates = published_bound_updates + 1
+                 WHERE id = 1;
+             END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        add_transcript(
+            &pool,
+            "post-install-delta",
+            "post-install",
+            "novel canonical change survives replay recovery",
+        )
+        .await;
+        publish_meeting(
+            &pool,
+            "gen-post-install",
+            "post-install",
+            &[
+                "alpha baseline document",
+                "novel canonical change survives replay recovery",
+            ],
+        )
+        .await;
+        let pending_bounds = RetrievalRepository::publication_lag(&pool, "gen-post-install")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            pending_bounds.0 > pending_bounds.1,
+            "the canonical change must be durable before the replay publisher starts"
+        );
+        assert_eq!(
+            pending_bounds.0 - pending_bounds.1,
+            1,
+            "the fixture must contain exactly one pending journal change"
+        );
+
+        let blocked_service = Arc::new(service);
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        blocked_service.set_replayed_snapshot_install_barrier(Arc::clone(&barrier));
+        let installed = blocked_service.replayed_snapshot_installed();
+        let installed_wait = installed.notified();
+        let publisher_pool = pool.clone();
+        let publisher_service = Arc::clone(&blocked_service);
+        let mut publisher = AbortOnDrop::new(tokio::spawn(async move {
+            publish_tick(&publisher_pool, publisher_service.as_ref()).await
+        }));
+        tokio::time::timeout(Duration::from_secs(2), installed_wait)
+            .await
+            .expect("replay publisher did not install its reader snapshot in time");
+
+        // This barrier is after the production reader swap: the service can
+        // serve the new overlay document while the durable journal remains
+        // deliberately unacknowledged and the persistent audit is still zero.
+        assert!(contains_hit(
+            &search_all(blocked_service.as_ref(), "novel").await.unwrap(),
+            "doc-post-install-1"
+        ));
+        assert_eq!(
+            blocked_service.active_snapshot().unwrap().overlay_documents,
+            2,
+            "the live reader must hold the fully folded replacement overlay"
+        );
+        assert_eq!(
+            RetrievalRepository::publication_lag(&pool, "gen-post-install")
+                .await
+                .unwrap(),
+            Some(pending_bounds),
+            "the post-install barrier must precede durable acknowledgement"
+        );
+        let acknowledgement_updates: i64 = sqlx::query_scalar(
+            "SELECT published_bound_updates FROM post_install_ack_audit WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            acknowledgement_updates, 0,
+            "the blocked publisher must not advance the durable bound"
+        );
+
+        // Abort only this deterministic source-level task, then close/drop the
+        // old pool and service before reopening a fresh process-shaped pair.
+        assert!(
+            publisher.abort_and_join().await.unwrap_err().is_cancelled(),
+            "the blocked publisher task must be cancelled"
+        );
+        drop(blocked_service);
+        drop(barrier);
+        pool.close().await;
+        drop(pool);
+
+        let recovered_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let recovered_service = fresh_service();
+        publish_tick(&recovered_pool, &recovered_service)
+            .await
+            .unwrap();
+
+        assert!(contains_hit(
+            &search_all(&recovered_service, "novel").await.unwrap(),
+            "doc-post-install-1"
+        ));
+        assert_eq!(recovered_service.publication_lag(), 0);
+        assert_eq!(
+            RetrievalRepository::publication_lag(&recovered_pool, "gen-post-install")
+                .await
+                .unwrap(),
+            Some((pending_bounds.0, pending_bounds.0)),
+            "fresh recovery must converge the durable journal bound"
+        );
+        let (meeting_rows, primary_transcript_rows): (i64, i64) = sqlx::query_as(
+            "SELECT
+                (SELECT COUNT(*) FROM meetings WHERE id = 'post-install'),
+                (SELECT COUNT(*) FROM transcripts WHERE id = 'post-install-primary')",
+        )
+        .fetch_one(&recovered_pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (meeting_rows, primary_transcript_rows),
+            (1, 1),
+            "recovery must preserve primary rows without duplicates"
+        );
+        let primary_transcript_after: String =
+            sqlx::query_scalar("SELECT transcript FROM transcripts WHERE id = ?")
+                .bind("post-install-primary")
+                .fetch_one(&recovered_pool)
+                .await
+                .unwrap();
+        assert_eq!(primary_transcript_after, primary_transcript_before);
+        let (document_rows, vector_rows, distinct_document_rows, distinct_vector_rows): (
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT COUNT(*), COUNT(vector), COUNT(DISTINCT document_id), COUNT(DISTINCT vector)
+             FROM retrieval_documents WHERE generation_id = ?",
+        )
+        .bind("gen-post-install")
+        .fetch_one(&recovered_pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (
+                document_rows,
+                vector_rows,
+                distinct_document_rows,
+                distinct_vector_rows
+            ),
+            (2, 2, 2, 2),
+            "recovery must preserve canonical document/vector rows without duplicates"
+        );
+        let acknowledgement_updates: i64 = sqlx::query_scalar(
+            "SELECT published_bound_updates FROM post_install_ack_audit WHERE id = 1",
+        )
+        .fetch_one(&recovered_pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            acknowledgement_updates, 1,
+            "fresh recovery must durably advance the published bound exactly once"
+        );
 
         recovered_pool.close().await;
         directory.close().unwrap();
