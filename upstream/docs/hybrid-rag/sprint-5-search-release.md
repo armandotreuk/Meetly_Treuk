@@ -1416,7 +1416,8 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 
 ### Task 5.5 - initial local qualification baseline
 
-**Status:** Blocked (local activation/disk and reranker-p95 diagnostic rows recorded; no release or sprint-close claim)
+**Status:** Blocked (local activation/disk, reranker-p95, and cross-surface
+scheduler diagnostic rows recorded; no release or sprint-close claim)
 **Owner:** `worker-l` (Task 5.5 initial qualification pass)
 **Completed:** 2026-09-09–10
 **Implemented:**
@@ -1442,9 +1443,19 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
   vendor/family/model/stepping; and logical-processor and physical-memory
   hardware details. It never logs synthetic text, filesystem paths, or a raw
   environment variable.
+- A deterministic source-level regression now holds the shared interactive
+  lease in a Chat-purpose retrieval while the real Sidebar
+  `execute_hybrid_search` adapter queues with `RetrievalPurpose::Search`. It
+  proves the two request-ownership surfaces coexist; queued Sidebar
+  cancellation reclaims its queue entry without cancelling Chat; Chat
+  cancellation reaches its parked embedding work and releases the permit; and
+  a fresh real Sidebar search then completes with both the scheduler queue and
+  request registry empty. It makes no per-surface-priority or stream-latency
+  claim.
 **Not implemented:**
-- Concurrency, crash/restart, recording, provider-answer, package-smoke, and
-  the remaining full-matrix qualifications.
+- Sustained typing against a live Chat stream, real reranker cancellation,
+  concurrent indexing, crash/restart, recording, provider-answer,
+  package-smoke, and the remaining full-matrix qualifications.
 **Why not implemented:**
 - They require dedicated controlled data, native/package sessions, or external
   evidence not available to this local baseline.
@@ -1455,6 +1466,16 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 - Direct `node node_modules/typescript/bin/tsc --noEmit` from `frontend` -
   pass; this is not `pnpm --dir frontend run typecheck`.
 - `git diff --check` - pass.
+- `cargo test --locked --manifest-path frontend/src-tauri/Cargo.toml --lib
+  retrieval::tests::chat_cancellation_releases_shared_permit_for_queued_sidebar_search
+  -- --exact` - pass: 1 / 0 / 928 filtered. The Sidebar legs use the actual
+  `execute_hybrid_search` adapter, not the lower-level retrieval method, so
+  the Search-purpose route is exercised.
+- Existing focused queue checks also pass: 
+  `retrieval::tests::hybrid_request_id_cancellation_reaches_queued_retrieval`
+  (1 / 0 / 928 filtered) and
+  `retrieval::worker::tests::interactive_queue_caps_at_eight_and_cancels_deterministically`
+  (1 / 0 / 928 filtered).
 - The pre-selector serial library baseline passed 921 / 0 / 4 ignored in
   115.37 s. The current selector change has focused selector and scale-test
   coverage below; no broad current-head library-suite result is claimed because
@@ -1537,6 +1558,12 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 - The local activation/disk and reranker rows do not establish corpus quality,
   Fast/Deep quality, reference-hardware performance, package behavior, or
   release acceptance.
+- The cross-surface regression is local source-test evidence only. Independent
+  code review initially required the real Search adapter rather than an inert
+  purpose field; the corrected test was approved on re-review. Independent
+  architecture review approved its shared-permit/cancellation scope and its
+  explicit absence of a priority, package, performance, corpus, or release
+  claim.
 
 ## Sprint Reviews
 

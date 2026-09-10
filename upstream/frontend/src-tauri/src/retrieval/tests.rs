@@ -2297,6 +2297,146 @@ async fn hybrid_request_id_cancellation_reaches_queued_retrieval() {
 }
 
 #[tokio::test]
+async fn chat_cancellation_releases_shared_permit_for_queued_sidebar_search() {
+    let pool = migrated_pool().await;
+    insert_meeting(&pool, "m-chat-sidebar-queue", "Shared scheduler").await;
+    add_transcript(
+        &pool,
+        "t-chat-sidebar-queue",
+        "m-chat-sidebar-queue",
+        "needle text",
+    )
+    .await;
+    register_test_model(&pool).await;
+    RetrievalRepository::ensure_generation(&pool, "gen-chat-sidebar-queue", MODEL_ID)
+        .await
+        .unwrap();
+    publish_meeting(
+        &pool,
+        "gen-chat-sidebar-queue",
+        "m-chat-sidebar-queue",
+        &["needle"],
+    )
+    .await;
+    let embedder = ServiceEmbedder::new();
+    let (release_chat, receiver) = std::sync::mpsc::channel();
+    *embedder.park_until.lock().unwrap() = Some(receiver);
+    let lifecycle = query_lifecycle(&embedder);
+    install_snapshot(&pool, &lifecycle, MODEL_ID).await;
+    let scheduler = lifecycle.scheduler();
+    let state = ChatRequestState::new();
+
+    let chat = tokio::spawn({
+        let pool = pool.clone();
+        let state = state.clone();
+        let service = RetrievalService::new(lifecycle.clone());
+        async move {
+            with_hybrid_request(
+                &state,
+                ChatRequestSurface::Chat,
+                "chat-shared-permit".to_string(),
+                Duration::from_secs(30),
+                move |token| async move {
+                    service
+                        .retrieve(
+                            &pool,
+                            request(
+                                "needle",
+                                PersistedRetrievalScope::All,
+                                RetrievalLimits::default(),
+                                CoreTermLanguage::English,
+                                Some(token.as_ref().clone()),
+                            ),
+                        )
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                },
+            )
+            .await
+        }
+    });
+    wait_until(async || embedder.entered.load(Ordering::SeqCst)).await;
+
+    let sidebar = tokio::spawn({
+        let pool = pool.clone();
+        let state = state.clone();
+        let lifecycle = lifecycle.clone();
+        async move {
+            execute_hybrid_search(
+                &pool,
+                lifecycle,
+                &state,
+                ChatRequestSurface::Sidebar,
+                "sidebar-shared-permit".to_string(),
+                "needle".to_string(),
+                HybridScope::All {},
+                Some(1),
+                Duration::from_secs(30),
+            )
+            .await
+            .map(|_| ())
+        }
+    });
+    wait_until(async || scheduler.queued_interactive() == 1).await;
+    assert_eq!(state.request_count(), 2);
+    assert!(
+        !embedder.cancelled.load(Ordering::SeqCst),
+        "admitting Sidebar must not cancel the active Chat request"
+    );
+
+    assert!(state.cancel_request(ChatRequestSurface::Sidebar, Some("sidebar-shared-permit")));
+    let sidebar_result = tokio::time::timeout(Duration::from_secs(5), sidebar)
+        .await
+        .expect("cancelled Sidebar must not wait for Chat's permit")
+        .unwrap();
+    assert_eq!(
+        sidebar_result,
+        Err("Hybrid request was cancelled or superseded".to_string())
+    );
+    assert_eq!(scheduler.queued_interactive(), 0);
+    assert_eq!(state.request_count(), 1);
+    assert!(
+        !embedder.cancelled.load(Ordering::SeqCst),
+        "cancelling Sidebar must not cancel the active Chat request"
+    );
+
+    assert!(state.cancel_request(ChatRequestSurface::Chat, Some("chat-shared-permit")));
+    let chat_result = tokio::time::timeout(Duration::from_secs(5), chat)
+        .await
+        .expect("cancelled Chat must release the shared permit")
+        .unwrap();
+    drop(release_chat);
+    assert_eq!(
+        chat_result,
+        Err("Hybrid request was cancelled or superseded".to_string())
+    );
+    assert!(
+        embedder.cancelled.load(Ordering::SeqCst),
+        "Chat cancellation must reach the running embedding work"
+    );
+    assert_eq!(state.request_count(), 0);
+
+    let fresh_sidebar = execute_hybrid_search(
+        &pool,
+        lifecycle,
+        &state,
+        ChatRequestSurface::Sidebar,
+        "sidebar-after-chat-cancel".to_string(),
+        "needle".to_string(),
+        HybridScope::All {},
+        Some(1),
+        Duration::from_secs(5),
+    );
+    tokio::time::timeout(Duration::from_secs(5), fresh_sidebar)
+        .await
+        .expect("a fresh Sidebar request must acquire the released permit")
+        .expect("fresh Sidebar request must complete after Chat cancellation");
+    assert_eq!(scheduler.queued_interactive(), 0);
+    assert_eq!(state.request_count(), 0);
+}
+
+#[tokio::test]
 async fn hybrid_tauri_deletion_after_terminal_recheck_suppresses_search_and_context() {
     for (meeting_id, context) in [("m-tauri-search", false), ("m-tauri-context", true)] {
         let pool = migrated_pool().await;
