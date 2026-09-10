@@ -1230,6 +1230,12 @@ async fn process_semantic_item(
         ..ChunkerConfig::default()
     };
     let documents = chunk_meeting(&source, &config, &EmbedderTokenizer(embedder));
+    // Chunking/tokenization is synchronous and may take long enough for
+    // shutdown to arrive. Do not start staging-pruning SQL after that work
+    // unless the lifecycle is still live.
+    if cancel.is_cancelled() {
+        return;
+    }
 
     // Staging is bound to (generation, meeting, revision); a crashed run with
     // the same binding resumes instead of duplicating work. Rows diverging
@@ -1804,6 +1810,8 @@ mod tests {
         completed_document_calls: AtomicU64,
         park_first_call: StdMutex<Option<std::sync::mpsc::Receiver<()>>>,
         entered_first_call: Arc<AtomicBool>,
+        park_first_token_count: StdMutex<Option<std::sync::mpsc::Receiver<()>>>,
+        entered_first_token_count: Arc<AtomicBool>,
         response_fault: StdMutex<Option<ResponseFault>>,
     }
 
@@ -1825,6 +1833,8 @@ mod tests {
                 completed_document_calls: AtomicU64::new(0),
                 park_first_call: StdMutex::new(None),
                 entered_first_call: Arc::new(AtomicBool::new(false)),
+                park_first_token_count: StdMutex::new(None),
+                entered_first_token_count: Arc::new(AtomicBool::new(false)),
                 response_fault: StdMutex::new(None),
             })
         }
@@ -1862,6 +1872,18 @@ mod tests {
         }
 
         fn count_tokens(&self, text: &str) -> usize {
+            if self
+                .entered_first_token_count
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                if let Some(receiver) = self.park_first_token_count.lock().unwrap().take() {
+                    // Chunking is intentionally synchronous; the regression
+                    // releases this deterministic per-fake gate after it has
+                    // signalled lifecycle shutdown.
+                    let _ = receiver.recv();
+                }
+            }
             text.split_whitespace().count()
         }
 
@@ -4457,6 +4479,128 @@ mod tests {
         )
         .await;
         assert_eq!(processed, 0, "no work may run after shutdown fencing");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_during_chunking_fences_staging_and_embedding() {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "m", "Chunking Fence").await;
+        add_transcript(&pool, "t1", "m", "conteudo bloqueado durante tokenizacao").await;
+        let embedder = FakeEmbedder::new();
+        let generation = ensure_test_generation(&pool).await;
+        let revision = RetrievalRepository::current_source_revision(&pool, "m")
+            .await
+            .unwrap()
+            .expect("fixture has a source revision");
+        let job_id = staging_job_id(&generation, "m", revision);
+        let stale_document_id = "stale-before-chunking";
+        RetrievalRepository::stage_documents(
+            &pool,
+            &job_id,
+            &generation,
+            "m",
+            revision,
+            &[test_document(stale_document_id, "stale staging payload")],
+        )
+        .await
+        .unwrap();
+        let retry_before: (String, i64, i64, String, String) = sqlx::query_as(
+            "SELECT state, attempt_count, indexed_source_revision,
+                    COALESCE(next_attempt_at, ''), COALESCE(last_error, '')
+             FROM retrieval_meeting_state WHERE generation_id = ? AND meeting_id = 'm'",
+        )
+        .bind(&generation)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(retry_before.0, "pending");
+        let staging_before = scalar(&pool, "SELECT COUNT(*) FROM retrieval_document_staging").await;
+        let canonical_before = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM retrieval_documents WHERE generation_id = ? AND meeting_id = 'm'",
+        )
+        .bind(&generation)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // These durable bounds advance with the replacement journal, so an
+        // unchanged pair proves the blocked attempt did not journal either.
+        let bounds_before = published_bounds(&pool, &generation).await;
+
+        // Park an actual tokenizer call reached by the normal lifecycle. The
+        // sender is local to this fake, so an assertion failure drops it and
+        // releases the blocking call instead of leaving a test worker stuck.
+        let (release_tokenization, tokenization_park) = std::sync::mpsc::channel::<()>();
+        *embedder.park_first_token_count.lock().unwrap() = Some(tokenization_park);
+        let lifecycle = lifecycle_for_test(free_pressure(), ok_loader(&embedder));
+        lifecycle.attach_database(pool.clone());
+        wait_until(async || embedder.entered_first_token_count.load(Ordering::SeqCst)).await;
+
+        // `shutdown` publishes cancellation before it waits for the worker.
+        // Do not await its completion before releasing synchronous chunking:
+        // the worker cannot observe the new fence until tokenization returns.
+        let worker_cancel = locked(&lifecycle.0.attached)
+            .as_ref()
+            .expect("test lifecycle is attached")
+            .cancel
+            .clone();
+        let shutdown_lifecycle = lifecycle.clone();
+        let shutdown = tokio::spawn(async move { shutdown_lifecycle.shutdown().await });
+        wait_until(async || worker_cancel.is_cancelled()).await;
+        release_tokenization
+            .send(())
+            .expect("the parked tokenizer remains live until release");
+        tokio::time::timeout(Duration::from_secs(5), shutdown)
+            .await
+            .expect("shutdown joins after chunking returns")
+            .expect("shutdown task does not panic");
+
+        assert!(!lifecycle.is_running());
+        assert!(
+            !embedder.entered_first_call.load(Ordering::SeqCst),
+            "the post-chunk cancellation fence must prevent embedding"
+        );
+        assert_eq!(embedder.completed_document_calls(), 0);
+        assert!(embedder.embedded_texts().is_empty());
+        assert_eq!(
+            RetrievalRepository::list_staged_document_ids(&pool, &job_id)
+                .await
+                .unwrap(),
+            vec![stale_document_id.to_string()],
+            "cancelled chunking must not prune the stale staging identity"
+        );
+        assert_eq!(
+            scalar(&pool, "SELECT COUNT(*) FROM retrieval_document_staging").await,
+            staging_before
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM retrieval_documents WHERE generation_id = ? AND meeting_id = 'm'",
+            )
+            .bind(&generation)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            canonical_before,
+            "cancelled chunking must not replace canonical documents"
+        );
+        assert_eq!(
+            published_bounds(&pool, &generation).await,
+            bounds_before,
+            "cancelled chunking must not append a journal entry or advance bounds"
+        );
+        let retry_after: (String, i64, i64, String, String) = sqlx::query_as(
+            "SELECT state, attempt_count, indexed_source_revision,
+                    COALESCE(next_attempt_at, ''), COALESCE(last_error, '')
+             FROM retrieval_meeting_state WHERE generation_id = ? AND meeting_id = 'm'",
+        )
+        .bind(&generation)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            retry_after, retry_before,
+            "shutdown leaves retry state pending"
+        );
     }
 
     #[tokio::test]

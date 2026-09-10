@@ -1417,7 +1417,7 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 ### Task 5.5 - initial local qualification baseline
 
 **Status:** Blocked (local activation/disk, reranker-p95, cross-surface
-scheduler, and six narrow crash/restart diagnostic rows recorded; no release or
+scheduler, and seven narrow crash/restart diagnostic rows recorded; no release or
 sprint-close claim)
 **Owner:** `worker-l` (Task 5.5 initial qualification pass)
 **Completed:** 2026-09-09–10
@@ -1509,12 +1509,22 @@ sprint-close claim)
   expected documents once, acknowledges one publication, and leaves staging
   empty. This is a graceful worker-cancellation/resume row, not a durable
   file-backed reopen or process-crash row.
+- A seventh in-memory source-level worker regression parks a real synchronous
+  fake-tokenizer call during chunking, starts cooperative lifecycle shutdown,
+  waits until the worker cancellation token is set, and only then releases
+  tokenization. A production cancellation fence immediately after chunking
+  returns before staging-pruning SQL. The test seeds a deliberately stale
+  identity in the exact current-revision staging job and proves it remains;
+  it also proves no embedding, canonical replacement, journal/bound movement,
+  or retry-state mutation. This leaves synchronous chunking cooperative rather
+  than preemptively interruptible.
 **Not implemented:**
 - Sustained typing against a live Chat stream, real reranker cancellation,
-  concurrent indexing, the remaining crash/restart points (chunking, other
-  embedding interruption/failure paths, sidecar/cache, other activation interruption points,
+  concurrent indexing, the remaining crash/restart points (other chunking
+  interruption/failure paths, other embedding interruption/failure paths,
+  sidecar/cache, other activation interruption points,
   same-service acknowledgement retry, and other overlay interruption points),
-  recording, provider-answer, Q2-Q7 behavior in an installed
+  recording, provider-answer, Q2-Q8 behavior in an installed
   application, and the remaining full-matrix qualifications.
 **Why not implemented:**
 - They require dedicated controlled data, native/package sessions, or external
@@ -1588,6 +1598,11 @@ sprint-close claim)
   exactly once.
 - Adjacent `crash_resume_reuses_valid_staging_without_duplicate_embedding`
   also passes: 1 / 0 / 934 filtered.
+- `cargo test --manifest-path frontend/src-tauri/Cargo.toml --lib
+  retrieval::worker::tests::shutdown_during_chunking_fences_staging_and_embedding
+  -- --exact` - pass: 1 / 0 / 935 filtered. It parks synchronous chunking,
+  signals cooperative shutdown, releases tokenization, and directly proves
+  the exact stale staging identity was not pruned before cancellation exits.
 - Exact-source Windows integration run [CI59](https://github.com/armandotreuk/Meetly_Treuk/actions/runs/34481012557)
   passed at `935558bc688d69ae3d58fbcba85fc583a2aca168`: Cargo Check, Windows
   CPU packaging, fresh installed MSI and NSIS smokes, and the terminal evidence
