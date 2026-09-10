@@ -1417,7 +1417,7 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 ### Task 5.5 - initial local qualification baseline
 
 **Status:** Blocked (local activation/disk, reranker-p95, cross-surface
-scheduler, and two narrow restart diagnostic rows recorded; no release or
+scheduler, and three narrow crash/restart diagnostic rows recorded; no release or
 sprint-close claim)
 **Owner:** `worker-l` (Task 5.5 initial qualification pass)
 **Completed:** 2026-09-09–10
@@ -1469,10 +1469,21 @@ sprint-close claim)
   with a fresh service recovers the shadow snapshot, reaches zero lag, preserves
   primary and derived content, avoids duplicate rows/vectors, and uses a
   shadow-scoped durable audit trigger to observe one bound advance.
+- A third file-backed source-level regression pauses the replacement transaction
+  immediately after its destructive canonical-document delete and before any
+  staging read, bookkeeping, journal write, or commit. It aborts the task,
+  closes and drops the one-connection pool, reopens the WAL database, and
+  proves rollback keeps the old canonical document, primary transcript,
+  replacement staging, document count, journal count, and bounds intact. A
+  normal resumed replacement then publishes the distinct staged set exactly
+  once, clears staging, advances canonical once without advancing published,
+  and sets the expected document count. The test-only barrier has a bounded
+  wait and RAII cleanup for the matching global registration, task, and
+  temporary database files.
 **Not implemented:**
 - Sustained typing against a live Chat stream, real reranker cancellation,
   concurrent indexing, the remaining crash/restart points (chunking,
-  embedding, SQLite replacement, post-installation/acknowledgement,
+  embedding, post-installation/acknowledgement,
   sidecar/cache, other activation interruption points, and steady-state overlay
   replay), recording, provider-answer, Q2/Q3 behavior in an installed
   application, and the remaining full-matrix qualifications.
@@ -1514,6 +1525,15 @@ sprint-close claim)
 - Existing
   `retrieval::index::tests::activation_commit_cannot_resurrect_after_clear_fences_publication`
   also passes: 1 / 0 / 930 filtered.
+- `cargo test --locked --manifest-path frontend/src-tauri/Cargo.toml --lib
+  database::repositories::retrieval::tests::sqlite_replacement_task_abort_after_delete_rolls_back_and_retries_exactly_once
+  -- --exact` - pass: 1 / 0 / 931 filtered. It holds the one-shot test-only
+  post-delete/pre-commit barrier, aborts the replacement task, explicitly
+  closes/drops and reopens the file-backed WAL pool, then checks rollback and
+  exactly-once retry state.
+- Existing
+  `database::repositories::retrieval::tests::poisoned_page_aborts_replacement_and_keeps_prior_documents_and_staging_resumable`
+  also passes: 1 / 0 / 931 filtered.
 - Exact-source Windows integration run [CI59](https://github.com/armandotreuk/Meetly_Treuk/actions/runs/34481012557)
   passed at `935558bc688d69ae3d58fbcba85fc583a2aca168`: Cargo Check, Windows
   CPU packaging, fresh installed MSI and NSIS smokes, and the terminal evidence
@@ -1626,6 +1646,12 @@ sprint-close claim)
   acknowledgement audit. It models task cancellation plus graceful database
   close rather than an OS/process kill, and covers only the committed-pointer,
   pre-memory-installation/acknowledgement point.
+- The SQLite-replacement regression is local source-test evidence only. Its
+  independent code review first required a bounded barrier wait and RAII
+  cleanup for the global hook, spawned task, and SQLite/WAL files; the corrected
+  test passed code re-review and architecture re-review. It models task abort,
+  graceful pool close, and reopen after the destructive delete, not an OS or
+  power-loss crash, hot-WAL replay, filesystem durability, or corruption.
 - CI59 passed Windows packaging, both fresh installer smokes, and the terminal
   evidence gate at the exact Q3 source commit. It supplies current-source
   package integration evidence only; it neither runs Q2/Q3 inside an installed

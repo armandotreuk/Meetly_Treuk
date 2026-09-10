@@ -5,6 +5,14 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Error as SqlxError, QueryBuilder, Sqlite, SqliteConnection, SqlitePool, Transaction};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, OnceLock,
+};
+#[cfg(test)]
+use tokio::sync::Notify;
+
 pub const GENERATION_STATES: [&str; 4] = ["building", "ready", "failed", "retired"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,6 +280,115 @@ pub struct ReplacementJob<'a> {
     pub meeting_id: &'a str,
     pub expected_source_revision: i64,
     pub job_id: &'a str,
+}
+
+/// Test-only, one-shot pause after replacement has destructively deleted its
+/// canonical rows but before it reads staging. It gives the regression test a
+/// deterministic cancellation boundary without changing production behavior.
+#[cfg(test)]
+#[derive(Debug)]
+struct ReplacementDeleteBarrier {
+    reached: Notify,
+    release: Notify,
+    armed: AtomicBool,
+}
+
+#[cfg(test)]
+impl ReplacementDeleteBarrier {
+    fn new() -> Self {
+        Self {
+            reached: Notify::new(),
+            release: Notify::new(),
+            armed: AtomicBool::new(true),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct ReplacementDeleteBarrierRegistration {
+    generation_id: String,
+    meeting_id: String,
+    job_id: String,
+    barrier: Arc<ReplacementDeleteBarrier>,
+}
+
+#[cfg(test)]
+struct ReplacementDeleteBarrierGuard {
+    barrier: Arc<ReplacementDeleteBarrier>,
+}
+
+#[cfg(test)]
+impl ReplacementDeleteBarrierGuard {
+    fn barrier(&self) -> &Arc<ReplacementDeleteBarrier> {
+        &self.barrier
+    }
+}
+
+#[cfg(test)]
+impl Drop for ReplacementDeleteBarrierGuard {
+    fn drop(&mut self) {
+        let mut slot = replacement_delete_barrier_slot()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|registration| Arc::ptr_eq(&registration.barrier, &self.barrier))
+        {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+static REPLACEMENT_DELETE_BARRIER: OnceLock<Mutex<Option<ReplacementDeleteBarrierRegistration>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn replacement_delete_barrier_slot() -> &'static Mutex<Option<ReplacementDeleteBarrierRegistration>>
+{
+    REPLACEMENT_DELETE_BARRIER.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn install_replacement_delete_barrier(
+    generation_id: &str,
+    meeting_id: &str,
+    job_id: &str,
+) -> ReplacementDeleteBarrierGuard {
+    let barrier = Arc::new(ReplacementDeleteBarrier::new());
+    let mut slot = replacement_delete_barrier_slot().lock().unwrap();
+    assert!(
+        slot.is_none(),
+        "replacement delete barrier is already installed"
+    );
+    *slot = Some(ReplacementDeleteBarrierRegistration {
+        generation_id: generation_id.to_string(),
+        meeting_id: meeting_id.to_string(),
+        job_id: job_id.to_string(),
+        barrier: Arc::clone(&barrier),
+    });
+    ReplacementDeleteBarrierGuard { barrier }
+}
+
+#[cfg(test)]
+async fn pause_after_replacement_delete(job: &ReplacementJob<'_>) {
+    let barrier = replacement_delete_barrier_slot()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|registration| {
+            registration.generation_id == job.generation_id
+                && registration.meeting_id == job.meeting_id
+                && registration.job_id == job.job_id
+        })
+        .map(|registration| Arc::clone(&registration.barrier));
+    if let Some(barrier) = barrier {
+        if barrier.armed.swap(false, Ordering::AcqRel) {
+            barrier.reached.notify_one();
+            barrier.release.notified().await;
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1778,6 +1895,8 @@ impl RetrievalRepository {
         .execute(&mut *tx)
         .await?
         .rows_affected();
+        #[cfg(test)]
+        pause_after_replacement_delete(&job).await;
         let now = Utc::now().to_rfc3339();
         // Incremental document_count bookkeeping: prior rows removed plus this
         // replacement's inserted page totals. The delta is exact for every
@@ -3277,6 +3396,64 @@ mod tests {
         sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
     }
 
+    #[derive(Debug)]
+    struct TempSqliteFiles {
+        db_path: std::path::PathBuf,
+    }
+
+    impl TempSqliteFiles {
+        fn new(db_path: std::path::PathBuf) -> Self {
+            Self { db_path }
+        }
+
+        fn cleanup(&self) -> std::io::Result<()> {
+            for path in [
+                self.db_path.clone(),
+                self.db_path.with_extension("sqlite-wal"),
+                self.db_path.with_extension("sqlite-shm"),
+            ] {
+                match std::fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for TempSqliteFiles {
+        fn drop(&mut self) {
+            let _ = self.cleanup();
+        }
+    }
+
+    struct AbortOnDrop {
+        handle: tokio::task::AbortHandle,
+        armed: bool,
+    }
+
+    impl AbortOnDrop {
+        fn new(handle: tokio::task::AbortHandle) -> Self {
+            Self {
+                handle,
+                armed: true,
+            }
+        }
+
+        fn disarm(&mut self) {
+            self.armed = false;
+        }
+    }
+
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            if self.armed {
+                self.handle.abort();
+            }
+        }
+    }
+
     #[tokio::test]
     async fn clear_derived_index_preserves_primary_and_fts_data() {
         let pool = migrated_pool().await;
@@ -4230,6 +4407,280 @@ mod tests {
             1,
             "the aborted replacement must not journal anything"
         );
+    }
+
+    #[tokio::test]
+    async fn sqlite_replacement_task_abort_after_delete_rolls_back_and_retries_exactly_once() {
+        // This is a deterministic source-level cancellation boundary, not an
+        // OS-kill simulation: it holds the live SQLite transaction immediately
+        // after canonical deletion, then aborts the replacement task.
+        let db_path = std::env::temp_dir().join(format!(
+            "meetly-retrieval-replace-abort-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        // Declared before pools so its Drop cleanup runs after every pool has
+        // been dropped, including when the spawned test body panics.
+        let files = TempSqliteFiles::new(db_path.clone());
+        let options = SqliteConnectOptions::from_str(db_path.to_str().unwrap())
+            .unwrap()
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone())
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        let replacement_test_pool = pool.clone();
+        let test_result = tokio::spawn(async move {
+            let pool = replacement_test_pool;
+            RetrievalRepository::register_model(&pool, &f32_spec("model", 2))
+                .await
+                .unwrap();
+            insert_meeting(&pool, "m", "Replacement Abort").await;
+            add_transcript(&pool, "primary", "m", "primary transcript survives").await;
+            let source_revision = source_state(&pool, "m").await.unwrap().0;
+            RetrievalRepository::register_generation(&pool, "gen-abort", "model")
+                .await
+                .unwrap();
+
+            let old = [doc(
+                "old",
+                2,
+                VectorEncoding::F32,
+                normalized_f32(&[1.0, 0.0]),
+            )];
+            RetrievalRepository::stage_documents(
+                &pool,
+                "job-old",
+                "gen-abort",
+                "m",
+                source_revision,
+                &old,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                RetrievalRepository::replace_meeting_documents(
+                    &pool,
+                    ReplacementJob {
+                        generation_id: "gen-abort",
+                        meeting_id: "m",
+                        expected_source_revision: source_revision,
+                        job_id: "job-old",
+                    },
+                )
+                .await
+                .unwrap(),
+                ReplacementOutcome::Published { .. }
+            ));
+
+            let baseline_journal = scalar_count(
+                &pool,
+                "SELECT COUNT(*) FROM retrieval_index_changes WHERE generation_id = 'gen-abort'",
+            )
+            .await;
+            let baseline_bounds: (i64, i64) = sqlx::query_as(
+                "SELECT canonical_change_id, published_change_id
+             FROM retrieval_index_state WHERE generation_id = 'gen-abort'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(baseline_journal, 1);
+            assert_eq!(baseline_bounds, (1, 0));
+
+            let replacement = [
+                doc("new-a", 2, VectorEncoding::F32, normalized_f32(&[0.0, 1.0])),
+                doc("new-b", 2, VectorEncoding::F32, normalized_f32(&[1.0, 0.0])),
+            ];
+            RetrievalRepository::stage_documents(
+                &pool,
+                "job-new",
+                "gen-abort",
+                "m",
+                source_revision,
+                &replacement,
+            )
+            .await
+            .unwrap();
+
+            let barrier = install_replacement_delete_barrier("gen-abort", "m", "job-new");
+            let replacement_pool = pool.clone();
+            let replacement_task = tokio::spawn(async move {
+                RetrievalRepository::replace_meeting_documents(
+                    &replacement_pool,
+                    ReplacementJob {
+                        generation_id: "gen-abort",
+                        meeting_id: "m",
+                        expected_source_revision: source_revision,
+                        job_id: "job-new",
+                    },
+                )
+                .await
+            });
+            let mut replacement_abort = AbortOnDrop::new(replacement_task.abort_handle());
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                barrier.barrier().reached.notified(),
+            )
+            .await
+            .expect("replacement did not reach the post-delete test barrier within 5 seconds");
+            replacement_task.abort();
+            assert!(
+                replacement_task.await.unwrap_err().is_cancelled(),
+                "the replacement task must be aborted while its transaction holds the delete"
+            );
+            replacement_abort.disarm();
+            drop(barrier);
+
+            // Close the sole connection before reopening this same WAL database;
+            // recovery must observe the dropped task's uncommitted transaction.
+            pool.close().await;
+            drop(pool);
+            let reopened = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(options)
+                .await
+                .unwrap();
+
+            let canonical_after_abort: Vec<String> = sqlx::query_scalar(
+                "SELECT document_id FROM retrieval_documents
+             WHERE generation_id = 'gen-abort' AND meeting_id = 'm'
+             ORDER BY document_id",
+            )
+            .fetch_all(&reopened)
+            .await
+            .unwrap();
+            assert_eq!(canonical_after_abort, ["old"]);
+            assert_eq!(
+            scalar_count(
+                &reopened,
+                "SELECT document_count FROM retrieval_generations WHERE generation_id = 'gen-abort'",
+            )
+            .await,
+            1,
+            "the aborted delete cannot leave document_count partially applied"
+        );
+            assert_eq!(
+                RetrievalRepository::list_staged_document_ids(&reopened, "job-new")
+                    .await
+                    .unwrap(),
+                ["new-a", "new-b"],
+                "the staged replacement remains resumable after reopening"
+            );
+            let transcript: String = sqlx::query_scalar(
+                "SELECT transcript FROM transcripts WHERE id = 'primary' AND meeting_id = 'm'",
+            )
+            .fetch_one(&reopened)
+            .await
+            .unwrap();
+            assert_eq!(transcript, "primary transcript survives");
+            assert_eq!(
+            scalar_count(
+                &reopened,
+                "SELECT COUNT(*) FROM retrieval_index_changes WHERE generation_id = 'gen-abort'",
+            )
+            .await,
+            baseline_journal,
+            "the aborted replacement cannot append a journal record"
+        );
+            let bounds_after_abort: (i64, i64) = sqlx::query_as(
+                "SELECT canonical_change_id, published_change_id
+             FROM retrieval_index_state WHERE generation_id = 'gen-abort'",
+            )
+            .fetch_one(&reopened)
+            .await
+            .unwrap();
+            assert_eq!(bounds_after_abort, baseline_bounds);
+
+            let outcome = RetrievalRepository::replace_meeting_documents(
+                &reopened,
+                ReplacementJob {
+                    generation_id: "gen-abort",
+                    meeting_id: "m",
+                    expected_source_revision: source_revision,
+                    job_id: "job-new",
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                outcome,
+                ReplacementOutcome::Published {
+                    change_id: baseline_bounds.0 + 1
+                }
+            );
+            let canonical_after_retry: Vec<String> = sqlx::query_scalar(
+                "SELECT document_id FROM retrieval_documents
+             WHERE generation_id = 'gen-abort' AND meeting_id = 'm'
+             ORDER BY document_id",
+            )
+            .fetch_all(&reopened)
+            .await
+            .unwrap();
+            assert_eq!(canonical_after_retry, ["new-a", "new-b"]);
+            assert_eq!(
+                scalar_count(
+                    &reopened,
+                    "SELECT COUNT(DISTINCT document_id) FROM retrieval_documents
+                 WHERE generation_id = 'gen-abort' AND meeting_id = 'm'",
+                )
+                .await,
+                2,
+                "the resumed replacement publishes each staged document once"
+            );
+            assert_eq!(
+                scalar_count(
+                    &reopened,
+                    "SELECT COUNT(*) FROM retrieval_document_staging WHERE job_id = 'job-new'",
+                )
+                .await,
+                0
+            );
+            assert_eq!(
+            scalar_count(
+                &reopened,
+                "SELECT COUNT(*) FROM retrieval_index_changes WHERE generation_id = 'gen-abort'",
+            )
+            .await,
+            baseline_journal + 1
+        );
+            let bounds_after_retry: (i64, i64) = sqlx::query_as(
+                "SELECT canonical_change_id, published_change_id
+             FROM retrieval_index_state WHERE generation_id = 'gen-abort'",
+            )
+            .fetch_one(&reopened)
+            .await
+            .unwrap();
+            assert_eq!(
+                bounds_after_retry,
+                (baseline_bounds.0 + 1, baseline_bounds.1),
+                "canonical advances only with the retry; publication remains unchanged"
+            );
+            assert_eq!(
+            scalar_count(
+                &reopened,
+                "SELECT document_count FROM retrieval_generations WHERE generation_id = 'gen-abort'",
+            )
+            .await,
+            2
+        );
+
+            reopened.close().await;
+            drop(reopened);
+        });
+
+        // This supervisor stays outside the fallible body so it can close and
+        // drop the pool before file cleanup even when that body panics.
+        let test_result = test_result.await;
+        pool.close().await;
+        drop(pool);
+        files.cleanup().unwrap();
+        test_result.unwrap();
     }
 
     #[tokio::test]
