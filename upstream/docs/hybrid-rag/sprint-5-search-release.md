@@ -34,7 +34,7 @@ proof, or any release gate.
 | 5.4a package authority | Accepted after real Tauri expansion, staging/recovery tests, and independent review. | Installed-package evidence belongs to 5.4c. |
 | 5.4b retrieval diagnostic | Accepted after pinned Rust 1.88 tests, real source-side package-layout inference, fallback tests, and independent review. | Source-layout inference is not MSI/NSIS installation evidence. |
 | 5.4c installer CI | Accepted. CI9 at exact R10 head `bc1dd943652b5c358412baa03158733878072a4c` passed package production, fresh MSI and NSIS installed smokes, and terminal evidence gate. Both evidence records are schema 2/current-commit, use the approved 12-file / 430,993,263-byte bundle and manifest `8a375106…264ff4`, and pass isolated discovery, ownership, dbstat, real retrieval, teardown, residue, and signing policy. This records policy satisfaction, not a positive signature claim. | 5.4c is complete; Task 5.5 and all inherited release gates remain open. |
-| 5.5 release qualification | Full release qualification not started; a limited non-corpus local baseline is recorded. Dependencies and inherited evidence remain open. | Valid independently authored Portuguese corpus, production-path quality and final provider-answer evidence, native Windows/R13 full loaded-application session, full qualification matrix, final reviewed-head Actions, final reviews, and user close approval. |
+| 5.5 release qualification | Partially begun: limited non-corpus local source-level diagnostics and CI59 exact-source Windows/package integration are recorded. Dependencies and inherited evidence remain open. | Valid independently authored Portuguese corpus, production-path quality and final provider-answer evidence, native Windows/R13 full loaded-application session, full qualification matrix, final reviewed-head Actions, final reviews, and user close approval. |
 
 The latest explicit Rust 1.88 integration run passed 920 library tests (four
 ignored), 18 model tests, 22 staged-bundle tests, cargo check, frontend
@@ -1474,8 +1474,8 @@ sprint-close claim)
   concurrent indexing, the remaining crash/restart points (chunking,
   embedding, SQLite replacement, post-installation/acknowledgement,
   sidecar/cache, other activation interruption points, and steady-state overlay
-  replay), recording, provider-answer,
-  package-smoke, and the remaining full-matrix qualifications.
+  replay), recording, provider-answer, Q2/Q3 behavior in an installed
+  application, and the remaining full-matrix qualifications.
 **Why not implemented:**
 - They require dedicated controlled data, native/package sessions, or external
   evidence not available to this local baseline.
@@ -1514,6 +1514,17 @@ sprint-close claim)
 - Existing
   `retrieval::index::tests::activation_commit_cannot_resurrect_after_clear_fences_publication`
   also passes: 1 / 0 / 930 filtered.
+- Exact-source Windows integration run [CI59](https://github.com/armandotreuk/Meetly_Treuk/actions/runs/34481012557)
+  passed at `935558bc688d69ae3d58fbcba85fc583a2aca168`: Cargo Check, Windows
+  CPU packaging, fresh installed MSI and NSIS smokes, and the terminal evidence
+  gate all passed. The 12-file / 430,993,263-byte bundle and manifest
+  `8a3751069f4c77ddec4db7c92f75d99900525bbe48e00e28ec1cf3ffff264ff4`
+  were used; the combined evidence artifact digest was
+  `9b9df0aa603b49c6df571c15b8d51eb83f4c512e5b635a8d4fbcd4fc98a5d562`.
+  Signing policy passed while credentials/tooling were unavailable, so this is
+  not positive signing evidence. The installed smokes package the current
+  source; they do not execute or qualify the Q2/Q3 service-loss scenarios in
+  an installed application.
 - The pre-selector serial library baseline passed 921 / 0 / 4 ignored in
   115.37 s. The current selector change has focused selector and scale-test
   coverage below; no broad current-head library-suite result is claimed because
@@ -1588,8 +1599,9 @@ sprint-close claim)
 - A valid independently authored Portuguese corpus, production-path quality and
   final provider-answer evidence, a native Windows/R13 full loaded-application
   session, reference-hardware/package reranker p95 and the remaining Task 5.5
-  matrix, installed-package smoke, final reviewed-head Actions, final reviews,
-  and user closure remain open.
+  matrix, final reviewed-head Actions, final reviews, and user closure remain
+  open. CI59 is current-source Windows/package integration evidence, not the
+  eventual final reviewed-head release run.
 - No non-completing library test was found: the serial log ends with the full
   passing harness summary. The longer serial wall time is diagnostic only and
   does not replace any scale or performance qualification.
@@ -1614,6 +1626,11 @@ sprint-close claim)
   acknowledgement audit. It models task cancellation plus graceful database
   close rather than an OS/process kill, and covers only the committed-pointer,
   pre-memory-installation/acknowledgement point.
+- CI59 passed Windows packaging, both fresh installer smokes, and the terminal
+  evidence gate at the exact Q3 source commit. It supplies current-source
+  package integration evidence only; it neither runs Q2/Q3 inside an installed
+  application nor closes a corpus, provider, native/R13, performance, final
+  exact-head, review, or user-closure gate.
 
 ## Sprint Reviews
 
