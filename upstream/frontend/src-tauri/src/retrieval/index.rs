@@ -3394,6 +3394,253 @@ mod tests {
         directory.close().unwrap();
     }
 
+    /// Source-level crash/restart mechanics only: this is not installed-package,
+    /// native/R13, corpus, provider, or release evidence.
+    #[tokio::test]
+    async fn activation_pointer_commit_recovers_shadow_snapshot_after_service_loss() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("activation-restart.sqlite");
+        let options = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone())
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        insert_meeting(&pool, "activation-restart", "Activation restart").await;
+        add_transcript(
+            &pool,
+            "activation-restart-transcript",
+            "activation-restart",
+            "primary transcript survives activation restart",
+        )
+        .await;
+        register_test_model(&pool).await;
+        RetrievalRepository::ensure_generation(&pool, "gen-activation-old", MODEL_ID)
+            .await
+            .unwrap();
+        publish_meeting(
+            &pool,
+            "gen-activation-old",
+            "activation-restart",
+            &["old active content"],
+        )
+        .await;
+        let blocked_service = Arc::new(fresh_service());
+        publish_tick(&pool, &blocked_service).await.unwrap();
+        assert_eq!(
+            blocked_service.active_generation().as_deref(),
+            Some("gen-activation-old")
+        );
+
+        // Build the shadow completely while the old snapshot remains live.
+        let shadow = request_rebuild(&pool).await.unwrap();
+        publish_meeting(
+            &pool,
+            &shadow,
+            "activation-restart",
+            &["shadow activation content"],
+        )
+        .await;
+        let shadow_bounds = RetrievalRepository::publication_lag(&pool, &shadow)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            shadow_bounds.0 > shadow_bounds.1,
+            "the completed shadow must retain durable, unacknowledged journal work"
+        );
+        let primary_transcript_before: String =
+            sqlx::query_scalar("SELECT transcript FROM transcripts WHERE id = ?")
+                .bind("activation-restart-transcript")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let shadow_document_before: String = sqlx::query_scalar(
+            "SELECT content FROM retrieval_documents
+             WHERE generation_id = ? AND document_id = ?",
+        )
+        .bind(&shadow)
+        .bind("doc-activation-restart-0")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // This persistent test-only audit survives reopening the SQLite file
+        // and observes the one durable published-bound update on recovery.
+        sqlx::query(
+            "CREATE TABLE activation_restart_ack_audit (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                generation_id TEXT NOT NULL,
+                published_bound_updates INTEGER NOT NULL DEFAULT 0
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO activation_restart_ack_audit (id, generation_id) VALUES (1, ?)")
+            .bind(&shadow)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER activation_restart_ack_audit_trigger
+             AFTER UPDATE OF published_change_id ON retrieval_index_state
+             WHEN NEW.published_change_id > OLD.published_change_id
+                  AND NEW.generation_id = (
+                      SELECT generation_id
+                      FROM activation_restart_ack_audit
+                      WHERE id = 1
+                  )
+             BEGIN
+                 UPDATE activation_restart_ack_audit
+                 SET published_bound_updates = published_bound_updates + 1
+                 WHERE id = 1;
+             END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        blocked_service.set_activation_commit_barrier(Arc::clone(&barrier));
+        let committed = blocked_service.activation_committed();
+        let committed_notification = committed.notified();
+        let publisher_pool = pool.clone();
+        let publisher_service = Arc::clone(&blocked_service);
+        let publisher =
+            tokio::spawn(async move { publish_tick(&publisher_pool, &publisher_service).await });
+        committed_notification.await;
+
+        // The activation transaction committed its durable pointer and retired
+        // the old generation, but the barrier is before memory installation
+        // and acknowledgement. The live service is therefore still old.
+        assert_eq!(
+            RetrievalRepository::active_generation_id(&pool)
+                .await
+                .unwrap(),
+            Some(shadow.clone())
+        );
+        assert_eq!(
+            blocked_service.active_generation().as_deref(),
+            Some("gen-activation-old")
+        );
+        let report = index_status(&pool, &blocked_service, false).await.unwrap();
+        assert_eq!(report.serving_state, "transitioning");
+        assert!(matches!(
+            search_all(&blocked_service, "old").await,
+            Err(SearchFailure::CatchUpPending { .. })
+        ));
+        assert_eq!(
+            RetrievalRepository::publication_lag(&pool, &shadow)
+                .await
+                .unwrap(),
+            Some(shadow_bounds)
+        );
+        let (old_state, shadow_state): (String, String) = sqlx::query_as(
+            "SELECT
+                (SELECT state FROM retrieval_generations WHERE generation_id = 'gen-activation-old'),
+                (SELECT state FROM retrieval_generations WHERE generation_id = ?)",
+        )
+        .bind(&shadow)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(old_state, "retired");
+        assert_eq!(shadow_state, "ready");
+
+        // Do not release the barrier: aborting this task and discarding its
+        // service models loss after the durable pointer commit.
+        publisher.abort();
+        assert!(publisher.await.unwrap_err().is_cancelled());
+        drop(blocked_service);
+        drop(barrier);
+        pool.close().await;
+        drop(pool);
+
+        let recovered_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let recovered_service = fresh_service();
+        publish_tick(&recovered_pool, &recovered_service)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            recovered_service.active_generation().as_deref(),
+            Some(shadow.as_str())
+        );
+        assert_eq!(recovered_service.publication_lag(), 0);
+        assert_eq!(
+            RetrievalRepository::publication_lag(&recovered_pool, &shadow)
+                .await
+                .unwrap(),
+            Some((shadow_bounds.0, shadow_bounds.0))
+        );
+        let (document_rows, vector_rows): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COUNT(vector) FROM retrieval_documents WHERE generation_id = ?",
+        )
+        .bind(&shadow)
+        .fetch_one(&recovered_pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (document_rows, vector_rows),
+            (1, 1),
+            "restart reconciliation must not duplicate shadow canonical rows"
+        );
+        let primary_transcript_after: String =
+            sqlx::query_scalar("SELECT transcript FROM transcripts WHERE id = ?")
+                .bind("activation-restart-transcript")
+                .fetch_one(&recovered_pool)
+                .await
+                .unwrap();
+        assert_eq!(primary_transcript_after, primary_transcript_before);
+        let shadow_document_after: String = sqlx::query_scalar(
+            "SELECT content FROM retrieval_documents
+             WHERE generation_id = ? AND document_id = ?",
+        )
+        .bind(&shadow)
+        .bind("doc-activation-restart-0")
+        .fetch_one(&recovered_pool)
+        .await
+        .unwrap();
+        assert_eq!(shadow_document_after, shadow_document_before);
+        let acknowledgement_updates: i64 = sqlx::query_scalar(
+            "SELECT published_bound_updates
+             FROM activation_restart_ack_audit
+             WHERE id = 1 AND generation_id = ?",
+        )
+        .bind(&shadow)
+        .fetch_one(&recovered_pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            acknowledgement_updates, 1,
+            "recovery must durably acknowledge the installed shadow bound once"
+        );
+        assert!(contains_hit(
+            &search_all(&recovered_service, "shadow").await.unwrap(),
+            "doc-activation-restart-0"
+        ));
+        let (old_state,): (String,) = sqlx::query_as(
+            "SELECT state FROM retrieval_generations WHERE generation_id = 'gen-activation-old'",
+        )
+        .fetch_one(&recovered_pool)
+        .await
+        .unwrap();
+        assert_eq!(old_state, "retired");
+
+        recovered_pool.close().await;
+        directory.close().unwrap();
+    }
+
     #[tokio::test]
     async fn sparse_ids_repeated_upserts_and_upsert_delete_ordering_converge() {
         let pool = migrated_pool().await;

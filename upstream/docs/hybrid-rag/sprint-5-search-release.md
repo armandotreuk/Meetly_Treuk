@@ -1417,7 +1417,7 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 ### Task 5.5 - initial local qualification baseline
 
 **Status:** Blocked (local activation/disk, reranker-p95, cross-surface
-scheduler, and one publication-restart diagnostic row recorded; no release or
+scheduler, and two narrow restart diagnostic rows recorded; no release or
 sprint-close claim)
 **Owner:** `worker-l` (Task 5.5 initial qualification pass)
 **Completed:** 2026-09-09–10
@@ -1461,11 +1461,20 @@ sprint-close claim)
   document, returns a search hit, and uses a durable local audit trigger to
   observe one published-bound advance. Its isolated temporary database is
   explicitly closed and removed.
+- A second file-backed source-level regression commits the shadow generation's
+  durable active pointer, then holds at the barrier before its in-memory
+  snapshot installation and acknowledgement. While held, the existing service
+  reports `transitioning` and rejects stale-old-snapshot search with typed
+  catch-up pending. Aborting/dropping that service and reopening the database
+  with a fresh service recovers the shadow snapshot, reaches zero lag, preserves
+  primary and derived content, avoids duplicate rows/vectors, and uses a
+  shadow-scoped durable audit trigger to observe one bound advance.
 **Not implemented:**
 - Sustained typing against a live Chat stream, real reranker cancellation,
   concurrent indexing, the remaining crash/restart points (chunking,
-  embedding, SQLite replacement, post-installation, sidecar/cache, activation,
-  and steady-state overlay replay), recording, provider-answer,
+  embedding, SQLite replacement, post-installation/acknowledgement,
+  sidecar/cache, other activation interruption points, and steady-state overlay
+  replay), recording, provider-answer,
   package-smoke, and the remaining full-matrix qualifications.
 **Why not implemented:**
 - They require dedicated controlled data, native/package sessions, or external
@@ -1495,6 +1504,16 @@ sprint-close claim)
   are all exercised through the production `publish_tick` path.
 - Existing `retrieval::index::tests::journal_crash_replay_publishes_missing_changes_on_restart`
   also passes: 1 / 0 / 929 filtered.
+- `cargo test --locked --manifest-path frontend/src-tauri/Cargo.toml --lib
+  retrieval::index::tests::activation_pointer_commit_recovers_shadow_snapshot_after_service_loss
+  -- --exact` - pass: 1 / 0 / 930 filtered. The test commits the durable shadow
+  pointer while the prior snapshot is still resident, verifies public
+  transitioning/catch-up behavior, abandons the task/service before
+  installation/acknowledgement, and recovers the pointed shadow from a fresh
+  file-backed pool/service.
+- Existing
+  `retrieval::index::tests::activation_commit_cannot_resurrect_after_clear_fences_publication`
+  also passes: 1 / 0 / 930 filtered.
 - The pre-selector serial library baseline passed 921 / 0 / 4 ignored in
   115.37 s. The current selector change has focused selector and scale-test
   coverage below; no broad current-head library-suite result is claimed because
@@ -1589,6 +1608,12 @@ sprint-close claim)
   primary-transcript preservation, and visible temporary-directory cleanup. It
   models task cancellation plus a graceful database close, not an OS/process
   kill, and covers only the pre-publication/initial-generation point.
+- The activation-pointer restart regression is also local source-test evidence
+  only. Independent code and architecture re-reviews approved it after adding
+  public `transitioning`/catch-up assertions and shadow-scoping its durable
+  acknowledgement audit. It models task cancellation plus graceful database
+  close rather than an OS/process kill, and covers only the committed-pointer,
+  pre-memory-installation/acknowledgement point.
 
 ## Sprint Reviews
 
