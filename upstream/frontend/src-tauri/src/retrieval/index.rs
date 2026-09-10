@@ -6525,6 +6525,220 @@ mod tests {
         );
     }
 
+    /// Source-level cooperative task-cancellation mechanics only: this does
+    /// not model OS/process/power loss, packages, corpus, or release behavior.
+    #[tokio::test]
+    async fn task_5_5_same_service_cancel_after_replayed_snapshot_install_acknowledges_once_on_retry(
+    ) {
+        let pool = migrated_pool().await;
+        insert_meeting(&pool, "m", "Replay cancellation").await;
+        register_test_model(&pool).await;
+        RetrievalRepository::ensure_generation(&pool, "gen-replay-cancel-ack", MODEL_ID)
+            .await
+            .unwrap();
+        publish_meeting(
+            &pool,
+            "gen-replay-cancel-ack",
+            "m",
+            &["baseline replay document"],
+        )
+        .await;
+
+        // Establish an active, acknowledged generation first, so the sole
+        // pending change below takes the steady-state replay path.
+        let service = Arc::new(fresh_service());
+        publish_tick(&pool, service.as_ref()).await.unwrap();
+        let baseline_bounds = RetrievalRepository::publication_lag(&pool, "gen-replay-cancel-ack")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(baseline_bounds.0, baseline_bounds.1);
+
+        // Count only durable advancement for the pending change. The trigger
+        // is installed after initial activation, so one retry acknowledgement
+        // must increment it exactly once.
+        sqlx::query(
+            "CREATE TABLE replay_cancel_ack_audit (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                published_bound_updates INTEGER NOT NULL DEFAULT 0
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO replay_cancel_ack_audit (id) VALUES (1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER replay_cancel_ack_audit_trigger
+             AFTER UPDATE OF published_change_id ON retrieval_index_state
+             WHEN OLD.generation_id = 'gen-replay-cancel-ack'
+                  AND NEW.published_change_id > OLD.published_change_id
+             BEGIN
+                 UPDATE replay_cancel_ack_audit
+                 SET published_bound_updates = published_bound_updates + 1
+                 WHERE id = 1;
+             END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        add_transcript(&pool, "t2", "m", "novel replay cancellation content").await;
+        publish_meeting(
+            &pool,
+            "gen-replay-cancel-ack",
+            "m",
+            &[
+                "baseline replay document",
+                "novel replay cancellation content",
+            ],
+        )
+        .await;
+        let pending_bounds = RetrievalRepository::publication_lag(&pool, "gen-replay-cancel-ack")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pending_bounds.0 - pending_bounds.1,
+            1,
+            "the fixture must have exactly one pending journal change"
+        );
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        service.set_replayed_snapshot_install_barrier(Arc::clone(&barrier));
+        let installed = service.replayed_snapshot_installed();
+        let installed_wait = installed.notified();
+        let cancel = CancellationToken::new();
+        let publisher_pool = pool.clone();
+        let publisher_service = Arc::clone(&service);
+        let publisher_cancel = cancel.clone();
+        let publisher = tokio::spawn(async move {
+            publish_tick_with(
+                &publisher_pool,
+                publisher_service.as_ref(),
+                &publisher_cancel,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), installed_wait)
+            .await
+            .expect("replay publisher did not install its reader snapshot in time");
+
+        // The installed snapshot exposes the complete folded overlay, but
+        // its durable bound and audit must remain untouched while the barrier
+        // holds the publisher before acknowledge_journal.
+        let snapshot = service.active_snapshot().unwrap();
+        assert!(snapshot
+            .overlay
+            .upserted
+            .values()
+            .flatten()
+            .any(|doc| doc.meta.document_id == "doc-m-1"));
+        assert_eq!(
+            snapshot.overlay_documents, 2,
+            "the installed replacement overlay must contain exactly the two current documents"
+        );
+        assert_eq!(
+            RetrievalRepository::publication_lag(&pool, "gen-replay-cancel-ack")
+                .await
+                .unwrap(),
+            Some(pending_bounds)
+        );
+        let acknowledgement_updates: i64 = sqlx::query_scalar(
+            "SELECT published_bound_updates FROM replay_cancel_ack_audit WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(acknowledgement_updates, 0);
+        // The publisher refreshes this state when its pass returns; while it
+        // is deliberately paused at the seam, refresh it from the unchanged
+        // durable bound so readers expose the normal catch-up contract.
+        update_publication_lag(&pool, service.as_ref()).await;
+        assert!(matches!(
+            search_all(service.as_ref(), "novel").await,
+            Err(SearchFailure::CatchUpPending { behind }) if behind > 0
+        ));
+
+        // Cancel cooperatively after installation, release the one-shot seam,
+        // and wait for the same task to observe cancellation before its ack.
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), barrier.wait())
+            .await
+            .expect("cancelled publisher did not leave the install barrier in time");
+        assert!(tokio::time::timeout(Duration::from_secs(2), publisher)
+            .await
+            .expect("cancelled publisher did not finish in time")
+            .unwrap()
+            .is_ok());
+        assert_eq!(
+            RetrievalRepository::publication_lag(&pool, "gen-replay-cancel-ack")
+                .await
+                .unwrap(),
+            Some(pending_bounds),
+            "cancellation after installation must not acknowledge"
+        );
+        let acknowledgement_updates: i64 = sqlx::query_scalar(
+            "SELECT published_bound_updates FROM replay_cancel_ack_audit WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(acknowledgement_updates, 0);
+
+        // The ordinary retry retains this same service and replay-folds the
+        // installed change idempotently before making exactly one durable ack.
+        publish_tick(&pool, service.as_ref()).await.unwrap();
+        assert_eq!(service.publication_lag(), 0);
+        assert_eq!(
+            RetrievalRepository::publication_lag(&pool, "gen-replay-cancel-ack")
+                .await
+                .unwrap(),
+            Some((pending_bounds.0, pending_bounds.0))
+        );
+        let (document_rows, vector_rows, distinct_document_ids, distinct_document_vector_ids): (
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT
+                COUNT(*),
+                COUNT(vector),
+                COUNT(DISTINCT document_id),
+                COUNT(DISTINCT document_id || ':' || hex(vector))
+             FROM retrieval_documents WHERE generation_id = ?",
+        )
+        .bind("gen-replay-cancel-ack")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (
+                document_rows,
+                vector_rows,
+                distinct_document_ids,
+                distinct_document_vector_ids
+            ),
+            (2, 2, 2, 2),
+            "same-service replay retry must not duplicate rows, identities, or vectors"
+        );
+        assert_eq!(service.active_snapshot().unwrap().document_count(), 2);
+        let acknowledgement_updates: i64 = sqlx::query_scalar(
+            "SELECT published_bound_updates FROM replay_cancel_ack_audit WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(acknowledgement_updates, 1);
+        assert!(contains_hit(
+            &search_all(service.as_ref(), "novel").await.unwrap(),
+            "doc-m-1"
+        ));
+    }
+
     #[tokio::test]
     async fn deletion_only_tombstone_churn_reaches_the_compaction_threshold() {
         let pool = migrated_pool().await;
