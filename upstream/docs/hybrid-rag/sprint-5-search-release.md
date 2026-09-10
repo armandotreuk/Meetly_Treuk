@@ -1416,7 +1416,7 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 
 ### Task 5.5 - initial local qualification baseline
 
-**Status:** Blocked (local baseline and synthetic activation-scale rows recorded; no release or sprint-close claim)
+**Status:** Blocked (local baseline and synthetic activation/disk scale rows recorded; no release or sprint-close claim)
 **Owner:** `worker-l` (Task 5.5 initial qualification pass)
 **Completed:** 2026-09-09
 **Implemented:**
@@ -1427,12 +1427,14 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
   to its prior 250k behavior when unset. Its exact-axis query cap is now bounded
   by the deterministic number of exact synthetic matches, so smaller approved
   rows never validate zero-similarity filler rows as exact matches.
-- All three guarded local source-path active-plus-shadow activation-envelope
-  rows passed using the approved staged bundle.
+- Benchmark database cleanup now drops the closed pool before bounded removal,
+  retries the three database files, and has a drop guard for assertion-failure
+  paths. A successful run fails if its own temporary database remains.
+- All three guarded local source-path active-plus-shadow activation and exact
+  derived-disk-envelope rows passed using the approved staged bundle.
 **Not implemented:**
-- Derived-disk, p95 latency, concurrency, crash/restart, recording,
-  provider-answer, package-smoke, and the remaining full-matrix
-  qualifications.
+- P95 latency, concurrency, crash/restart, recording, provider-answer,
+  package-smoke, and the remaining full-matrix qualifications.
 **Why not implemented:**
 - They require dedicated controlled data, native/package sessions, or external
   evidence not available to this local baseline.
@@ -1464,15 +1466,22 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
   retrieval::index::tests::bench_2r6_production_activation_envelope --
   --nocapture`, with all three rows passing inside the 20-minute watchdog:
 
-  | Documents | Test time after release compile | Active snapshot | Active+shadow process peak / window | Reranker validation |
-  |---:|---:|---:|---:|---:|
-  | 12,000 | 4.21 s after 1m 03s compile | 136 ms | 743.2 MiB / 157 ms | 745 ms; 1,041.8 MiB process peak |
-  | 50,000 | 9.96 s after 1m 01s compile | 733 ms | 740.9 MiB / 817 ms | 699 ms; 1,078.7 MiB process peak |
-  | 250,000 | 57.83 s after 1m 01s compile | 8,695 ms | 1,113.2 MiB / 9,185 ms | 698 ms; 1,277.6 MiB process peak |
+  | Documents | Test time after release compile | Active snapshot | Exact derived disk steady / active+shadow | Active+shadow process peak / window | Reranker validation |
+  |---:|---:|---:|---:|---:|---:|
+  | 12,000 | 3.98 s after 1m 04s compile | 132 ms | 13.3 MiB / 26.5 MiB | 734.5 MiB / 152 ms | 678 ms; 1,042.7 MiB process peak |
+  | 50,000 | 10.95 s after 1m 04s compile | 751 ms | 55.0 MiB / 110.1 MiB | 743.7 MiB / 872 ms | 721 ms; 1,078.0 MiB process peak |
+  | 250,000 | 56.86 s after 1m 28s compile | 9,068 ms | 275.5 MiB / 551.0 MiB | 1,113.2 MiB / 9,699 ms | 719 ms; 1,272.8 MiB process peak |
 
-  The 250k row measured 1,167,306,752 bytes, leaving 228,557,619 bytes under
+  The exact `dbstat` 250k row measured 288,849,920 bytes steady and
+  577,785,856 bytes active-plus-shadow, leaving 1,858,633,728 bytes below the
+  2 GiB steady target and 2,643,439,616 bytes below the 3 GiB activation limit.
+  Its process peak was 1,167,290,368 bytes, leaving 228,574,003 bytes under
   the test's 1.30 GiB transient ceiling. Temporary benchmark databases from
-  all rows were removed; no cargo, compiler, or benchmark process remained.
+  the three post-fix rows were removed, and no cargo, compiler, or benchmark
+  process remained. Three 32,231,888-byte synthetic database files from the
+  earlier pre-fix failed run remain outside the worktree because this execution
+  environment forbids their manual deletion; they are not qualification
+  evidence and no process holds them.
 - `pnpm --dir frontend run typecheck` - unavailable in this worktree: pnpm
   requested a non-interactive modules-directory replacement. No install or
   replacement was authorized for this baseline.
@@ -1483,15 +1492,14 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 **Decisions and follow-ups:**
 - A valid independently authored Portuguese corpus, production-path quality and
   final provider-answer evidence, a native Windows/R13 full loaded-application
-  session, derived-disk/p95 and the remaining Task 5.5 matrix,
-  installed-package smoke, final reviewed-head Actions, final reviews, and
-  user closure remain open.
+  session, p95 and the remaining Task 5.5 matrix, installed-package smoke,
+  final reviewed-head Actions, final reviews, and user closure remain open.
 - No non-completing library test was found: the serial log ends with the full
   passing harness summary. The longer serial wall time is diagnostic only and
   does not replace any scale or performance qualification.
-- The three activation-envelope rows do not establish corpus quality, Fast/Deep
-  quality or p95 latency, reference-hardware performance, package behavior, or
-  release acceptance.
+- The three activation/disk-envelope rows do not establish corpus quality,
+  Fast/Deep quality or p95 latency, reference-hardware performance, package
+  behavior, or release acceptance.
 
 ## Sprint Reviews
 

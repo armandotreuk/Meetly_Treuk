@@ -6614,6 +6614,41 @@ mod tests {
         peak_working_set: u64,
     }
 
+    struct BenchDatabaseCleanup {
+        paths: Vec<std::path::PathBuf>,
+    }
+
+    impl BenchDatabaseCleanup {
+        fn new(db_path: &std::path::Path) -> Self {
+            let mut paths = vec![db_path.to_path_buf()];
+            for suffix in ["-wal", "-shm"] {
+                let mut path = db_path.as_os_str().to_os_string();
+                path.push(suffix);
+                paths.push(std::path::PathBuf::from(path));
+            }
+            Self { paths }
+        }
+
+        fn remove_all(&self) -> bool {
+            for _ in 0..20 {
+                for path in &self.paths {
+                    let _ = std::fs::remove_file(path);
+                }
+                if self.paths.iter().all(|path| !path.exists()) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            false
+        }
+    }
+
+    impl Drop for BenchDatabaseCleanup {
+        fn drop(&mut self) {
+            let _ = self.remove_all();
+        }
+    }
+
     /// Same metric family as the retained Sprint 1 evidence: Windows process
     /// working-set counters. Peak working set is monotonic per process, so the
     /// fixture phases stay far below the measured two-snapshot window below.
@@ -6849,6 +6884,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        let cleanup = BenchDatabaseCleanup::new(&db_path);
         let options = SqliteConnectOptions::from_str(db_path.to_str().unwrap())
             .unwrap()
             .create_if_missing(true)
@@ -6922,6 +6958,16 @@ mod tests {
             "[active] production snapshot activated ({corpus} documents) in {:.0} ms",
             t_active.elapsed().as_secs_f64() * 1000.0
         );
+        let steady_disk = RetrievalRepository::derived_disk_usage(&pool)
+            .await
+            .unwrap()
+            .bytes
+            .expect("2.R6 requires exact dbstat derived-disk measurement");
+        assert!(
+            steady_disk <= DERIVED_DISK_STEADY_TARGET_BYTES,
+            "[blocked-disk-envelope] measured steady derived storage {steady_disk} bytes exceeds the \
+             {DERIVED_DISK_STEADY_TARGET_BYTES}-byte approved target"
+        );
 
         // Phase B - SHADOW generation: the manual-rebuild shape (a second live
         // generation for the SAME approved model holding copies of the same
@@ -6930,6 +6976,27 @@ mod tests {
             .await
             .unwrap();
         bench_seed_generation(&pool, "gen-bench-shadow", corpus).await;
+        let shadow_disk = RetrievalRepository::derived_disk_usage(&pool)
+            .await
+            .unwrap()
+            .bytes
+            .expect("2.R6 requires exact dbstat derived-disk measurement");
+        assert!(
+            shadow_disk <= DERIVED_DISK_ACTIVATION_LIMIT_BYTES,
+            "[blocked-disk-envelope] measured active-plus-shadow derived storage {shadow_disk} bytes \
+             exceeds the {DERIVED_DISK_ACTIVATION_LIMIT_BYTES}-byte approved activation limit"
+        );
+        println!(
+            "[envelope-disk] exact derived storage steady {} bytes ({:.1} MiB), active+shadow {} bytes ({:.1} MiB); margins {} bytes ({:.1} MiB) / {} bytes ({:.1} MiB) vs 2 GiB steady / 3 GiB activation limits",
+            steady_disk,
+            steady_disk as f64 / (1024.0 * 1024.0),
+            shadow_disk,
+            shadow_disk as f64 / (1024.0 * 1024.0),
+            DERIVED_DISK_STEADY_TARGET_BYTES.saturating_sub(steady_disk),
+            DERIVED_DISK_STEADY_TARGET_BYTES.saturating_sub(steady_disk) as f64 / (1024.0 * 1024.0),
+            DERIVED_DISK_ACTIVATION_LIMIT_BYTES.saturating_sub(shadow_disk),
+            DERIVED_DISK_ACTIVATION_LIMIT_BYTES.saturating_sub(shadow_disk) as f64 / (1024.0 * 1024.0),
+        );
 
         // Phase C - measured activation window: the publisher reloads and
         // journal-catches-up the whole shadow candidate WHILE the active
@@ -7068,11 +7135,10 @@ mod tests {
         );
 
         pool.close().await;
-        let _ = std::fs::remove_file(&db_path);
-        for suffix in ["-wal", "-shm"] {
-            let mut path = db_path.clone().into_os_string();
-            path.push(suffix);
-            let _ = std::fs::remove_file(std::path::PathBuf::from(path));
-        }
+        drop(pool);
+        assert!(
+            cleanup.remove_all(),
+            "benchmark database cleanup left temporary database files behind"
+        );
     }
 }
