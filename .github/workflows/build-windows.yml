@@ -13,6 +13,11 @@ on:
         type: choice
         options: [debug, release]
         default: release
+      r13_validation_package:
+        description: 'Build the isolated R13 validation package identity'
+        required: true
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
