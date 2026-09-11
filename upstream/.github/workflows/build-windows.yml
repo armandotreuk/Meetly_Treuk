@@ -10,7 +10,6 @@ on:
         options:
           - debug
           - release
-          - r13-validation
         default: release
       sign-build:
         description: 'Sign the build'
@@ -81,7 +80,10 @@ jobs:
         id: r13-validation
         shell: pwsh
         run: |
-          $r13Requested = ('${{ github.event.inputs.r13_validation_package }}' -eq 'true') -or ('${{ github.event.inputs.build-type }}' -eq 'r13-validation')
+          # GitHub validates manual inputs against the default branch even
+          # when a run targets this R5 branch. Therefore this review branch
+          # always selects the isolated R13 package on manual Windows runs.
+          $r13Requested = ('${{ github.event.inputs.r13_validation_package }}' -eq 'true') -or ('${{ github.ref_name }}' -eq 'fix/sprint-5-review-r5')
           $uploadArtifacts = ('${{ github.event.inputs.upload-artifacts }}' -eq 'true') -or $r13Requested
 
           if (-not $r13Requested) {
