@@ -13,6 +13,11 @@ on:
         type: choice
         options: [debug, release]
         default: release
+      r13_validation_package:
+        description: 'Build the isolated R13 validation package identity'
+        required: true
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -28,6 +33,7 @@ jobs:
     runs-on: windows-latest
     outputs:
       build-profile: ${{ steps.build-profile.outputs.profile }}
+      r13-validation: ${{ steps.r13-validation.outputs.enabled }}
     permissions:
       contents: write
 
@@ -56,6 +62,39 @@ jobs:
             echo "profile=release" >> "$GITHUB_OUTPUT"
             echo "args=" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Determine R13 validation package mode
+        id: r13-validation
+        shell: pwsh
+        run: |
+          $r13Requested = '${{ github.event.inputs.r13_validation_package }}' -eq 'true'
+          if (-not $r13Requested) {
+            'enabled=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            'tauri_args=' | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            Write-Host 'R13 validation package mode: disabled'
+            return
+          }
+
+          $overlayPath = 'upstream/frontend/src-tauri/tauri.r13-validation.conf.json'
+          $overlay = Get-Content -LiteralPath $overlayPath -Raw | ConvertFrom-Json
+          $properties = @($overlay.PSObject.Properties.Name)
+          if (@($properties | Where-Object { $_ -notin @('productName', 'identifier') }).Count -ne 0) {
+            throw 'R13 validation overlay must only override package identity.'
+          }
+          if ($overlay.productName -ne 'meetily-r13-validation' -or $overlay.identifier -ne 'com.meetily.ai.r13validation') {
+            throw 'R13 validation package identity does not match the approved isolated values.'
+          }
+
+          $baseConfig = Get-Content -LiteralPath 'upstream/frontend/src-tauri/tauri.conf.json' -Raw | ConvertFrom-Json
+          if ($baseConfig.identifier -ne 'com.meetily.ai' -or $baseConfig.productName -ne 'meetily') {
+            throw 'The normal package identity must not be changed by R13 validation work.'
+          }
+
+          powershell -NoProfile -ExecutionPolicy Bypass -File 'upstream/frontend/src-tauri/scripts/prepare-r13-validation-profile.ps1' -ValidationRoot 'D:\Meetly-R13-Validation' -WhatIf
+
+          'enabled=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          'tauri_args=--features r13-validation --config src-tauri/tauri.r13-validation.conf.json' | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host 'R13 validation package mode: enabled'
 
       # --- Frontend setup ---
       - name: Setup pnpm
@@ -260,7 +299,7 @@ jobs:
           cd upstream/frontend
           # The guarded preparation step cleaned this exact target, not the Rust cache.
           set +e
-          pnpm tauri build ${{ steps.build-profile.outputs.args }} --verbose -- --locked > "$TAURI_BUILD_LOG" 2>&1
+          pnpm tauri build ${{ steps.build-profile.outputs.args }} ${{ steps.r13-validation.outputs.tauri_args }} --verbose -- --locked > "$TAURI_BUILD_LOG" 2>&1
           RC=$?
           set -e
           echo "tauri_build_exit_code=$RC" >> "$GITHUB_OUTPUT"
@@ -301,6 +340,37 @@ jobs:
           echo "Tauri build failed with exit code ${{ steps.tauri-build.outputs.tauri_build_exit_code }}"
           exit 1
 
+      - name: Verify R13 validation artifact identity
+        if: steps.r13-validation.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $bundleRoot = 'upstream/frontend/target/${{ steps.build-profile.outputs.profile }}/bundle'
+          $msi = @(Get-ChildItem -LiteralPath (Join-Path $bundleRoot 'msi') -Filter '*.msi' -File -ErrorAction Stop)
+          $nsis = @(Get-ChildItem -LiteralPath (Join-Path $bundleRoot 'nsis') -Filter '*.exe' -File -ErrorAction Stop)
+          if ($msi.Count -ne 1 -or $nsis.Count -ne 1) { throw 'Expected exactly one MSI and one NSIS R13 validation installer.' }
+          if ($msi[0].Name -notmatch 'meetily-r13-validation' -or $nsis[0].Name -notmatch 'meetily-r13-validation') {
+            throw 'R13 validation installer names do not carry the isolated product identity.'
+          }
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $database = $null
+          $view = $null
+          $record = $null
+          try {
+            $database = $installer.OpenDatabase([IO.Path]::GetFullPath($msi[0].FullName), 0)
+            $view = $database.OpenView("SELECT `Value` FROM `Property` WHERE `Property`='ProductName'")
+            $null = $view.Execute()
+            $record = $view.Fetch()
+            if ($null -eq $record -or [string]$record.StringData(1) -cne 'meetily-r13-validation') {
+              throw 'R13 validation MSI ProductName does not carry the isolated product identity.'
+            }
+          } finally {
+            if ($null -ne $record) { $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($record) }
+            if ($null -ne $view) { $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($view) }
+            if ($null -ne $database) { $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($database) }
+            if ($null -ne $installer) { $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($installer) }
+          }
+          Get-FileHash -Algorithm SHA256 $msi[0], $nsis[0] | Format-Table -AutoSize
+
       - name: Rename build profile dir for upload
         shell: bash
         run: |
@@ -316,6 +386,7 @@ jobs:
         run: ./upstream/frontend/src-tauri/scripts/windows-package-smoke.ps1 -Mode MeasureAfter
 
       - name: Prepare package-smoke handoff
+        if: steps.r13-validation.outputs.enabled != 'true'
         shell: pwsh
         run: |
           # The installed smokes run on fresh runners. Hand off only their two
@@ -335,6 +406,7 @@ jobs:
           Copy-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'meetily-package-sizes.json') -Destination (Join-Path $handoff 'evidence/meetily-package-sizes.json')
 
       - name: Upload package-smoke input
+        if: steps.r13-validation.outputs.enabled != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: meetily-windows-package-smoke-input
@@ -346,7 +418,7 @@ jobs:
 
       # --- Upload ---
       - name: Upload MSI installer
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.r13-validation.outputs.enabled != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: meetily-windows-msi-v${{ steps.get-version.outputs.version }}
@@ -355,7 +427,7 @@ jobs:
           retention-days: 30
 
       - name: Upload NSIS installer
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.r13-validation.outputs.enabled != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: meetily-windows-nsis-v${{ steps.get-version.outputs.version }}
@@ -364,7 +436,7 @@ jobs:
           retention-days: 30
 
       - name: Upload compiled exe (for dev testing)
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && steps.r13-validation.outputs.enabled != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: meetily-windows-exe-v${{ steps.get-version.outputs.version }}
@@ -372,9 +444,23 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      - name: Upload isolated R13 validation package
+        if: steps.r13-validation.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: meetily-r13-validation-windows-x64-v${{ steps.get-version.outputs.version }}
+          path: |
+            ${{ env.ARTIFACT_DIR }}/bundle/msi/*.msi
+            ${{ env.ARTIFACT_DIR }}/bundle/nsis/*.exe
+            ${{ env.ARTIFACT_DIR }}/meetily.exe
+            upstream/frontend/src-tauri/scripts/prepare-r13-validation-profile.ps1
+          if-no-files-found: error
+          retention-days: 30
+
   smoke-msi:
     name: Installed MSI smoke (Windows)
     needs: build-windows
+    if: needs.build-windows.outputs.r13-validation != 'true'
     runs-on: windows-latest
     steps:
       - name: Checkout repository
@@ -424,6 +510,7 @@ jobs:
   smoke-nsis:
     name: Installed NSIS smoke (Windows)
     needs: build-windows
+    if: needs.build-windows.outputs.r13-validation != 'true'
     runs-on: windows-latest
     steps:
       - name: Checkout repository
@@ -508,6 +595,7 @@ jobs:
         run: exit 1
 
       - name: Fail if an executed installed-package smoke failed
+        if: needs.build-windows.outputs.r13-validation != 'true'
         shell: pwsh
         env:
           MSI_SMOKE_OUTCOME: ${{ needs.smoke-msi.result }}
@@ -516,6 +604,12 @@ jobs:
           # Skipped smokes leave earlier build failures intact. Executed smokes
           # must have current-SHA evidence for BOTH diagnostics and teardown.
           ./upstream/frontend/src-tauri/scripts/windows-package-smoke.ps1 -Mode Gate -MsiOutcome $env:MSI_SMOKE_OUTCOME -NsisOutcome $env:NSIS_SMOKE_OUTCOME
+
+      - name: Record deferred R13 installed-package smoke
+        if: needs.build-windows.outputs.r13-validation == 'true'
+        shell: pwsh
+        run: |
+          Write-Host 'R13 package identity was verified before upload. Installed-package smokes are deferred to the isolated D: native validation session because this harness intentionally assumes the normal meetily install layout.'
 
       - name: Upload sanitized installed-package evidence
         if: always()
