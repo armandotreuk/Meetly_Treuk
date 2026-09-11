@@ -62,7 +62,7 @@ fn toggle_recording_handler<R: Runtime>(app: &AppHandle<R>) {
             log::info!("Tray toggle: Stopping recording...");
 
             // Generate save path (same as RecordingControls.tsx)
-            let data_dir = match app_clone.path().app_data_dir() {
+            let data_dir = match crate::paths::app_data_dir(&app_clone) {
                 Ok(dir) => dir,
                 Err(e) => {
                     log::error!("Failed to get app data dir: {}", e);
@@ -161,7 +161,7 @@ fn stop_recording_handler<R: Runtime>(app: &AppHandle<R>) {
         log::info!("Tray: Stopping recording...");
 
         // Generate save path (same as RecordingControls.tsx)
-        let data_dir = match app_clone.path().app_data_dir() {
+        let data_dir = match crate::paths::app_data_dir(&app_clone) {
             Ok(dir) => dir,
             Err(e) => {
                 log::error!("Failed to get app data dir: {}", e);

@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+#[cfg(not(feature = "r13-validation"))]
 use dirs;
 use log::info as log_info;
 use serde::{Deserialize, Serialize};
@@ -112,11 +113,18 @@ impl<R: Runtime> ConsentManager<R> {
 
     /// Get the path where notification settings are stored
     fn get_settings_path() -> Result<PathBuf> {
+        #[cfg(feature = "r13-validation")]
+        let path = crate::paths::r13_validation_app_data_dir().join("notifications.json");
+
+        #[cfg(not(feature = "r13-validation"))]
         let mut path =
             dirs::config_dir().ok_or_else(|| anyhow!("Could not find config directory"))?;
 
-        path.push("meetily");
-        path.push("notifications.json");
+        #[cfg(not(feature = "r13-validation"))]
+        {
+            path.push("meetily");
+            path.push("notifications.json");
+        }
 
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {

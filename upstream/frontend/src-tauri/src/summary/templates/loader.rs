@@ -104,10 +104,18 @@ pub fn set_bundled_templates_dir(path: PathBuf) {
 /// - Windows: %APPDATA%\Meetily\templates\
 /// - Linux: ~/.config/Meetily/templates/
 fn get_custom_templates_dir() -> Option<PathBuf> {
-    let mut path = dirs::data_dir()?;
-    path.push("Meetily");
-    path.push("templates");
-    Some(path)
+    #[cfg(feature = "r13-validation")]
+    {
+        return Some(crate::paths::r13_validation_app_data_dir().join("templates"));
+    }
+
+    #[cfg(not(feature = "r13-validation"))]
+    {
+        let mut path = dirs::data_dir()?;
+        path.push("Meetily");
+        path.push("templates");
+        Some(path)
+    }
 }
 
 /// Load a template from the bundled resources directory

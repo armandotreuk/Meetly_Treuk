@@ -6,7 +6,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, Manager, Runtime};
+use tauri::{AppHandle, Emitter, Runtime};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use uuid::Uuid;
@@ -2906,7 +2906,7 @@ pub async fn api_chat_with_meetings<R: Runtime>(
     let request_state = request_state.inner().clone();
     let token = request_state.claim_superseding_request(ChatRequestSurface::Chat, &request_id);
     let pool = state.db_manager.pool().clone();
-    let app_data_dir = app.path().app_data_dir().ok();
+    let app_data_dir = crate::paths::app_data_dir(&app).ok();
     let client = reqwest::Client::new();
     let lifecycle = retrieval.inner().clone();
     let result = tokio::time::timeout(CHAT_REQUEST_TIMEOUT, async {
@@ -3008,7 +3008,7 @@ pub async fn api_chat_with_scoped_conversation<R: Runtime>(
     let request_state = request_state.inner().clone();
     let token = request_state.claim_superseding_request(ChatRequestSurface::Chat, &request_id);
     let pool = state.db_manager.pool().clone();
-    let app_data_dir = app.path().app_data_dir().ok();
+    let app_data_dir = crate::paths::app_data_dir(&app).ok();
     let client = reqwest::Client::new();
     let lifecycle = retrieval.inner().clone();
     let result = tokio::time::timeout(CHAT_REQUEST_TIMEOUT, async {
@@ -3106,7 +3106,7 @@ pub async fn api_chat_with_meetings_stream<R: Runtime>(
         async {
             let inputs = match prepare_chat_inputs_with_lifecycle(
                 state.db_manager.pool(),
-                app.path().app_data_dir().ok(),
+                crate::paths::app_data_dir(&app).ok(),
                 &client,
                 &query,
                 history.as_ref(),
@@ -3171,7 +3171,7 @@ pub async fn api_chat_with_scoped_conversation_stream<R: Runtime>(
         async {
             let inputs = match prepare_scoped_chat_inputs_with_authorization(
                 state.db_manager.pool(),
-                app.path().app_data_dir().ok(),
+                crate::paths::app_data_dir(&app).ok(),
                 &client,
                 &query,
                 history.as_ref(),

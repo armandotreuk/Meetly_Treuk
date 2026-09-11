@@ -697,7 +697,7 @@ pub fn spawn_from_app<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
             .try_state::<crate::api::chat::ChatRequestState>()
             .map(|requests| requests.inner().clone())
             .unwrap_or_else(crate::api::chat::ChatRequestState::new);
-        let app_data_dir = app.path().app_data_dir().ok();
+        let app_data_dir = crate::paths::app_data_dir(&app).ok();
         if let Some(retrieval) = retrieval {
             tauri::async_runtime::spawn(async move {
                 start_server(pool, app_data_dir, None, retrieval, chat_requests).await;

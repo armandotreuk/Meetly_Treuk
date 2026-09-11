@@ -53,6 +53,7 @@ pub mod onboarding;
 pub mod openai;
 pub mod openrouter;
 pub mod parakeet_engine;
+pub mod paths;
 pub mod retrieval;
 pub mod retrieval_smoke;
 pub mod security;
