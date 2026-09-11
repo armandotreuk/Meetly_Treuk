@@ -6,7 +6,11 @@ use anyhow::Result;
 pub use aes::{decrypt, encrypt};
 pub use keyring::get_or_create_master_key as get_master_key;
 
-pub const KEYRING_SERVICE: &str = "com.meetily.ai";
+pub const KEYRING_SERVICE: &str = if cfg!(feature = "r13-validation") {
+    "com.meetily.ai.r13validation"
+} else {
+    "com.meetily.ai"
+};
 pub const KEYRING_ACCOUNT: &str = "master-key";
 
 pub fn init() -> Result<()> {
@@ -32,6 +36,16 @@ pub fn is_encrypted(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn keyring_service_matches_the_compiled_package_identity() {
+        let expected = if cfg!(feature = "r13-validation") {
+            "com.meetily.ai.r13validation"
+        } else {
+            "com.meetily.ai"
+        };
+        assert_eq!(super::KEYRING_SERVICE, expected);
+    }
+
     /// Verifies the OS keyring roundtrip on this machine: master key must be
     /// creatable/retrievable and AES-GCM encrypt→decrypt must roundtrip.
     /// If this fails, all `enc:` values in the DB are unreadable and users
