@@ -81,6 +81,11 @@ export function ChatPanel({ scope, resolvedLabel, onClose, isExpanded, onToggleE
     const conversationIdRef = useRef<string | null>(null);
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLTextAreaElement>(null);
+    // A new panel initially renders its composer disabled while the scoped
+    // conversation is created. Remember whether that newly enabled composer
+    // has received the promised initial focus, rather than attempting to
+    // focus the disabled textarea only on mount.
+    const initialComposerFocusPendingRef = useRef(true);
     const unlistenersRef = useRef<UnlistenFn[]>([]);
     const streamIdRef = useRef<string | null>(null);
     // Locally observed deletions, generation-tagged (R74): meeting id to the
@@ -257,6 +262,7 @@ export function ChatPanel({ scope, resolvedLabel, onClose, isExpanded, onToggleE
         setPreparationProgress(null);
         setLoadError(null);
         conversationIdRef.current = null;
+        initialComposerFocusPendingRef.current = true;
         setConversationId(null);
         setMessages([]);
 
@@ -322,10 +328,14 @@ export function ChatPanel({ scope, resolvedLabel, onClose, isExpanded, onToggleE
         messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }, [messages]);
 
-    // Focus input on mount
+    // A composer cannot receive focus while its scoped conversation is still
+    // loading because the textarea is disabled. Focus it exactly once once it
+    // becomes available; this also covers a scope replacement in an open panel.
     useEffect(() => {
+        if (!conversationId || isBusy || !initialComposerFocusPendingRef.current) return;
         inputRef.current?.focus();
-    }, []);
+        initialComposerFocusPendingRef.current = false;
+    }, [conversationId, isBusy]);
 
     // Clean up event listeners on unmount
     useEffect(() => {

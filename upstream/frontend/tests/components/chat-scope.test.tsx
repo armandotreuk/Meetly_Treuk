@@ -95,6 +95,35 @@ describe("createSearchSnapshotScope", () => {
 });
 
 describe("ChatHost scoped panel", () => {
+    it("moves focus to the composer after the docked conversation becomes ready", async () => {
+        const scope: ChatScope = { kind: "all", key: "all" };
+        let resolveConversation: ((conversation: { id: string }) => void) | undefined;
+        mocks.invoke.mockImplementation((command: string) => {
+            if (command === "api_get_chat_model_config") return Promise.resolve({});
+            if (command === "api_chat_get_or_create_scoped_conversation") {
+                return new Promise<{ id: string }>((resolve) => {
+                    resolveConversation = resolve;
+                });
+            }
+            if (command === "api_chat_get_messages") return Promise.resolve([]);
+            return Promise.resolve();
+        });
+        await act(async () => root.render(<ChatHost><Launcher scope={scope} label="all" /></ChatHost>));
+        const launcher = container.querySelector("button") as HTMLButtonElement;
+        launcher.focus();
+
+        await act(async () => launcher.click());
+        const composerBeforeLoad = container.querySelector("textarea") as HTMLTextAreaElement;
+        expect(composerBeforeLoad.disabled).toBe(true);
+
+        expect(resolveConversation).toBeDefined();
+        await act(async () => resolveConversation!({ id: "conversation-all" }));
+        await flush();
+
+        const composer = container.querySelector("textarea") as HTMLTextAreaElement;
+        expect(composer.disabled).toBe(false);
+        expect(document.activeElement).toBe(composer);
+    });
     it("expands into a modal and returns focus to the launcher when closed", async () => {
         const scope: ChatScope = { kind: "all", key: "all" };
         await act(async () => root.render(<ChatHost><Launcher scope={scope} label="all" /></ChatHost>));
