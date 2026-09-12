@@ -27,7 +27,7 @@ on:
         type: boolean
         default: true
       r13_validation_package:
-        description: 'Build the isolated R13 validation package identity'
+        description: 'Build the isolated R13 CUDA validation package identity'
         required: true
         type: boolean
         default: false
@@ -88,6 +88,7 @@ jobs:
 
           if (-not $r13Requested) {
             "enabled=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            "backend=vulkan" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
             "tauri_args=--features vulkan" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
             "upload_artifacts=$($uploadArtifacts.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
             "artifact_name=meetily-windows-x64-${{ steps.build-profile.outputs.profile }}-${{ steps.get-version.outputs.version }}" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
@@ -95,28 +96,53 @@ jobs:
             return
           }
 
-          $overlayPath = 'frontend/src-tauri/tauri.r13-validation.conf.json'
+          $overlayPath = 'frontend/src-tauri/tauri.r13-cuda-validation.conf.json'
           $overlay = Get-Content -LiteralPath $overlayPath -Raw | ConvertFrom-Json
           $properties = @($overlay.PSObject.Properties.Name)
-          if (@($properties | Where-Object { $_ -notin @('productName', 'identifier') }).Count -ne 0) {
-            throw 'R13 validation overlay must only override package identity.'
+          if (@($properties | Where-Object { $_ -notin @('$schema', 'productName', 'identifier', 'bundle') }).Count -ne 0) {
+            throw 'R13 CUDA validation overlay may only override package identity and CUDA bundle settings.'
           }
           if ($overlay.productName -ne 'meetily-r13-validation' -or $overlay.identifier -ne 'com.meetily.ai.r13validation') {
             throw 'R13 validation package identity does not match the approved isolated values.'
+          }
+          $expectedResources = @(
+            'templates/*.json',
+            'templates/fonts/*',
+            'resources/retrieval/bundle',
+            'resources/cuda-runtime'
+          )
+          $bundleProperties = @($overlay.bundle.PSObject.Properties.Name)
+          if (@($bundleProperties | Where-Object { $_ -notin @('targets', 'resources', 'windows') }).Count -ne 0) {
+            throw 'R13 CUDA validation bundle contains unapproved settings.'
+          }
+          if ($overlay.bundle.targets.Count -ne 1 -or $overlay.bundle.targets[0] -ne 'nsis') {
+            throw 'R13 CUDA validation must produce the reviewed NSIS installer only.'
+          }
+          if ($overlay.bundle.resources.Count -ne $expectedResources.Count -or @($expectedResources | Where-Object { $_ -notin $overlay.bundle.resources }).Count -ne 0) {
+            throw 'R13 CUDA validation bundle resources do not match the approved runtime layout.'
+          }
+          $windowsProperties = @($overlay.bundle.windows.PSObject.Properties.Name)
+          $nsisProperties = @($overlay.bundle.windows.nsis.PSObject.Properties.Name)
+          if ($windowsProperties.Count -ne 1 -or $windowsProperties[0] -ne 'nsis' -or $nsisProperties.Count -ne 1 -or $nsisProperties[0] -ne 'installerHooks' -or $overlay.bundle.windows.nsis.installerHooks -ne 'windows/cuda-runtime-hooks.nsh') {
+            throw 'R13 CUDA validation NSIS hook does not match the approved runtime installer contract.'
           }
 
           $baseConfig = Get-Content -LiteralPath 'frontend/src-tauri/tauri.conf.json' -Raw | ConvertFrom-Json
           if ($baseConfig.identifier -ne 'com.meetily.ai' -or $baseConfig.productName -ne 'meetily') {
             throw 'The normal package identity must not be changed by R13 validation work.'
           }
+          if ($baseConfig.bundle.windows.signCommand -ne 'powershell -ExecutionPolicy Bypass -File scripts/sign-windows.ps1 -FilePath %1') {
+            throw 'The normal package signing command must not be changed by R13 validation work.'
+          }
 
           powershell -NoProfile -ExecutionPolicy Bypass -File 'frontend/src-tauri/scripts/prepare-r13-validation-profile.ps1' -ValidationRoot 'D:\Meetly-R13-Validation' -WhatIf
 
           "enabled=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "tauri_args=--features vulkan,r13-validation --config src-tauri/tauri.r13-validation.conf.json" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "backend=cuda" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "tauri_args=--features cuda,r13-validation --config src-tauri/tauri.r13-cuda-validation.conf.json" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "upload_artifacts=$($uploadArtifacts.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "artifact_name=meetily-r13-validation-windows-x64-${{ steps.build-profile.outputs.profile }}-${{ steps.get-version.outputs.version }}" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          Write-Host 'R13 validation package mode: enabled'
+          "artifact_name=meetily-r13-validation-windows-x64-cuda-${{ steps.build-profile.outputs.profile }}-${{ steps.get-version.outputs.version }}" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host 'R13 CUDA validation package mode: enabled'
 
       - name: Setup DigiCert Environment
         if: ${{ github.event.inputs.sign-build == 'true' }}
@@ -563,15 +589,17 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
-          key: windows-x64-vulkan-v2
+          key: windows-x64-${{ steps.r13-validation.outputs.backend }}-v3
 
       - name: Install Vulkan SDK
+        if: ${{ steps.r13-validation.outputs.backend == 'vulkan' }}
         uses: humbletim/install-vulkan-sdk@v1.2
         with:
           version: 1.4.309.0
           cache: true
 
       - name: Verify and Configure Vulkan SDK
+        if: ${{ steps.r13-validation.outputs.backend == 'vulkan' }}
         shell: pwsh
         run: |
           Write-Host "=== Vulkan SDK Configuration ==="
@@ -640,6 +668,7 @@ jobs:
           Write-Host "=== Vulkan SDK Configuration Complete ==="
 
       - name: Copy Vulkan runtime for bundling
+        if: ${{ steps.r13-validation.outputs.backend == 'vulkan' }}
         shell: pwsh
         run: |
           # Create runtime directory
@@ -690,6 +719,42 @@ jobs:
           # Verify
           Write-Host "Contents of vulkan-runtime directory:"
           Get-ChildItem $runtimeDir -ErrorAction SilentlyContinue
+
+      - name: Install CUDA Toolkit for R13 CUDA validation
+        if: ${{ steps.r13-validation.outputs.backend == 'cuda' }}
+        uses: Jimver/cuda-toolkit@v0.2.36
+        id: cuda-toolkit
+        with:
+          # whisper-rs 0.13.2's vendored whisper.cpp still compiles compute_52,
+          # which CUDA 13 removed. CUDA 12.8 retains that target and supports
+          # the RTX 50-series generation used for R13 validation.
+          cuda: '12.8.1'
+
+      - name: Stage and verify CUDA runtime for R13 validation
+        if: ${{ steps.r13-validation.outputs.backend == 'cuda' }}
+        shell: pwsh
+        run: |
+          if (-not $env:CUDA_PATH -or -not (Test-Path -LiteralPath $env:CUDA_PATH)) {
+            throw 'CUDA_PATH was not configured by the CUDA toolkit setup.'
+          }
+          nvcc --version
+          $cudaBinCandidates = @(
+            (Join-Path $env:CUDA_PATH 'bin'),
+            (Join-Path $env:CUDA_PATH 'bin\\x64')
+          ) | Where-Object { Test-Path -LiteralPath $_ }
+          if ($cudaBinCandidates.Count -eq 0) { throw 'CUDA runtime directory was not found.' }
+
+          $runtimeDir = 'frontend/src-tauri/resources/cuda-runtime'
+          New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
+          foreach ($pattern in @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll')) {
+            $matches = @($cudaBinCandidates | ForEach-Object { Get-ChildItem -LiteralPath $_ -Filter $pattern -File })
+            if ($matches.Count -ne 1) { throw "Expected exactly one CUDA runtime matching $pattern; found $($matches.Count)." }
+            Copy-Item -LiteralPath $matches[0].FullName -Destination $runtimeDir -Force
+            Write-Host "Staged CUDA runtime: $($matches[0].Name)"
+          }
+          if (Get-ChildItem -LiteralPath $runtimeDir -Filter 'nvcuda.dll' -File) {
+            throw 'The NVIDIA driver DLL nvcuda.dll must never be bundled.'
+          }
 
       - name: Install frontend dependencies
         run: |
@@ -759,18 +824,48 @@ jobs:
           echo "## Build Artifacts"
           find target/x86_64-pc-windows-msvc/${{ steps.build-profile.outputs.profile }}/bundle -type f \( -name "*.msi" -o -name "*.exe" \) -exec ls -lh {} \;
 
-      - name: Verify R13 validation artifact identity
-        if: ${{ github.event.inputs.r13_validation_package == 'true' }}
+      - name: Verify R13 CUDA validation artifact identity and dependencies
+        if: ${{ steps.r13-validation.outputs.enabled == 'true' }}
         shell: pwsh
         run: |
           $bundleRoot = 'target/x86_64-pc-windows-msvc/${{ steps.build-profile.outputs.profile }}/bundle'
-          $msi = @(Get-ChildItem -LiteralPath (Join-Path $bundleRoot 'msi') -Filter '*.msi' -File -ErrorAction Stop)
           $nsis = @(Get-ChildItem -LiteralPath (Join-Path $bundleRoot 'nsis') -Filter '*.exe' -File -ErrorAction Stop)
-          if ($msi.Count -ne 1 -or $nsis.Count -ne 1) { throw 'Expected exactly one MSI and one NSIS R13 validation installer.' }
-          if ($msi[0].Name -notmatch 'meetily-r13-validation' -or $nsis[0].Name -notmatch 'meetily-r13-validation') {
-            throw 'R13 validation installer names do not carry the isolated product identity.'
+          if ($nsis.Count -ne 1) { throw 'Expected exactly one NSIS R13 CUDA validation installer.' }
+          if ($nsis[0].Name -notmatch 'meetily-r13-validation') {
+            throw 'R13 CUDA validation installer name does not carry the isolated product identity.'
           }
-          Get-FileHash -Algorithm SHA256 $msi[0], $nsis[0] | Format-Table -AutoSize
+          $app = 'target/x86_64-pc-windows-msvc/${{ steps.build-profile.outputs.profile }}/meetily.exe'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $dumpbin = Get-ChildItem -Path (Join-Path $vsInstall 'VC\Tools\MSVC') -Filter dumpbin.exe -Recurse |
+            Where-Object { $_.FullName -match 'Hostx64\\x64\\dumpbin.exe$' } |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $dumpbin) { throw 'Visual Studio dumpbin.exe was not found for the CUDA dependency audit.' }
+          $dependencies = & $dumpbin /DEPENDENTS $app
+          $dependencies | Select-String -Pattern 'cudart64_|cublas64_|cublasLt64_' | ForEach-Object { Write-Host $_ }
+          foreach ($runtime in @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll')) {
+            if (-not ($dependencies -match $runtime.Replace('*', '.*'))) { throw "meetily.exe is missing expected CUDA import $runtime" }
+          }
+          if (Get-ChildItem -LiteralPath 'frontend/src-tauri/resources/cuda-runtime' -Filter 'nvcuda.dll' -File) {
+            throw 'The NVIDIA driver DLL nvcuda.dll must not be bundled.'
+          }
+          Get-FileHash -Algorithm SHA256 $nsis[0] | Format-Table -AutoSize
+
+      - name: Verify installed R13 CUDA runtime layout
+        if: ${{ steps.r13-validation.outputs.enabled == 'true' }}
+        shell: pwsh
+        run: |
+          $bundleRoot = 'target/x86_64-pc-windows-msvc/${{ steps.build-profile.outputs.profile }}/bundle'
+          $installer = @(Get-ChildItem -LiteralPath (Join-Path $bundleRoot 'nsis') -Filter '*.exe' -File -ErrorAction Stop)
+          if ($installer.Count -ne 1) { throw 'Expected exactly one R13 CUDA NSIS installer for the layout check.' }
+          $installRoot = Join-Path $env:RUNNER_TEMP 'meetily-r13-cuda-package-layout'
+          & $installer[0].FullName /S "/D=$installRoot"
+          if ($LASTEXITCODE -ne 0) { throw "R13 CUDA NSIS installer failed with exit code $LASTEXITCODE" }
+          foreach ($runtime in @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll')) {
+            if (@(Get-ChildItem -LiteralPath $installRoot -Filter $runtime -File).Count -ne 1) {
+              throw "Installed R13 CUDA package is missing $runtime beside meetily.exe"
+            }
+          }
 
       - name: Upload artifacts
         if: ${{ steps.r13-validation.outputs.upload_artifacts == 'true' && steps.r13-validation.outputs.enabled != 'true' }}
@@ -790,8 +885,6 @@ jobs:
         with:
           name: ${{ steps.r13-validation.outputs.artifact_name }}
           path: |
-            target/x86_64-pc-windows-msvc/${{ steps.build-profile.outputs.profile }}/bundle/msi/*.msi
-            target/x86_64-pc-windows-msvc/${{ steps.build-profile.outputs.profile }}/bundle/msi/*.msi.sig
             target/x86_64-pc-windows-msvc/${{ steps.build-profile.outputs.profile }}/bundle/nsis/*.exe
             target/x86_64-pc-windows-msvc/${{ steps.build-profile.outputs.profile }}/bundle/nsis/*.exe.sig
             frontend/src-tauri/scripts/prepare-r13-validation-profile.ps1
@@ -811,6 +904,7 @@ jobs:
           echo "| **Signed** | ${{ (github.event.inputs.sign-build == 'true') && '✅ Yes' || '❌ No' }} |" >> $GITHUB_STEP_SUMMARY
           if [[ "${{ steps.r13-validation.outputs.enabled }}" == "true" ]]; then
             echo "| **D: Validation Root** | Run \`prepare-r13-validation-profile.ps1 -ValidationRoot D:\\Meetly-R13-Validation\` before first launch. |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Acceleration backend** | CUDA (requires an NVIDIA driver at runtime) |" >> $GITHUB_STEP_SUMMARY
           fi
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### 📦 Build Artifacts" >> $GITHUB_STEP_SUMMARY

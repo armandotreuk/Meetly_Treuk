@@ -11,6 +11,21 @@ import { useConfig, NotificationSettings } from "@/contexts/ConfigContext";
 import { logger } from "@/lib/logger";
 import { RetrievalIndexSettings } from "./RetrievalIndexSettings";
 
+type TranscriptionPerformancePreferences = {
+    cpuThreadLimit: number | null;
+};
+
+type TranscriptionHardwareStatus = {
+    compiledBackend: string;
+    detectedGpu: string;
+    gpuRuntimeStatus: string;
+    cpuLogicalCores: number;
+    recommendedCpuThreads: number;
+    configuredCpuThreads: number | null;
+    effectiveCpuThreads: number;
+    message: string;
+};
+
 export function PreferenceSettings() {
     const {
         notificationSettings,
@@ -30,6 +45,47 @@ export function PreferenceSettings() {
     const [vocabulary, setVocabulary] = useState("");
     const [vocabularyLoading, setVocabularyLoading] = useState(false);
     const [vocabularySaving, setVocabularySaving] = useState(false);
+    const [transcriptionPreferences, setTranscriptionPreferences] =
+        useState<TranscriptionPerformancePreferences | null>(null);
+    const [transcriptionHardware, setTranscriptionHardware] =
+        useState<TranscriptionHardwareStatus | null>(null);
+    const [transcriptionPerformanceSaving, setTranscriptionPerformanceSaving] = useState(false);
+
+    useEffect(() => {
+        const loadTranscriptionPerformance = async () => {
+            try {
+                const [preferences, hardware] = await Promise.all([
+                    invoke<TranscriptionPerformancePreferences>(
+                        "get_transcription_performance_preferences"
+                    ),
+                    invoke<TranscriptionHardwareStatus>("get_transcription_hardware_status"),
+                ]);
+                setTranscriptionPreferences(preferences);
+                setTranscriptionHardware(hardware);
+            } catch (error) {
+                logger.error("Failed to load transcription performance settings:", error);
+            }
+        };
+        loadTranscriptionPerformance();
+    }, []);
+
+    const saveThreadLimit = async (cpuThreadLimit: number | null) => {
+        setTranscriptionPerformanceSaving(true);
+        try {
+            const preferences = { cpuThreadLimit };
+            await invoke("set_transcription_performance_preferences", { preferences });
+            setTranscriptionPreferences(preferences);
+            setTranscriptionHardware(
+                await invoke<TranscriptionHardwareStatus>("get_transcription_hardware_status")
+            );
+            toast.success("Transcription performance setting saved");
+        } catch (error) {
+            logger.error("Failed to save transcription performance setting:", error);
+            toast.error("Failed to save transcription performance setting");
+        } finally {
+            setTranscriptionPerformanceSaving(false);
+        }
+    };
 
     useEffect(() => {
         const loadVocab = async () => {
@@ -171,6 +227,71 @@ export function PreferenceSettings() {
         <div className="space-y-6">
             <RetrievalIndexSettings />
 
+            {/* Transcription Performance Section */}
+            <div className="bg-white rounded-lg border border-gray-200 p-6 shadow-sm">
+                <h3 className="text-lg font-semibold text-gray-900 mb-2">
+                    Transcription Performance
+                </h3>
+                {transcriptionHardware ? (
+                    <>
+                        <p className="text-sm text-gray-600 mb-4">
+                            Compiled backend:{" "}
+                            <span className="font-medium">
+                                {transcriptionHardware.compiledBackend}
+                            </span>
+                            {" · "}
+                            Detected graphics support:{" "}
+                            <span className="font-medium">{transcriptionHardware.detectedGpu}</span>
+                        </p>
+                        <p className="text-sm text-gray-600 mb-4">
+                            GPU runtime: {transcriptionHardware.gpuRuntimeStatus}
+                        </p>
+                        <div className="p-3 mb-4 rounded-md bg-blue-50 text-sm text-blue-900">
+                            {transcriptionHardware.message}
+                        </div>
+                        <label
+                            className="block text-sm font-medium text-gray-800 mb-2"
+                            htmlFor="cpu-thread-limit"
+                        >
+                            CPU decoding threads
+                        </label>
+                        <select
+                            id="cpu-thread-limit"
+                            className="w-full max-w-sm rounded-md border border-gray-300 bg-white px-3 py-2 text-sm"
+                            disabled={transcriptionPerformanceSaving || !transcriptionPreferences}
+                            value={transcriptionPreferences?.cpuThreadLimit ?? "auto"}
+                            onChange={(event) =>
+                                saveThreadLimit(
+                                    event.target.value === "auto"
+                                        ? null
+                                        : Number(event.target.value)
+                                )
+                            }
+                        >
+                            <option value="auto">
+                                Automatic ({transcriptionHardware.recommendedCpuThreads}{" "}
+                                recommended)
+                            </option>
+                            {Array.from(
+                                { length: transcriptionHardware.cpuLogicalCores },
+                                (_, index) => index + 1
+                            ).map((threads) => (
+                                <option key={threads} value={threads}>
+                                    {threads} {threads === 1 ? "thread" : "threads"}
+                                </option>
+                            ))}
+                        </select>
+                        <p className="mt-2 text-xs text-gray-600">
+                            Current setting uses {transcriptionHardware.effectiveCpuThreads} of{" "}
+                            {transcriptionHardware.cpuLogicalCores} logical CPU cores. This applies
+                            to the next transcription.
+                        </p>
+                    </>
+                ) : (
+                    <p className="text-sm text-gray-600">Loading transcription hardware status…</p>
+                )}
+            </div>
+
             {/* Notifications Section */}
             <div className="bg-white rounded-lg border border-gray-200 p-6 shadow-sm">
                 <div className="flex items-center justify-between">
@@ -253,14 +374,11 @@ export function PreferenceSettings() {
             <div className="bg-white rounded-lg border border-gray-200 p-6 shadow-sm">
                 <div className="flex items-center gap-2 mb-2">
                     <BookOpen className="h-5 w-5 text-gray-700" />
-                    <h3 className="text-lg font-semibold text-gray-900">
-                        Custom Vocabulary
-                    </h3>
+                    <h3 className="text-lg font-semibold text-gray-900">Custom Vocabulary</h3>
                 </div>
                 <p className="text-sm text-gray-600 mb-4">
-                    One word or phrase per line. Improves recognition of names, acronyms,
-                    and domain terms in transcription, and keeps terminology consistent
-                    in summaries.
+                    One word or phrase per line. Improves recognition of names, acronyms, and domain
+                    terms in transcription, and keeps terminology consistent in summaries.
                 </p>
                 <Textarea
                     value={vocabulary}

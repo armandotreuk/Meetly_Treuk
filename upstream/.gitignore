@@ -82,3 +82,5 @@ frontend/src-tauri/resources/retrieval/bundle/*
 !frontend/src-tauri/resources/retrieval/bundle/README.md
 frontend/src-tauri/resources/retrieval/.staging-*/
 frontend/src-tauri/resources/retrieval/.bundle-backup-*
+# CUDA DLLs are staged only by the dedicated R13 CUDA package workflow.
+frontend/src-tauri/resources/cuda-runtime/*.dll

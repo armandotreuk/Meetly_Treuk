@@ -974,6 +974,9 @@ pub fn run() {
             audio::recording_preferences::get_current_audio_backend,
             audio::recording_preferences::set_audio_backend,
             audio::recording_preferences::get_audio_backend_info,
+            whisper_engine::performance_preferences::get_transcription_performance_preferences,
+            whisper_engine::performance_preferences::set_transcription_performance_preferences,
+            whisper_engine::performance_preferences::get_transcription_hardware_status,
             // Language preference commands
             set_language_preference,
             // Notification system commands

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "meetily-r13-validation",
+  "identifier": "com.meetily.ai.r13validation",
+  "bundle": {
+    "targets": ["nsis"],
+    "resources": [
+      "templates/*.json",
+      "templates/fonts/*",
+      "resources/retrieval/bundle",
+      "resources/cuda-runtime"
+    ],
+    "windows": {
+      "nsis": {
+        "installerHooks": "windows/cuda-runtime-hooks.nsh"
+      }
+    }
+  }
+}

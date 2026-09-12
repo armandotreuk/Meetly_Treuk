@@ -1,6 +1,7 @@
 // Commit name to recover the serial whisper engine processing for smaller meetings [Slower processing but dooes not fail] - "before parallel processing implementation"
 
 use super::acceleration::{whisper_context_acceleration_for, WhisperCompiledBackend};
+use super::performance_preferences::effective_thread_count;
 use crate::config::WHISPER_MODEL_CATALOG;
 use anyhow::{anyhow, Result};
 use reqwest::Client;
@@ -608,11 +609,7 @@ impl WhisperEngine {
         params.set_max_len(200);
         params.set_single_segment(false);
 
-        // Set thread count based on hardware (if supported by whisper.cpp)
-        if let Some(_max_threads) = adaptive_config.max_threads {
-            // Note: whisper.cpp may or may not expose thread control through params
-            // Removed debug log to reduce I/O overhead in transcription hot path
-        }
+        params.set_n_threads(effective_thread_count(adaptive_config.max_threads) as i32);
 
         let duration_seconds = audio_data.len() as f64 / 16000.0;
         let is_partial = duration_seconds < 15.0; // Consider chunks under 15s as partial
@@ -735,6 +732,7 @@ impl WhisperEngine {
         // Reasonable length limits
         params.set_max_len(200); // Reasonable length
         params.set_single_segment(false); // Allow multiple segments for better accuracy
+        params.set_n_threads(effective_thread_count(adaptive_config.max_threads) as i32);
 
         // Note: compression_ratio_threshold would be ideal but not available in current whisper-rs
         // This would help detect repetitive outputs: params.set_compression_ratio_threshold(2.4);
