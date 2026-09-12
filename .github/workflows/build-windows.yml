@@ -462,20 +462,56 @@ jobs:
           # rather than treating any unrelated line as a non-match.
           $dependents = ((& $dumpbin /dependents $exe) -join "`n")
           if ($LASTEXITCODE -ne 0) { throw "dumpbin at $dumpbin could not inspect the R13 CUDA executable." }
-          foreach ($runtime in @('cudart64_\d+\.dll', 'cublas64_\d+\.dll', 'cublasLt64_\d+\.dll')) {
-            if ($dependents -notmatch "(?im)^\s*$runtime\s*$") {
-              throw "R13 CUDA executable is missing the expected $runtime import."
+          # CUDA builds do not necessarily expose every redistributable as a
+          # direct PE import: CMake may link cudart statically, while cublasLt
+          # can be a transitive or delay-loaded dependency. The package
+          # contract is therefore the staged and installed runtime set, plus
+          # the direct cublas import that demonstrates the CUDA backend link.
+          $runtimeDir = 'upstream/frontend/src-tauri/resources/cuda-runtime'
+          $runtimePatterns = [ordered]@{
+            cudart   = 'cudart64_*.dll'
+            cublas   = 'cublas64_*.dll'
+            cublasLt = 'cublasLt64_*.dll'
+          }
+          $stagedRuntimes = [ordered]@{}
+          foreach ($runtimeName in $runtimePatterns.Keys) {
+            $candidates = @(Get-ChildItem -LiteralPath $runtimeDir -Filter $runtimePatterns[$runtimeName] -File -ErrorAction Stop)
+            if ($candidates.Count -ne 1) {
+              throw "R13 CUDA staging must contain exactly one $runtimeName runtime; found $($candidates.Count)."
             }
+            $stagedRuntimes[$runtimeName] = $candidates[0]
+          }
+          $runtimeVersions = @(
+            foreach ($runtime in $stagedRuntimes.Values) {
+              if ($runtime.Name -notmatch '64_(\d+)\.dll$') {
+                throw "R13 CUDA runtime has an unexpected name: $($runtime.Name)."
+              }
+              $Matches[1]
+            }
+          )
+          if (@($runtimeVersions | Sort-Object -Unique).Count -ne 1) {
+            throw "R13 CUDA runtimes do not share one toolkit-family version: $($stagedRuntimes.Values.Name -join ', ')."
+          }
+          $cublasImport = [regex]::Match($dependents, '(?im)^\s*(cublas64_\d+\.dll)\s*$')
+          if (-not $cublasImport.Success) {
+            throw 'R13 CUDA executable is missing the expected direct cublas import.'
+          }
+          if ($cublasImport.Groups[1].Value -ine $stagedRuntimes['cublas'].Name) {
+            throw "R13 CUDA executable imports $($cublasImport.Groups[1].Value), but staging contains $($stagedRuntimes['cublas'].Name)."
           }
           if ($dependents -match '(?im)^\s*nvcuda\.dll\s*$') { throw 'R13 CUDA executable must not import nvcuda.dll.' }
           $installRoot = Join-Path $env:RUNNER_TEMP 'meetily-r13-cuda-installer-layout'
           try {
             & $nsis[0].FullName '/S' "/D=$installRoot"
             if ($LASTEXITCODE -ne 0) { throw 'R13 CUDA NSIS installer did not install silently.' }
-            foreach ($runtime in @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll')) {
-              if (@(Get-ChildItem -LiteralPath $installRoot -Filter $runtime -File).Count -ne 1) {
-                throw "R13 CUDA installer did not place $runtime beside the executable."
+            foreach ($runtimeName in $runtimePatterns.Keys) {
+              $installed = @(Get-ChildItem -LiteralPath $installRoot -Filter $runtimePatterns[$runtimeName] -File)
+              if ($installed.Count -ne 1 -or $installed[0].Name -ine $stagedRuntimes[$runtimeName].Name) {
+                throw "R13 CUDA installer did not place the staged $($stagedRuntimes[$runtimeName].Name) beside the executable."
               }
+            }
+            if (Test-Path -LiteralPath (Join-Path $installRoot 'nvcuda.dll') -PathType Leaf) {
+              throw 'R13 CUDA installer must not package the NVIDIA driver DLL nvcuda.dll.'
             }
           } finally {
             Remove-Item -LiteralPath $installRoot -Recurse -Force -ErrorAction SilentlyContinue
