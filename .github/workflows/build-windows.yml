@@ -457,14 +457,17 @@ jobs:
           if ($null -eq $dumpbin) {
             throw "Could not resolve the x64 dumpbin.exe from $toolsetRoot."
           }
-          $dependents = & $dumpbin /dependents $exe
+          # External-command output is an array of lines in PowerShell. Join it
+          # before testing so the import checks evaluate the complete table,
+          # rather than treating any unrelated line as a non-match.
+          $dependents = ((& $dumpbin /dependents $exe) -join "`n")
           if ($LASTEXITCODE -ne 0) { throw "dumpbin at $dumpbin could not inspect the R13 CUDA executable." }
-          foreach ($runtime in @('cudart64_\\d+\\.dll', 'cublas64_\\d+\\.dll', 'cublasLt64_\\d+\\.dll')) {
-            if ($dependents -notmatch "(?im)^\\s*$runtime\\s*$") {
+          foreach ($runtime in @('cudart64_\d+\.dll', 'cublas64_\d+\.dll', 'cublasLt64_\d+\.dll')) {
+            if ($dependents -notmatch "(?im)^\s*$runtime\s*$") {
               throw "R13 CUDA executable is missing the expected $runtime import."
             }
           }
-          if ($dependents -match '(?im)^\\s*nvcuda\\.dll\\s*$') { throw 'R13 CUDA executable must not import nvcuda.dll.' }
+          if ($dependents -match '(?im)^\s*nvcuda\.dll\s*$') { throw 'R13 CUDA executable must not import nvcuda.dll.' }
           $installRoot = Join-Path $env:RUNNER_TEMP 'meetily-r13-cuda-installer-layout'
           try {
             & $nsis[0].FullName '/S' "/D=$installRoot"
