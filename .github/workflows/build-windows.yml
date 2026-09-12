@@ -433,8 +433,32 @@ jobs:
           }
           $exe = "upstream/frontend/target/${{ steps.build-profile.outputs.profile }}/meetily.exe"
           if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'R13 CUDA executable is missing.' }
-          $dependents = & dumpbin.exe /dependents $exe
-          if ($LASTEXITCODE -ne 0) { throw 'dumpbin could not inspect the R13 CUDA executable.' }
+          # The GitHub runner does not put Visual Studio developer tools on the
+          # default PowerShell PATH. Resolve the x64 dumpbin from the same
+          # VS 2022 instance validated for the CUDA build so this remains a
+          # real import-table check instead of silently skipping it.
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
+            throw "Visual Studio discovery tool was not found at $vswhere."
+          }
+          $vs2022 = & $vswhere -products * -latest -version '[17.0,18.0)' -property installationPath
+          if ([string]::IsNullOrWhiteSpace($vs2022)) {
+            throw 'The R13 CUDA artifact check requires a Visual Studio 2022 (17.x) C++ toolset.'
+          }
+          $toolsetRoot = Join-Path $vs2022 'VC\Tools\MSVC'
+          $dumpbin = $null
+          foreach ($toolset in @(Get-ChildItem -LiteralPath $toolsetRoot -Directory -ErrorAction Stop | Sort-Object @{ Expression = { [version]$_.Name }; Descending = $true })) {
+            $candidate = Join-Path $toolset.FullName 'bin\Hostx64\x64\dumpbin.exe'
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+              $dumpbin = $candidate
+              break
+            }
+          }
+          if ($null -eq $dumpbin) {
+            throw "Could not resolve the x64 dumpbin.exe from $toolsetRoot."
+          }
+          $dependents = & $dumpbin /dependents $exe
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin at $dumpbin could not inspect the R13 CUDA executable." }
           foreach ($runtime in @('cudart64_\\d+\\.dll', 'cublas64_\\d+\\.dll', 'cublasLt64_\\d+\\.dll')) {
             if ($dependents -notmatch "(?im)^\\s*$runtime\\s*$") {
               throw "R13 CUDA executable is missing the expected $runtime import."
