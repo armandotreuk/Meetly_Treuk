@@ -89,7 +89,7 @@ export function ChatMessage({ role, content, sources, isStreaming, isError, onSo
                 {!isUser && sources && sources.length > 0 && (
                     <div className="mt-2 pt-2 border-t border-gray-200">
                         <div className="text-xs text-gray-500 mb-1">{t("chat.message.sources")}</div>
-                        <div className="flex flex-wrap gap-1">
+                        <div className="grid gap-2">
                             {sources.map((src, i) => {
                                 const isLive = src.sourceKind === "live_recording" || src.chunkType === "live_transcript";
                                 const SourceTag = isLive ? "span" : "button";
@@ -101,12 +101,19 @@ export function ChatMessage({ role, content, sources, isStreaming, isError, onSo
                                     }}
                                     aria-label={isLive ? t("chat.message.liveSourceAria") : t("chat.message.openMeetingAria", { title: src.meetingTitle })}
                                     title={src.snippet ? `${src.meetingTitle}: ${src.snippet}` : src.meetingTitle}
-                                    className={`inline-flex items-center gap-1 rounded bg-gray-200 px-1.5 py-0.5 text-xs text-gray-700 ${isLive ? "" : "cursor-pointer hover:bg-gray-300"}`}
+                                    className={`block rounded border border-gray-200 bg-white px-2 py-1.5 text-left text-xs text-gray-700 ${isLive ? "" : "cursor-pointer hover:border-blue-200 hover:bg-blue-50"}`}
                                 >
-                                    {!isLive && <ExternalLink className="h-3 w-3" />}
-                                    {src.meetingTitle}
-                                    {src.folderName && (
-                                        <span className="text-gray-400">/ {src.folderName}</span>
+                                    <span className="flex items-center gap-1 font-medium text-gray-800">
+                                        {!isLive && <ExternalLink className="h-3 w-3 shrink-0" />}
+                                        <span className="truncate">{src.meetingTitle}</span>
+                                        {src.folderName && (
+                                            <span className="truncate font-normal text-gray-400">/ {src.folderName}</span>
+                                        )}
+                                    </span>
+                                    {src.snippet && (
+                                        <span className="mt-1 block max-h-10 overflow-hidden break-words text-gray-500">
+                                            {src.snippet}
+                                        </span>
                                     )}
                                 </SourceTag>;
                             })}

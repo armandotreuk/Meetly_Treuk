@@ -611,10 +611,11 @@ const Sidebar: React.FC = () => {
     };
   }, []);
 
+  const isHomePage = pathname === '/';
+
   const renderCollapsedIcons = () => {
     if (!isCollapsed) return null;
 
-    const isHomePage = pathname === '/';
     const isMeetingPage = pathname?.includes('/meeting-details');
     const isSettingsPage = pathname === '/settings';
 
@@ -627,6 +628,9 @@ const Sidebar: React.FC = () => {
             <TooltipTrigger asChild>
               <button
                 onClick={() => router.push('/')}
+                aria-label={t('app.sidebar.homeAria')}
+                aria-current={isHomePage ? 'page' : undefined}
+                title={t('app.sidebar.home')}
                 className={`p-2 rounded-lg transition-colors duration-150 ${isHomePage ? 'bg-gray-100' : 'hover:bg-gray-100'
                   }`}
               >
@@ -634,7 +638,7 @@ const Sidebar: React.FC = () => {
               </button>
             </TooltipTrigger>
             <TooltipContent side="right">
-              <p>Home</p>
+              <p>{t('app.sidebar.home')}</p>
             </TooltipContent>
           </Tooltip>
 
@@ -798,13 +802,15 @@ const Sidebar: React.FC = () => {
           {/* Fixed navigation items */}
           <div className="flex-shrink-0">
             {!isCollapsed && (
-              <div
+              <button
+                type="button"
                 onClick={() => router.push('/')}
-                className="p-3  text-lg font-semibold items-center hover:bg-gray-100 h-10   flex mx-3 mt-3 rounded-lg cursor-pointer"
+                aria-current={isHomePage ? 'page' : undefined}
+                className={`p-3 text-lg font-semibold items-center h-10 flex mx-3 mt-3 rounded-lg w-[calc(100%_-_1.5rem)] ${isHomePage ? 'bg-gray-100' : 'hover:bg-gray-100'}`}
               >
                 <Home className="w-4 h-4 mr-2" />
-                <span>Home</span>
-              </div>
+                <span>{t('app.sidebar.home')}</span>
+              </button>
             )}
           </div>
 

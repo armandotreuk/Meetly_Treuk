@@ -30,7 +30,10 @@ env:
 jobs:
   build-windows:
     name: Package Windows x64
-    runs-on: windows-latest
+    # CUDA 12.8 supports the Visual Studio 2022 toolset, not the Visual Studio
+    # 2026 image currently behind windows-latest. Keep normal CPU packages on
+    # latest while pinning only the explicitly requested R13 CUDA package.
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.r13_validation_package == 'true' && 'windows-2022' || 'windows-latest' }}
     outputs:
       build-profile: ${{ steps.build-profile.outputs.profile }}
       r13-validation: ${{ steps.r13-validation.outputs.enabled }}
@@ -174,6 +177,42 @@ jobs:
         uses: Jimver/cuda-toolkit@v0.2.36
         with:
           cuda: "12.8.1"
+
+      - name: Validate CUDA and Visual Studio 2022 toolchain
+        if: steps.r13-validation.outputs.backend == 'cuda'
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
+            throw "Visual Studio discovery tool was not found at $vswhere."
+          }
+          $vs2022 = & $vswhere -products * -latest -version '[17.0,18.0)' -property installationPath
+          if ([string]::IsNullOrWhiteSpace($vs2022)) {
+            throw 'The R13 CUDA package requires a Visual Studio 2022 (17.x) C++ toolset.'
+          }
+          if (-not (Get-Command nvcc.exe -ErrorAction SilentlyContinue)) {
+            throw 'CUDA setup completed without nvcc on PATH.'
+          }
+          & nvcc.exe --version
+          if ($LASTEXITCODE -ne 0) { throw 'nvcc could not report its version.' }
+
+          # Make the compatible generator explicit for whisper-rs's CMake
+          # invocation too, rather than depending on the runner default.
+          $env:CMAKE_GENERATOR = 'Visual Studio 17 2022'
+          'CMAKE_GENERATOR=Visual Studio 17 2022' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          $probe = Join-Path $env:RUNNER_TEMP 'meetily-cuda-toolchain-probe'
+          $probeBuild = Join-Path $env:RUNNER_TEMP 'meetily-cuda-toolchain-probe-build'
+          New-Item -ItemType Directory -Path $probe -Force | Out-Null
+          @'
+          cmake_minimum_required(VERSION 3.20)
+          project(meetily_cuda_toolchain_probe LANGUAGES CUDA)
+          '@ | Set-Content -LiteralPath (Join-Path $probe 'CMakeLists.txt') -NoNewline
+          & cmake.exe -S $probe -B $probeBuild -G 'Visual Studio 17 2022' -A x64
+          if ($LASTEXITCODE -ne 0) {
+            throw 'CMake could not configure a CUDA project with the Visual Studio 2022 generator.'
+          }
+          Write-Host "Validated CUDA toolchain against $vs2022"
 
       # --- Task 1.R1 release gate: staged retrieval bundle + reference inference ---
       - name: Locate retrieval model cache directory

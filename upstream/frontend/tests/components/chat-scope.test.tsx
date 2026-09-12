@@ -95,6 +95,26 @@ describe("createSearchSnapshotScope", () => {
 });
 
 describe("ChatHost scoped panel", () => {
+    it("expands into a modal and returns focus to the launcher when closed", async () => {
+        const scope: ChatScope = { kind: "all", key: "all" };
+        await act(async () => root.render(<ChatHost><Launcher scope={scope} label="all" /></ChatHost>));
+        const launcher = container.querySelector("button") as HTMLButtonElement;
+        launcher.focus();
+        await act(async () => launcher.click());
+        await flush();
+
+        const expand = container.querySelector('[aria-label="Expand chat"]') as HTMLButtonElement;
+        await act(async () => expand.click());
+        await flush();
+        expect(container.querySelector('[role="dialog"][aria-modal="true"]')).not.toBeNull();
+        expect(container.querySelector('[aria-label="Return chat to dock"]')).not.toBeNull();
+
+        await act(async () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+        await flush();
+        expect(container.querySelector("textarea")).toBeNull();
+        expect(document.activeElement).toBe(launcher);
+    });
+
     it("closes persisted chat on recording start, keeps live chat, and ignores persisted launchers", async () => {
         const persisted: ChatScope = { kind: "all", key: "all" };
         const live: ChatScope = { kind: "live_recording", key: "live-1" };

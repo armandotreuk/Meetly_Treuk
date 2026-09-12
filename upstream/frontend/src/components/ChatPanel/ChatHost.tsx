@@ -1,6 +1,14 @@
 "use client";
 
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import React, {
+    createContext,
+    useCallback,
+    useContext,
+    useEffect,
+    useMemo,
+    useRef,
+    useState,
+} from "react";
 import type { ChatScope } from "@/types";
 import { ChatPanel } from ".";
 import { invoke } from "@tauri-apps/api/core";
@@ -36,6 +44,9 @@ interface OpenChatState {
 
 export function ChatHost({ children }: { children: React.ReactNode }) {
     const [chat, setChat] = useState<OpenChatState | null>(null);
+    const [isExpanded, setIsExpanded] = useState(false);
+    const returnFocusRef = useRef<HTMLElement | null>(null);
+    const expandedPanelRef = useRef<HTMLDivElement | null>(null);
     const { isRecording, liveTranscriptScopeKey } = useRecordingState();
     useEffect(() => {
         if (isRecording)
@@ -48,11 +59,67 @@ export function ChatHost({ children }: { children: React.ReactNode }) {
     }, [isRecording, liveTranscriptScopeKey]);
     const openChat = useCallback(
         (nextScope: ChatScope, label?: string) => {
-            if (!isRecording || nextScope.kind === "live_recording")
+            if (!isRecording || nextScope.kind === "live_recording") {
+                returnFocusRef.current =
+                    document.activeElement instanceof HTMLElement ? document.activeElement : null;
+                setIsExpanded(false);
                 setChat({ scope: nextScope, label });
+            }
         },
         [isRecording]
     );
+    const closeChat = useCallback(() => {
+        setChat(null);
+        setIsExpanded(false);
+        const trigger = returnFocusRef.current;
+        returnFocusRef.current = null;
+        if (typeof window.requestAnimationFrame === "function") {
+            window.requestAnimationFrame(() => trigger?.focus());
+        } else {
+            trigger?.focus();
+        }
+    }, []);
+    useEffect(() => {
+        if (!chat || !isExpanded) return;
+        const panel = expandedPanelRef.current;
+        if (!panel) return;
+        const getFocusableElements = () =>
+            Array.from(
+                panel.querySelectorAll<HTMLElement>(
+                    'a[href], button:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
+                )
+            ).filter((element) => !element.hasAttribute("hidden"));
+        const focusInitialElement = () => {
+            const composer = panel.querySelector<HTMLTextAreaElement>("textarea:not([disabled])");
+            (composer ?? getFocusableElements()[0] ?? panel).focus();
+        };
+        const onKeyDown = (event: KeyboardEvent) => {
+            if (event.key === "Escape") {
+                event.preventDefault();
+                closeChat();
+                return;
+            }
+            if (event.key !== "Tab") return;
+            const focusable = getFocusableElements();
+            if (focusable.length === 0) {
+                event.preventDefault();
+                panel.focus();
+                return;
+            }
+            const first = focusable[0];
+            const last = focusable[focusable.length - 1];
+            if (event.shiftKey && document.activeElement === first) {
+                event.preventDefault();
+                last.focus();
+            } else if (!event.shiftKey && document.activeElement === last) {
+                event.preventDefault();
+                first.focus();
+            }
+        };
+        focusInitialElement();
+        document.addEventListener("keydown", onKeyDown);
+        return () => document.removeEventListener("keydown", onKeyDown);
+    }, [chat, isExpanded, closeChat]);
     const promoteLiveChat = useCallback(
         async (liveScopeKey: string, meetingId: string, alreadyPromoted = false) => {
             if (!alreadyPromoted)
@@ -75,11 +142,39 @@ export function ChatHost({ children }: { children: React.ReactNode }) {
     );
     return (
         <ChatHostContext.Provider value={value}>
-            {children}
+            <div
+                className={
+                    chat && !isExpanded ? "transition-[padding] duration-200 lg:pr-[27rem]" : ""
+                }
+            >
+                {children}
+            </div>
             {chat && (
-                <div className="fixed bottom-0 right-0 z-30 h-80 w-full max-w-3xl border-l border-t border-gray-200 shadow-xl">
-                    <ChatPanel scope={chat.scope} resolvedLabel={chat.label} onClose={() => setChat(null)} />
-                </div>
+                <>
+                    {isExpanded && (
+                        <div className="fixed inset-0 z-40 bg-black/20" aria-hidden="true" />
+                    )}
+                    <div
+                        ref={expandedPanelRef}
+                        role={isExpanded ? "dialog" : undefined}
+                        aria-modal={isExpanded || undefined}
+                        aria-label={isExpanded ? t("chat.header.title") : undefined}
+                        tabIndex={isExpanded ? -1 : undefined}
+                        className={
+                            isExpanded
+                                ? "fixed inset-4 z-50 overflow-hidden rounded-xl border border-gray-200 bg-white shadow-2xl"
+                                : "fixed bottom-4 right-4 z-50 h-[min(38rem,calc(100dvh-2rem))] w-[calc(100vw-2rem)] max-w-[26rem] overflow-hidden rounded-xl border border-gray-200 bg-white shadow-2xl"
+                        }
+                    >
+                        <ChatPanel
+                            scope={chat.scope}
+                            resolvedLabel={chat.label}
+                            onClose={closeChat}
+                            isExpanded={isExpanded}
+                            onToggleExpanded={() => setIsExpanded((expanded) => !expanded)}
+                        />
+                    </div>
+                </>
             )}
         </ChatHostContext.Provider>
     );

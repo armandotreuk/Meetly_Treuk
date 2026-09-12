@@ -17,7 +17,7 @@ const MainContent: React.FC<MainContentProps> = ({ children }) => {
             }`}
             style={isCollapsed ? undefined : { marginLeft: sidebarWidth }}
         >
-            <div className="pl-8">{children}</div>
+            <div className="px-4 md:px-6">{children}</div>
         </main>
     );
 };

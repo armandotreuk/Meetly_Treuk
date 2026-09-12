@@ -29,6 +29,8 @@ import { useRouter } from "next/navigation";
 import { togglePanelOnShortcut } from "@/lib/panel-shortcuts";
 import { t } from "@/lib/i18n";
 import { LiveChatLauncher, useChatHost } from "@/components/ChatPanel/ChatHost";
+import { useImportDialog } from "@/contexts/ImportDialogContext";
+import { HomeReadyState } from "./_components/HomeReadyState";
 
 export default function Home() {
     // Local page state (not moved to contexts)
@@ -39,7 +41,7 @@ export default function Home() {
 
     // Use contexts for state management
     const { meetingTitle } = useTranscripts();
-    const { transcriptModelConfig, selectedDevices } = useConfig();
+    const { transcriptModelConfig, selectedDevices, betaFeatures } = useConfig();
     const recordingState = useRecordingState();
     const { openChat } = useChatHost();
 
@@ -47,12 +49,18 @@ export default function Home() {
     const { status, isStopping, isProcessing, isSaving } = recordingState;
 
     // Hooks
-    const { hasMicrophone } = usePermissionCheck();
+    const {
+        hasMicrophone,
+        checkPermissions,
+        isChecking: isCheckingMicrophone,
+    } = usePermissionCheck();
+    const { openImportDialog } = useImportDialog();
     const {
         setIsMeetingActive,
         isCollapsed: sidebarCollapsed,
         refetchMeetings,
         sidebarWidth,
+        meetings,
     } = useSidebar();
 
     // Recording-screen notes panel — resizable from its left edge.
@@ -277,6 +285,21 @@ export default function Home() {
                     isProcessingStop={isProcessingStop}
                     isStopping={isStopping}
                     showModal={showModal}
+                    idleContent={
+                        <HomeReadyState
+                            meetings={meetings}
+                            modelName={transcriptModelConfig.model}
+                            hasMicrophone={hasMicrophone}
+                            isCheckingMicrophone={isCheckingMicrophone}
+                            canImportAudio={betaFeatures.importAndRetranscribe}
+                            onStartRecording={handleRecordingStart}
+                            onCheckMicrophone={() => void checkPermissions()}
+                            onImportAudio={() => openImportDialog()}
+                            onOpenMeeting={(meetingId) =>
+                                router.push(`/meeting-details?id=${meetingId}`)
+                            }
+                        />
+                    }
                 />
 
                 {/* Notes panel — auto-opens during recording, mirrored to notes.md in the meeting folder */}

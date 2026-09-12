@@ -5,7 +5,7 @@ import { logger } from "@/lib/logger";
 import { t } from "@/lib/i18n";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
-import { Send, Square, Loader2, X, MessageSquare, Trash2 } from "lucide-react";
+import { Send, Square, Loader2, X, MessageSquare, Trash2, Maximize2, Minimize2 } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { ChatMessage } from "./ChatMessage";
 import type {
@@ -28,6 +28,8 @@ interface ChatPanelProps {
     scope: ChatScope;
     resolvedLabel?: string;
     onClose: () => void;
+    isExpanded: boolean;
+    onToggleExpanded: () => void;
 }
 
 // ponytail: deletions recorded per panel epoch are capped; overflowing the
@@ -65,7 +67,7 @@ function classifyProvider(provider: string | null): "local" | "cloud" | "custom"
     return "custom";
 }
 
-export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
+export function ChatPanel({ scope, resolvedLabel, onClose, isExpanded, onToggleExpanded }: ChatPanelProps) {
     const router = useRouter();
     const [messages, setMessages] = useState<ChatMessageType[]>([]);
     const [input, setInput] = useState("");
@@ -690,7 +692,11 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
                 ];
 
     return (
-        <div className="flex flex-col h-full bg-white border-t border-gray-200">
+        <div
+            className="flex flex-col h-full bg-white"
+            role="region"
+            aria-label={t("chat.header.title")}
+        >
             {/* Header */}
             <div className="flex items-center justify-between px-4 py-2 border-b border-gray-200 bg-gray-50">
                 <div className="flex items-center gap-2">
@@ -723,9 +729,21 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
                     </div>
                 </div>
                 <div className="flex items-center gap-2">
-                    <span className="text-xs text-gray-500" aria-label={t("chat.scope.aria")}>
+                    <span
+                        className="max-w-28 truncate rounded-full bg-blue-50 px-2 py-1 text-xs font-medium text-blue-700"
+                        aria-label={t("chat.scope.aria")}
+                        title={scopeLabel}
+                    >
                         {scopeLabel}
                     </span>
+                    <button
+                        onClick={onToggleExpanded}
+                        aria-label={isExpanded ? t("chat.restoreAria") : t("chat.expandAria")}
+                        title={isExpanded ? t("chat.restoreAria") : t("chat.expandAria")}
+                        className="rounded p-1 text-gray-400 hover:bg-gray-200 hover:text-gray-600"
+                    >
+                        {isExpanded ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
+                    </button>
                     <button
                         onClick={handleClear}
                         disabled={!conversationId || isBusy}
@@ -777,7 +795,12 @@ export function ChatPanel({ scope, resolvedLabel, onClose }: ChatPanelProps) {
             </div>
 
             {/* Messages */}
-            <div className="flex-1 overflow-y-auto p-4 space-y-4">
+            <div
+                className="flex-1 overflow-y-auto p-4 space-y-4"
+                role="log"
+                aria-live="polite"
+                aria-label={t("chat.messagesAria")}
+            >
                 {loadError && (
                     <div
                         role="status"

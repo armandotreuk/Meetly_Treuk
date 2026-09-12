@@ -9,7 +9,7 @@ import { useRecordingState } from "@/contexts/RecordingStateContext";
 import { usePermissionCheck } from "@/hooks/usePermissionCheck";
 import { ModalType } from "@/hooks/useModalState";
 import { useIsLinux } from "@/hooks/usePlatform";
-import { useMemo } from "react";
+import { type ReactNode, useMemo } from "react";
 
 /**
  * TranscriptPanel Component
@@ -23,9 +23,15 @@ interface TranscriptPanelProps {
     isProcessingStop: boolean;
     isStopping: boolean;
     showModal: (name: ModalType, message?: string) => void;
+    idleContent?: ReactNode;
 }
 
-export function TranscriptPanel({ isProcessingStop, isStopping, showModal }: TranscriptPanelProps) {
+export function TranscriptPanel({
+    isProcessingStop,
+    isStopping,
+    showModal,
+    idleContent,
+}: TranscriptPanelProps) {
     // Contexts
     const { transcripts, transcriptContainerRef, copyTranscript } = useTranscripts();
     const { transcriptModelConfig } = useConfig();
@@ -45,6 +51,12 @@ export function TranscriptPanel({ isProcessingStop, isStopping, showModal }: Tra
             })),
         [transcripts]
     );
+    const showIdleContent =
+        Boolean(idleContent) &&
+        segments.length === 0 &&
+        !isRecording &&
+        !isProcessingStop &&
+        !isStopping;
 
     return (
         <div
@@ -100,16 +112,20 @@ export function TranscriptPanel({ isProcessingStop, isStopping, showModal }: Tra
             {/* Transcript content */}
             <div className="pb-20">
                 <div className="flex justify-center">
-                    <div className="w-2/3 max-w-[750px]">
-                        <VirtualizedTranscriptView
-                            segments={segments}
-                            isRecording={isRecording}
-                            isPaused={isPaused}
-                            isProcessing={isProcessingStop}
-                            isStopping={isStopping}
-                            enableStreaming={isRecording}
-                            showConfidence={true}
-                        />
+                    <div className={showIdleContent ? "w-full" : "w-2/3 max-w-[750px]"}>
+                        {showIdleContent ? (
+                            idleContent
+                        ) : (
+                            <VirtualizedTranscriptView
+                                segments={segments}
+                                isRecording={isRecording}
+                                isPaused={isPaused}
+                                isProcessing={isProcessingStop}
+                                isStopping={isStopping}
+                                enableStreaming={isRecording}
+                                showConfidence={true}
+                            />
+                        )}
                     </div>
                 </div>
             </div>
