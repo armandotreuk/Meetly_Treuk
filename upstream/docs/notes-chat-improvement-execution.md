@@ -4512,6 +4512,12 @@ etrieval/model.rs:1714 unused_parens warning).
 - Verification: `git diff --check` passed. An independent read-only code review (`composer_focus_fix_review`, GPT-5.6 Luna / low) found no blocker or should-fix and confirmed loading, streaming, scope-switch, expanded-mode, and close-return-focus boundaries. After the worktree dependency links were restored, `frontend/node_modules/.bin/vitest.cmd run --config vitest.config.ts tests/components/chat-scope.test.tsx tests/components/home-ready-state.test.tsx` passed 37 tests in 2 files, including the exact composer-ready regression. The next exact-head Windows package run remains the authoritative integration check.
 - Acceptance boundary: this repair proves neither packaged runtime behavior nor the broader manual desktop/narrow/expanded UX checklist. It does not change retrieval, providers, transcripts, package identity, persistent data, corpus work, or release status.
 
+### Result HR-5.UX.3 — Home microphone-check progress feedback
+- Date: 2026-09-12
+- Trigger: the UX accessibility review found that the idle Home primary action was correctly disabled during a microphone-permission/device check, but gave no visible or announced progress state.
+- Remediation: while the check is pending, the action now reads `Checking microphone…`, exposes `aria-busy`, and emits a concise status announcement. The normal record and microphone-check action routing is unchanged.
+- Verification: a Home-ready regression asserts the disabled state, busy state, announced progress, and suppression of the inactive click handler. This is a source-level UX correction only; the desktop narrow-layout and packaged manual checks remain separate acceptance evidence.
+
 ### Result HR-5.R13.6 — Local-first Windows CI recovery
 - Date: 2026-09-12
 - Trigger: the reviewed R13 Windows run `#74` lasted 1h 34m 52s and failed after the CUDA/NSIS package had been produced. This was not an Actions timeout: the full Tauri build completed in 1h 6m 28s. The failure was an incorrect post-package rule that rejected a direct executable import of `nvcuda.dll`; the CUDA executable imports the system-provided NVIDIA display-driver API. The terminal R13 gate also attempted to download normal MSI/NSIS smoke evidence even though those normal-install jobs are intentionally skipped for the isolated R13 package.

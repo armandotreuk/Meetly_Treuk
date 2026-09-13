@@ -71,6 +71,21 @@ describe("HomeReadyState", () => {
         expect(props.onStartRecording).not.toHaveBeenCalled();
     });
 
+    it("announces microphone checking while the primary action is disabled", () => {
+        const props = renderReadyState({ hasMicrophone: false, isCheckingMicrophone: true });
+        const action = container.querySelector("button") as HTMLButtonElement;
+
+        expect(action.disabled).toBe(true);
+        expect(action.getAttribute("aria-busy")).toBe("true");
+        expect(action.textContent).toContain("Checking microphone");
+        expect(container.querySelector('[role="status"]')?.textContent).toContain(
+            "Checking microphone"
+        );
+
+        act(() => action.click());
+        expect(props.onCheckMicrophone).not.toHaveBeenCalled();
+    });
+
     it("starts recording and respects the import beta gate", () => {
         const props = renderReadyState({ canImportAudio: false });
         const start = Array.from(container.querySelectorAll("button")).find((button) =>

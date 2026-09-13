@@ -68,11 +68,21 @@ export function HomeReadyState({
                         type="button"
                         onClick={hasMicrophone ? onStartRecording : onCheckMicrophone}
                         disabled={isCheckingMicrophone}
+                        aria-busy={isCheckingMicrophone || undefined}
                         className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2.5 text-sm font-medium text-white shadow-sm transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-blue-300"
                     >
                         <Mic className="h-4 w-4" aria-hidden="true" />
-                        {hasMicrophone ? t("home.startRecording") : t("home.checkAudio")}
+                        {isCheckingMicrophone
+                            ? t("home.checkingAudio")
+                            : hasMicrophone
+                              ? t("home.startRecording")
+                              : t("home.checkAudio")}
                     </button>
+                    {isCheckingMicrophone && (
+                        <span role="status" aria-live="polite" className="sr-only">
+                            {t("home.checkingAudio")}
+                        </span>
+                    )}
                     {canImportAudio && (
                         <button
                             type="button"

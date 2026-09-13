@@ -114,6 +114,7 @@ export const en: Record<string, string> = {
         "Record a meeting or import audio to keep its transcript, notes, and follow-ups together.",
     "home.startRecording": "Start recording",
     "home.checkAudio": "Check microphone",
+    "home.checkingAudio": "Checking microphone…",
     "home.importAudio": "Import audio",
     "home.transcriptionProfile": "Transcription profile",
     "home.privacy":
