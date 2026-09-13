@@ -8,6 +8,8 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $workflowPath = Join-Path $repoRoot '.github/workflows/build-windows.yml'
 $workflow = Get-Content -LiteralPath $workflowPath -Raw
+$preflightPath = Join-Path $repoRoot '.github/workflows/windows-preflight.yml'
+$preflight = Get-Content -LiteralPath $preflightPath -Raw
 
 function Get-WorkflowSection([string]$StartMarker, [string]$EndMarker) {
     $start = $workflow.IndexOf($StartMarker, [StringComparison]::Ordinal)
@@ -56,6 +58,51 @@ foreach ($stepName in @('Download MSI smoke evidence', 'Download NSIS smoke evid
     if (-not [regex]::IsMatch($gate, $pattern)) {
         throw "R13 terminal gate must skip '$stepName' when normal smokes are intentionally absent."
     }
+}
+
+# The staging self-test uses `cargo test --offline` for the workspace helper.
+# Keep it in the Rust job, after `cargo fetch --locked`, so a clean runner has
+# its git dependencies before that intentionally offline test begins.
+$frontendStart = $preflight.IndexOf('  frontend-and-policy:', [StringComparison]::Ordinal)
+$cargoStart = $preflight.IndexOf('  cargo-check:', [StringComparison]::Ordinal)
+$preflightGateStart = $preflight.IndexOf('  gate-preflight:', [StringComparison]::Ordinal)
+if ($frontendStart -lt 0 -or $cargoStart -lt 0 -or $preflightGateStart -lt 0) {
+    throw 'Windows preflight must retain frontend, Cargo, and terminal-gate jobs.'
+}
+$frontendPreflight = $preflight.Substring($frontendStart, $cargoStart - $frontendStart)
+$cargoPreflight = $preflight.Substring($cargoStart, $preflightGateStart - $cargoStart)
+
+function Get-NamedPreflightStep([string]$Job, [string]$JobName, [string]$StepName) {
+    $stepPattern = "(?m)^ {6}- name: $([regex]::Escape($StepName))[ \t]*\r?$"
+    $matches = [regex]::Matches($Job, $stepPattern)
+    if ($matches.Count -ne 1) {
+        throw "The $JobName preflight job must contain exactly one '$StepName' step."
+    }
+    $start = $matches[0].Index
+    $stepStartRegex = New-Object System.Text.RegularExpressions.Regex('(?m)^ {6}- name: ')
+    $next = $stepStartRegex.Match($Job, $start + 1)
+    $end = if ($next.Success) { $next.Index } else { $Job.Length }
+    return [pscustomobject]@{
+        Start = $start
+        Text = $Job.Substring($start, $end - $start)
+    }
+}
+
+$selfTestName = 'Run retrieval staging/recovery self-test'
+$selfTestInvocation = '(?m)^ {8}run: \./upstream/frontend/src-tauri/scripts/stage-retrieval-models\.ps1 -SelfTest[ \t]*\r?$'
+if ([regex]::IsMatch($frontendPreflight, $selfTestInvocation)) {
+    throw 'The offline retrieval self-test invocation must not run in the frontend-only preflight job.'
+}
+$fetchStep = Get-NamedPreflightStep $cargoPreflight 'Cargo' 'Fetch deps and restore whisper-rs-sys bindings'
+$selfTestStep = Get-NamedPreflightStep $cargoPreflight 'Cargo' $selfTestName
+if ($fetchStep.Text -notmatch '(?m)^ {10}cargo fetch --locked[ \t]*\r?$') {
+    throw 'The Cargo dependency-fetch step must execute cargo fetch --locked.'
+}
+if ($selfTestStep.Text -notmatch $selfTestInvocation) {
+    throw 'The Cargo self-test step must execute stage-retrieval-models.ps1 -SelfTest.'
+}
+if ($fetchStep.Start -ge $selfTestStep.Start) {
+    throw 'The Cargo preflight must fetch locked dependencies before the offline retrieval self-test.'
 }
 
 Write-Host 'windows-ci-contract: passed'

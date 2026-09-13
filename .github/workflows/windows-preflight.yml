@@ -62,10 +62,6 @@ jobs:
         shell: pwsh
         run: ./upstream/frontend/src-tauri/scripts/windows-package-smoke.tests.ps1
 
-      - name: Run retrieval staging/recovery self-test
-        shell: pwsh
-        run: ./upstream/frontend/src-tauri/scripts/stage-retrieval-models.ps1 -SelfTest
-
       - name: Validate Windows package CI contract
         shell: pwsh
         run: ./.github/scripts/validate-windows-ci-contract.ps1
@@ -110,6 +106,14 @@ jobs:
           cd upstream
           cargo fetch --locked
           node frontend/scripts/restore-whisper-bindings.mjs
+
+      # This self-test executes a locked, offline workspace helper.  It must run
+      # after the fetch above: a clean runner has no cached git dependency such
+      # as ffmpeg-sidecar, and putting it in the frontend-only job made the
+      # preflight fail before its real recovery assertions could run.
+      - name: Run retrieval staging/recovery self-test
+        shell: pwsh
+        run: ./upstream/frontend/src-tauri/scripts/stage-retrieval-models.ps1 -SelfTest
 
       - name: Build llama-helper sidecar for workspace check
         shell: bash
