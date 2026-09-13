@@ -4518,6 +4518,13 @@ etrieval/model.rs:1714 unused_parens warning).
 - Remediation: while the check is pending, the action now reads `Checking microphone…`, exposes `aria-busy`, and emits a concise status announcement. The normal record and microphone-check action routing is unchanged.
 - Verification: a Home-ready regression asserts the disabled state, busy state, announced progress, and suppression of the inactive click handler. This is a source-level UX correction only; the desktop narrow-layout and packaged manual checks remain separate acceptance evidence.
 
+### Result HR-5.UX.4 — Expanded-chat keyboard-containment regression
+
+- Date: 2026-09-13
+- Scope: add source-level acceptance coverage for the existing expanded Chat dialog focus trap; no product behavior, layout, retrieval, provider, persistence, or package configuration changed.
+- Verification: the regression enables the visible **Send message** control, then proves forward Tab wraps from it to the visible model-configuration control and reverse Shift+Tab wraps back; both events are cancelable and must be prevented. This uses stable user-facing controls rather than copying the production focusable-selector implementation. The focused Chat/Home suite passed 39 tests and frontend typecheck passed. Independent accessibility review approved the revised test.
+- Acceptance boundary: source coverage does not replace the manual desktop/narrow/expanded run in the final isolated R13 package; that runtime validation remains open.
+
 ### Result HR-5.R13.6 — Local-first Windows CI recovery
 - Date: 2026-09-12
 - Trigger: the reviewed R13 Windows run `#74` lasted 1h 34m 52s and failed after the CUDA/NSIS package had been produced. This was not an Actions timeout: the full Tauri build completed in 1h 6m 28s. The failure was an incorrect post-package rule that rejected a direct executable import of `nvcuda.dll`; the CUDA executable imports the system-provided NVIDIA display-driver API. The terminal R13 gate also attempted to download normal MSI/NSIS smoke evidence even though those normal-install jobs are intentionally skipped for the isolated R13 package.

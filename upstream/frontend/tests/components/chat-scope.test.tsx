@@ -144,6 +144,49 @@ describe("ChatHost scoped panel", () => {
         expect(document.activeElement).toBe(launcher);
     });
 
+    it("keeps Tab and Shift+Tab inside the expanded chat dialog", async () => {
+        const scope: ChatScope = { kind: "all", key: "all" };
+        await act(async () => root.render(<ChatHost><Launcher scope={scope} label="all" /></ChatHost>));
+        await act(async () => (container.querySelector("button") as HTMLButtonElement).click());
+        await flush();
+        await act(async () => (container.querySelector('[aria-label="Expand chat"]') as HTMLButtonElement).click());
+        await flush();
+
+        const dialog = container.querySelector('[role="dialog"][aria-modal="true"]') as HTMLDivElement;
+        const firstControl = dialog.querySelector(
+            '[aria-label="Open Settings to change chat model"]'
+        ) as HTMLButtonElement;
+        const composer = dialog.querySelector("textarea") as HTMLTextAreaElement;
+        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(
+            composer,
+            "question"
+        );
+        await act(async () => composer.dispatchEvent(new Event("input", { bubbles: true })));
+        const lastControl = dialog.querySelector('[aria-label="Send message"]') as HTMLButtonElement;
+        expect(lastControl.disabled).toBe(false);
+
+        lastControl.focus();
+        const forward = new KeyboardEvent("keydown", {
+            key: "Tab",
+            bubbles: true,
+            cancelable: true,
+        });
+        await act(async () => document.dispatchEvent(forward));
+        expect(forward.defaultPrevented).toBe(true);
+        expect(document.activeElement).toBe(firstControl);
+
+        firstControl.focus();
+        const backward = new KeyboardEvent("keydown", {
+            key: "Tab",
+            shiftKey: true,
+            bubbles: true,
+            cancelable: true,
+        });
+        await act(async () => document.dispatchEvent(backward));
+        expect(backward.defaultPrevented).toBe(true);
+        expect(document.activeElement).toBe(lastControl);
+    });
+
     it("closes persisted chat on recording start, keeps live chat, and ignores persisted launchers", async () => {
         const persisted: ChatScope = { kind: "all", key: "all" };
         const live: ChatScope = { kind: "live_recording", key: "live-1" };
