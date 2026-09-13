@@ -798,7 +798,10 @@ jobs:
           Write-Host 'R13 package identity was verified before upload. Installed-package smokes are deferred to the isolated D: native validation session because this harness intentionally assumes the normal meetily install layout.'
 
       - name: Upload sanitized installed-package evidence
-        if: always()
+        # R13 validates its isolated identity before upload and defers the
+        # installer-layout smoke to the native D: session. Those evidence
+        # files therefore do not exist for this deliberate mode.
+        if: ${{ always() && needs.build-windows.outputs.r13-validation != 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: meetily-windows-installed-smoke-evidence

@@ -925,13 +925,22 @@ describe("ChatHost scoped panel", () => {
         expect(banner.textContent).not.toContain("database is locked");
     });
 
-    it("renders live sources without meeting navigation and keeps stored sources navigable", async () => {
+    it("renders source snippets, keeps live sources non-navigable, and preserves safe stored-source navigation", async () => {
         await act(async () => root.render(<><ChatMessage role="assistant" content="live" sources={[{ meetingId: "live-1", meetingTitle: "Live recording", chunkType: "live_transcript", snippet: "now", folderName: "", sourceKind: "live_recording" }]} onSourceClick={mocks.routerPush} /><ChatMessage role="assistant" content="saved" sources={[{ meetingId: "meeting-1", meetingTitle: "Planning", chunkType: "transcript", snippet: "then", folderName: "" }]} onSourceClick={mocks.routerPush} /></>));
         const liveSource = container.querySelector('[aria-label="Live recording transcript source"]') as HTMLElement;
+        const savedSource = container.querySelector('[aria-label="Open meeting Planning"]') as HTMLButtonElement;
         expect(liveSource.tagName).toBe("SPAN");
+        expect(liveSource.textContent).toContain("now");
+        expect(savedSource.textContent).toContain("then");
         liveSource.click();
         expect(mocks.routerPush).not.toHaveBeenCalled();
-        (container.querySelector('[aria-label="Open meeting Planning"]') as HTMLButtonElement).click();
+
+        const selectedText = vi.spyOn(window, "getSelection").mockReturnValue({ toString: () => "Planning" } as Selection);
+        savedSource.click();
+        expect(mocks.routerPush).not.toHaveBeenCalled();
+
+        selectedText.mockRestore();
+        savedSource.click();
         expect(mocks.routerPush).toHaveBeenCalledWith("meeting-1");
     });
 
