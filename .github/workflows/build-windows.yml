@@ -505,8 +505,18 @@ jobs:
           }
           $installRoot = Join-Path $env:RUNNER_TEMP 'meetily-r13-cuda-installer-layout'
           try {
-            & $nsis[0].FullName '/S' "/D=$installRoot"
-            if ($LASTEXITCODE -ne 0) { throw 'R13 CUDA NSIS installer did not install silently.' }
+            # NSIS requires /D to be its final, unquoted command-line token.
+            # Pass one raw argument string through Start-Process, matching the
+            # reviewed installed-package smoke harness. The PowerShell call
+            # operator can otherwise render a separate /D argument in a way
+            # NSIS silently ignores, yielding a successful exit with no
+            # installation at the requested isolated location.
+            $r13InstallerArgs = "/S /D=$installRoot"
+            $installerProcess = Start-Process -FilePath $nsis[0].FullName -ArgumentList $r13InstallerArgs -Wait -PassThru -WindowStyle Hidden
+            if ($installerProcess.ExitCode -ne 0) { throw 'R13 CUDA NSIS installer did not install silently.' }
+            if (-not (Test-Path -LiteralPath $installRoot -PathType Container)) {
+              throw 'R13 CUDA NSIS installer completed without creating the requested isolated installation directory.'
+            }
             foreach ($runtimeName in $runtimePatterns.Keys) {
               $installed = @(Get-ChildItem -LiteralPath $installRoot -Filter $runtimePatterns[$runtimeName] -File)
               if ($installed.Count -ne 1 -or $installed[0].Name -ine $stagedRuntimes[$runtimeName].Name) {

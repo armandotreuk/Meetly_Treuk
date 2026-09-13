@@ -29,6 +29,15 @@ if ($identity -notmatch 'Join-Path \$installRoot ''nvcuda\.dll''') {
 if ($identity -notmatch 'system-provided NVIDIA driver API') {
     throw 'R13 package verification must document the system driver boundary.'
 }
+if ($identity.IndexOf('$r13InstallerArgs = "/S /D=$installRoot"', [StringComparison]::Ordinal) -lt 0) {
+    throw 'R13 package verification must pass NSIS silent and destination arguments as one raw string, with /D last.'
+}
+if ($identity -notmatch '(?s)Start-Process\s+-FilePath\s+\$nsis\[0\]\.FullName\s+-ArgumentList\s+\$r13InstallerArgs\s+-Wait\s+-PassThru') {
+    throw 'R13 package verification must wait for the NSIS installer using its raw destination argument string.'
+}
+if ($identity -notmatch 'completed without creating the requested isolated installation directory') {
+    throw 'R13 package verification must fail clearly when NSIS ignores the isolated destination.'
+}
 $nvcudaBranchMarker = '          if ($dependents -match ''(?im)^\s*nvcuda\.dll\s*$'') {'
 $nvcudaBranchStart = $identity.IndexOf($nvcudaBranchMarker, [StringComparison]::Ordinal)
 if ($nvcudaBranchStart -lt 0) {
