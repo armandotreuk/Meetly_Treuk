@@ -78,6 +78,7 @@ export function ChatPanel({ scope, resolvedLabel, onClose, isExpanded, onToggleE
         useState<ChatPreparationProgressPayload | null>(null);
     const [conversationId, setConversationId] = useState<string | null>(null);
     const [loadError, setLoadError] = useState<string | null>(null);
+    const isBusy = isLoading || isStreaming;
     const conversationIdRef = useRef<string | null>(null);
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -657,7 +658,6 @@ export function ChatPanel({ scope, resolvedLabel, onClose, isExpanded, onToggleE
         setInput(textarea.value);
     };
 
-    const isBusy = isLoading || isStreaming;
     const isLiveScope = scope.kind === "live_recording";
     const selectedRetrievalMode: ChatRetrievalMode = isLiveScope ? "fast" : retrievalMode;
     const providerCategory = classifyProvider(providerKind);

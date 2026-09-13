@@ -499,7 +499,13 @@ jobs:
           if ($cublasImport.Groups[1].Value -ine $stagedRuntimes['cublas'].Name) {
             throw "R13 CUDA executable imports $($cublasImport.Groups[1].Value), but staging contains $($stagedRuntimes['cublas'].Name)."
           }
-          if ($dependents -match '(?im)^\s*nvcuda\.dll\s*$') { throw 'R13 CUDA executable must not import nvcuda.dll.' }
+          # nvcuda.dll is the NVIDIA display-driver API supplied by Windows
+          # driver installation. A CUDA executable may legitimately import it;
+          # the installer contract below is what prevents the driver DLL from
+          # being bundled or replacing the user's driver.
+          if ($dependents -match '(?im)^\s*nvcuda\.dll\s*$') {
+            Write-Host 'R13 CUDA executable imports the system-provided NVIDIA driver API (nvcuda.dll).'
+          }
           $installRoot = Join-Path $env:RUNNER_TEMP 'meetily-r13-cuda-installer-layout'
           try {
             & $nsis[0].FullName '/S' "/D=$installRoot"
@@ -715,6 +721,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download MSI smoke evidence
+        if: needs.build-windows.outputs.r13-validation != 'true'
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
@@ -722,6 +729,7 @@ jobs:
           path: ${{ runner.temp }}/meetily-smoke-msi-evidence
 
       - name: Download NSIS smoke evidence
+        if: needs.build-windows.outputs.r13-validation != 'true'
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
@@ -729,6 +737,7 @@ jobs:
           path: ${{ runner.temp }}/meetily-smoke-nsis-evidence
 
       - name: Restore gate evidence
+        if: needs.build-windows.outputs.r13-validation != 'true'
         shell: pwsh
         run: |
           Copy-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'meetily-smoke-msi-evidence/meetily-smoke-msi-result.json') -Destination (Join-Path $env:RUNNER_TEMP 'meetily-smoke-msi-result.json') -ErrorAction SilentlyContinue
