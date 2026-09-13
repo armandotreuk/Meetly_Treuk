@@ -148,7 +148,11 @@ jobs:
     # source-level preflight. Full CPU/R13 installers are manual promotion.
     name: Build Windows x64 (CPU)
     needs: [frontend-and-policy, cargo-check]
-    if: always()
+    # GitHub's documented status-function alternative to `always()`: preserve
+    # a terminal verdict after ordinary failures, but do not let a canceled
+    # stale run keep the concurrency group occupied after a newer
+    # pull-request head has replaced it.
+    if: ${{ !cancelled() }}
     runs-on: windows-latest
     steps:
       - name: Require both Windows preflight jobs to pass

@@ -71,6 +71,21 @@ if ($frontendStart -lt 0 -or $cargoStart -lt 0 -or $preflightGateStart -lt 0) {
 }
 $frontendPreflight = $preflight.Substring($frontendStart, $cargoStart - $frontendStart)
 $cargoPreflight = $preflight.Substring($cargoStart, $preflightGateStart - $cargoStart)
+$preflightGate = $preflight.Substring($preflightGateStart)
+$preflightGateStepsStart = $preflightGate.IndexOf('    steps:', [StringComparison]::Ordinal)
+if ($preflightGateStepsStart -lt 0) {
+    throw 'The Windows preflight terminal gate must define steps after its job-level condition.'
+}
+$preflightGatePreamble = $preflightGate.Substring(0, $preflightGateStepsStart)
+
+# GitHub documents `!cancelled()` as the status-function alternative to
+# `always()`: ordinary frontend/Cargo failures obtain a terminal verdict, but
+# a canceled stale workflow cannot start its gate and hold the per-ref
+# concurrency group ahead of a newer pull-request head.
+$preflightGateCondition = '(?m)^ {4}if: \$\{\{ !cancelled\(\) \}\}\r?$'
+if ([regex]::Matches($preflightGatePreamble, $preflightGateCondition).Count -ne 1) {
+    throw 'The Windows preflight terminal gate must run after failures but skip a canceled stale workflow.'
+}
 
 function Get-NamedPreflightStep([string]$Job, [string]$JobName, [string]$StepName) {
     $stepPattern = "(?m)^ {6}- name: $([regex]::Escape($StepName))[ \t]*\r?$"
