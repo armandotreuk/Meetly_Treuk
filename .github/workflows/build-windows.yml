@@ -1,10 +1,6 @@
 name: "Build Windows (CI)"
 
 on:
-  push:
-    branches: [main, dev]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
     inputs:
       build-type:
@@ -38,7 +34,7 @@ jobs:
       build-profile: ${{ steps.build-profile.outputs.profile }}
       r13-validation: ${{ steps.r13-validation.outputs.enabled }}
     permissions:
-      contents: write
+      contents: read
 
     steps:
       - name: Checkout repository
@@ -57,7 +53,8 @@ jobs:
         id: build-profile
         shell: bash
         run: |
-          # Default to release for push events; allow override via workflow_dispatch input
+          # Manual package promotion defaults to release; allow an explicit
+          # debug package only through the workflow_dispatch input.
           if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.build-type }}" == "debug" ]]; then
             echo "profile=debug" >> "$GITHUB_OUTPUT"
             echo "args=--debug" >> "$GITHUB_OUTPUT"
@@ -710,9 +707,10 @@ jobs:
           retention-days: 30
 
   gate-installed-package-smoke:
-    # Retain the established required-check identity on the terminal verdict,
-    # not merely on the package-producing predecessor.
-    name: Build Windows x64 (CPU)
+    # The automatic preflight retains the historical required-check identity.
+    # Keep this deliberate installer-promotion verdict distinct so a manually
+    # dispatched package cannot satisfy a source-preflight requirement.
+    name: Windows package promotion verdict
     needs: [build-windows, smoke-msi, smoke-nsis]
     if: always()
     runs-on: windows-latest
@@ -777,98 +775,3 @@ jobs:
             ${{ runner.temp }}/meetily-package-sizes.json
           if-no-files-found: warn
           retention-days: 30
-
-  # Quick cargo check on every push (faster than full build)
-  check-rust:
-    name: Cargo Check (Windows)
-    runs-on: windows-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Read pinned Rust channel from rust-toolchain.toml
-        id: rust-channel
-        shell: bash
-        run: |
-          CHANNEL=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' upstream/rust-toolchain.toml)
-          if [ -z "$CHANNEL" ]; then echo "no channel found in upstream/rust-toolchain.toml"; exit 1; fi
-          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
-
-      - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ steps.rust-channel.outputs.channel }}
-          targets: x86_64-pc-windows-msvc
-
-      - name: Verify active toolchain matches rust-toolchain.toml
-        shell: pwsh
-        run: |
-          $expected = (Select-String -Path upstream/rust-toolchain.toml -Pattern 'channel\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
-          $actual = ((rustc --version) -replace '^rustc ', '') -replace ' \(.*\)$', ''
-          Write-Host "rust-toolchain.toml channel: $expected; active rustc: $actual"
-          if ($actual -ne $expected) {
-            Write-Error "Active toolchain $actual does not match the pinned $expected"
-            exit 1
-          }
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: "upstream -> upstream/target"
-          key: windows-x64-check-v2
-
-      - name: Fetch deps and restore whisper-rs-sys bindings
-        shell: bash
-        run: |
-          cd upstream
-          cargo fetch --locked
-          node frontend/scripts/restore-whisper-bindings.mjs
-
-      - name: Build llama-helper sidecar for workspace check
-        shell: bash
-        env:
-          CARGO_TARGET_DIR: target
-        run: |
-          cd upstream
-          cargo build --locked -p llama-helper
-          mkdir -p frontend/src-tauri/binaries
-          cp target/debug/llama-helper.exe frontend/src-tauri/binaries/llama-helper-x86_64-pc-windows-msvc.exe
-
-      - name: Cargo check workspace
-        id: cargo-check
-        shell: bash
-        continue-on-error: true
-        env:
-          CARGO_DEBUG_LOG: ${{ runner.temp }}/cargo_check_out.txt
-          CARGO_TARGET_DIR: target
-        run: |
-          cd upstream
-          # Capture all cargo output (no color codes for clean parsing)
-          LOG="$CARGO_DEBUG_LOG"
-          # GitHub invokes Bash with -e. Persist cargo's result before its gate.
-          set +e
-          CARGO_TERM_COLOR=never cargo check --locked --workspace --message-format=short > "$LOG" 2>&1
-          RC=$?
-          set -e
-          echo "cargo_check_exit_code=$RC" >> "$GITHUB_OUTPUT"
-          echo "=== CARGO CHECK EXIT CODE: $RC ==="
-          echo "--- CARGO OUTPUT START ---"
-          cat "$LOG"
-          echo "--- CARGO OUTPUT END ---"
-          exit 0   # Always succeed; the artifact upload + a separate check step will surface the failure
-
-      - name: Upload cargo check output (for public debugging)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: cargo-check-output
-          path: ${{ runner.temp }}/cargo_check_out.txt
-          retention-days: 14
-          if-no-files-found: warn
-
-      - name: Fail job if cargo check failed
-        if: steps.cargo-check.outputs.cargo_check_exit_code != '0'
-        shell: bash
-        run: |
-          echo "Cargo check failed with exit code ${{ steps.cargo-check.outputs.cargo_check_exit_code }}"
-          exit 1

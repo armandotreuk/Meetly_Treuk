@@ -112,11 +112,11 @@ review entries for the implemented state.
   navigation/content.
 - `frontend/src/components/shared/DownloadProgressToast.tsx` provides a global
   progress-event UI pattern, although retrieval indexing is not a download.
-- The repository root `.github/workflows/build-windows.yml` builds the Windows
-  package but does not install it and execute ORT inference. It is the only
-  active workflow in this fork; `upstream/.github/workflows/build-macos.yml`
-  and `build-linux.yml` are nested where GitHub Actions never reads them and
-  have never run.
+- Repository-root Windows CI is split between automatic
+  `.github/workflows/windows-preflight.yml` source validation and deliberate
+  manual package promotion in `.github/workflows/build-windows.yml`. Nested
+  `upstream/.github/workflows/build-macos.yml` and `build-linux.yml` are where
+  GitHub Actions never reads them and have never run.
 - Sprints 2-4 provide backend status/control, hybrid search internals, context
   retention, and all persisted Chat behavior.
 
@@ -501,12 +501,13 @@ usable through the existing typed lexical fallback.
 - `frontend/src-tauri/src/main.rs` currently reserves first-argument packaged
   diagnostics, including `--smoke-dbstat`. A retrieval diagnostic must preserve
   that exact first-argument safety rule and use distinct documented exit codes.
-- The only active platform workflow is repository-root
-  `.github/workflows/build-windows.yml`. It already stages/verifies the bundle,
-  runs source-tree reference inference, builds both package formats, installs
-  both for `--smoke-dbstat`, preserves the existing signer, and uploads the
-  installers. Nested workflows under `upstream/.github/workflows/` are inert
-  for this fork and are out of scope.
+- Repository-root `.github/workflows/windows-preflight.yml` automatically
+  validates the checked source; the deliberate
+  `.github/workflows/build-windows.yml` promotion workflow stages/verifies the
+  bundle, runs source-tree reference inference, builds both package formats,
+  installs both for `--smoke-dbstat`, preserves the existing signer, and
+  uploads the installers. Nested workflows under `upstream/.github/workflows/`
+  are inert for this fork and are out of scope.
 
 **Parent success criteria:**
 
@@ -696,9 +697,12 @@ failure blocks publication rather than appearing after installation.
   smoke failures.
 - Run after artifact staging, source reference inference, and Tauri package
   build, and before installer upload/publication.
-- Preserve workflow triggers, Windows x64 CPU target, package targets, artifact
-  names, application identifier, and signing behavior. Never add dummy
-  certificates, bypass flags, unsigned fallback publication, or secret output.
+- Preserve the manual package-promotion interface, Windows x64 CPU target,
+  package targets, artifact names, application identifier, and signing
+  behavior. The automatic source preflight may be split into its own workflow,
+  but it must neither publish installers nor stand in for exact-head package
+  evidence. Never add dummy certificates, bypass flags, unsigned fallback
+  publication, or secret output.
 - Record MSI bytes, NSIS bytes, staged retrieval bundle bytes, model-cache
   bytes/hit state, and build-output/cache impact using native filesystem
   measurements. These are evidence only; do not introduce telemetry.
@@ -971,6 +975,7 @@ measured metrics, fixes made, omissions, residual risks, and rollback drill.
 | 2026-09-08 | Approve a three-character sidebar model-inference minimum (`SIDEBAR_SEARCH_MIN_QUERY_LENGTH` / `SEARCH_MIN_MODEL_QUERY_CHARS`). | A one-character minimum did not reduce per-keystroke cross-encoder work; exact title matching remains available without model inference for shorter non-empty queries, while the three-character guard bounds interactive ONNX cost. | Restore a one-character model-inference minimum; rely only on debounce. | OpenCode under the user's delegated decision authority through 07:00 UTC-03 |
 | 2026-09-08 | Add an additive `retrieval_title_fts` mirror for authoritative bounded hybrid title lookup. | The current ID-ordered title scan is incomplete above its arbitrary row limit and is unsuitable for MCP/Context. A separately maintained FTS5 title mirror supports normalized all-core-term lookup without changing the existing public `meeting_fts` lexical commands, semantic document set, vector inputs, or title provenance semantics. | Keep a capped scan with an incomplete-result flag; add title rows to existing `meeting_fts`; add title vectors. | OpenCode under the user's delegated decision authority through 07:00 UTC-03 |
 | 2026-09-08 | Adopt exact SQL score-and-ID title top-k and document its linear matching-set work, amending the strict candidate-limit database-work requirement for this channel. | The synthetic 250k-title diagnostic measured about 436 ms versus 5,960 ms for snapshot-paged scans with identical exact top-k. Output/retained memory remain bounded, but every match is scored; preserve scope/snapshot/hydration/cancellation and all other release gates. | Retain the strict work requirement and leave title search pending a new index design. | User |
+| 2026-09-12 | Split Windows CI into automatic source preflight and manual installer-package promotion. | The prior cold R13 package ran for about 94 minutes and failed at a policy gate after packaging. Automatic local-cost source gates protect integrations; one reviewed exact head receives package evidence. Distinct terminal check names prevent a manual package run from satisfying a source-preflight requirement. | Package on every push/PR; path-filter the required preflight. | User |
 
 ## Task Execution Log
 

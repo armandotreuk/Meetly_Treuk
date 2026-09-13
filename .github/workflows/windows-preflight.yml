@@ -1,0 +1,159 @@
+name: "Windows Preflight (CI)"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  frontend-and-policy:
+    name: Windows frontend and package-policy preflight
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Get pnpm store directory
+        id: pnpm-store
+        shell: bash
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: windows-preflight-pnpm-${{ hashFiles('upstream/frontend/pnpm-lock.yaml') }}
+          restore-keys: windows-preflight-pnpm-
+
+      - name: Install frontend dependencies
+        shell: bash
+        run: |
+          cd upstream/frontend
+          pnpm install --frozen-lockfile
+
+      - name: Run frontend typecheck and tests
+        shell: bash
+        run: |
+          cd upstream/frontend
+          pnpm run typecheck
+          pnpm test
+
+      - name: Run Windows package-smoke mechanics tests
+        shell: pwsh
+        run: ./upstream/frontend/src-tauri/scripts/windows-package-smoke.tests.ps1
+
+      - name: Run retrieval staging/recovery self-test
+        shell: pwsh
+        run: ./upstream/frontend/src-tauri/scripts/stage-retrieval-models.ps1 -SelfTest
+
+      - name: Validate Windows package CI contract
+        shell: pwsh
+        run: ./.github/scripts/validate-windows-ci-contract.ps1
+
+  cargo-check:
+    name: Cargo Check (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read pinned Rust channel from rust-toolchain.toml
+        id: rust-channel
+        shell: bash
+        run: |
+          CHANNEL=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' upstream/rust-toolchain.toml)
+          if [ -z "$CHANNEL" ]; then echo "no channel found in upstream/rust-toolchain.toml"; exit 1; fi
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust-channel.outputs.channel }}
+          targets: x86_64-pc-windows-msvc
+
+      - name: Verify active toolchain matches rust-toolchain.toml
+        shell: pwsh
+        run: |
+          $expected = (Select-String -Path upstream/rust-toolchain.toml -Pattern 'channel\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $actual = ((rustc --version) -replace '^rustc ', '') -replace ' \(.*\)$', ''
+          if ($actual -ne $expected) { throw "Active toolchain $actual does not match pinned $expected" }
+
+      - name: Restore Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "upstream -> upstream/target"
+          key: windows-x64-check-v3
+
+      - name: Fetch deps and restore whisper-rs-sys bindings
+        shell: bash
+        run: |
+          cd upstream
+          cargo fetch --locked
+          node frontend/scripts/restore-whisper-bindings.mjs
+
+      - name: Build llama-helper sidecar for workspace check
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: target
+        run: |
+          cd upstream
+          cargo build --locked -p llama-helper
+          mkdir -p frontend/src-tauri/binaries
+          cp target/debug/llama-helper.exe frontend/src-tauri/binaries/llama-helper-x86_64-pc-windows-msvc.exe
+
+      - name: Cargo check workspace
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: target
+          CARGO_TERM_COLOR: never
+        run: |
+          cd upstream
+          cargo check --locked --workspace --message-format=short
+
+      - name: Cargo check R13 validation feature
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: target
+          CARGO_TERM_COLOR: never
+        run: |
+          cd upstream
+          cargo check --locked --manifest-path frontend/src-tauri/Cargo.toml --features r13-validation --message-format=short
+
+  gate-preflight:
+    # Keep the existing required-check identity while automatic CI is a
+    # source-level preflight. Full CPU/R13 installers are manual promotion.
+    name: Build Windows x64 (CPU)
+    needs: [frontend-and-policy, cargo-check]
+    if: always()
+    runs-on: windows-latest
+    steps:
+      - name: Require both Windows preflight jobs to pass
+        shell: pwsh
+        env:
+          FRONTEND_RESULT: ${{ needs.frontend-and-policy.result }}
+          CARGO_RESULT: ${{ needs.cargo-check.result }}
+        run: |
+          if ($env:FRONTEND_RESULT -ne 'success' -or $env:CARGO_RESULT -ne 'success') {
+            throw "Windows preflight failed: frontend=$env:FRONTEND_RESULT cargo=$env:CARGO_RESULT"
+          }
+          Write-Host 'Windows preflight passed; package promotion remains manual.'

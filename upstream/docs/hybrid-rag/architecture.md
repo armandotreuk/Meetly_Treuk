@@ -62,8 +62,9 @@ The original draft required packaged tokenizer, embedding, and reranker
 inference on Windows x64, macOS ARM64, and Linux x64 before Sprint 2, and again
 on installed packages in Sprint 5. That requirement was unsatisfiable:
 
-- This fork's only active CI workflow is `.github/workflows/build-windows.yml`
-  at the repository root.
+- This fork's active Windows CI is rooted in `.github/workflows/`: automatic
+  source preflight is `windows-preflight.yml`, while the expensive installer
+  promotion workflow is deliberately manual in `build-windows.yml`.
 - `upstream/.github/workflows/build-macos.yml` and `build-linux.yml` exist on
   disk but are nested inside `upstream/`, which GitHub Actions never reads.
   They have never executed for this fork and cannot execute without new
@@ -196,9 +197,10 @@ Consequences that Sprint 1 MUST treat as given rather than rediscover:
   manager, so retrieval state will be additive.
 - `frontend/src-tauri/src/mcp/server.rs:133-233` exposes lexical search,
   context, and shared Chat preparation to localhost MCP clients.
-- The repository root `.github/workflows/` contains only `build-windows.yml`.
-  The macOS and Linux workflows under `upstream/.github/workflows/` are inert
-  for this fork. This is the basis for the Windows-only platform scope.
+- The repository root `.github/workflows/` contains the Windows preflight and
+  manual package-promotion workflows. The macOS and Linux workflows under
+  `upstream/.github/workflows/` are inert for this fork. This is the basis for
+  the Windows-only platform scope.
 - `frontend/src-tauri/tests/` and `frontend/src-tauri/benches/` do not exist.
   Sprint 1 creates the first integration-test target and MUST pin its name.
 - `upstream/.cargo/config.toml` sets only `WHISPER_DONT_GENERATE_BINDINGS`. It
@@ -2347,7 +2349,7 @@ Any failure to resolve one of these gates blocks Sprint 2 approval.
 | 2026-08-21 | Keep MCP Chat Fast-only in the first release. | Avoid iterative provider calls through unauthenticated localhost MCP without cancellation/cost controls. | User |
 | 2026-08-21 | Use per-generation indexed source revisions plus a canonical/publication journal. | Prevent model upgrades/rebuilds, crashes, and deletions from leaving stale active vectors. | User |
 | 2026-08-21 | Durably repair FTS before semantic indexing. | FTS cannot be the availability fallback if best-effort refresh failures remain permanent. | User |
-| 2026-08-21 | **Ship Windows x64 only; defer macOS ARM64 and Linux x64.** | This fork's only active workflow is the root `build-windows.yml`; the macOS/Linux workflows are nested under `upstream/` where GitHub Actions never reads them, and no macOS/Linux hardware is recorded. The original all-three-target `MUST` was unsatisfiable and would have blocked Sprint 1 permanently. | User |
+| 2026-08-21 | **Ship Windows x64 only; defer macOS ARM64 and Linux x64.** | This fork's active Windows workflows are rooted in `.github/workflows/`; the macOS/Linux workflows are nested under `upstream/` where GitHub Actions never reads them, and no macOS/Linux hardware is recorded. The original all-three-target `MUST` was unsatisfiable and would have blocked Sprint 1 permanently. | User |
 | 2026-08-21 | Express the RAM envelope as budget arithmetic and apply it as a model-selection pre-filter. | A 768-dim f32 model is inadmissible at 250k documents before any model loads. Deriving that up front avoids two L-sized benchmark tasks discovering arithmetic empirically. | User |
 | 2026-08-21 | Split the vector-backend decision rule by gate; ANN answers latency only. | An HNSW graph adds memory to the vectors it indexes and cannot remedy a RAM miss. The original single "scale gate" rule sent workers down a path that could not succeed. | User |
 | 2026-08-21 | Remove the fixed byte-width vector `CHECK`; validate encoding at the repository boundary. | The constraint hardcoded f32 and forbade the quantization escape hatch that the same document offers as the RAM remedy. | User |
@@ -2386,3 +2388,4 @@ Any failure to resolve one of these gates blocks Sprint 2 approval.
 | 2026-09-02 | Require bounded Deep generation options in the shared LLM client, a provider capability/fallback matrix, and candidate/evidence authority bounds. | Provider-specific output limits, hard byte/parser caps, deadline cancellation, and per-round offered-ID validation preserve the 512-token/8 KiB/15-second/30-second contract without a second client or scope widening. | User-authorized R40 |
 | 2026-09-02 | Carry the single persisted `force_lexical_retrieval` decision through every hybrid round/surface and give MCP timeouts an internal shared-retrieval cancellation token. | The typed `ForcedLexical` fallback remains reversible across requests/restarts, while server timeouts terminate queued/running work without claiming a public MCP cancel API. | User-authorized R40 |
 | 2026-09-08 | Adopt exact SQL title top-k and explicitly accept linear matching-set scoring work instead of the strict candidate-limit work requirement for this channel. | The synthetic 250k-title diagnostic returned identical exact top-k in about 436 ms versus 5,960 ms for paged scans; all measured exact approaches still score every match. Retain snapshot/scope correctness, ID ordering, cancellation and every other release gate. Implementation is independently reviewed, targeted integration checks pass, and CI10 passed at its exact source head; Task 5.5/final-release verification remains required. | User |
+| 2026-09-12 | Split Windows CI into automatic source preflight and manual installer-package promotion. | A cold CUDA/Tauri installer package took about 94 minutes and #74 failed only at a post-package policy gate. Fast checked-source validation protects each integration while a package is built only at a reviewed exact head; preflight and package terminal checks have distinct identities so manual packaging cannot satisfy a source-preflight requirement. | Keep full packaging on every push/PR; use path filters that can leave a required PR check pending. | User |
