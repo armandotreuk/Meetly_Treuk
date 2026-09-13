@@ -210,22 +210,14 @@ fn exact_mapping_cannot_be_omitted_duplicated_or_redirected() {
 }
 
 #[test]
-fn rejects_empty_mapping_that_would_truncate_tauris_whole_list() {
+fn rejects_empty_mapping_without_relying_on_tauris_whole_list_iterator() {
     let root = fixture();
     fs::create_dir(root.path().join("empty-dir")).unwrap();
-    let paths = vec![
-        root.path().join("empty-dir").display().to_string(),
-        root.path()
-            .join("resources/retrieval/bundle")
-            .display()
-            .to_string(),
-    ];
-    assert!(
-        tauri_utils::resources::ResourcePaths::new(&paths, true)
-            .next()
-            .is_none(),
-        "pin Tauri's whole-list early termination"
-    );
+    // The contract expands each mapping independently.  Do not assert the
+    // upstream multi-source iterator's first item here: its result differs
+    // between otherwise valid Windows temporary-directory volumes.  The
+    // product guarantee is that this empty mapping is rejected and therefore
+    // cannot hide the required bundle mapping.
     assert!(check(
         root.path(),
         json!(["empty-dir", "resources/retrieval/bundle"]),
