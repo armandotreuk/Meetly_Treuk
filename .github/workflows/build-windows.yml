@@ -109,7 +109,7 @@ jobs:
             throw 'The normal package identity must not be changed by R13 validation work.'
           }
 
-          powershell -NoProfile -ExecutionPolicy Bypass -File 'upstream/frontend/src-tauri/scripts/prepare-r13-validation-profile.ps1' -ValidationRoot 'D:\Meetly-R13-Validation' -WhatIf
+          powershell -NoProfile -ExecutionPolicy Bypass -File 'upstream/frontend/src-tauri/scripts/prepare-r13-validation-profile.ps1' -WhatIf
 
           'enabled=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           'backend=cuda' | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
@@ -745,7 +745,7 @@ jobs:
     # dispatched package cannot satisfy a source-preflight requirement.
     name: Windows package promotion verdict
     needs: [build-windows, smoke-msi, smoke-nsis]
-    if: always()
+    if: ${{ !cancelled() }}
     runs-on: windows-latest
     steps:
       - name: Checkout repository

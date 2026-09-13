@@ -8,17 +8,15 @@ The validation Tauri configuration has its own application identifier
 (`com.meetily.ai.r13validation`). Windows/Tauri resolves that identifier below
 the user's roaming and local application-data folders. This script creates
 new directory junctions for those *validation-only* paths so their contents
-are stored below the supplied D: validation root instead. It refuses to
-replace an existing directory, link, or any non-validation application ID.
+are stored below the fixed D:\Meetly-R13-Validation root shared with the
+native validation data. It refuses to replace an existing directory, link, or
+any non-validation application ID.
 
 Run this before the first launch of the validation package. Use -WhatIf to
 inspect the exact paths without changing the machine.
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
-    [Parameter(Mandatory)]
-    [string]$ValidationRoot,
-
     [string]$ApplicationIdentifier = 'com.meetily.ai.r13validation'
 )
 
@@ -52,13 +50,7 @@ if ($ApplicationIdentifier -ne 'com.meetily.ai.r13validation') {
     throw 'This helper only supports the dedicated R13 validation application identifier.'
 }
 
-$root = [IO.Path]::GetFullPath($ValidationRoot)
-if (-not $root.StartsWith('D:\', [StringComparison]::OrdinalIgnoreCase)) {
-    throw "ValidationRoot must be under D:\; received '$root'."
-}
-if ($root.TrimEnd('\') -ieq 'D:') {
-    throw 'ValidationRoot must be a dedicated child directory under D:\, not the drive root.'
-}
+$root = 'D:\Meetly-R13-Validation'
 
 $profileRoots = @()
 foreach ($variableName in @('APPDATA', 'LOCALAPPDATA')) {
@@ -75,7 +67,7 @@ foreach ($variableName in @('APPDATA', 'LOCALAPPDATA')) {
         throw "Refusing to replace existing validation path '$link'. Inspect or remove it manually only after preserving required evidence."
     }
     if (Test-DirectoryEntryExists $target) {
-        throw "Refusing to reuse existing validation target '$target'. Choose a fresh D: validation root."
+        throw "Refusing to reuse existing validation target '$target'. Preserve required evidence, then remove it manually before retrying."
     }
 
     $profileRoots += [PSCustomObject]@{
@@ -104,7 +96,7 @@ try {
         }
         $resolved = if ($targetProperty.Value -is [array]) { $targetProperty.Value[0] } else { [string]$targetProperty.Value }
         if ((Normalize-PathForComparison $resolved) -ne (Normalize-PathForComparison $profileRoot.Target)) {
-            throw "Validation junction '$($profileRoot.Link)' does not resolve to the requested D: target."
+            throw "Validation junction '$($profileRoot.Link)' does not resolve to the fixed D: target."
         }
         Write-Host "Prepared validation-only profile root: $($profileRoot.Link) -> $($profileRoot.Target)"
     }

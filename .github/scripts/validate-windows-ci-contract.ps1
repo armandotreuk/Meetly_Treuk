@@ -10,6 +10,21 @@ $workflowPath = Join-Path $repoRoot '.github/workflows/build-windows.yml'
 $workflow = Get-Content -LiteralPath $workflowPath -Raw
 $preflightPath = Join-Path $repoRoot '.github/workflows/windows-preflight.yml'
 $preflight = Get-Content -LiteralPath $preflightPath -Raw
+$profileHelperPath = Join-Path $repoRoot 'upstream/frontend/src-tauri/scripts/prepare-r13-validation-profile.ps1'
+$profileHelper = Get-Content -LiteralPath $profileHelperPath -Raw
+
+if ($profileHelper -notmatch '(?m)^\$root = ''D:\\Meetly-R13-Validation''\r?$') {
+    throw 'The R13 profile helper must use the one fixed D:\Meetly-R13-Validation root.'
+}
+if ($profileHelper -match '(?m)^\s*\[string\]\$ValidationRoot\b') {
+    throw 'The R13 profile helper must not accept an arbitrary validation root.'
+}
+if ($workflow -notmatch "prepare-r13-validation-profile\.ps1' -WhatIf") {
+    throw 'The R13 package workflow must verify the fixed profile helper in WhatIf mode.'
+}
+if ($workflow -match "prepare-r13-validation-profile\.ps1' -ValidationRoot\b") {
+    throw 'The R13 package workflow must not pass an arbitrary validation root to the profile helper.'
+}
 
 function Get-WorkflowSection([string]$StartMarker, [string]$EndMarker) {
     $start = $workflow.IndexOf($StartMarker, [StringComparison]::Ordinal)
@@ -82,6 +97,17 @@ if ($nvcudaBranch -match '(?im)\b(?:throw|exit)\b') {
 $gateStart = $workflow.IndexOf('  gate-installed-package-smoke:', [StringComparison]::Ordinal)
 if ($gateStart -lt 0) { throw 'Missing R13 terminal gate.' }
 $gate = $workflow.Substring($gateStart)
+$gatePreambleEnd = $gate.IndexOf('    steps:', [StringComparison]::Ordinal)
+if ($gatePreambleEnd -lt 0) { throw 'R13 terminal gate must define steps after its job-level condition.' }
+$gatePreamble = $gate.Substring(0, $gatePreambleEnd)
+# GitHub documents `!cancelled()` as the status-function alternative to
+# `always()`: ordinary dependency failures still reach this terminal verdict,
+# while a canceled stale package workflow releases its per-ref concurrency
+# group instead of retaining the runner behind it.
+$gateCondition = '(?m)^ {4}if: \$\{\{ !cancelled\(\) \}\}\r?$'
+if ([regex]::Matches($gatePreamble, $gateCondition).Count -ne 1) {
+    throw 'The R13 terminal gate must run after failures but skip a canceled stale workflow.'
+}
 if ($gate -notmatch "if: needs\.build-windows\.outputs\.r13-validation != 'true'") {
     throw 'R13 terminal gate must conditionally skip normal smoke evidence.'
 }

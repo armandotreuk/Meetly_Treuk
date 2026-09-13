@@ -326,8 +326,24 @@ export function createSidebarSearchController({
     return { search, cancel, dispose };
 }
 
-function responseMatchesScope(response: HybridSearchResponse, folderId: string | null): boolean {
-    if (folderId === null) return response.scope.kind === "all";
+// Keep this grammar aligned with the backend's `folder:"Name"` operator.
+// Resolution of the name to an id is intentionally backend-authoritative, but
+// a folder-scoped response is only legitimate for an All-scope request that
+// actually contains a non-empty, quoted operator. The controller's generation
+// and request-id checks then ensure this response belongs to the current query.
+const FOLDER_QUERY_OPERATOR = /folder:"[^"]+"/i;
+
+function responseMatchesScope(
+    response: HybridSearchResponse,
+    query: string,
+    folderId: string | null
+): boolean {
+    if (folderId === null) {
+        return (
+            response.scope.kind === "all" ||
+            (response.scope.kind === "folder" && FOLDER_QUERY_OPERATOR.test(query))
+        );
+    }
     return response.scope.kind === "folder" && response.scope.folderId === folderId;
 }
 
@@ -444,7 +460,8 @@ export function buildSidebarSearchRows(
         rows.push({ meeting, snippet, provenance });
     };
 
-    const usableResponse = response && responseMatchesScope(response, folderId) ? response : null;
+    const usableResponse =
+        response && responseMatchesScope(response, query, folderId) ? response : null;
     const ranked = usableResponse
         ? usableResponse.results.slice(0, SIDEBAR_SEARCH_RESULT_LIMIT)
         : [];

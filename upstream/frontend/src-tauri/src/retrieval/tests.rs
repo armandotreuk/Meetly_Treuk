@@ -1065,6 +1065,153 @@ async fn search_and_context_purposes_use_the_shared_service() {
     }
 }
 
+/// A one- or two-character Search effective query must finish while the sole
+/// inference permit is held elsewhere. This proves the policy gate sits
+/// before scheduler admission (and therefore before embedding/vector scan),
+/// while the folder-normalized lexical/title path and public status survive.
+#[tokio::test]
+async fn short_folder_operator_search_skips_all_model_work_and_reports_lexical_only() {
+    let pool = migrated_pool().await;
+    insert_folder(&pool, "f-short", "Short", None).await;
+    insert_meeting(&pool, "m-short", "Ab planning").await;
+    set_meeting_folder(&pool, "m-short", Some("f-short")).await;
+    add_transcript(&pool, "t-short", "m-short", "ab lexical evidence").await;
+    crate::database::repositories::fts::FtsRepository::refresh_meeting(&pool, "m-short")
+        .await
+        .unwrap();
+    register_test_model(&pool).await;
+    RetrievalRepository::ensure_generation(&pool, "gen-short-search", MODEL_ID)
+        .await
+        .unwrap();
+    publish_meeting(
+        &pool,
+        "gen-short-search",
+        "m-short",
+        &["ab semantic evidence"],
+    )
+    .await;
+    let embedder = ServiceEmbedder::new();
+    let lifecycle = query_lifecycle(&embedder);
+    install_snapshot(&pool, &lifecycle, MODEL_ID).await;
+    let index = lifecycle.index_service();
+    let scheduler = lifecycle.scheduler();
+    let held = scheduler
+        .enqueue_interactive()
+        .unwrap()
+        .wait_for_permit()
+        .await
+        .unwrap();
+
+    let mut retrieval = request(
+        r#"folder:"Short" ab"#,
+        PersistedRetrievalScope::All,
+        RetrievalLimits::default(),
+        CoreTermLanguage::English,
+        None,
+    );
+    retrieval.purpose = RetrievalPurpose::Search;
+    let ranked = tokio::time::timeout(
+        Duration::from_secs(5),
+        RetrievalService::new(lifecycle.clone()).retrieve_ranked(&pool, retrieval),
+    )
+    .await
+    .expect("short Search must not wait for an inference permit")
+    .unwrap();
+    assert_eq!(
+        ranked.semantic_fallback,
+        Some(SemanticFallbackReason::SearchQueryTooShort)
+    );
+    assert_eq!(ranked.ranking.effective_query, "ab");
+    assert!(matches!(
+        ranked.scope.scope,
+        PersistedRetrievalScope::Folder(ref id) if id == "f-short"
+    ));
+    assert!(!ranked.ranking.reranker_used);
+    assert!(ranked.ranking.evidence.iter().any(|entry| entry
+        .evidence
+        .provenance
+        .iter()
+        .any(|provenance| provenance.channel == RetrievalChannel::Lexical)));
+    assert!(ranked
+        .ranking
+        .title_matches
+        .iter()
+        .any(|title| title.meeting_id == "m-short"));
+    assert!(ranked.ranking.evidence.iter().all(|entry| entry
+        .evidence
+        .provenance
+        .iter()
+        .all(|provenance| provenance.channel != RetrievalChannel::Semantic)));
+    assert!(!embedder.entered.load(Ordering::SeqCst));
+    assert_eq!(index.fast_hybrid_query_count(), 0);
+    assert_eq!(scheduler.queued_interactive(), 0);
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        execute_hybrid_search(
+            &pool,
+            lifecycle,
+            &ChatRequestState::new(),
+            ChatRequestSurface::Sidebar,
+            "short-folder-search".to_string(),
+            r#"folder:"Short" ab"#.to_string(),
+            HybridScope::All {},
+            Some(50),
+            Duration::from_secs(30),
+        ),
+    )
+    .await
+    .expect("public short Search must not wait for an inference permit")
+    .unwrap();
+    assert_eq!(
+        response.retrieval_status,
+        HybridRetrievalStatus::LexicalFallback
+    );
+    assert!(matches!(
+        response.scope,
+        HybridScope::Folder { ref folder_id } if folder_id == "f-short"
+    ));
+    assert!(response
+        .results
+        .iter()
+        .any(|result| result.meeting_id == "m-short"));
+    assert!(!embedder.entered.load(Ordering::SeqCst));
+    assert_eq!(index.fast_hybrid_query_count(), 0);
+    assert_eq!(scheduler.queued_interactive(), 0);
+    drop(held);
+}
+
+/// The minimum-length inference policy is Search-only: Chat and Context keep
+/// their existing semantic behavior even for the same short query.
+#[tokio::test]
+async fn short_chat_and_context_queries_still_run_semantic_retrieval() {
+    let (pool, lifecycle, embedder) = active_test_retrieval("short-non-search").await;
+    let index = lifecycle.index_service();
+    let service = RetrievalService::new(lifecycle);
+
+    for (offset, purpose) in [RetrievalPurpose::Chat, RetrievalPurpose::Context]
+        .into_iter()
+        .enumerate()
+    {
+        let mut retrieval = request(
+            "ne",
+            PersistedRetrievalScope::All,
+            RetrievalLimits::default(),
+            CoreTermLanguage::English,
+            None,
+        );
+        retrieval.purpose = purpose;
+        let result = service.retrieve(&pool, retrieval).await.unwrap();
+        assert!(result.semantic_fallback.is_none());
+        assert!(result.candidates.iter().any(|candidate| candidate
+            .provenance
+            .iter()
+            .any(|provenance| provenance.channel == RetrievalChannel::Semantic)));
+        assert_eq!(index.fast_hybrid_query_count(), offset as u64 + 1);
+    }
+    assert!(embedder.entered.load(Ordering::SeqCst));
+}
+
 #[tokio::test]
 async fn folder_operator_normalizes_into_folder_scope_from_all() {
     let pool = migrated_pool().await;

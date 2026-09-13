@@ -386,6 +386,46 @@ describe("sidebar search lifecycle", () => {
 });
 
 describe("sidebar search result policy", () => {
+    it("accepts a backend-normalized folder response for an All-scope folder query", () => {
+        const rows = buildSidebarSearchRows(
+            [],
+            'folder:"Project" budget',
+            null,
+            response([hybridResult], "hybrid", { kind: "folder", folderId: "project" })
+        );
+
+        expect(rows.map((row) => row.meeting.id)).toEqual(["semantic"]);
+    });
+
+    it("accepts an ordinary All-scope response for an All-scope query", () => {
+        const rows = buildSidebarSearchRows([], "budget", null, response([hybridResult]));
+
+        expect(rows.map((row) => row.meeting.id)).toEqual(["semantic"]);
+    });
+
+    it("rejects an unexpected folder response for an All-scope query", () => {
+        const meetings = [{ id: "local", title: "Budget planning" }];
+        const rows = buildSidebarSearchRows(
+            meetings,
+            "budget",
+            null,
+            response([hybridResult], "hybrid", { kind: "folder", folderId: "unexpected" })
+        );
+
+        expect(rows.map((row) => row.meeting.id)).toEqual(["local"]);
+    });
+
+    it("keeps explicit UI folder correlation strict despite a query operator", () => {
+        const rows = buildSidebarSearchRows(
+            [],
+            'folder:"Project" budget',
+            "selected-folder",
+            response([hybridResult], "hybrid", { kind: "folder", folderId: "project" })
+        );
+
+        expect(rows).toEqual([]);
+    });
+
     it("falls back to local title matches when no usable response exists", () => {
         const meetings = [
             { id: "m1", title: "Retention policy review", folder_id: "f1" },

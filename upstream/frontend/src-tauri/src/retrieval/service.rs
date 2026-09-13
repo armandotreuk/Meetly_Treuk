@@ -237,6 +237,12 @@ pub enum SemanticFallbackReason {
     EmbeddingUnavailable,
     SchedulerRejected,
     ForcedLexical,
+    /// Interactive Search deliberately skipped every local-model stage
+    /// because its effective query, after folder-operator normalization, was
+    /// shorter than the approved inference threshold. Lexical and title
+    /// channels remain available; this is surfaced as lexical-only rather
+    /// than misreported as a successful hybrid retrieval.
+    SearchQueryTooShort,
     CatchUpTimeout {
         behind: i64,
     },
@@ -423,17 +429,23 @@ impl RetrievalService {
             .await
             .map_err(db_error)?;
         let normalized = self.normalize_request(pool, &request, &cancel).await?;
+        let semantic_policy_fallback = if force_lexical {
+            Some(SemanticFallbackReason::ForcedLexical)
+        } else if matches!(request.purpose, RetrievalPurpose::Search)
+            && normalized.effective_query().chars().count()
+                < crate::retrieval::ranking::SEARCH_MIN_MODEL_QUERY_CHARS
+        {
+            Some(SemanticFallbackReason::SearchQueryTooShort)
+        } else {
+            None
+        };
         ensure_not_cancelled(&cancel)?;
         if let ScopeFilter::Meetings(ids) = &normalized.membership {
             if ids.is_empty() {
                 return Ok(RetrievalResult {
                     scope: normalized.resolved(),
                     candidates: Vec::new(),
-                    semantic_fallback: if force_lexical {
-                        Some(SemanticFallbackReason::ForcedLexical)
-                    } else {
-                        None
-                    },
+                    semantic_fallback: semantic_policy_fallback,
                 });
             }
         }
@@ -446,8 +458,8 @@ impl RetrievalService {
         self.title_channel(pool, &normalized, limits, &cancel, &mut candidates)
             .await?;
         ensure_not_cancelled(&cancel)?;
-        let semantic_fallback = if force_lexical {
-            Some(SemanticFallbackReason::ForcedLexical)
+        let semantic_fallback = if let Some(reason) = semantic_policy_fallback {
+            Some(reason)
         } else {
             self.semantic_channel(pool, &normalized, limits, &cancel, &mut candidates)
                 .await?
@@ -1604,6 +1616,15 @@ impl RetrievalService {
 }
 
 impl NormalizedRequest {
+    /// The same effective-query rule used by ranking, applied after the
+    /// service has stripped every approved folder operator.
+    fn effective_query(&self) -> &str {
+        self.lexical_rewritten
+            .as_deref()
+            .unwrap_or(&self.lexical_original)
+            .trim()
+    }
+
     fn resolved(&self) -> ResolvedScope {
         ResolvedScope {
             scope: self.scope.clone(),
@@ -1991,6 +2012,7 @@ impl SemanticFallbackReason {
             Self::EmbeddingUnavailable => "embedding_unavailable",
             Self::SchedulerRejected => "scheduler_rejected",
             Self::ForcedLexical => "forced_lexical",
+            Self::SearchQueryTooShort => "search_query_too_short",
             Self::CatchUpTimeout { .. } => "catch_up_timeout",
             Self::SemanticScanFailed => "semantic_scan_failed",
         }

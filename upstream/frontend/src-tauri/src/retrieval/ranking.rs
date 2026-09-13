@@ -203,8 +203,10 @@ impl RankingConfig {
     /// bound the cost of one- and two-character queries; a zero depth skips
     /// reranking entirely (`rank_with_mode` takes the fused-order path) rather
     /// than rejecting the query, so short queries still return lexical and
-    /// title results. Enforced here so a direct Tauri/MCP caller is bounded
-    /// exactly like the sidebar.
+    /// title results. [`RetrievalService::retrieve`](crate::retrieval::service::RetrievalService::retrieve)
+    /// applies the same normalized effective-query policy before semantic
+    /// scheduler admission, bounding both embedding and reranking for every
+    /// direct Tauri/MCP caller exactly like the sidebar.
     pub fn for_purpose_and_query(
         purpose: crate::retrieval::service::RetrievalPurpose,
         query: &str,
