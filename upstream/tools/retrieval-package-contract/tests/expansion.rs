@@ -1,8 +1,13 @@
 //! Each invocation has its own cwd, so parallel tests exercise exactly the
 //! bundler's filesystem semantics without process-global cwd races.
 use serde_json::{json, Value};
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 use tempfile::TempDir;
+use tauri_utils::resources::resource_relpath;
 
 fn fixture() -> TempDir {
     let root = tempfile::tempdir().unwrap();
@@ -47,6 +52,14 @@ fn check(root: &Path, resources: Value, static_only: bool) -> Result<(), String>
         );
         Err(message)
     }
+}
+
+#[test]
+fn locked_tauri_resource_relpath_keeps_cuda_runtime_under_one_resources_root() {
+    assert_eq!(
+        resource_relpath(Path::new("resources/cuda-runtime/cudart64_12.dll")),
+        PathBuf::from("resources/cuda-runtime/cudart64_12.dll")
+    );
 }
 
 #[test]

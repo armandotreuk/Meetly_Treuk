@@ -26,8 +26,32 @@ if ($identity -match 'must not import nvcuda\.dll') {
 if ($identity -notmatch 'Join-Path \$installRoot ''nvcuda\.dll''') {
     throw 'R13 package verification must reject a bundled nvcuda.dll.'
 }
+if ($identity -notmatch 'Get-ChildItem -LiteralPath \$installRoot -Filter ''nvcuda\.dll'' -File -Recurse') {
+    throw 'R13 package verification must reject nvcuda.dll anywhere in the installed tree.'
+}
 if ($identity -notmatch 'system-provided NVIDIA driver API') {
     throw 'R13 package verification must document the system driver boundary.'
+}
+if ($identity -notmatch '\$installedResourceDir = Join-Path \$installRoot ''resources\\cuda-runtime''') {
+    throw 'R13 package verification must inspect Tauri''s one-root CUDA runtime resource directory.'
+}
+if ($identity -notmatch 'did not preserve the staged .* in its resource directory') {
+    throw 'R13 package verification must validate the staged CUDA runtimes inside the installed resource directory.'
+}
+if ($identity -notmatch 'nested resources resource directory') {
+    throw 'R13 package verification must reject a nested Tauri resource root.'
+}
+$cudaRuntimeHookPath = Join-Path $repoRoot 'upstream/frontend/src-tauri/windows/cuda-runtime-hooks.nsh'
+if (-not (Test-Path -LiteralPath $cudaRuntimeHookPath -PathType Leaf)) {
+    throw 'R13 CUDA validation hook is missing.'
+}
+$cudaRuntimeHook = Get-Content -LiteralPath $cudaRuntimeHookPath -Raw
+$expectedCudaRuntimeCopy = 'CopyFiles /SILENT "$INSTDIR\resources\cuda-runtime\*.dll" "$INSTDIR"'
+if ($cudaRuntimeHook.IndexOf($expectedCudaRuntimeCopy, [StringComparison]::Ordinal) -lt 0) {
+    throw 'R13 CUDA validation hook must copy the staged runtime from the single Tauri installer resource root.'
+}
+if ($cudaRuntimeHook.IndexOf('$INSTDIR\resources\resources\cuda-runtime', [StringComparison]::Ordinal) -ge 0) {
+    throw 'R13 CUDA validation hook must not add a second resources directory.'
 }
 if ($identity.IndexOf('$r13InstallerArgs = "/S /D=$installRoot"', [StringComparison]::Ordinal) -lt 0) {
     throw 'R13 package verification must pass NSIS silent and destination arguments as one raw string, with /D last.'
