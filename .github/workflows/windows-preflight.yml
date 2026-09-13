@@ -153,7 +153,10 @@ jobs:
     # stale run keep the concurrency group occupied after a newer
     # pull-request head has replaced it.
     if: ${{ !cancelled() }}
-    runs-on: windows-latest
+    # This is a source-result aggregator. Its required-check name stays
+    # stable, but its sole step is portable PowerShell and does not justify a
+    # third Windows runner allocation after the two Windows validations pass.
+    runs-on: ubuntu-latest
     steps:
       - name: Require both Windows preflight jobs to pass
         shell: pwsh
