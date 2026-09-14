@@ -40,6 +40,10 @@ concurrency:
 env:
   RUST_BACKTRACE: 1
   CARGO_TERM_COLOR: always
+  # ggml otherwise probes the hosted runner and may compile AVX-512 instructions
+  # that are illegal on supported client CPUs. This applies to both the Tauri
+  # app's Whisper library and the CPU llama-helper sidecar.
+  CMAKE_PROJECT_TOP_LEVEL_INCLUDES: ${{ github.workspace }}/frontend/src-tauri/cmake/ggml-portable-x64.cmake
 
 jobs:
   build-windows:
@@ -143,6 +147,20 @@ jobs:
           "upload_artifacts=$($uploadArtifacts.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "artifact_name=meetily-r13-validation-windows-x64-cuda-${{ steps.build-profile.outputs.profile }}-${{ steps.get-version.outputs.version }}" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           Write-Host 'R13 CUDA validation package mode: enabled'
+
+      - name: Verify portable GGML policy support
+        shell: pwsh
+        run: |
+          $overlay = 'frontend/src-tauri/cmake/ggml-portable-x64.cmake'
+          if (-not (Test-Path -LiteralPath $overlay)) {
+            throw "Portable GGML policy file was not found: $overlay"
+          }
+          $cmakeVersionLine = cmake --version | Select-Object -First 1
+          $cmakeVersion = [Version](($cmakeVersionLine -split '\s+')[-1])
+          if ($cmakeVersion -lt [Version]'3.24') {
+            throw "CMake 3.24 or newer is required for CMAKE_PROJECT_TOP_LEVEL_INCLUDES; found $cmakeVersion."
+          }
+          Write-Host "Portable GGML policy is supported by CMake $cmakeVersion."
 
       - name: Setup DigiCert Environment
         if: ${{ github.event.inputs.sign-build == 'true' }}
@@ -823,6 +841,42 @@ jobs:
         run: |
           echo "## Build Artifacts"
           find target/x86_64-pc-windows-msvc/${{ steps.build-profile.outputs.profile }}/bundle -type f \( -name "*.msi" -o -name "*.exe" \) -exec ls -lh {} \;
+
+      - name: Verify portable x64 CPU instruction set
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $dumpbin = Get-ChildItem -Path (Join-Path $vsInstall 'VC\Tools\MSVC') -Filter dumpbin.exe -Recurse |
+            Where-Object { $_.FullName -match 'Hostx64\\x64\\dumpbin.exe$' } |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $dumpbin) { throw 'Visual Studio dumpbin.exe was not found for the portable CPU instruction audit.' }
+
+          # ONNX Runtime legitimately bundles dispatch-only AVX-512 kernels in
+          # meetily.exe. Audit the CMake-built Whisper/GGML libraries directly,
+          # because they caused the observed illegal instruction, and audit the
+          # separate llama-helper executable that is bundled with the package.
+          $whisperLibraries = @(
+            Get-ChildItem -LiteralPath 'target/x86_64-pc-windows-msvc/${{ steps.build-profile.outputs.profile }}/build' -Recurse -Filter '*.lib' |
+              Where-Object { $_.FullName -match '\\whisper-rs-sys-[^\\]+\\out\\lib\\(ggml|whisper)\.lib$' }
+          )
+          if ($whisperLibraries.Count -ne 2) {
+            throw "Expected the ggml and whisper static libraries exactly once; found $($whisperLibraries.Count)."
+          }
+          foreach ($library in $whisperLibraries) {
+            if (& $dumpbin /DISASM $library.FullName | Select-String -Pattern '\bzmm(?:word|\d+)\b' -Quiet) {
+              throw "$($library.Name) contains AVX-512 ZMM instructions and is not portable to supported Windows x64 CPUs."
+            }
+          }
+
+          $llamaHelper = 'frontend/src-tauri/binaries/llama-helper-x86_64-pc-windows-msvc.exe'
+          if (-not (Test-Path -LiteralPath $llamaHelper)) {
+            throw "Expected packaged executable was not found: $llamaHelper"
+          }
+          if (& $dumpbin /DISASM $llamaHelper | Select-String -Pattern '\bzmm(?:word|\d+)\b' -Quiet) {
+            throw "$llamaHelper contains AVX-512 ZMM instructions and is not portable to supported Windows x64 CPUs."
+          }
+          Write-Host 'Portable x64 CPU instruction audit passed for Whisper/GGML and llama-helper.'
 
       - name: Verify R13 CUDA validation artifact identity and dependencies
         if: ${{ steps.r13-validation.outputs.enabled == 'true' }}
