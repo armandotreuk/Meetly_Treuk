@@ -60,6 +60,25 @@ pub(crate) fn cpu_control_available(backend: WhisperCompiledBackend) -> bool {
     cfg!(feature = "r13-validation") && matches!(backend, WhisperCompiledBackend::Cuda)
 }
 
+fn normalize_preferences_for_backend(
+    mut preferences: TranscriptionPerformancePreferences,
+    backend: WhisperCompiledBackend,
+) -> TranscriptionPerformancePreferences {
+    // A validation-only value may remain in the shared store if the executable
+    // changes. Do not let a hidden, unavailable preference reject unrelated
+    // thread-limit changes in CPU, Vulkan, or normal packages.
+    if !cpu_control_available(backend) {
+        preferences.force_whisper_cpu = false;
+    }
+    preferences
+}
+
+fn normalize_preferences(
+    preferences: TranscriptionPerformancePreferences,
+) -> TranscriptionPerformancePreferences {
+    normalize_preferences_for_backend(preferences, WhisperCompiledBackend::current())
+}
+
 fn set_stored_preferences(preferences: &TranscriptionPerformancePreferences) {
     set_stored_thread_limit(preferences.cpu_thread_limit);
     FORCE_WHISPER_CPU.store(
@@ -170,12 +189,14 @@ fn load_preferences<R: Runtime>(
             format!("Failed to access transcription performance preferences: {error}")
         })?;
 
-    match store.get("preferences") {
+    let preferences = match store.get("preferences") {
         Some(value) => serde_json::from_value(value.clone()).map_err(|error| {
             format!("Failed to read transcription performance preferences: {error}")
         }),
         None => Ok(TranscriptionPerformancePreferences::default()),
-    }
+    }?;
+
+    Ok(normalize_preferences(preferences))
 }
 
 /// Called at setup so a persisted limit is in effect before the first recording.
@@ -268,7 +289,8 @@ pub async fn get_transcription_hardware_status() -> Result<TranscriptionHardware
 #[cfg(test)]
 mod tests {
     use super::{
-        cpu_control_available, resolve_thread_count_with_limit, TranscriptionPerformancePreferences,
+        cpu_control_available, normalize_preferences_for_backend, resolve_thread_count_with_limit,
+        TranscriptionPerformancePreferences,
     };
     use crate::whisper_engine::acceleration::WhisperCompiledBackend;
 
@@ -309,5 +331,19 @@ mod tests {
 
         assert_eq!(restored.cpu_thread_limit, Some(6));
         assert!(restored.force_whisper_cpu);
+    }
+
+    #[test]
+    fn unavailable_package_normalizes_stale_cpu_control() {
+        let preferences = normalize_preferences_for_backend(
+            TranscriptionPerformancePreferences {
+                cpu_thread_limit: Some(6),
+                force_whisper_cpu: true,
+            },
+            WhisperCompiledBackend::Cpu,
+        );
+
+        assert_eq!(preferences.cpu_thread_limit, Some(6));
+        assert!(!preferences.force_whisper_cpu);
     }
 }
