@@ -366,6 +366,191 @@ describe("ChatHost scoped panel", () => {
         expect(container.querySelector('[aria-label="Stop generating"]')).toBeNull();
     });
 
+    it("keeps a follow-up draft editable during a request without starting a second stream", async () => {
+        const scope: ChatScope = { kind: "all", key: "all" };
+        let resolveStream!: () => void;
+        mocks.invoke.mockImplementation((command: string, args?: any) => {
+            if (command === "api_get_chat_model_config") return Promise.resolve({});
+            if (command === "api_chat_get_or_create_scoped_conversation") {
+                return Promise.resolve({ id: `conversation-${args.scope.key}` });
+            }
+            if (command === "api_chat_get_messages") return Promise.resolve([]);
+            if (command === "api_chat_with_scoped_conversation_stream") {
+                return new Promise<void>((resolve) => {
+                    resolveStream = resolve;
+                });
+            }
+            return Promise.resolve();
+        });
+
+        await act(async () => root.render(<ChatHost><Launcher scope={scope} label="all" /></ChatHost>));
+        await act(async () => (container.querySelector("button") as HTMLButtonElement).click());
+        await flush();
+
+        const textarea = container.querySelector("textarea")!;
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, "first question ");
+            textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        await act(async () => (container.querySelector('[aria-label="Send message"]') as HTMLButtonElement).click());
+        await flush();
+
+        expect(textarea.disabled).toBe(false);
+        expect(textarea.value).toBe("");
+        expect(container.querySelector('[aria-label="Stop generating"]')).not.toBeNull();
+
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, "follow-up draft");
+            textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        expect(textarea.value).toBe("follow-up draft");
+
+        await act(async () => {
+            textarea.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+        });
+        expect(mocks.invoke.mock.calls.filter(([command]) => command === "api_chat_with_scoped_conversation_stream")).toHaveLength(1);
+        expect(textarea.value).toBe("follow-up draft");
+
+        await act(async () => (container.querySelector('[aria-label="Stop generating"]') as HTMLButtonElement).click());
+        expect(container.querySelector('[aria-label="Send message"]')).not.toBeNull();
+        expect(textarea.value).toBe("follow-up draft");
+        await act(async () => resolveStream());
+    });
+
+    it("prevents a second live request while provider configuration is pending", async () => {
+        const scope: ChatScope = { kind: "live_recording", key: "live-1" };
+        let resolveConfig!: (config: { provider: string }) => void;
+        let configCallCount = 0;
+        mocks.invoke.mockImplementation((command: string, args?: any) => {
+            if (command === "api_get_chat_model_config") {
+                configCallCount += 1;
+                if (configCallCount === 1) return Promise.resolve({ provider: "ollama" });
+                return new Promise<{ provider: string }>((resolve) => {
+                    resolveConfig = resolve;
+                });
+            }
+            if (command === "api_chat_get_or_create_scoped_conversation") {
+                return Promise.resolve({ id: `conversation-${args.scope.key}` });
+            }
+            if (command === "api_chat_get_messages") return Promise.resolve([]);
+            return Promise.resolve();
+        });
+
+        await act(async () =>
+            root.render(
+                <ChatHost>
+                    <Launcher scope={scope} label="live" />
+                </ChatHost>
+            )
+        );
+        await act(async () => (container.querySelector("button") as HTMLButtonElement).click());
+        await flush();
+        expect(configCallCount).toBe(1);
+
+        const textarea = container.querySelector("textarea")!;
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(
+                textarea,
+                "same text"
+            );
+            textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        await act(async () =>
+            (container.querySelector('[aria-label="Send message"]') as HTMLButtonElement).click()
+        );
+        await flush();
+
+        expect(textarea.disabled).toBe(false);
+        expect(container.querySelector('[aria-label="Stop generating"]')).not.toBeNull();
+        expect(configCallCount).toBe(2);
+
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(
+                textarea,
+                "same text"
+            );
+            textarea.dispatchEvent(new Event("input", { bubbles: true }));
+            textarea.dispatchEvent(
+                new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })
+            );
+        });
+        expect(textarea.value).toBe("same text");
+        expect(configCallCount).toBe(2);
+
+        await act(async () =>
+            (container.querySelector('[aria-label="Stop generating"]') as HTMLButtonElement).click()
+        );
+        expect(container.querySelector('[aria-label="Send message"]')).not.toBeNull();
+        expect(textarea.value).toBe("same text");
+        expect(mocks.invoke).not.toHaveBeenCalledWith("api_cancel_chat_stream", expect.anything());
+
+        await act(async () => resolveConfig({ provider: "ollama" }));
+        await flush();
+        expect(
+            mocks.invoke.mock.calls.some(
+                ([command]) => command === "api_chat_with_scoped_conversation_stream"
+            )
+        ).toBe(false);
+    });
+
+    it("retains a live draft typed during provider configuration when the stream starts", async () => {
+        const scope: ChatScope = { kind: "live_recording", key: "live-1" };
+        let resolveConfig!: (config: { provider: string }) => void;
+        let configCallCount = 0;
+        mocks.invoke.mockImplementation((command: string, args?: any) => {
+            if (command === "api_get_chat_model_config") {
+                configCallCount += 1;
+                if (configCallCount === 1) return Promise.resolve({ provider: "ollama" });
+                return new Promise<{ provider: string }>((resolve) => {
+                    resolveConfig = resolve;
+                });
+            }
+            if (command === "api_chat_get_or_create_scoped_conversation") {
+                return Promise.resolve({ id: `conversation-${args.scope.key}` });
+            }
+            if (command === "api_chat_get_messages") return Promise.resolve([]);
+            return Promise.resolve();
+        });
+
+        await act(async () =>
+            root.render(
+                <ChatHost>
+                    <Launcher scope={scope} label="live" />
+                </ChatHost>
+            )
+        );
+        await act(async () => (container.querySelector("button") as HTMLButtonElement).click());
+        await flush();
+
+        const textarea = container.querySelector("textarea")!;
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(
+                textarea,
+                "same text"
+            );
+            textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        await act(async () =>
+            (container.querySelector('[aria-label="Send message"]') as HTMLButtonElement).click()
+        );
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(
+                textarea,
+                "same text"
+            );
+            textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+
+        await act(async () => resolveConfig({ provider: "ollama" }));
+        await flush();
+        expect(textarea.value).toBe("same text");
+        expect(
+            mocks.invoke.mock.calls.filter(
+                ([command]) => command === "api_chat_with_scoped_conversation_stream"
+            )
+        ).toHaveLength(1);
+    });
+
     it("clears rendered sources when a timeout-race deletion aborts before command completion", async () => {
         const scope: ChatScope = { kind: "all", key: "all" };
         let resolveStream!: () => void;
@@ -998,10 +1183,18 @@ describe("ChatHost scoped panel", () => {
         await flush();
         const streamCall = mocks.invoke.mock.calls.find(([command]) => command === "api_chat_with_scoped_conversation_stream")!;
         const streamId = streamCall[1].streamId;
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(
+                textarea,
+                "draft for the old scope"
+            );
+            textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        });
         await act(async () => (Array.from(container.querySelectorAll("button")).find((button) => button.textContent === "meeting") as HTMLButtonElement).click());
         await flush();
         expect(mocks.invoke).toHaveBeenCalledWith("api_cancel_chat_stream", { streamId });
         expect(mocks.unlisten).toHaveBeenCalled();
+        expect((container.querySelector("textarea") as HTMLTextAreaElement).value).toBe("");
 
         await act(async () => mocks.listeners.get("chat-stream-done")!({ payload: { streamId, answer: "old answer", sources: [] } }));
         expect(mocks.invoke.mock.calls.filter(([command, args]) => command === "api_chat_save_message" && args.content === "old answer")).toHaveLength(0);

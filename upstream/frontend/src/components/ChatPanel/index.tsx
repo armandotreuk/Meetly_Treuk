@@ -82,6 +82,10 @@ export function ChatPanel({ scope, resolvedLabel, onClose, isExpanded, onToggleE
     const conversationIdRef = useRef<string | null>(null);
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLTextAreaElement>(null);
+    // A revision, rather than a string comparison, distinguishes the raw text
+    // that started a request from an identical follow-up draft typed while a
+    // live-provider configuration check is still pending.
+    const inputRevisionRef = useRef(0);
     // A new panel initially renders its composer disabled while the scoped
     // conversation is created. Remember whether that newly enabled composer
     // has received the promised initial focus, rather than attempting to
@@ -89,6 +93,11 @@ export function ChatPanel({ scope, resolvedLabel, onClose, isExpanded, onToggleE
     const initialComposerFocusPendingRef = useRef(true);
     const unlistenersRef = useRef<UnlistenFn[]>([]);
     const streamIdRef = useRef<string | null>(null);
+    // React state updates do not synchronously protect a second Enter/click.
+    // Keep a synchronous ownership token from configuration through the stream
+    // terminal event so a live-provider configuration await cannot race a
+    // second request into the same conversation.
+    const activeRequestTokenRef = useRef<string | null>(null);
     // Locally observed deletions, generation-tagged (R74): meeting id to the
     // scope generation during which the deletion was observed. Bounded by
     // MAX_LOCALLY_DELETED_MEETING_IDS; entries from older generations are
@@ -255,6 +264,7 @@ export function ChatPanel({ scope, resolvedLabel, onClose, isExpanded, onToggleE
         if (evictedIn !== null && evictedIn < generation) deletedSourcesEvictedInRef.current = null;
         const oldStreamId = streamIdRef.current;
         if (oldStreamId) void invoke("api_cancel_chat_stream", { streamId: oldStreamId });
+        activeRequestTokenRef.current = null;
         streamIdRef.current = null;
         cleanupListeners();
         setIsLoading(false);
@@ -266,6 +276,8 @@ export function ChatPanel({ scope, resolvedLabel, onClose, isExpanded, onToggleE
         initialComposerFocusPendingRef.current = true;
         setConversationId(null);
         setMessages([]);
+        inputRevisionRef.current += 1;
+        setInput("");
 
         const loadConversation = async () => {
             try {
@@ -342,6 +354,7 @@ export function ChatPanel({ scope, resolvedLabel, onClose, isExpanded, onToggleE
     useEffect(() => {
         return () => {
             scopeGenerationRef.current += 1;
+            activeRequestTokenRef.current = null;
             void invoke("api_cancel_chat_stream", { streamId: null }).catch((error) =>
                 logger.error("Failed to cancel chat stream on close:", error)
             );
@@ -362,12 +375,35 @@ export function ChatPanel({ scope, resolvedLabel, onClose, isExpanded, onToggleE
     }, []);
 
     const sendQuery = async (query: string) => {
-        if (!query || isLoading || isStreaming || !conversationId) return;
+        if (
+            !query ||
+            isLoading ||
+            isStreaming ||
+            activeRequestTokenRef.current ||
+            !conversationId
+        )
+            return;
+        const requestToken = crypto.randomUUID();
+        activeRequestTokenRef.current = requestToken;
+        const submittedInputRevision = inputRevisionRef.current;
         const requestGeneration = scopeGenerationRef.current;
         const streamConversationId = conversationId;
         const isCurrentScope = () =>
+            activeRequestTokenRef.current === requestToken &&
             requestGeneration === scopeGenerationRef.current &&
             conversationIdRef.current === streamConversationId;
+        const abandonRequest = () => {
+            if (activeRequestTokenRef.current !== requestToken) return;
+            activeRequestTokenRef.current = null;
+            setIsLoading(false);
+            setIsStreaming(false);
+            setPreparationProgress(null);
+        };
+        // A live provider configuration/consent check is part of beginning a
+        // request. Show its cancellable preparation state immediately, while
+        // retaining an editable follow-up draft in the composer.
+        setIsLoading(true);
+        setPreparationProgress(null);
         let liveTranscriptConsent = false;
         if (scope.kind === "live_recording") {
             const currentConfig = await invoke<{ provider?: string | null }>(
@@ -375,7 +411,10 @@ export function ChatPanel({ scope, resolvedLabel, onClose, isExpanded, onToggleE
             ).catch(() => null);
             if (!isCurrentScope()) return;
             if (classifyProvider(currentConfig?.provider ?? providerKind) !== "local") {
-                if (!window.confirm(t("chat.live.disclosure"))) return;
+                if (!window.confirm(t("chat.live.disclosure"))) {
+                    abandonRequest();
+                    return;
+                }
                 liveTranscriptConsent = true;
             }
         }
@@ -385,11 +424,14 @@ export function ChatPanel({ scope, resolvedLabel, onClose, isExpanded, onToggleE
         const userMessage: ChatMessageType = { role: "user", content: query };
         setMessages((prev) => [...prev, userMessage]);
         saveMessage(conversationId, userMessage);
-        setInput("");
-        if (inputRef.current) inputRef.current.style.height = "auto";
-        setIsLoading(true);
-        setPreparationProgress(null);
-
+        // A live request may have waited for provider configuration while the
+        // user drafted the next turn. Clear only the exact input revision that
+        // began this request, never a newer (even identically worded) draft.
+        if (inputRevisionRef.current === submittedInputRevision) {
+            inputRevisionRef.current += 1;
+            setInput("");
+            if (inputRef.current) inputRef.current.style.height = "auto";
+        }
         // Build history from previous messages (last 10), excluding error bubbles
         const history = messages
             .filter((m) => !m.isError)
@@ -477,6 +519,8 @@ export function ChatPanel({ scope, resolvedLabel, onClose, isExpanded, onToggleE
                 "chat-stream-done",
                 (event) => {
                     if (!isCurrentRequest() || event.payload.streamId !== streamId) return;
+                    activeRequestTokenRef.current = null;
+                    if (streamIdRef.current === streamId) streamIdRef.current = null;
                     const sources = sanitizeSources(event.payload.sources, streamSourcesTrusted);
                     setIsStreaming(false);
                     setPreparationProgress(null);
@@ -512,6 +556,8 @@ export function ChatPanel({ scope, resolvedLabel, onClose, isExpanded, onToggleE
                 "chat-stream-error",
                 (event) => {
                     if (!isCurrentRequest() || event.payload.streamId !== streamId) return;
+                    activeRequestTokenRef.current = null;
+                    if (streamIdRef.current === streamId) streamIdRef.current = null;
                     setIsLoading(false);
                     setIsStreaming(false);
                     setPreparationProgress(null);
@@ -556,6 +602,8 @@ export function ChatPanel({ scope, resolvedLabel, onClose, isExpanded, onToggleE
                 "chat-stream-abort",
                 (event) => {
                     if (!isCurrentRequest() || event.payload.streamId !== streamId) return;
+                    activeRequestTokenRef.current = null;
+                    if (streamIdRef.current === streamId) streamIdRef.current = null;
                     setIsLoading(false);
                     setIsStreaming(false);
                     setPreparationProgress(null);
@@ -590,6 +638,8 @@ export function ChatPanel({ scope, resolvedLabel, onClose, isExpanded, onToggleE
             });
         } catch (error) {
             if (!isCurrentRequest()) return;
+            activeRequestTokenRef.current = null;
+            if (streamIdRef.current === streamId) streamIdRef.current = null;
             setIsLoading(false);
             setIsStreaming(false);
             setPreparationProgress(null);
@@ -612,13 +662,17 @@ export function ChatPanel({ scope, resolvedLabel, onClose, isExpanded, onToggleE
 
     const handleStop = async () => {
         const streamId = streamIdRef.current;
-        if (!streamId || (!isLoading && !isStreaming)) return;
+        const requestToken = activeRequestTokenRef.current;
+        if (!requestToken || (!isLoading && !isStreaming)) return;
+        activeRequestTokenRef.current = null;
         try {
-            await invoke("api_cancel_chat_stream", { streamId });
+            if (streamId) {
+                await invoke("api_cancel_chat_stream", { streamId });
+            }
         } catch (error) {
             logger.error("Failed to cancel chat stream:", error);
         } finally {
-            if (streamIdRef.current === streamId) {
+            if (!streamId || streamIdRef.current === streamId) {
                 streamIdRef.current = null;
                 setIsLoading(false);
                 setIsStreaming(false);
@@ -655,6 +709,7 @@ export function ChatPanel({ scope, resolvedLabel, onClose, isExpanded, onToggleE
         const textarea = e.currentTarget;
         textarea.style.height = "auto";
         textarea.style.height = `${Math.min(textarea.scrollHeight, 120)}px`;
+        inputRevisionRef.current += 1;
         setInput(textarea.value);
     };
 
@@ -909,7 +964,11 @@ export function ChatPanel({ scope, resolvedLabel, onClose, isExpanded, onToggleE
                         onInput={handleInput}
                         onKeyDown={handleKeyDown}
                         placeholder={t("chat.input.placeholder")}
-                        disabled={isBusy || !conversationId}
+                        // Keep the next question editable while a response is
+                        // preparing or streaming. sendQuery still rejects a
+                        // concurrent request, and the Stop action remains the
+                        // only submission control until that request finishes.
+                        disabled={!conversationId}
                         className="max-h-[120px] flex-1 resize-none overflow-y-auto rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-transparent focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-50 disabled:text-gray-400"
                     />
                     {isBusy ? (
