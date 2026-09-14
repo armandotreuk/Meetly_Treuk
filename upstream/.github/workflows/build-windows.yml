@@ -743,10 +743,49 @@ jobs:
         uses: Jimver/cuda-toolkit@v0.2.36
         id: cuda-toolkit
         with:
-          # whisper-rs 0.13.2's vendored whisper.cpp still compiles compute_52,
-          # which CUDA 13 removed. CUDA 12.8 retains that target and supports
-          # the RTX 50-series generation used for R13 validation.
-          cuda: '12.8.1'
+          # The R13 reference machine uses CUDA 13.3 with an RTX 5060 (sm_120).
+          # The explicit architecture below avoids whisper.cpp's legacy default
+          # list, which includes compute_52 and is not supported by CUDA 13.
+          cuda: '13.3.0'
+
+      - name: Configure CUDA 13.3 Whisper build for R13 validation
+        if: ${{ steps.r13-validation.outputs.backend == 'cuda' }}
+        shell: pwsh
+        run: |
+          if (-not $env:CUDA_PATH -or -not (Test-Path -LiteralPath $env:CUDA_PATH)) {
+            throw 'CUDA_PATH was not configured by the CUDA toolkit setup.'
+          }
+          $nvcc = Join-Path $env:CUDA_PATH 'bin\\nvcc.exe'
+          if (-not (Test-Path -LiteralPath $nvcc -PathType Leaf)) {
+            throw "CUDA 13.3 compiler was not found at $nvcc."
+          }
+          $nvccVersion = & $nvcc --version | Out-String
+          Write-Host $nvccVersion
+          if ($nvccVersion -notmatch 'release 13\.3') {
+            throw "R13 CUDA validation requires CUDA 13.3, but nvcc reported: $nvccVersion"
+          }
+
+          # whisper-rs-sys forwards CMAKE_* and WHISPER_* variables to the
+          # vendored whisper.cpp CMake configuration. These settings match the
+          # locally proven CUDA 13.3 build without changing the pinned crate.
+          $settings = @(
+            "CMAKE_CUDA_COMPILER=$nvcc",
+            'CMAKE_CUDA_ARCHITECTURES=120',
+            'CMAKE_CUDA_FLAGS=-Xcompiler /Zc:preprocessor',
+            'CMAKE_CXX_STANDARD=17',
+            'CMAKE_CUDA_STANDARD=17',
+            'CMAKE_CUDA_STANDARD_REQUIRED=ON',
+            # CUDA 13.3 + CMake 4.3 can fail compiler detection before it
+            # compiles any Whisper source; this is required by the proven
+            # local CUDA 13.3 configuration.
+            'CMAKE_CUDA_COMPILER_WORKS=1',
+            'WHISPER_DONT_GENERATE_BINDINGS=1',
+            "CUDA_PATH_V13_3=$env:CUDA_PATH"
+          )
+          foreach ($setting in $settings) {
+            $setting | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+          Write-Host 'Configured Whisper CUDA backend for sm_120.'
 
       - name: Stage and verify CUDA runtime for R13 validation
         if: ${{ steps.r13-validation.outputs.backend == 'cuda' }}
