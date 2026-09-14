@@ -46,6 +46,10 @@ pub struct WhisperContextAcceleration {
 
 impl WhisperContextAcceleration {
     pub fn status_label(self) -> &'static str {
+        if !self.use_gpu && !matches!(self.compiled_backend, WhisperCompiledBackend::Cpu) {
+            return "CPU control requested for this Whisper context";
+        }
+
         match (self.compiled_backend, self.flash_attn) {
             (WhisperCompiledBackend::Metal, true) => "Metal GPU with Flash Attention (Ultra-Fast)",
             (WhisperCompiledBackend::Metal, false) => "Metal GPU acceleration",
@@ -62,8 +66,9 @@ pub fn whisper_context_acceleration_for(
     compiled_backend: WhisperCompiledBackend,
     runtime_detected_gpu: GpuType,
     performance_tier: PerformanceTier,
+    force_cpu: bool,
 ) -> WhisperContextAcceleration {
-    let use_gpu = !matches!(compiled_backend, WhisperCompiledBackend::Cpu);
+    let use_gpu = !force_cpu && !matches!(compiled_backend, WhisperCompiledBackend::Cpu);
     let fast_tier = matches!(
         performance_tier,
         PerformanceTier::High | PerformanceTier::Ultra
@@ -94,6 +99,7 @@ mod tests {
             WhisperCompiledBackend::Vulkan,
             GpuType::Cuda,
             PerformanceTier::High,
+            false,
         );
 
         assert_eq!(params.compiled_backend, WhisperCompiledBackend::Vulkan);
@@ -108,6 +114,7 @@ mod tests {
             WhisperCompiledBackend::Vulkan,
             GpuType::None,
             PerformanceTier::Low,
+            false,
         );
 
         assert!(params.use_gpu);
@@ -120,11 +127,13 @@ mod tests {
             WhisperCompiledBackend::Cuda,
             GpuType::Cuda,
             PerformanceTier::High,
+            false,
         );
         let ultra = whisper_context_acceleration_for(
             WhisperCompiledBackend::Cuda,
             GpuType::Cuda,
             PerformanceTier::Ultra,
+            false,
         );
 
         assert!(high.use_gpu);
@@ -140,10 +149,29 @@ mod tests {
                 WhisperCompiledBackend::Cpu,
                 runtime_gpu,
                 PerformanceTier::Ultra,
+                false,
             );
 
             assert!(!params.use_gpu);
             assert!(!params.flash_attn);
+            assert_eq!(params.status_label(), "CPU processing only");
         }
+    }
+
+    #[test]
+    fn cpu_control_disables_cuda_offload_and_flash_attention() {
+        let params = whisper_context_acceleration_for(
+            WhisperCompiledBackend::Cuda,
+            GpuType::Cuda,
+            PerformanceTier::Ultra,
+            true,
+        );
+
+        assert!(!params.use_gpu);
+        assert!(!params.flash_attn);
+        assert_eq!(
+            params.status_label(),
+            "CPU control requested for this Whisper context"
+        );
     }
 }

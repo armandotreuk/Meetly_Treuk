@@ -1,7 +1,7 @@
 // Commit name to recover the serial whisper engine processing for smaller meetings [Slower processing but dooes not fail] - "before parallel processing implementation"
 
 use super::acceleration::{whisper_context_acceleration_for, WhisperCompiledBackend};
-use super::performance_preferences::effective_thread_count;
+use super::performance_preferences::{effective_thread_count, force_whisper_cpu};
 use crate::config::WHISPER_MODEL_CATALOG;
 use anyhow::{anyhow, Result};
 use reqwest::Client;
@@ -311,6 +311,7 @@ impl WhisperEngine {
                     WhisperCompiledBackend::current(),
                     hardware_profile.gpu_type,
                     hardware_profile.performance_tier,
+                    force_whisper_cpu(),
                 );
 
                 let context_param = WhisperContextParameters {

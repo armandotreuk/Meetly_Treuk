@@ -13,6 +13,7 @@ import { RetrievalIndexSettings } from "./RetrievalIndexSettings";
 
 type TranscriptionPerformancePreferences = {
     cpuThreadLimit: number | null;
+    forceWhisperCpu: boolean;
 };
 
 type TranscriptionHardwareStatus = {
@@ -23,6 +24,8 @@ type TranscriptionHardwareStatus = {
     recommendedCpuThreads: number;
     configuredCpuThreads: number | null;
     effectiveCpuThreads: number;
+    validationPackage: boolean;
+    cpuControlAvailable: boolean;
     message: string;
 };
 
@@ -69,10 +72,14 @@ export function PreferenceSettings() {
         loadTranscriptionPerformance();
     }, []);
 
-    const saveThreadLimit = async (cpuThreadLimit: number | null) => {
+    const saveTranscriptionPreferences = async (
+        update: Partial<TranscriptionPerformancePreferences>
+    ) => {
+        if (!transcriptionPreferences) return;
+
         setTranscriptionPerformanceSaving(true);
         try {
-            const preferences = { cpuThreadLimit };
+            const preferences = { ...transcriptionPreferences, ...update };
             await invoke("set_transcription_performance_preferences", { preferences });
             setTranscriptionPreferences(preferences);
             setTranscriptionHardware(
@@ -244,7 +251,7 @@ export function PreferenceSettings() {
                             <span className="font-medium">{transcriptionHardware.detectedGpu}</span>
                         </p>
                         <p className="text-sm text-gray-600 mb-4">
-                            GPU runtime: {transcriptionHardware.gpuRuntimeStatus}
+                            GPU prerequisite/status hint: {transcriptionHardware.gpuRuntimeStatus}
                         </p>
                         <div className="p-3 mb-4 rounded-md bg-blue-50 text-sm text-blue-900">
                             {transcriptionHardware.message}
@@ -261,11 +268,12 @@ export function PreferenceSettings() {
                             disabled={transcriptionPerformanceSaving || !transcriptionPreferences}
                             value={transcriptionPreferences?.cpuThreadLimit ?? "auto"}
                             onChange={(event) =>
-                                saveThreadLimit(
-                                    event.target.value === "auto"
-                                        ? null
-                                        : Number(event.target.value)
-                                )
+                                saveTranscriptionPreferences({
+                                    cpuThreadLimit:
+                                        event.target.value === "auto"
+                                            ? null
+                                            : Number(event.target.value),
+                                })
                             }
                         >
                             <option value="auto">
@@ -286,6 +294,37 @@ export function PreferenceSettings() {
                             {transcriptionHardware.cpuLogicalCores} logical CPU cores. This applies
                             to the next transcription.
                         </p>
+                        {transcriptionHardware.cpuControlAvailable && (
+                            <div className="mt-5 border-t border-gray-200 pt-4">
+                                <div className="flex items-start justify-between gap-4">
+                                    <div>
+                                        <label
+                                            className="block text-sm font-medium text-gray-800"
+                                            htmlFor="r13-whisper-cpu-control"
+                                        >
+                                            R13 CPU control
+                                        </label>
+                                        <p className="mt-1 text-xs text-gray-600">
+                                            Disable Whisper GPU offload for the next newly loaded
+                                            model context. Use this only to compare CPU and CUDA in
+                                            the isolated R13 validation package; reload the model or
+                                            restart before measuring.
+                                        </p>
+                                    </div>
+                                    <Switch
+                                        id="r13-whisper-cpu-control"
+                                        checked={transcriptionPreferences?.forceWhisperCpu ?? false}
+                                        disabled={
+                                            transcriptionPerformanceSaving ||
+                                            !transcriptionPreferences
+                                        }
+                                        onCheckedChange={(forceWhisperCpu) =>
+                                            saveTranscriptionPreferences({ forceWhisperCpu })
+                                        }
+                                    />
+                                </div>
+                            </div>
+                        )}
                     </>
                 ) : (
                     <p className="text-sm text-gray-600">Loading transcription hardware status…</p>
