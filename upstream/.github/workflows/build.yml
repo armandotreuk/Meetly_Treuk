@@ -111,7 +111,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
-          key: ${{ inputs.platform }}-${{ inputs.target }}-vulkan-v2
+          key: ${{ inputs.platform }}-${{ inputs.target }}-cuda13-v1
 
       - name: install dependencies (ubuntu 24.04)
         if: contains(inputs.platform, 'ubuntu-24.04')
@@ -131,112 +131,42 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libasound2-dev libopenblas-dev libx11-dev libxtst-dev libxrandr-dev
 
-      - name: Install Vulkan SDK (Windows)
+      - name: Install CUDA Toolkit 13.3 (Windows)
         if: contains(inputs.platform, 'windows')
-        uses: humbletim/install-vulkan-sdk@v1.2
+        uses: Jimver/cuda-toolkit@v0.2.36
         with:
-          version: 1.4.309.0
-          cache: true
+          cuda: '13.3.0'
 
-      - name: Verify and Configure Vulkan SDK (Windows)
+      - name: Configure CUDA 13.3 runtime (Windows)
         if: contains(inputs.platform, 'windows')
         shell: pwsh
         run: |
-          Write-Host "=== Vulkan SDK Configuration ==="
+          if (-not $env:CUDA_PATH -or -not (Test-Path -LiteralPath $env:CUDA_PATH)) { throw 'CUDA_PATH was not configured by the CUDA toolkit setup.' }
+          $nvcc = Join-Path $env:CUDA_PATH 'bin\nvcc.exe'
+          $nvccVersion = & $nvcc --version | Out-String
+          if ($nvccVersion -notmatch 'release 13\.3') { throw "CUDA 13.3 is required, but nvcc reported: $nvccVersion" }
+          @(
+            "CMAKE_CUDA_COMPILER=$nvcc",
+            'CMAKE_CUDA_ARCHITECTURES=120',
+            'CMAKE_CUDA_FLAGS=-Xcompiler /Zc:preprocessor',
+            'CMAKE_CXX_STANDARD=17',
+            'CMAKE_CUDA_STANDARD=17',
+            'CMAKE_CUDA_STANDARD_REQUIRED=ON',
+            'CMAKE_CUDA_COMPILER_WORKS=1',
+            'WHISPER_DONT_GENERATE_BINDINGS=1',
+            "CMAKE_PROJECT_TOP_LEVEL_INCLUDES=$env:GITHUB_WORKSPACE/frontend/src-tauri/cmake/ggml-portable-x64.cmake",
+            "CUDA_PATH_V13_3=$env:CUDA_PATH"
+          ) | ForEach-Object { $_ | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append }
 
-          $vulkanSdk = $env:VULKAN_SDK
-          Write-Host "VULKAN_SDK: $vulkanSdk"
-
-          if (-not $vulkanSdk -or -not (Test-Path $vulkanSdk)) {
-            Write-Error "VULKAN_SDK not set or path does not exist"
-            exit 1
+          $runtimeDir = 'frontend/src-tauri/resources/cuda-runtime'
+          New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
+          $cudaBinCandidates = @((Join-Path $env:CUDA_PATH 'bin'), (Join-Path $env:CUDA_PATH 'bin\x64')) | Where-Object { Test-Path -LiteralPath $_ }
+          foreach ($pattern in @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll')) {
+            $matches = @($cudaBinCandidates | ForEach-Object { Get-ChildItem -LiteralPath $_ -Filter $pattern -File })
+            if ($matches.Count -ne 1) { throw "Expected exactly one CUDA runtime matching $pattern; found $($matches.Count)." }
+            Copy-Item -LiteralPath $matches[0].FullName -Destination $runtimeDir -Force
           }
-
-          # Verify critical directories exist
-          $binDir = Join-Path $vulkanSdk "Bin"
-          $libDir = Join-Path $vulkanSdk "Lib"
-          $includeDir = Join-Path $vulkanSdk "Include"
-
-          Write-Host "Directory structure:"
-          Write-Host "  Bin: $(if (Test-Path $binDir) { 'EXISTS' } else { 'MISSING' })"
-          Write-Host "  Lib: $(if (Test-Path $libDir) { 'EXISTS' } else { 'MISSING' })"
-          Write-Host "  Include: $(if (Test-Path $includeDir) { 'EXISTS' } else { 'MISSING' })"
-
-          # Check for glslc and glslangValidator
-          $glslc = Join-Path $binDir "glslc.exe"
-          $glslangValidator = Join-Path $binDir "glslangValidator.exe"
-
-          Write-Host "Shader compilers:"
-          Write-Host "  glslc: $(if (Test-Path $glslc) { 'FOUND' } else { 'MISSING' })"
-          Write-Host "  glslangValidator: $(if (Test-Path $glslangValidator) { 'FOUND' } else { 'MISSING' })"
-
-          # Ensure Bin is in PATH for shader compilers
-          $currentPath = $env:PATH
-          if (-not $currentPath.Contains($binDir)) {
-            Write-Host "Adding Vulkan SDK Bin to PATH..."
-            "PATH=$binDir;$currentPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          }
-
-          # Set additional environment variables for CMake
-          Write-Host "Setting CMake-related environment variables..."
-          "Vulkan_LIBRARY=$libDir\vulkan-1.lib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "Vulkan_INCLUDE_DIR=$includeDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "VK_SDK_PATH=$vulkanSdk" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-          Write-Host "=== Vulkan SDK Configuration Complete ==="
-
-      - name: Copy Vulkan runtime for bundling (Windows)
-        if: contains(inputs.platform, 'windows')
-        shell: pwsh
-        run: |
-          # Create runtime directory
-          $runtimeDir = "frontend/src-tauri/vulkan-runtime"
-          if (!(Test-Path $runtimeDir)) {
-            New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
-          }
-
-          # Find Vulkan SDK - check multiple possible locations
-          $vulkanSdk = $env:VULKAN_SDK
-          Write-Host "VULKAN_SDK env: $vulkanSdk"
-
-          # Common installation paths
-          $possiblePaths = @(
-            "$vulkanSdk\Bin\vulkan-1.dll",
-            "$vulkanSdk\runtime\x64\vulkan-1.dll",
-            "C:\VulkanSDK\1.4.309.0\Bin\vulkan-1.dll",
-            "C:\VulkanSDK\1.4.309.0\runtime\x64\vulkan-1.dll",
-            "$env:ProgramFiles\VulkanSDK\Bin\vulkan-1.dll",
-            "$env:SystemRoot\System32\vulkan-1.dll"
-          )
-
-          $vulkanDll = $null
-          foreach ($path in $possiblePaths) {
-            Write-Host "Checking: $path"
-            if (Test-Path $path) {
-              $vulkanDll = $path
-              Write-Host "Found vulkan-1.dll at: $path"
-              break
-            }
-          }
-
-          if ($vulkanDll) {
-            Copy-Item $vulkanDll -Destination $runtimeDir
-            Write-Host "Copied vulkan-1.dll to $runtimeDir"
-          } else {
-            Write-Host "Searching for vulkan-1.dll on system..."
-            $found = Get-ChildItem -Path "C:\" -Filter "vulkan-1.dll" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($found) {
-              Write-Host "Found at: $($found.FullName)"
-              Copy-Item $found.FullName -Destination $runtimeDir
-            } else {
-              Write-Warning "vulkan-1.dll not found - Vulkan apps may not work without it"
-              Write-Host "System will use the user's installed Vulkan runtime"
-            }
-          }
-
-          # Verify
-          Write-Host "Contents of vulkan-runtime directory:"
-          Get-ChildItem $runtimeDir -ErrorAction SilentlyContinue
+          if (Get-ChildItem -LiteralPath $runtimeDir -Filter 'nvcuda.dll' -File) { throw 'The NVIDIA driver DLL nvcuda.dll must never be bundled.' }
 
       - name: Setup DigiCert Environment
         if: contains(inputs.platform, 'windows') && inputs.sign-binaries
@@ -486,10 +416,11 @@ jobs:
         run: |
           FEATURES=""
 
-          # Windows: Use Vulkan for GPU acceleration
+          # Windows: CUDA 13.3 for the RTX 5060 reference hardware. The NSIS
+          # overlay is required to install the runtime DLLs beside meetily.exe.
           if [[ "${{ inputs.platform }}" == *"windows"* ]]; then
-            FEATURES="--features vulkan"
-            echo "Windows build with Vulkan GPU acceleration"
+            FEATURES="--features cuda --config src-tauri/tauri.cuda.conf.json"
+            echo "Windows build with CUDA 13.3 GPU acceleration"
           fi
 
           # Linux: Use OpenBLAS for optimized CPU performance
@@ -593,6 +524,37 @@ jobs:
           releaseId: ${{ inputs.release-id }}
           args: ${{ inputs.build-args }} ${{ steps.build-features.outputs.features }}
 
+      - name: Verify CUDA NSIS package (Windows)
+        if: contains(inputs.platform, 'windows')
+        shell: pwsh
+        run: |
+          $bundleRoot = "target/${{ inputs.target }}/${{ steps.build-profile.outputs.profile }}/bundle"
+          $nsis = @(Get-ChildItem -LiteralPath (Join-Path $bundleRoot 'nsis') -Filter '*.exe' -File -ErrorAction Stop)
+          if ($nsis.Count -ne 1) { throw 'Expected exactly one CUDA NSIS installer.' }
+          if (@(Get-ChildItem -LiteralPath (Join-Path $bundleRoot 'msi') -Filter '*.msi' -File -ErrorAction SilentlyContinue).Count -ne 0) {
+            throw 'CUDA runtime placement is implemented through the reviewed NSIS hook; an MSI installer must not be emitted.'
+          }
+          $app = "target/${{ inputs.target }}/${{ steps.build-profile.outputs.profile }}/meetily.exe"
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $dumpbin = Get-ChildItem -Path (Join-Path $vsInstall 'VC\Tools\MSVC') -Filter dumpbin.exe -Recurse |
+            Where-Object { $_.FullName -match 'Hostx64\\x64\\dumpbin.exe$' } |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $dumpbin) { throw 'Visual Studio dumpbin.exe was not found for the CUDA dependency audit.' }
+          $dependencies = & $dumpbin /DEPENDENTS $app | Out-String
+          if ($dependencies -notmatch '(?im)^\s*cublas64_13\.dll\s*$') {
+            throw 'The Windows executable does not directly import the CUDA 13 cuBLAS runtime.'
+          }
+          $installRoot = Join-Path $env:RUNNER_TEMP 'meetily-cuda-release-layout'
+          $install = Start-Process -FilePath $nsis[0].FullName -ArgumentList "/S /D=$installRoot" -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "CUDA NSIS installer failed with exit code $($install.ExitCode)" }
+          if (-not (Test-Path -LiteralPath (Join-Path $installRoot 'meetily.exe'))) { throw 'CUDA NSIS installer did not place meetily.exe at the requested root.' }
+          foreach ($runtime in @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll')) {
+            if (@(Get-ChildItem -LiteralPath $installRoot -Filter $runtime -File).Count -ne 1) {
+              throw "Installed CUDA package is missing $runtime beside meetily.exe"
+            }
+          }
+
       - name: Upload artifacts (macOS)
         if: inputs.upload-artifacts && contains(inputs.platform, 'macos')
         uses: actions/upload-artifact@v4
@@ -673,8 +635,6 @@ jobs:
         with:
           name: ${{ inputs.asset-prefix }}-${{ inputs.target }}
           path: |
-            target/${{ steps.build-profile.outputs.profile }}/bundle/msi/*.msi
-            target/${{ steps.build-profile.outputs.profile }}/bundle/msi/*.msi.sig
             target/${{ steps.build-profile.outputs.profile }}/bundle/nsis/*.exe
             target/${{ steps.build-profile.outputs.profile }}/bundle/nsis/*.exe.sig
           retention-days: 30

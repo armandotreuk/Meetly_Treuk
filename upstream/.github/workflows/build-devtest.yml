@@ -40,7 +40,7 @@ jobs:
           - platform: windows-latest
             platform-name: Windows
             target: x86_64-pc-windows-msvc
-            args: --target x86_64-pc-windows-msvc
+            args: --target x86_64-pc-windows-msvc --bundles nsis
           - platform: ubuntu-22.04
             platform-name: Linux (Ubuntu 22.04)
             target: x86_64-unknown-linux-gnu
@@ -137,12 +137,42 @@ jobs:
           sudo apt install vulkan-sdk -y
           sudo apt-get install -y mesa-vulkan-drivers
 
-      - name: Install Vulkan SDK (Windows)
+      - name: Install CUDA Toolkit 13.3 (Windows)
         if: contains(matrix.platform, 'windows')
-        uses: humbletim/install-vulkan-sdk@v1.2
+        uses: Jimver/cuda-toolkit@v0.2.36
         with:
-          version: 1.4.309.0
-          cache: true
+          cuda: '13.3.0'
+
+      - name: Configure CUDA 13.3 runtime (Windows)
+        if: contains(matrix.platform, 'windows')
+        shell: pwsh
+        run: |
+          if (-not $env:CUDA_PATH -or -not (Test-Path -LiteralPath $env:CUDA_PATH)) { throw 'CUDA_PATH was not configured by the CUDA toolkit setup.' }
+          $nvcc = Join-Path $env:CUDA_PATH 'bin\nvcc.exe'
+          $nvccVersion = & $nvcc --version | Out-String
+          if ($nvccVersion -notmatch 'release 13\.3') { throw "CUDA 13.3 is required, but nvcc reported: $nvccVersion" }
+          @(
+            "CMAKE_CUDA_COMPILER=$nvcc",
+            'CMAKE_CUDA_ARCHITECTURES=120',
+            'CMAKE_CUDA_FLAGS=-Xcompiler /Zc:preprocessor',
+            'CMAKE_CXX_STANDARD=17',
+            'CMAKE_CUDA_STANDARD=17',
+            'CMAKE_CUDA_STANDARD_REQUIRED=ON',
+            'CMAKE_CUDA_COMPILER_WORKS=1',
+            'WHISPER_DONT_GENERATE_BINDINGS=1',
+            "CMAKE_PROJECT_TOP_LEVEL_INCLUDES=$env:GITHUB_WORKSPACE/frontend/src-tauri/cmake/ggml-portable-x64.cmake",
+            "CUDA_PATH_V13_3=$env:CUDA_PATH"
+          ) | ForEach-Object { $_ | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append }
+
+          $runtimeDir = 'frontend/src-tauri/resources/cuda-runtime'
+          New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
+          $cudaBinCandidates = @((Join-Path $env:CUDA_PATH 'bin'), (Join-Path $env:CUDA_PATH 'bin\x64')) | Where-Object { Test-Path -LiteralPath $_ }
+          foreach ($pattern in @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll')) {
+            $matches = @($cudaBinCandidates | ForEach-Object { Get-ChildItem -LiteralPath $_ -Filter $pattern -File })
+            if ($matches.Count -ne 1) { throw "Expected exactly one CUDA runtime matching $pattern; found $($matches.Count)." }
+            Copy-Item -LiteralPath $matches[0].FullName -Destination $runtimeDir -Force
+          }
+          if (Get-ChildItem -LiteralPath $runtimeDir -Filter 'nvcuda.dll' -File) { throw 'The NVIDIA driver DLL nvcuda.dll must never be bundled.' }
 
       - name: Install frontend dependencies
         run: |
@@ -317,10 +347,10 @@ jobs:
         run: |
           FEATURES=""
 
-          # Windows: Use Vulkan for GPU acceleration
+          # Windows: CUDA 13.3 for the RTX 5060 reference hardware.
           if [[ "${{ matrix.platform }}" == *"windows"* ]]; then
-            FEATURES="--features vulkan"
-            echo "Windows build with Vulkan GPU acceleration"
+            FEATURES="--features cuda --config src-tauri/tauri.cuda.conf.json"
+            echo "Windows build with CUDA 13.3 GPU acceleration"
           fi
 
           # Linux: Use OpenBLAS for optimized CPU performance
@@ -347,8 +377,7 @@ jobs:
             LLAMA_FEATURES="--features metal"
             echo "Using Metal GPU acceleration for macOS"
           elif [[ "${{ matrix.platform }}" == *"windows"* ]]; then
-            LLAMA_FEATURES="--features vulkan"
-            echo "Using Vulkan GPU acceleration for Windows"
+            echo "Using CPU-only llama-helper for Windows"
           else
             echo "Using CPU-only mode for Linux"
           fi
@@ -461,10 +490,10 @@ jobs:
         if: contains(matrix.platform, 'windows') && github.event.inputs.sign-build == 'true'
         shell: pwsh
         run: |
-          $msiPath = Get-ChildItem -Path "target/x86_64-pc-windows-msvc/release/bundle/msi" -Filter "*.msi" | Select-Object -First 1 -ExpandProperty FullName
-          if ($msiPath) {
-            Write-Host "Verifying MSI signature: $msiPath"
-            Get-AuthenticodeSignature -FilePath "$msiPath" | Format-List
+          $nsisPath = Get-ChildItem -Path "target/x86_64-pc-windows-msvc/release/bundle/nsis" -Filter "*.exe" | Select-Object -First 1 -ExpandProperty FullName
+          if ($nsisPath) {
+            Write-Host "Verifying NSIS installer signature: $nsisPath"
+            Get-AuthenticodeSignature -FilePath "$nsisPath" | Format-List
           }
 
       # Upload artifacts
@@ -478,8 +507,6 @@ jobs:
             target/aarch64-apple-darwin/release/bundle/macos/*.app
             target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz
             target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
-            target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
-            target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi.sig
             target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
             target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe.sig
             target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
